@@ -27,62 +27,8 @@
 <!-- Social Media Credentials -->
 <div class="card">
     <h2>Social Media Accounts</h2>
-
-    <div class="social-settings">
-        <div class="social-platform-config" id="config-twitter">
-            <h3><span class="platform-badge platform-twitter">Twitter / X</span></h3>
-            <p class="help-text">Requires Twitter API v2 Basic plan ($100/mo). Create app at developer.x.com.</p>
-            <div class="form-row">
-                <div class="form-group"><label>API Key</label><input type="text" data-platform="twitter" data-key="api_key"></div>
-                <div class="form-group"><label>API Secret</label><input type="password" data-platform="twitter" data-key="api_secret"></div>
-            </div>
-            <div class="form-row">
-                <div class="form-group"><label>Access Token</label><input type="text" data-platform="twitter" data-key="access_token"></div>
-                <div class="form-group"><label>Access Token Secret</label><input type="password" data-platform="twitter" data-key="access_token_secret"></div>
-            </div>
-            <button class="btn btn-sm" onclick="saveSocialConfig('twitter')">Save</button>
-        </div>
-
-        <div class="social-platform-config" id="config-bluesky">
-            <h3><span class="platform-badge platform-bluesky">Bluesky</span></h3>
-            <p class="help-text">Use an App Password from bsky.app → Settings → App Passwords.</p>
-            <div class="form-row">
-                <div class="form-group"><label>Handle</label><input type="text" data-platform="bluesky" data-key="handle" placeholder="you.bsky.social"></div>
-                <div class="form-group"><label>App Password</label><input type="password" data-platform="bluesky" data-key="app_password"></div>
-            </div>
-            <button class="btn btn-sm" onclick="saveSocialConfig('bluesky')">Save</button>
-        </div>
-
-        <div class="social-platform-config" id="config-mastodon">
-            <h3><span class="platform-badge platform-mastodon">Mastodon</span></h3>
-            <p class="help-text">Create an app in your instance's Settings → Development → New Application.</p>
-            <div class="form-row">
-                <div class="form-group"><label>Instance URL</label><input type="text" data-platform="mastodon" data-key="instance_url" placeholder="https://mastodon.social"></div>
-                <div class="form-group"><label>Access Token</label><input type="password" data-platform="mastodon" data-key="access_token"></div>
-            </div>
-            <button class="btn btn-sm" onclick="saveSocialConfig('mastodon')">Save</button>
-        </div>
-
-        <div class="social-platform-config" id="config-linkedin">
-            <h3><span class="platform-badge platform-linkedin">LinkedIn</span></h3>
-            <p class="help-text">Requires LinkedIn app with w_member_social scope. Get person URN from /v2/me.</p>
-            <div class="form-row">
-                <div class="form-group"><label>Access Token</label><input type="password" data-platform="linkedin" data-key="access_token"></div>
-                <div class="form-group"><label>Person URN</label><input type="text" data-platform="linkedin" data-key="person_urn" placeholder="urn:li:person:xxxxxxxx"></div>
-            </div>
-            <button class="btn btn-sm" onclick="saveSocialConfig('linkedin')">Save</button>
-        </div>
-
-        <div class="social-platform-config" id="config-threads">
-            <h3><span class="platform-badge platform-threads">Threads</span></h3>
-            <p class="help-text">Requires Meta developer app with threads_publish scope.</p>
-            <div class="form-row">
-                <div class="form-group"><label>Access Token</label><input type="password" data-platform="threads" data-key="access_token"></div>
-                <div class="form-group"><label>User ID</label><input type="text" data-platform="threads" data-key="user_id"></div>
-                <div class="form-group"><label>Username</label><input type="text" data-platform="threads" data-key="username"></div>
-            </div>
-            <button class="btn btn-sm" onclick="saveSocialConfig('threads')">Save</button>
-        </div>
+    <div id="social-platforms" class="social-settings">
+        <p class="loading">Loading platforms...</p>
     </div>
 </div>
 
@@ -109,16 +55,22 @@
 
 {% block scripts %}
 <script>
-// Auth status
+// --- YouTube Auth ---
 async function loadAuthStatus() {
     const resp = await fetch('/auth/status');
     const data = await resp.json();
     const el = document.getElementById('auth-info');
-    const storage = data.storage === 'keychain' ? 'macOS Keychain' : 'local file';
+    const storage = data.storage === 'keychain' ? 'macOS Keychain' : 'encrypted secrets file';
     if (data.authenticated) {
-        el.innerHTML = `<span class="badge badge-published">Authenticated</span> <span style="color: var(--text-muted); font-size: 0.8rem; margin-left: 0.5rem;">Stored in ${storage}</span>`;
+        el.innerHTML = `<span class="badge badge-published">Authenticated</span>
+            <span style="color: var(--text-muted); font-size: 0.8rem; margin-left: 0.5rem;">
+                Stored in ${storage}
+            </span>`;
     } else {
-        el.innerHTML = `<span class="badge badge-draft">Not authenticated</span> <span style="color: var(--text-muted); font-size: 0.8rem; margin-left: 0.5rem;">Will use ${storage}</span>`;
+        el.innerHTML = `<span class="badge badge-draft">Not authenticated</span>
+            <span style="color: var(--text-muted); font-size: 0.8rem; margin-left: 0.5rem;">
+                Will use ${storage}
+            </span>`;
     }
 }
 
@@ -132,6 +84,7 @@ document.getElementById('client-secret-file').addEventListener('change', async (
 });
 
 async function doLogin() {
+    showToast('Opening browser for YouTube authentication...', 'info');
     const resp = await fetch('/auth/login', {method: 'POST'});
     const data = await resp.json();
     if (data.status === 'ok') {
@@ -154,21 +107,107 @@ async function doLogout() {
     }
 }
 
+// --- Social Media Platforms (dynamically rendered) ---
+async function loadSocialPlatforms() {
+    const container = document.getElementById('social-platforms');
+    const resp = await fetch('/api/settings/social');
+    const platforms = await resp.json();
+
+    container.innerHTML = Object.entries(platforms).map(([name, config]) => {
+        const statusBadge = config.configured
+            ? '<span class="badge badge-published">Connected</span>'
+            : '<span class="badge badge-draft">Not configured</span>';
+
+        const storageNote = config.storage === 'keychain' ? 'macOS Keychain' : 'encrypted file';
+
+        const fields = config.fields.map(f => `
+            <div class="form-group">
+                <label>${f.label}</label>
+                <input type="${f.type || 'text'}"
+                    data-platform="${name}" data-key="${f.key}"
+                    value="${config.stored[f.key] || ''}"
+                    placeholder="${f.placeholder || ''}"
+                    autocomplete="off">
+            </div>
+        `).join('');
+
+        // Group fields into rows of 2
+        const fieldPairs = config.fields.reduce((rows, f, i) => {
+            if (i % 2 === 0) rows.push([]);
+            rows[rows.length - 1].push(f);
+            return rows;
+        }, []);
+
+        const fieldRows = fieldPairs.map(pair => `
+            <div class="form-row">
+                ${pair.map(f => `
+                    <div class="form-group">
+                        <label>${f.label}</label>
+                        <input type="${f.type || 'text'}"
+                            data-platform="${name}" data-key="${f.key}"
+                            value="${config.stored[f.key] || ''}"
+                            placeholder="${f.placeholder || ''}"
+                            autocomplete="off">
+                    </div>
+                `).join('')}
+            </div>
+        `).join('');
+
+        return `
+            <div class="social-platform-config" id="config-${name}">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                    <h3><span class="platform-badge platform-${name}">${name}</span> ${statusBadge}</h3>
+                    ${config.configured ? `<button class="btn btn-sm btn-danger" onclick="disconnectSocial('${name}')">Disconnect</button>` : ''}
+                </div>
+                <p class="help-text">${config.description} <span style="color: var(--text-muted);">Secrets stored in ${storageNote}.</span></p>
+                ${fieldRows}
+                <button class="btn btn-sm btn-primary" onclick="saveSocialConfig('${name}')">Save</button>
+            </div>
+        `;
+    }).join('');
+}
+
 async function saveSocialConfig(platform) {
     const inputs = document.querySelectorAll(`[data-platform="${platform}"]`);
     const data = {};
     inputs.forEach(input => {
-        if (input.value) data[input.dataset.key] = input.value;
+        const val = input.value.trim();
+        // Don't send masked values back (they end with "...")
+        if (val && !val.endsWith('...')) {
+            data[input.dataset.key] = val;
+        }
     });
+
+    if (Object.keys(data).length === 0) {
+        showToast('No new values to save (masked values are unchanged)', 'info');
+        return;
+    }
+
     const resp = await fetch(`/api/settings/social/${platform}`, {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(data),
     });
-    if (resp.ok) showToast(`${platform} credentials saved`, 'success');
-    else showToast('Failed to save', 'error');
+    if (resp.ok) {
+        const result = await resp.json();
+        const where = result.storage === 'keychain' ? 'Keychain' : 'secrets file';
+        showToast(`${platform} credentials saved to ${where}`, 'success');
+        loadSocialPlatforms();
+    } else {
+        showToast('Failed to save', 'error');
+    }
 }
 
+async function disconnectSocial(platform) {
+    if (!confirm(`Remove all ${platform} credentials?`)) return;
+    const resp = await fetch(`/api/settings/social/${platform}`, {method: 'DELETE'});
+    if (resp.ok) {
+        showToast(`${platform} disconnected`, 'success');
+        loadSocialPlatforms();
+    }
+}
+
+// --- General Settings ---
 async function saveGeneralSettings() {
     const data = {
         default_pinned_links: document.getElementById('default-pinned-links').value,
@@ -194,7 +233,9 @@ async function loadSettings() {
         document.getElementById('caption-check-interval').value = settings.caption_check_interval;
 }
 
+// Load everything
 loadAuthStatus();
+loadSocialPlatforms();
 loadSettings();
 </script>
 {% endblock %}

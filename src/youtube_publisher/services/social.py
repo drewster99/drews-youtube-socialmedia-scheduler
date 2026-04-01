@@ -1,11 +1,10 @@
-"""Social media posting — multi-platform."""
+"""Social media posting — multi-platform with Keychain credential storage."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
-from youtube_publisher.database import get_db
+from youtube_publisher.services.keychain import load_all_secrets, load_secret
 
 
 class SocialPoster:
@@ -13,48 +12,48 @@ class SocialPoster:
 
     platform: str = ""
 
+    # Keys that are secrets (stored in Keychain) vs. non-secrets (also in Keychain for simplicity)
+    # All platform config is stored securely since even handles can be sensitive.
+    required_keys: list[str] = []
+
+    def _get_creds(self) -> dict[str, str]:
+        """Load all credentials for this platform from Keychain/secrets."""
+        return load_all_secrets(self.platform)
+
     async def post(self, text: str, media_path: str | None = None) -> dict:
         """Post content. Returns {"url": "...", "id": "..."} on success."""
         raise NotImplementedError
 
     async def is_configured(self) -> bool:
-        """Check if this platform's credentials are configured."""
-        db = await get_db()
-        rows = await db.execute_fetchall(
-            "SELECT value FROM settings WHERE key = ?",
-            (f"social_{self.platform}_configured",),
-        )
-        return bool(rows) and rows[0]["value"] == "1"
+        """Check if this platform has all required credentials."""
+        creds = self._get_creds()
+        return all(creds.get(k) for k in self.required_keys)
 
 
 class TwitterPoster(SocialPoster):
     platform = "twitter"
+    required_keys = ["api_key", "api_secret", "access_token", "access_token_secret"]
 
     async def post(self, text: str, media_path: str | None = None) -> dict:
-        db = await get_db()
-        rows = await db.execute_fetchall(
-            "SELECT key, value FROM settings WHERE key LIKE 'social_twitter_%'"
-        )
-        creds = {r["key"].replace("social_twitter_", ""): r["value"] for r in rows}
+        creds = self._get_creds()
 
         try:
             import tweepy
 
             client = tweepy.Client(
-                consumer_key=creds.get("api_key", ""),
-                consumer_secret=creds.get("api_secret", ""),
-                access_token=creds.get("access_token", ""),
-                access_token_secret=creds.get("access_token_secret", ""),
+                consumer_key=creds["api_key"],
+                consumer_secret=creds["api_secret"],
+                access_token=creds["access_token"],
+                access_token_secret=creds["access_token_secret"],
             )
 
             media_ids = None
             if media_path and Path(media_path).exists():
-                # v1.1 API needed for media upload
                 auth = tweepy.OAuth1UserHandler(
-                    creds.get("api_key", ""),
-                    creds.get("api_secret", ""),
-                    creds.get("access_token", ""),
-                    creds.get("access_token_secret", ""),
+                    creds["api_key"],
+                    creds["api_secret"],
+                    creds["access_token"],
+                    creds["access_token_secret"],
                 )
                 api_v1 = tweepy.API(auth)
                 media = api_v1.media_upload(media_path)
@@ -69,19 +68,16 @@ class TwitterPoster(SocialPoster):
 
 class BlueskyPoster(SocialPoster):
     platform = "bluesky"
+    required_keys = ["handle", "app_password"]
 
     async def post(self, text: str, media_path: str | None = None) -> dict:
-        db = await get_db()
-        rows = await db.execute_fetchall(
-            "SELECT key, value FROM settings WHERE key LIKE 'social_bluesky_%'"
-        )
-        creds = {r["key"].replace("social_bluesky_", ""): r["value"] for r in rows}
+        creds = self._get_creds()
 
         try:
             from atproto import Client
 
             client = Client()
-            client.login(creds.get("handle", ""), creds.get("app_password", ""))
+            client.login(creds["handle"], creds["app_password"])
 
             embed = None
             if media_path and Path(media_path).exists():
@@ -94,26 +90,23 @@ class BlueskyPoster(SocialPoster):
                 }
 
             response = client.send_post(text=text, embed=embed)
-            return {"url": f"https://bsky.app/profile/{creds.get('handle', '')}", "id": str(response.uri)}
+            return {"url": f"https://bsky.app/profile/{creds['handle']}", "id": str(response.uri)}
         except Exception as e:
             raise RuntimeError(f"Bluesky post failed: {e}") from e
 
 
 class MastodonPoster(SocialPoster):
     platform = "mastodon"
+    required_keys = ["access_token", "instance_url"]
 
     async def post(self, text: str, media_path: str | None = None) -> dict:
-        db = await get_db()
-        rows = await db.execute_fetchall(
-            "SELECT key, value FROM settings WHERE key LIKE 'social_mastodon_%'"
-        )
-        creds = {r["key"].replace("social_mastodon_", ""): r["value"] for r in rows}
+        creds = self._get_creds()
 
         try:
             from mastodon import Mastodon
 
             client = Mastodon(
-                access_token=creds.get("access_token", ""),
+                access_token=creds["access_token"],
                 api_base_url=creds.get("instance_url", "https://mastodon.social"),
             )
 
@@ -130,31 +123,22 @@ class MastodonPoster(SocialPoster):
 
 class LinkedInPoster(SocialPoster):
     platform = "linkedin"
+    required_keys = ["access_token", "person_urn"]
 
     async def post(self, text: str, media_path: str | None = None) -> dict:
-        """Post to LinkedIn using their API.
-
-        Note: LinkedIn API requires an approved app with posting permissions.
-        This uses the Share API (v2).
-        """
-        db = await get_db()
-        rows = await db.execute_fetchall(
-            "SELECT key, value FROM settings WHERE key LIKE 'social_linkedin_%'"
-        )
-        creds = {r["key"].replace("social_linkedin_", ""): r["value"] for r in rows}
+        creds = self._get_creds()
 
         try:
             import httpx
 
             headers = {
-                "Authorization": f"Bearer {creds.get('access_token', '')}",
+                "Authorization": f"Bearer {creds['access_token']}",
                 "Content-Type": "application/json",
                 "X-Restli-Protocol-Version": "2.0.0",
             }
 
-            person_urn = creds.get("person_urn", "")
             body = {
-                "author": person_urn,
+                "author": creds["person_urn"],
                 "lifecycleState": "PUBLISHED",
                 "specificContent": {
                     "com.linkedin.ugc.ShareContent": {
@@ -178,62 +162,89 @@ class LinkedInPoster(SocialPoster):
 
 class ThreadsPoster(SocialPoster):
     platform = "threads"
+    required_keys = ["access_token", "user_id"]
 
     async def post(self, text: str, media_path: str | None = None) -> dict:
-        """Post to Threads using Meta's Threads API."""
-        db = await get_db()
-        rows = await db.execute_fetchall(
-            "SELECT key, value FROM settings WHERE key LIKE 'social_threads_%'"
-        )
-        creds = {r["key"].replace("social_threads_", ""): r["value"] for r in rows}
+        creds = self._get_creds()
 
         try:
             import httpx
 
-            access_token = creds.get("access_token", "")
-            user_id = creds.get("user_id", "")
+            access_token = creds["access_token"]
+            user_id = creds["user_id"]
 
             async with httpx.AsyncClient() as client:
-                # Step 1: Create media container
                 create_resp = await client.post(
                     f"https://graph.threads.net/v1.0/{user_id}/threads",
-                    params={
-                        "media_type": "TEXT",
-                        "text": text,
-                        "access_token": access_token,
-                    },
+                    params={"media_type": "TEXT", "text": text, "access_token": access_token},
                 )
                 create_resp.raise_for_status()
                 container_id = create_resp.json()["id"]
 
-                # Step 2: Publish
                 publish_resp = await client.post(
                     f"https://graph.threads.net/v1.0/{user_id}/threads_publish",
-                    params={
-                        "creation_id": container_id,
-                        "access_token": access_token,
-                    },
+                    params={"creation_id": container_id, "access_token": access_token},
                 )
                 publish_resp.raise_for_status()
                 post_id = publish_resp.json()["id"]
 
-                return {"url": f"https://threads.net/@{creds.get('username', '')}/post/{post_id}", "id": post_id}
+                username = creds.get("username", "")
+                return {"url": f"https://threads.net/@{username}/post/{post_id}", "id": post_id}
         except Exception as e:
             raise RuntimeError(f"Threads post failed: {e}") from e
 
 
+# --- Registry ---
+
+_POSTERS: dict[str, type[SocialPoster]] = {
+    "twitter": TwitterPoster,
+    "bluesky": BlueskyPoster,
+    "mastodon": MastodonPoster,
+    "linkedin": LinkedInPoster,
+    "threads": ThreadsPoster,
+}
+
+ALL_PLATFORMS = list(_POSTERS.keys())
+
+# Per-platform field definitions for the settings UI
+PLATFORM_FIELDS: dict[str, list[dict]] = {
+    "twitter": [
+        {"key": "api_key", "label": "API Key", "type": "text", "secret": True},
+        {"key": "api_secret", "label": "API Secret", "type": "password", "secret": True},
+        {"key": "access_token", "label": "Access Token", "type": "text", "secret": True},
+        {"key": "access_token_secret", "label": "Access Token Secret", "type": "password", "secret": True},
+    ],
+    "bluesky": [
+        {"key": "handle", "label": "Handle", "type": "text", "secret": False, "placeholder": "you.bsky.social"},
+        {"key": "app_password", "label": "App Password", "type": "password", "secret": True},
+    ],
+    "mastodon": [
+        {"key": "instance_url", "label": "Instance URL", "type": "text", "secret": False, "placeholder": "https://mastodon.social"},
+        {"key": "access_token", "label": "Access Token", "type": "password", "secret": True},
+    ],
+    "linkedin": [
+        {"key": "access_token", "label": "Access Token", "type": "password", "secret": True},
+        {"key": "person_urn", "label": "Person URN", "type": "text", "secret": False, "placeholder": "urn:li:person:xxxxxxxx"},
+    ],
+    "threads": [
+        {"key": "access_token", "label": "Access Token", "type": "password", "secret": True},
+        {"key": "user_id", "label": "User ID", "type": "text", "secret": False},
+        {"key": "username", "label": "Username", "type": "text", "secret": False},
+    ],
+}
+
+PLATFORM_DESCRIPTIONS: dict[str, str] = {
+    "twitter": "Requires Twitter API v2 Basic plan ($100/mo). Create app at developer.x.com.",
+    "bluesky": "Use an App Password from bsky.app → Settings → App Passwords. Free.",
+    "mastodon": "Create an app in your instance's Settings → Development → New Application. Free.",
+    "linkedin": "Requires LinkedIn app with w_member_social scope. Get person URN from /v2/me.",
+    "threads": "Requires Meta developer app with threads_publish scope.",
+}
+
+
 def get_poster(platform: str) -> SocialPoster:
     """Get the poster instance for a platform."""
-    posters = {
-        "twitter": TwitterPoster(),
-        "bluesky": BlueskyPoster(),
-        "mastodon": MastodonPoster(),
-        "linkedin": LinkedInPoster(),
-        "threads": ThreadsPoster(),
-    }
-    if platform not in posters:
-        raise ValueError(f"Unknown platform: {platform}. Available: {list(posters.keys())}")
-    return posters[platform]
-
-
-ALL_PLATFORMS = ["twitter", "bluesky", "mastodon", "linkedin", "threads"]
+    cls = _POSTERS.get(platform)
+    if not cls:
+        raise ValueError(f"Unknown platform: {platform}. Available: {ALL_PLATFORMS}")
+    return cls()

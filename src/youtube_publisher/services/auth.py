@@ -1,11 +1,9 @@
-"""YouTube OAuth 2.0 authentication with macOS Keychain support."""
+"""YouTube OAuth 2.0 authentication using shared Keychain storage."""
 
 from __future__ import annotations
 
 import json
 import logging
-import platform
-import subprocess
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -14,117 +12,47 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 from youtube_publisher.config import CLIENT_SECRETS_PATH, CREDENTIALS_PATH, YOUTUBE_SCOPES
+from youtube_publisher.services.keychain import (
+    delete_secret,
+    get_storage_type,
+    load_secret,
+    store_secret,
+)
 
 logger = logging.getLogger(__name__)
 
-KEYCHAIN_SERVICE = "com.youtube-publisher.oauth"
-KEYCHAIN_ACCOUNT = "youtube-credentials"
-
-
-# --- Keychain storage (macOS) ---
-
-
-def _is_macos() -> bool:
-    return platform.system() == "Darwin"
-
-
-def _keychain_store(data: str) -> bool:
-    """Store credentials in macOS Keychain. Returns True on success."""
-    try:
-        # Delete existing entry first (ignore errors if it doesn't exist)
-        subprocess.run(
-            ["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT],
-            capture_output=True,
-        )
-        # Add new entry
-        result = subprocess.run(
-            [
-                "security", "add-generic-password",
-                "-s", KEYCHAIN_SERVICE,
-                "-a", KEYCHAIN_ACCOUNT,
-                "-w", data,
-                "-U",  # update if exists
-            ],
-            capture_output=True,
-            text=True,
-        )
-        return result.returncode == 0
-    except FileNotFoundError:
-        return False
-
-
-def _keychain_load() -> str | None:
-    """Load credentials from macOS Keychain. Returns JSON string or None."""
-    try:
-        result = subprocess.run(
-            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-        return None
-    except FileNotFoundError:
-        return None
-
-
-def _keychain_delete() -> bool:
-    """Delete credentials from macOS Keychain."""
-    try:
-        result = subprocess.run(
-            ["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT],
-            capture_output=True,
-        )
-        return result.returncode == 0
-    except FileNotFoundError:
-        return False
-
-
-# --- Credential storage (Keychain on macOS, file fallback) ---
+YOUTUBE_NAMESPACE = "youtube"
+YOUTUBE_CREDS_KEY = "oauth_credentials"
 
 
 def _save_credentials(creds: Credentials) -> None:
-    """Save credentials — Keychain on macOS, file on other platforms."""
-    creds_json = creds.to_json()
+    """Save credentials to Keychain (macOS) or secrets file."""
+    store_secret(YOUTUBE_NAMESPACE, YOUTUBE_CREDS_KEY, creds.to_json())
 
-    if _is_macos():
-        if _keychain_store(creds_json):
-            logger.info("Credentials stored in macOS Keychain")
-            # Remove file-based credentials if they exist (migration)
-            if CREDENTIALS_PATH.exists():
-                CREDENTIALS_PATH.unlink()
-                logger.info("Removed legacy file-based credentials")
-            return
-        logger.warning("Keychain storage failed, falling back to file")
-
-    # Fallback: file storage
-    CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CREDENTIALS_PATH.write_text(creds_json)
+    # Remove legacy file-based credentials if they exist
+    if CREDENTIALS_PATH.exists():
+        CREDENTIALS_PATH.unlink()
+        logger.info("Removed legacy file-based credentials")
 
 
 def _load_credentials_json() -> str | None:
     """Load credentials JSON from best available source."""
-    # Try Keychain first on macOS
-    if _is_macos():
-        data = _keychain_load()
-        if data:
-            return data
+    # Try Keychain/secrets file first
+    data = load_secret(YOUTUBE_NAMESPACE, YOUTUBE_CREDS_KEY)
+    if data:
+        return data
 
-    # Fallback: file
+    # Check for legacy file
     if CREDENTIALS_PATH.exists():
         data = CREDENTIALS_PATH.read_text().strip()
         if data:
-            # Migrate to Keychain if on macOS
-            if _is_macos():
-                if _keychain_store(data):
-                    CREDENTIALS_PATH.unlink()
-                    logger.info("Migrated credentials from file to Keychain")
+            # Migrate to Keychain
+            store_secret(YOUTUBE_NAMESPACE, YOUTUBE_CREDS_KEY, data)
+            CREDENTIALS_PATH.unlink()
+            logger.info("Migrated YouTube credentials to secure storage")
             return data
 
     return None
-
-
-# --- Public API ---
 
 
 def get_credentials() -> Credentials | None:
@@ -187,16 +115,17 @@ def get_youtube_service():
 def get_auth_status() -> dict:
     """Get current authentication status info."""
     creds = get_credentials()
+    storage = get_storage_type()
+
     if not creds:
-        return {"authenticated": False, "storage": "keychain" if _is_macos() else "file"}
+        return {"authenticated": False, "storage": storage}
 
     info = {
         "authenticated": True,
         "valid": creds.valid,
-        "storage": "keychain" if _is_macos() else "file",
+        "storage": storage,
     }
 
-    # Try to get client_id for display
     creds_json = _load_credentials_json()
     if creds_json:
         try:
@@ -209,8 +138,7 @@ def get_auth_status() -> dict:
 
 
 def clear_credentials() -> None:
-    """Remove all stored credentials."""
-    if _is_macos():
-        _keychain_delete()
+    """Remove all stored YouTube credentials."""
+    delete_secret(YOUTUBE_NAMESPACE, YOUTUBE_CREDS_KEY)
     if CREDENTIALS_PATH.exists():
         CREDENTIALS_PATH.unlink()
