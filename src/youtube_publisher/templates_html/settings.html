@@ -32,6 +32,23 @@
     </div>
 </div>
 
+<!-- Background Service -->
+<div class="card">
+    <h2>Background Service</h2>
+    <p style="color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 0.75rem;">
+        The background service keeps scheduled publishes, comment moderation, and caption checks
+        running even when you close the browser. On macOS it uses launchd (starts on login),
+        on Linux it uses systemd.
+    </p>
+    <div id="service-status">
+        <p class="loading">Checking...</p>
+    </div>
+    <div class="form-actions" style="margin-top: 0.75rem;">
+        <button class="btn btn-primary" id="btn-install-service" onclick="installService()">Install Service</button>
+        <button class="btn btn-danger" id="btn-uninstall-service" onclick="uninstallService()" style="display:none;">Uninstall Service</button>
+    </div>
+</div>
+
 <!-- General Settings -->
 <div class="card">
     <h2>General</h2>
@@ -233,9 +250,64 @@ async function loadSettings() {
         document.getElementById('caption-check-interval').value = settings.caption_check_interval;
 }
 
+// --- Background Service ---
+async function loadServiceStatus() {
+    try {
+        const resp = await fetch('/api/settings/service');
+        const data = await resp.json();
+        const el = document.getElementById('service-status');
+        const installBtn = document.getElementById('btn-install-service');
+        const uninstallBtn = document.getElementById('btn-uninstall-service');
+
+        if (data.installed && data.running) {
+            el.innerHTML = `<span class="badge badge-published">Running</span>
+                <span style="color: var(--text-muted); font-size: 0.8rem; margin-left: 0.5rem;">${data.platform} · auto-starts on login</span>`;
+            installBtn.style.display = 'none';
+            uninstallBtn.style.display = 'inline-flex';
+        } else if (data.installed) {
+            el.innerHTML = `<span class="badge badge-warning">Installed but not running</span>`;
+            installBtn.textContent = 'Reinstall Service';
+            uninstallBtn.style.display = 'inline-flex';
+        } else {
+            el.innerHTML = `<span class="badge badge-draft">Not installed</span>
+                <span style="color: var(--text-muted); font-size: 0.8rem; margin-left: 0.5rem;">
+                    Scheduled publishes require the service to be running.
+                </span>`;
+            installBtn.style.display = 'inline-flex';
+            uninstallBtn.style.display = 'none';
+        }
+    } catch {
+        document.getElementById('service-status').innerHTML = '<p class="empty-state">Could not check service status.</p>';
+    }
+}
+
+async function installService() {
+    const resp = await fetch('/api/settings/service/install', {method: 'POST'});
+    const result = await resp.json();
+    if (result.status === 'ok') {
+        showToast(result.message, 'success');
+        loadServiceStatus();
+    } else {
+        showToast(result.message || 'Failed to install', 'error');
+    }
+}
+
+async function uninstallService() {
+    if (!confirm('Remove the background service? Scheduled publishes will stop working.')) return;
+    const resp = await fetch('/api/settings/service/uninstall', {method: 'POST'});
+    const result = await resp.json();
+    if (result.status === 'ok') {
+        showToast(result.message, 'success');
+        loadServiceStatus();
+    } else {
+        showToast('Failed to uninstall', 'error');
+    }
+}
+
 // Load everything
 loadAuthStatus();
 loadSocialPlatforms();
+loadServiceStatus();
 loadSettings();
 </script>
 {% endblock %}

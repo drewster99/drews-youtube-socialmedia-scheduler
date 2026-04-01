@@ -41,8 +41,15 @@ def _keychain_set(service: str, account: str, value: str) -> bool:
             ["security", "delete-generic-password", "-s", service, "-a", account],
             capture_output=True,
         )
+        # -T "" allows any app by this user to access without prompting.
+        # This is needed for the launchd background agent to access credentials.
         result = subprocess.run(
-            ["security", "add-generic-password", "-s", service, "-a", account, "-w", value, "-U"],
+            [
+                "security", "add-generic-password",
+                "-s", service, "-a", account, "-w", value,
+                "-U",   # update if exists
+                "-T", "",  # allow access from all apps by this user
+            ],
             capture_output=True,
             text=True,
         )

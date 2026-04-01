@@ -136,6 +136,30 @@ async def delete_social_config(platform: str):
     return {"status": "ok"}
 
 
+# --- Background Service ---
+
+
+@router.get("/service")
+async def service_status():
+    """Get background service status."""
+    from youtube_publisher.services.daemon import get_service_status
+    return get_service_status()
+
+
+@router.post("/service/install")
+async def install_service():
+    """Install the background service (launchd on macOS, systemd on Linux)."""
+    from youtube_publisher.services.daemon import install_service as do_install
+    return do_install()
+
+
+@router.post("/service/uninstall")
+async def uninstall_service():
+    """Uninstall the background service."""
+    from youtube_publisher.services.daemon import uninstall_service as do_uninstall
+    return do_uninstall()
+
+
 # --- Blocklist ---
 
 
