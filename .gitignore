@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+.env
+.venv/
+venv/
+
+# Credentials — never commit these
+client_secret.json
+credentials.json
+
+# Data
+*.db
+uploads/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store

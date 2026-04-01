@@ -1,0 +1,186 @@
+{% extends "base.html" %}
+{% block title %}Settings — YouTube Publisher{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Settings</h1>
+</div>
+
+<!-- YouTube Auth -->
+<div class="card">
+    <h2>YouTube Authentication</h2>
+    <div id="auth-info">
+        <p class="loading">Checking...</p>
+    </div>
+    <div class="form-actions" style="margin-top: 1rem;">
+        <div>
+            <label class="btn btn-secondary">
+                Upload client_secret.json
+                <input type="file" id="client-secret-file" accept=".json" style="display:none;">
+            </label>
+        </div>
+        <button class="btn btn-primary" onclick="doLogin()">Authenticate with YouTube</button>
+    </div>
+</div>
+
+<!-- Social Media Credentials -->
+<div class="card">
+    <h2>Social Media Accounts</h2>
+
+    <div class="social-settings">
+        <div class="social-platform-config" id="config-twitter">
+            <h3><span class="platform-badge platform-twitter">Twitter / X</span></h3>
+            <p class="help-text">Requires Twitter API v2 Basic plan ($100/mo). Create app at developer.x.com.</p>
+            <div class="form-row">
+                <div class="form-group"><label>API Key</label><input type="text" data-platform="twitter" data-key="api_key"></div>
+                <div class="form-group"><label>API Secret</label><input type="password" data-platform="twitter" data-key="api_secret"></div>
+            </div>
+            <div class="form-row">
+                <div class="form-group"><label>Access Token</label><input type="text" data-platform="twitter" data-key="access_token"></div>
+                <div class="form-group"><label>Access Token Secret</label><input type="password" data-platform="twitter" data-key="access_token_secret"></div>
+            </div>
+            <button class="btn btn-sm" onclick="saveSocialConfig('twitter')">Save</button>
+        </div>
+
+        <div class="social-platform-config" id="config-bluesky">
+            <h3><span class="platform-badge platform-bluesky">Bluesky</span></h3>
+            <p class="help-text">Use an App Password from bsky.app → Settings → App Passwords.</p>
+            <div class="form-row">
+                <div class="form-group"><label>Handle</label><input type="text" data-platform="bluesky" data-key="handle" placeholder="you.bsky.social"></div>
+                <div class="form-group"><label>App Password</label><input type="password" data-platform="bluesky" data-key="app_password"></div>
+            </div>
+            <button class="btn btn-sm" onclick="saveSocialConfig('bluesky')">Save</button>
+        </div>
+
+        <div class="social-platform-config" id="config-mastodon">
+            <h3><span class="platform-badge platform-mastodon">Mastodon</span></h3>
+            <p class="help-text">Create an app in your instance's Settings → Development → New Application.</p>
+            <div class="form-row">
+                <div class="form-group"><label>Instance URL</label><input type="text" data-platform="mastodon" data-key="instance_url" placeholder="https://mastodon.social"></div>
+                <div class="form-group"><label>Access Token</label><input type="password" data-platform="mastodon" data-key="access_token"></div>
+            </div>
+            <button class="btn btn-sm" onclick="saveSocialConfig('mastodon')">Save</button>
+        </div>
+
+        <div class="social-platform-config" id="config-linkedin">
+            <h3><span class="platform-badge platform-linkedin">LinkedIn</span></h3>
+            <p class="help-text">Requires LinkedIn app with w_member_social scope. Get person URN from /v2/me.</p>
+            <div class="form-row">
+                <div class="form-group"><label>Access Token</label><input type="password" data-platform="linkedin" data-key="access_token"></div>
+                <div class="form-group"><label>Person URN</label><input type="text" data-platform="linkedin" data-key="person_urn" placeholder="urn:li:person:xxxxxxxx"></div>
+            </div>
+            <button class="btn btn-sm" onclick="saveSocialConfig('linkedin')">Save</button>
+        </div>
+
+        <div class="social-platform-config" id="config-threads">
+            <h3><span class="platform-badge platform-threads">Threads</span></h3>
+            <p class="help-text">Requires Meta developer app with threads_publish scope.</p>
+            <div class="form-row">
+                <div class="form-group"><label>Access Token</label><input type="password" data-platform="threads" data-key="access_token"></div>
+                <div class="form-group"><label>User ID</label><input type="text" data-platform="threads" data-key="user_id"></div>
+                <div class="form-group"><label>Username</label><input type="text" data-platform="threads" data-key="username"></div>
+            </div>
+            <button class="btn btn-sm" onclick="saveSocialConfig('threads')">Save</button>
+        </div>
+    </div>
+</div>
+
+<!-- General Settings -->
+<div class="card">
+    <h2>General</h2>
+    <div class="form-group">
+        <label>Default Pinned Links</label>
+        <textarea id="default-pinned-links" rows="4" placeholder="Links prepended to every video description..."></textarea>
+    </div>
+    <div class="form-row">
+        <div class="form-group">
+            <label>Comment Check Interval (minutes)</label>
+            <input type="number" id="comment-check-interval" value="30">
+        </div>
+        <div class="form-group">
+            <label>Caption Check Interval (minutes)</label>
+            <input type="number" id="caption-check-interval" value="15">
+        </div>
+    </div>
+    <button class="btn btn-primary" onclick="saveGeneralSettings()">Save General Settings</button>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Auth status
+async function loadAuthStatus() {
+    const resp = await fetch('/auth/status');
+    const data = await resp.json();
+    const el = document.getElementById('auth-info');
+    if (data.authenticated) {
+        el.innerHTML = `<span class="badge badge-published">Authenticated</span>`;
+    } else {
+        el.innerHTML = `<span class="badge badge-draft">Not authenticated</span>`;
+    }
+}
+
+document.getElementById('client-secret-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const formData = new FormData();
+    formData.append('file', file);
+    const resp = await fetch('/auth/upload-client-secret', {method: 'POST', body: formData});
+    if (resp.ok) showToast('Client secret saved', 'success');
+});
+
+async function doLogin() {
+    const resp = await fetch('/auth/login', {method: 'POST'});
+    const data = await resp.json();
+    if (data.status === 'ok') {
+        showToast('Authenticated!', 'success');
+        loadAuthStatus();
+    } else {
+        showToast(data.message, 'error');
+    }
+}
+
+async function saveSocialConfig(platform) {
+    const inputs = document.querySelectorAll(`[data-platform="${platform}"]`);
+    const data = {};
+    inputs.forEach(input => {
+        if (input.value) data[input.dataset.key] = input.value;
+    });
+    const resp = await fetch(`/api/settings/social/${platform}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(data),
+    });
+    if (resp.ok) showToast(`${platform} credentials saved`, 'success');
+    else showToast('Failed to save', 'error');
+}
+
+async function saveGeneralSettings() {
+    const data = {
+        default_pinned_links: document.getElementById('default-pinned-links').value,
+        comment_check_interval: document.getElementById('comment-check-interval').value,
+        caption_check_interval: document.getElementById('caption-check-interval').value,
+    };
+    const resp = await fetch('/api/settings', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(data),
+    });
+    if (resp.ok) showToast('Settings saved', 'success');
+}
+
+async function loadSettings() {
+    const resp = await fetch('/api/settings');
+    const settings = await resp.json();
+    if (settings.default_pinned_links)
+        document.getElementById('default-pinned-links').value = settings.default_pinned_links;
+    if (settings.comment_check_interval)
+        document.getElementById('comment-check-interval').value = settings.comment_check_interval;
+    if (settings.caption_check_interval)
+        document.getElementById('caption-check-interval').value = settings.caption_check_interval;
+}
+
+loadAuthStatus();
+loadSettings();
+</script>
+{% endblock %}

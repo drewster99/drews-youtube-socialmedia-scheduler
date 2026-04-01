@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}YouTube Publisher{% endblock %}</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="logo">
+            <h2>YT Publisher</h2>
+        </div>
+        <ul>
+            <li><a href="/" class="nav-link">Dashboard</a></li>
+            <li><a href="/upload" class="nav-link">Upload Video</a></li>
+            <li><a href="/templates" class="nav-link">Templates</a></li>
+            <li><a href="/moderation" class="nav-link">Moderation</a></li>
+            <li><a href="/settings" class="nav-link">Settings</a></li>
+        </ul>
+        <div class="auth-status" id="auth-status">
+            <span class="status-dot"></span>
+            <span>Checking...</span>
+        </div>
+    </nav>
+
+    <main class="content">
+        {% block content %}{% endblock %}
+    </main>
+
+    <div id="toast-container"></div>
+
+    <script src="/static/js/app.js"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>
