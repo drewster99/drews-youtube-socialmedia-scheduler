@@ -26,12 +26,23 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class TranscriptWord:
+    """A single word with precise timestamps."""
+
+    start: float  # seconds
+    end: float  # seconds
+    word: str
+    probability: float = 1.0
+
+
+@dataclass
 class TranscriptSegment:
     """A single segment of transcribed text with timestamps."""
 
     start: float  # seconds
     end: float  # seconds
     text: str
+    words: list[TranscriptWord] | None = None  # word-level timestamps if available
 
 
 @dataclass
@@ -41,19 +52,55 @@ class TranscriptionResult:
     segments: list[TranscriptSegment]
     backend: str  # which engine was used
     language: str | None = None
+    has_word_timestamps: bool = False
 
     @property
     def text(self) -> str:
         """Plain text transcript."""
         return " ".join(seg.text.strip() for seg in self.segments)
 
-    def to_srt(self) -> str:
-        """Convert to SRT subtitle format."""
+    @property
+    def all_words(self) -> list[TranscriptWord]:
+        """Flat list of all words with timestamps."""
+        words = []
+        for seg in self.segments:
+            if seg.words:
+                words.extend(seg.words)
+        return words
+
+    def to_srt(self, max_words_per_line: int | None = None) -> str:
+        """Convert to SRT subtitle format.
+
+        If max_words_per_line is set and word timestamps are available,
+        creates shorter, more readable subtitle lines.
+        """
+        if max_words_per_line and self.has_word_timestamps:
+            return self._word_level_srt(max_words_per_line)
+
         lines = []
         for i, seg in enumerate(self.segments, 1):
             start = _format_srt_time(seg.start)
             end = _format_srt_time(seg.end)
             lines.append(f"{i}\n{start} --> {end}\n{seg.text.strip()}\n")
+        return "\n".join(lines)
+
+    def _word_level_srt(self, max_words: int) -> str:
+        """Generate SRT with word-level timing for shorter subtitle lines."""
+        words = self.all_words
+        if not words:
+            return self.to_srt()
+
+        lines = []
+        idx = 1
+        i = 0
+        while i < len(words):
+            chunk = words[i : i + max_words]
+            start = _format_srt_time(chunk[0].start)
+            end = _format_srt_time(chunk[-1].end)
+            text = " ".join(w.word.strip() for w in chunk)
+            lines.append(f"{idx}\n{start} --> {end}\n{text}\n")
+            idx += 1
+            i += max_words
         return "\n".join(lines)
 
     def to_vtt(self) -> str:
@@ -65,10 +112,23 @@ class TranscriptionResult:
             lines.append(f"{start} --> {end}\n{seg.text.strip()}\n")
         return "\n".join(lines)
 
-    def save_srt(self, video_path: str | Path) -> Path:
-        """Save SRT file next to the video (or in uploads dir)."""
+    def to_json(self) -> list[dict]:
+        """Export as JSON with full word-level detail."""
+        result = []
+        for seg in self.segments:
+            entry = {"start": seg.start, "end": seg.end, "text": seg.text}
+            if seg.words:
+                entry["words"] = [
+                    {"start": w.start, "end": w.end, "word": w.word, "probability": w.probability}
+                    for w in seg.words
+                ]
+            result.append(entry)
+        return result
+
+    def save_srt(self, video_path: str | Path, max_words_per_line: int | None = 8) -> Path:
+        """Save SRT file. Uses word-level timing for cleaner subtitles if available."""
         out = UPLOAD_DIR / f"{Path(video_path).stem}.srt"
-        out.write_text(self.to_srt(), encoding="utf-8")
+        out.write_text(self.to_srt(max_words_per_line), encoding="utf-8")
         return out
 
     def save_vtt(self, video_path: str | Path) -> Path:
@@ -129,21 +189,37 @@ def _try_mlx_whisper(audio_path: Path, model: str, language: str | None) -> Tran
         return None
 
     logger.info(f"Transcribing with MLX Whisper (model: {model})")
-    kwargs = {"path_or_hf_repo": f"mlx-community/whisper-{model}-mlx"}
+    kwargs = {
+        "path_or_hf_repo": f"mlx-community/whisper-{model}-mlx",
+        "word_timestamps": True,
+    }
     if language:
         kwargs["language"] = language
 
     result = mlx_whisper.transcribe(str(audio_path), **kwargs)
 
-    segments = [
-        TranscriptSegment(start=seg["start"], end=seg["end"], text=seg["text"])
-        for seg in result.get("segments", [])
-    ]
+    segments = []
+    has_words = False
+    for seg in result.get("segments", []):
+        words = None
+        if "words" in seg and seg["words"]:
+            has_words = True
+            words = [
+                TranscriptWord(
+                    start=w["start"], end=w["end"],
+                    word=w["word"], probability=w.get("probability", 1.0),
+                )
+                for w in seg["words"]
+            ]
+        segments.append(TranscriptSegment(
+            start=seg["start"], end=seg["end"], text=seg["text"], words=words,
+        ))
 
     return TranscriptionResult(
         segments=segments,
         backend="mlx-whisper",
         language=result.get("language"),
+        has_word_timestamps=has_words,
     )
 
 
@@ -163,21 +239,34 @@ def _try_faster_whisper(audio_path: Path, model: str, language: str | None) -> T
     # Use CPU by default; faster-whisper auto-detects CUDA if available
     whisper_model = WhisperModel(model, device="auto", compute_type="auto")
 
-    kwargs = {}
+    kwargs = {"word_timestamps": True}
     if language:
         kwargs["language"] = language
 
     raw_segments, info = whisper_model.transcribe(str(audio_path), **kwargs)
 
-    segments = [
-        TranscriptSegment(start=seg.start, end=seg.end, text=seg.text)
-        for seg in raw_segments
-    ]
+    segments = []
+    has_words = False
+    for seg in raw_segments:
+        words = None
+        if hasattr(seg, "words") and seg.words:
+            has_words = True
+            words = [
+                TranscriptWord(
+                    start=w.start, end=w.end,
+                    word=w.word, probability=w.probability,
+                )
+                for w in seg.words
+            ]
+        segments.append(TranscriptSegment(
+            start=seg.start, end=seg.end, text=seg.text, words=words,
+        ))
 
     return TranscriptionResult(
         segments=segments,
         backend="faster-whisper",
         language=info.language,
+        has_word_timestamps=has_words,
     )
 
 

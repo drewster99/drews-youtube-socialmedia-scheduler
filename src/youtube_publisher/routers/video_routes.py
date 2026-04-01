@@ -191,8 +191,13 @@ async def transcribe_video(video_id: str, data: dict | None = None):
     except RuntimeError as e:
         raise HTTPException(400, str(e))
 
-    # Save transcript and SRT
+    # Save transcript, SRT, and JSON with word-level timestamps
     srt_path = result.save_srt(video_file)
+    vtt_path = result.save_vtt(video_file)
+
+    # Save full JSON transcript with word-level timestamps
+    json_path = UPLOAD_DIR / f"{Path(video_file).stem}_transcript.json"
+    json_path.write_text(json.dumps(result.to_json(), indent=2), encoding="utf-8")
 
     await db.execute(
         """UPDATE videos SET transcript = ?, status = 'captioned', updated_at = datetime('now')
@@ -206,8 +211,12 @@ async def transcribe_video(video_id: str, data: dict | None = None):
         "backend": result.backend,
         "language": result.language,
         "segments": len(result.segments),
+        "word_count": len(result.all_words),
+        "has_word_timestamps": result.has_word_timestamps,
         "characters": len(result.text),
         "srt_path": str(srt_path),
+        "vtt_path": str(vtt_path),
+        "json_path": str(json_path),
         "transcript_preview": result.text[:500],
     }
 
