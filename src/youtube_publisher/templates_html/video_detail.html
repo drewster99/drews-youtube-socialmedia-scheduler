@@ -54,9 +54,23 @@
         </div>
 
         <div class="card">
-            <h2>Transcript</h2>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h2>Transcript</h2>
+                <div style="display: flex; gap: 0.5rem; align-items: center;">
+                    <select id="transcribe-model" class="btn btn-sm" style="background: var(--bg-input); padding: 0.3rem 0.5rem;">
+                        <option value="large-v3">large-v3 (best)</option>
+                        <option value="medium">medium (faster)</option>
+                        <option value="small">small (fast)</option>
+                        <option value="base">base (fastest)</option>
+                    </select>
+                    <button class="btn btn-sm btn-primary" id="btn-transcribe" onclick="transcribeLocally()">
+                        Transcribe Locally
+                    </button>
+                </div>
+            </div>
+            <div id="transcribe-backends" style="margin-bottom: 0.5rem; font-size: 0.8rem; color: var(--text-muted);"></div>
             <div id="transcript-area">
-                <p class="empty-state">No transcript available yet. Waiting for YouTube auto-captions...</p>
+                <p class="empty-state">No transcript available yet. Click "Transcribe Locally" or wait for YouTube auto-captions.</p>
             </div>
         </div>
 
@@ -383,6 +397,45 @@ async function publishVideo() {
     }
 }
 
+async function transcribeLocally() {
+    const btn = document.getElementById('btn-transcribe');
+    const model = document.getElementById('transcribe-model').value;
+    btn.disabled = true;
+    btn.textContent = 'Transcribing...';
+    showToast(`Starting local transcription (${model})... This may take a few minutes.`, 'info');
+
+    try {
+        const resp = await fetch(`/api/videos/${videoId}/transcribe`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({model}),
+        });
+        const result = await resp.json();
+        if (resp.ok) {
+            showToast(`Transcribed! ${result.segments} segments via ${result.backend}`, 'success');
+            loadVideo();
+        } else {
+            showToast(result.detail || 'Transcription failed', 'error');
+        }
+    } catch (e) {
+        showToast('Transcription failed: ' + e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Transcribe Locally';
+    }
+}
+
+async function loadTranscriptionBackends() {
+    try {
+        const resp = await fetch('/api/videos/transcription-backends');
+        const backends = await resp.json();
+        const el = document.getElementById('transcribe-backends');
+        el.innerHTML = 'Backends: ' + backends.map(b =>
+            `<span style="color: ${b.status === 'available' ? 'var(--success)' : 'var(--text-muted)'};">${b.name} (${b.status})</span>`
+        ).join(' · ');
+    } catch {}
+}
+
 function copyToClipboard(elementId) {
     const el = document.getElementById(elementId);
     el.select();
@@ -391,5 +444,6 @@ function copyToClipboard(elementId) {
 }
 
 loadVideo();
+loadTranscriptionBackends();
 </script>
 {% endblock %}

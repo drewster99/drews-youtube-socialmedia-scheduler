@@ -159,6 +159,66 @@ async def update_video(video_id: str, data: dict):
     return {"status": "ok"}
 
 
+@router.post("/{video_id}/transcribe")
+async def transcribe_video(video_id: str, data: dict | None = None):
+    """Transcribe a video locally using on-device speech recognition.
+
+    Optional body params:
+        model: Whisper model size (tiny, base, small, medium, large-v3). Default: large-v3
+        language: Language code (e.g., "en"). Default: auto-detect
+        backend: Force specific backend (mlx-whisper, faster-whisper, whisper.cpp, macos-speech)
+    """
+    from youtube_publisher.services import transcription
+
+    db = await get_db()
+    rows = await db.execute_fetchall("SELECT * FROM videos WHERE id = ?", (video_id,))
+    if not rows:
+        raise HTTPException(404, "Video not found")
+
+    video = dict(rows[0])
+    video_file = video.get("video_file_path")
+    if not video_file or not Path(video_file).exists():
+        raise HTTPException(400, "Video file not found locally. Cannot transcribe.")
+
+    opts = data or {}
+    try:
+        result = transcription.transcribe(
+            video_path=video_file,
+            model=opts.get("model", "large-v3"),
+            language=opts.get("language"),
+            backend=opts.get("backend"),
+        )
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+
+    # Save transcript and SRT
+    srt_path = result.save_srt(video_file)
+
+    await db.execute(
+        """UPDATE videos SET transcript = ?, status = 'captioned', updated_at = datetime('now')
+        WHERE id = ?""",
+        (result.text, video_id),
+    )
+    await db.commit()
+
+    return {
+        "status": "ok",
+        "backend": result.backend,
+        "language": result.language,
+        "segments": len(result.segments),
+        "characters": len(result.text),
+        "srt_path": str(srt_path),
+        "transcript_preview": result.text[:500],
+    }
+
+
+@router.get("/transcription-backends")
+async def list_transcription_backends():
+    """List available transcription backends."""
+    from youtube_publisher.services import transcription
+    return transcription.list_available_backends()
+
+
 @router.post("/{video_id}/generate-description")
 async def generate_description(video_id: str, data: dict | None = None):
     """Generate an SEO description from the video's transcript."""

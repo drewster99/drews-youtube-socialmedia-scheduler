@@ -25,6 +25,12 @@ social = [
     "atproto>=0.0.55",
     "Mastodon.py>=1.8",
 ]
+transcription-mlx = [
+    "mlx-whisper>=0.4",
+]
+transcription = [
+    "faster-whisper>=1.0",
+]
 dev = [
     "ruff>=0.8",
     "pytest>=8.0",
