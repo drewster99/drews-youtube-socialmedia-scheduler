@@ -288,17 +288,63 @@ async def apply_description(video_id: str):
 
 @router.post("/{video_id}/publish")
 async def publish_video(video_id: str):
-    """Switch a video to public immediately."""
-    youtube.update_video_metadata(video_id, privacy_status="public")
+    """Publish a video immediately — flips to public and fires all approved social posts."""
+    from youtube_publisher.services.scheduler import publish_video_job
+    result = await publish_video_job(video_id)
+    return result
 
-    db = await get_db()
-    await db.execute(
-        "UPDATE videos SET privacy_status = 'public', status = 'published', updated_at = datetime('now') WHERE id = ?",
-        (video_id,),
-    )
-    await db.commit()
 
-    return {"status": "ok", "message": "Video is now public"}
+@router.post("/{video_id}/schedule")
+async def schedule_video(video_id: str, data: dict):
+    """Schedule a video to go public at a specific time.
+
+    Body: {"publish_at": "2026-04-03T09:00:00-05:00"}
+
+    At the scheduled time, the video flips to public and all
+    approved social posts are sent simultaneously.
+    """
+    from datetime import datetime as dt, timezone
+    from youtube_publisher.services.scheduler import schedule_publish
+
+    publish_at_str = data.get("publish_at")
+    if not publish_at_str:
+        raise HTTPException(400, "publish_at is required (ISO 8601 datetime)")
+
+    try:
+        publish_at = dt.fromisoformat(publish_at_str)
+    except ValueError:
+        raise HTTPException(400, "Invalid datetime format. Use ISO 8601 (e.g., 2026-04-03T09:00:00-05:00)")
+
+    if publish_at.tzinfo is None:
+        publish_at = publish_at.replace(tzinfo=timezone.utc)
+
+    if publish_at <= dt.now(timezone.utc):
+        raise HTTPException(400, "publish_at must be in the future")
+
+    job_id = await schedule_publish(video_id, publish_at)
+    return {
+        "status": "ok",
+        "job_id": job_id,
+        "publish_at": publish_at.isoformat(),
+        "message": f"Video will go public and social posts will fire at {publish_at.isoformat()}",
+    }
+
+
+@router.delete("/{video_id}/schedule")
+async def cancel_schedule(video_id: str):
+    """Cancel a scheduled publish."""
+    from youtube_publisher.services.scheduler import cancel_scheduled_publish
+    cancelled = await cancel_scheduled_publish(video_id)
+    if cancelled:
+        return {"status": "ok", "message": "Schedule cancelled"}
+    raise HTTPException(404, "No scheduled publish found for this video")
+
+
+@router.get("/scheduled")
+async def list_scheduled():
+    """List all videos with scheduled publishes."""
+    from youtube_publisher.services.scheduler import get_scheduled_jobs
+    return get_scheduled_jobs()
 
 
 @router.get("/{video_id}/captions")

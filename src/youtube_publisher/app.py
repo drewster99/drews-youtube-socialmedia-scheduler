@@ -13,7 +13,7 @@ from fastapi.templating import Jinja2Templates
 from youtube_publisher.config import UPLOAD_DIR, ensure_dirs
 from youtube_publisher.database import close_db, get_db
 from youtube_publisher.routers import auth_routes, video_routes, social_routes, template_routes, settings_routes
-from youtube_publisher.services.scheduler import start_scheduler, stop_scheduler
+from youtube_publisher.services.scheduler import restore_scheduled_jobs, start_scheduler, stop_scheduler
 from youtube_publisher.services.templates import ensure_default_template
 
 
@@ -24,6 +24,7 @@ async def lifespan(app: FastAPI):
     await get_db()
     await ensure_default_template()
     start_scheduler()
+    await restore_scheduled_jobs()
     yield
     stop_scheduler()
     await close_db()

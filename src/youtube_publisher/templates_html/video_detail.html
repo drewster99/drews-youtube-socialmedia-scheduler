@@ -7,7 +7,7 @@
     <div class="header-actions">
         <button class="btn btn-secondary" id="btn-generate-desc" onclick="generateDescription()">Generate Description</button>
         <button class="btn btn-secondary" id="btn-generate-posts" onclick="generatePosts()">Generate Social Posts</button>
-        <button class="btn btn-primary" id="btn-publish" onclick="publishVideo()">Publish Now</button>
+        <button class="btn btn-primary" id="btn-publish" onclick="publishVideo()">Publish + Post Now</button>
     </div>
 </div>
 
@@ -96,6 +96,22 @@
         </div>
 
         <div class="card">
+            <h3>Schedule Publish + Social Posts</h3>
+            <div id="schedule-info" style="margin-bottom: 0.5rem;"></div>
+            <div class="form-group" style="margin-bottom: 0.5rem;">
+                <label>Publish Date & Time</label>
+                <input type="datetime-local" id="schedule-datetime">
+            </div>
+            <div class="form-actions">
+                <button class="btn btn-sm btn-primary" onclick="schedulePublish()">Schedule</button>
+                <button class="btn btn-sm btn-danger" id="btn-cancel-schedule" onclick="cancelSchedule()" style="display:none;">Cancel Schedule</button>
+            </div>
+            <small style="color: var(--text-muted); display: block; margin-top: 0.5rem;">
+                At the scheduled time: video goes public + all approved social posts fire simultaneously.
+            </small>
+        </div>
+
+        <div class="card">
             <h3>Thumbnail</h3>
             <div id="thumbnail-area" class="thumbnail-area">
                 <p>No thumbnail</p>
@@ -173,6 +189,23 @@ async function loadVideo() {
         document.getElementById('st-views').textContent = stats.viewCount || '0';
         document.getElementById('st-likes').textContent = stats.likeCount || '0';
         document.getElementById('st-comments').textContent = stats.commentCount || '0';
+    }
+
+    // Schedule info
+    const scheduleInfo = document.getElementById('schedule-info');
+    const cancelBtn = document.getElementById('btn-cancel-schedule');
+    if (video.status === 'scheduled' && video.publish_at) {
+        const pubDate = new Date(video.publish_at);
+        scheduleInfo.innerHTML = `<span class="badge badge-captioned">Scheduled</span>
+            <span style="margin-left: 0.5rem;">${pubDate.toLocaleString()}</span>`;
+        cancelBtn.style.display = 'inline-flex';
+        document.getElementById('schedule-datetime').value = video.publish_at.slice(0, 16);
+    } else if (video.status === 'published') {
+        scheduleInfo.innerHTML = '<span class="badge badge-published">Published</span>';
+        cancelBtn.style.display = 'none';
+    } else {
+        scheduleInfo.innerHTML = '<span class="badge badge-draft">Not scheduled</span>';
+        cancelBtn.style.display = 'none';
     }
 
     // Thumbnail
@@ -387,13 +420,62 @@ async function sendPost(postId) {
 }
 
 async function publishVideo() {
-    if (!confirm('Switch this video to PUBLIC? This cannot be undone easily.')) return;
-    const resp = await fetch(`/api/videos/${videoId}/publish`, { method: 'POST' });
+    if (!confirm('Publish this video NOW and fire all approved social posts? This cannot be undone easily.')) return;
+    const btn = document.getElementById('btn-publish');
+    btn.disabled = true;
+    btn.textContent = 'Publishing...';
+    try {
+        const resp = await fetch(`/api/videos/${videoId}/publish`, { method: 'POST' });
+        const result = await resp.json();
+        if (resp.ok && result.published) {
+            showToast('Video is now public!', 'success');
+            // Report social results
+            for (const [platform, res] of Object.entries(result.social_results || {})) {
+                if (res.status === 'posted') {
+                    showToast(`Posted to ${platform}!`, 'success');
+                } else if (res.status === 'failed') {
+                    showToast(`${platform} failed: ${res.error}`, 'error');
+                }
+            }
+            loadVideo();
+            loadSocialPosts();
+        } else {
+            showToast(result.publish_error || 'Failed to publish', 'error');
+        }
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Publish + Post Now';
+    }
+}
+
+async function schedulePublish() {
+    const dt = document.getElementById('schedule-datetime').value;
+    if (!dt) {
+        showToast('Pick a date and time first', 'error');
+        return;
+    }
+    const resp = await fetch(`/api/videos/${videoId}/schedule`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({publish_at: dt}),
+    });
+    const result = await resp.json();
     if (resp.ok) {
-        showToast('Video is now public!', 'success');
+        showToast(`Scheduled! Video + social posts will fire at ${new Date(result.publish_at).toLocaleString()}`, 'success');
         loadVideo();
     } else {
-        showToast('Failed to publish', 'error');
+        showToast(result.detail || 'Failed to schedule', 'error');
+    }
+}
+
+async function cancelSchedule() {
+    if (!confirm('Cancel the scheduled publish?')) return;
+    const resp = await fetch(`/api/videos/${videoId}/schedule`, {method: 'DELETE'});
+    if (resp.ok) {
+        showToast('Schedule cancelled', 'success');
+        loadVideo();
+    } else {
+        showToast('Failed to cancel', 'error');
     }
 }
 

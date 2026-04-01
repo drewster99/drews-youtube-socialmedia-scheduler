@@ -232,6 +232,7 @@ body {
 .badge-uploaded { background: var(--warning); color: #000; }
 .badge-captioned { background: #8b5cf6; color: #fff; }
 .badge-ready { background: var(--accent); color: #000; }
+.badge-scheduled { background: #8b5cf6; color: #fff; }
 .badge-published { background: var(--success); color: #fff; }
 .badge-unlisted { background: var(--warning); color: #000; }
 .badge-private { background: var(--danger); color: #fff; }
