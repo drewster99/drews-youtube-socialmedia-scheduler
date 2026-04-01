@@ -20,6 +20,7 @@
             </label>
         </div>
         <button class="btn btn-primary" onclick="doLogin()">Authenticate with YouTube</button>
+        <button class="btn btn-danger" onclick="doLogout()">Disconnect</button>
     </div>
 </div>
 
@@ -113,10 +114,11 @@ async function loadAuthStatus() {
     const resp = await fetch('/auth/status');
     const data = await resp.json();
     const el = document.getElementById('auth-info');
+    const storage = data.storage === 'keychain' ? 'macOS Keychain' : 'local file';
     if (data.authenticated) {
-        el.innerHTML = `<span class="badge badge-published">Authenticated</span>`;
+        el.innerHTML = `<span class="badge badge-published">Authenticated</span> <span style="color: var(--text-muted); font-size: 0.8rem; margin-left: 0.5rem;">Stored in ${storage}</span>`;
     } else {
-        el.innerHTML = `<span class="badge badge-draft">Not authenticated</span>`;
+        el.innerHTML = `<span class="badge badge-draft">Not authenticated</span> <span style="color: var(--text-muted); font-size: 0.8rem; margin-left: 0.5rem;">Will use ${storage}</span>`;
     }
 }
 
@@ -137,6 +139,18 @@ async function doLogin() {
         loadAuthStatus();
     } else {
         showToast(data.message, 'error');
+    }
+}
+
+async function doLogout() {
+    if (!confirm('Disconnect from YouTube? You will need to re-authenticate.')) return;
+    const resp = await fetch('/auth/logout', {method: 'POST'});
+    const data = await resp.json();
+    if (data.status === 'ok') {
+        showToast('Disconnected from YouTube', 'success');
+        loadAuthStatus();
+    } else {
+        showToast(data.message || 'Failed', 'error');
     }
 }
 

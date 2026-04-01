@@ -6,7 +6,7 @@ from fastapi import APIRouter, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from youtube_publisher.config import CLIENT_SECRETS_PATH
-from youtube_publisher.services.auth import get_auth_status, is_authenticated, run_oauth_flow
+from youtube_publisher.services.auth import clear_credentials, get_auth_status, is_authenticated, run_oauth_flow
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -27,6 +27,16 @@ async def login():
         return {"status": "error", "message": str(e)}
     except Exception as e:
         return {"status": "error", "message": f"OAuth flow failed: {e}"}
+
+
+@router.post("/logout")
+async def logout():
+    """Clear stored credentials."""
+    try:
+        clear_credentials()
+        return {"status": "ok", "message": "Credentials removed"}
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to clear credentials: {e}"}
 
 
 @router.post("/upload-client-secret")
