@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
+from youtube_publisher.config import (
+    ANTHROPIC_API_KEY_FIELD,
+    ANTHROPIC_NAMESPACE,
+    get_anthropic_api_key,
+)
 from youtube_publisher.database import get_db
 from youtube_publisher.services import moderation
 from youtube_publisher.services.keychain import (
     delete_all_secrets,
+    delete_secret,
     get_storage_type,
     load_all_secrets,
     store_secret,
@@ -43,6 +49,37 @@ async def update_settings(data: dict):
             (key, str(value), str(value)),
         )
     await db.commit()
+    return {"status": "ok"}
+
+
+# --- Anthropic API Key ---
+
+
+@router.get("/anthropic")
+async def get_anthropic_status():
+    """Get Anthropic API key status (masked)."""
+    key = get_anthropic_api_key()
+    return {
+        "configured": bool(key),
+        "masked_key": key[:8] + "..." if key and len(key) > 8 else ("***" if key else ""),
+        "storage": get_storage_type(),
+    }
+
+
+@router.put("/anthropic")
+async def update_anthropic_key(data: dict):
+    """Save Anthropic API key to Keychain/secrets."""
+    api_key = data.get("api_key", "").strip()
+    if not api_key:
+        raise HTTPException(400, "API key is required")
+    store_secret(ANTHROPIC_NAMESPACE, ANTHROPIC_API_KEY_FIELD, api_key)
+    return {"status": "ok", "storage": get_storage_type()}
+
+
+@router.delete("/anthropic")
+async def delete_anthropic_key():
+    """Remove Anthropic API key from Keychain/secrets."""
+    delete_secret(ANTHROPIC_NAMESPACE, ANTHROPIC_API_KEY_FIELD)
     return {"status": "ok"}
 
 

@@ -19,8 +19,31 @@
                 <input type="file" id="client-secret-file" accept=".json" style="display:none;">
             </label>
         </div>
-        <button class="btn btn-primary" onclick="doLogin()">Authenticate with YouTube</button>
         <button class="btn btn-danger" onclick="doLogout()">Disconnect</button>
+    </div>
+    <p style="color: var(--text-muted); font-size: 0.8rem; margin-top: 0.75rem;">
+        To authenticate, run <code style="background: var(--bg-input); padding: 0.1rem 0.4rem; border-radius: 3px;">./run.sh auth</code> from the terminal.
+        You can optionally upload your client_secret.json here first.
+    </p>
+</div>
+
+<!-- Anthropic API Key -->
+<div class="card">
+    <h2>Anthropic API Key</h2>
+    <p style="color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 0.75rem;">
+        Used by Claude to generate descriptions and social posts. Stored securely in
+        <span id="anthropic-storage-type">Keychain</span>.
+    </p>
+    <div id="anthropic-status" style="margin-bottom: 0.75rem;">
+        <p class="loading">Checking...</p>
+    </div>
+    <div class="form-group">
+        <label>API Key</label>
+        <input type="password" id="anthropic-api-key" placeholder="sk-ant-..." autocomplete="off">
+    </div>
+    <div class="form-actions">
+        <button class="btn btn-primary" onclick="saveAnthropicKey()">Save</button>
+        <button class="btn btn-danger" id="btn-remove-anthropic" onclick="removeAnthropicKey()" style="display:none;">Remove</button>
     </div>
 </div>
 
@@ -100,18 +123,6 @@ document.getElementById('client-secret-file').addEventListener('change', async (
     if (resp.ok) showToast('Client secret saved', 'success');
 });
 
-async function doLogin() {
-    showToast('Opening browser for YouTube authentication...', 'info');
-    const resp = await fetch('/auth/login', {method: 'POST'});
-    const data = await resp.json();
-    if (data.status === 'ok') {
-        showToast('Authenticated!', 'success');
-        loadAuthStatus();
-    } else {
-        showToast(data.message, 'error');
-    }
-}
-
 async function doLogout() {
     if (!confirm('Disconnect from YouTube? You will need to re-authenticate.')) return;
     const resp = await fetch('/auth/logout', {method: 'POST'});
@@ -121,6 +132,56 @@ async function doLogout() {
         loadAuthStatus();
     } else {
         showToast(data.message || 'Failed', 'error');
+    }
+}
+
+// --- Anthropic API Key ---
+async function loadAnthropicStatus() {
+    const resp = await fetch('/api/settings/anthropic');
+    const data = await resp.json();
+    const el = document.getElementById('anthropic-status');
+    const removeBtn = document.getElementById('btn-remove-anthropic');
+    const storageEl = document.getElementById('anthropic-storage-type');
+
+    storageEl.textContent = data.storage === 'keychain' ? 'macOS Keychain' : 'encrypted secrets file';
+
+    if (data.configured) {
+        el.innerHTML = `<span class="badge badge-published">Configured</span>
+            <span style="color: var(--text-muted); font-size: 0.8rem; margin-left: 0.5rem;">${data.masked_key}</span>`;
+        removeBtn.style.display = 'inline-flex';
+        document.getElementById('anthropic-api-key').placeholder = 'Enter new key to replace...';
+    } else {
+        el.innerHTML = `<span class="badge badge-draft">Not configured</span>`;
+        removeBtn.style.display = 'none';
+    }
+}
+
+async function saveAnthropicKey() {
+    const key = document.getElementById('anthropic-api-key').value.trim();
+    if (!key) { showToast('Enter an API key', 'error'); return; }
+
+    const resp = await fetch('/api/settings/anthropic', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({api_key: key}),
+    });
+    if (resp.ok) {
+        const result = await resp.json();
+        const where = result.storage === 'keychain' ? 'Keychain' : 'secrets file';
+        showToast(`API key saved to ${where}`, 'success');
+        document.getElementById('anthropic-api-key').value = '';
+        loadAnthropicStatus();
+    } else {
+        showToast('Failed to save', 'error');
+    }
+}
+
+async function removeAnthropicKey() {
+    if (!confirm('Remove the Anthropic API key? AI features will stop working unless set in .env.')) return;
+    const resp = await fetch('/api/settings/anthropic', {method: 'DELETE'});
+    if (resp.ok) {
+        showToast('API key removed', 'success');
+        loadAnthropicStatus();
     }
 }
 
@@ -306,6 +367,7 @@ async function uninstallService() {
 
 // Load everything
 loadAuthStatus();
+loadAnthropicStatus();
 loadSocialPlatforms();
 loadServiceStatus();
 loadSettings();

@@ -24,9 +24,25 @@ YOUTUBE_SCOPES = [
     "https://www.googleapis.com/auth/youtube.force-ssl",
 ]
 
-# Claude API
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+# Claude API — env var as fallback; Keychain is checked at runtime via get_anthropic_api_key()
+_ANTHROPIC_API_KEY_ENV = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+
+ANTHROPIC_NAMESPACE = "anthropic"
+ANTHROPIC_API_KEY_FIELD = "api_key"
+
+
+def get_anthropic_api_key() -> str:
+    """Load the Anthropic API key, preferring Keychain over env var.
+
+    Avoids circular import by importing keychain lazily.
+    """
+    from youtube_publisher.services.keychain import load_secret
+
+    value = load_secret(ANTHROPIC_NAMESPACE, ANTHROPIC_API_KEY_FIELD)
+    if value:
+        return value
+    return _ANTHROPIC_API_KEY_ENV
 
 # Server
 HOST = os.getenv("YTP_HOST", "127.0.0.1")

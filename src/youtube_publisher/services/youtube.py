@@ -81,7 +81,10 @@ def update_video_metadata(
         raise ValueError(f"Video {video_id} not found")
 
     item = current["items"][0]
-    snippet = item["snippet"]
+    # Only keep mutable snippet fields — sending read-only fields (thumbnails,
+    # channelTitle, localized, etc.) causes the YouTube API to reject the update.
+    allowed_snippet = {"title", "description", "tags", "categoryId", "defaultLanguage", "defaultAudioLanguage"}
+    snippet = {k: v for k, v in item["snippet"].items() if k in allowed_snippet}
     status = item["status"]
 
     if title is not None:

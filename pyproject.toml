@@ -4,37 +4,37 @@ version = "0.1.0"
 description = "YouTube video publishing pipeline with AI-powered descriptions and social cross-posting"
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.34",
-    "jinja2>=3.1",
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.34,<1",
+    "jinja2>=3.1,<4",
     "python-multipart>=0.0.18",
     "aiofiles>=24.1",
-    "google-api-python-client>=2.160",
-    "google-auth-oauthlib>=1.2",
-    "google-auth-httplib2>=0.2",
-    "anthropic>=0.42",
-    "apscheduler>=3.10",
-    "httpx>=0.28",
-    "aiosqlite>=0.20",
-    "python-dotenv>=1.0",
+    "google-api-python-client>=2.160,<3",
+    "google-auth-oauthlib>=1.2,<2",
+    "google-auth-httplib2>=0.2,<1",
+    "anthropic>=0.42,<1",
+    "apscheduler>=3.10,<4",
+    "httpx>=0.28,<1",
+    "aiosqlite>=0.20,<1",
+    "python-dotenv>=1.0,<2",
 ]
 
 [project.optional-dependencies]
 social = [
-    "tweepy>=4.14",
-    "atproto>=0.0.55",
-    "Mastodon.py>=1.8",
+    "tweepy>=4.14,<5",
+    "atproto>=0.0.55,<1",
+    "Mastodon.py>=1.8,<2",
 ]
 transcription-mlx = [
-    "mlx-whisper>=0.4",
+    "mlx-whisper>=0.4,<1",
 ]
 transcription = [
-    "faster-whisper>=1.0",
+    "faster-whisper>=1.0,<2",
 ]
 dev = [
-    "ruff>=0.8",
-    "pytest>=8.0",
-    "pytest-asyncio>=0.24",
+    "ruff>=0.8,<1",
+    "pytest>=8.0,<9",
+    "pytest-asyncio>=0.24,<1",
 ]
 
 [project.scripts]
@@ -42,7 +42,7 @@ youtube-publisher = "youtube_publisher.main:main"
 
 [build-system]
 requires = ["setuptools>=75", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]

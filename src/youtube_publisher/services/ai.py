@@ -6,16 +6,17 @@ import re
 
 import anthropic
 
-from youtube_publisher.config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
+from youtube_publisher.config import ANTHROPIC_MODEL, get_anthropic_api_key
 
 
 def get_client() -> anthropic.Anthropic:
     """Get an Anthropic client."""
-    if not ANTHROPIC_API_KEY:
+    api_key = get_anthropic_api_key()
+    if not api_key:
         raise RuntimeError(
-            "ANTHROPIC_API_KEY not set. Add it to your .env file or environment."
+            "ANTHROPIC_API_KEY not configured. Set it in Settings or in your .env file."
         )
-    return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return anthropic.Anthropic(api_key=api_key)
 
 
 def generate_seo_description(

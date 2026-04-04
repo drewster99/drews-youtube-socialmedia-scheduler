@@ -26,6 +26,20 @@ async def list_videos():
     return [dict(r) for r in rows]
 
 
+@router.get("/transcription-backends")
+async def list_transcription_backends():
+    """List available transcription backends."""
+    from youtube_publisher.services import transcription
+    return transcription.list_available_backends()
+
+
+@router.get("/scheduled")
+async def list_scheduled():
+    """List all videos with scheduled publishes."""
+    from youtube_publisher.services.scheduler import get_scheduled_jobs
+    return get_scheduled_jobs()
+
+
 @router.get("/{video_id}")
 async def get_video(video_id: str):
     """Get a single video's details."""
@@ -40,8 +54,8 @@ async def get_video(video_id: str):
         yt_data = youtube.get_video(video_id)
         if yt_data:
             result["youtube_data"] = yt_data
-    except Exception:
-        pass
+    except Exception as e:
+        result["youtube_data_error"] = str(e)
 
     return result
 
@@ -68,7 +82,7 @@ async def upload_video(
 
     # Save thumbnail if provided
     thumbnail_path = None
-    if thumbnail_file:
+    if thumbnail_file and thumbnail_file.filename:
         thumbnail_path = UPLOAD_DIR / thumbnail_file.filename
         with open(thumbnail_path, "wb") as f:
             shutil.copyfileobj(thumbnail_file.file, f)
@@ -91,11 +105,12 @@ async def upload_video(
     video_id = result["id"]
 
     # Set thumbnail if provided
+    thumbnail_error = None
     if thumbnail_path:
         try:
             youtube.set_thumbnail(video_id, thumbnail_path)
         except Exception as e:
-            pass  # Non-fatal — thumbnail can be set later
+            thumbnail_error = str(e)
 
     # Track in database
     await db.execute(
@@ -116,7 +131,10 @@ async def upload_video(
     )
     await db.commit()
 
-    return {"status": "ok", "video_id": video_id, "youtube_url": f"https://youtu.be/{video_id}"}
+    resp = {"status": "ok", "video_id": video_id, "youtube_url": f"https://youtu.be/{video_id}"}
+    if thumbnail_error:
+        resp["thumbnail_error"] = thumbnail_error
+    return resp
 
 
 @router.put("/{video_id}")
@@ -219,13 +237,6 @@ async def transcribe_video(video_id: str, data: dict | None = None):
         "json_path": str(json_path),
         "transcript_preview": result.text[:500],
     }
-
-
-@router.get("/transcription-backends")
-async def list_transcription_backends():
-    """List available transcription backends."""
-    from youtube_publisher.services import transcription
-    return transcription.list_available_backends()
 
 
 @router.post("/{video_id}/generate-description")
@@ -340,13 +351,6 @@ async def cancel_schedule(video_id: str):
     raise HTTPException(404, "No scheduled publish found for this video")
 
 
-@router.get("/scheduled")
-async def list_scheduled():
-    """List all videos with scheduled publishes."""
-    from youtube_publisher.services.scheduler import get_scheduled_jobs
-    return get_scheduled_jobs()
-
-
 @router.get("/{video_id}/captions")
 async def list_captions(video_id: str):
     """List available caption tracks."""
@@ -362,7 +366,10 @@ async def list_comments(video_id: str, max_results: int = 50):
     try:
         return youtube.list_comment_threads(video_id, max_results=max_results)
     except Exception as e:
-        raise HTTPException(500, str(e))
+        error_msg = str(e)
+        if "disabled" in error_msg.lower() or "commentsDisabled" in error_msg:
+            raise HTTPException(403, "Comments are disabled on this video")
+        raise HTTPException(500, error_msg)
 
 
 @router.post("/{video_id}/set-thumbnail")

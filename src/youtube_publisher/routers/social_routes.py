@@ -13,12 +13,21 @@ router = APIRouter(prefix="/api/social", tags=["social"])
 
 
 @router.post("/generate-posts/{video_id}")
-async def generate_posts(video_id: str, template_name: str = "new_video"):
-    """Generate social media posts for a video using a template."""
+async def generate_posts(video_id: str, data: dict | None = None):
+    """Generate social media posts for a video using a template.
+
+    Optional body params:
+        template_name: Template to use (default: "new_video")
+        platforms: List of platform names to generate for (default: all in template)
+    """
     db = await get_db()
     rows = await db.execute_fetchall("SELECT * FROM videos WHERE id = ?", (video_id,))
     if not rows:
         raise HTTPException(404, "Video not found")
+
+    opts = data or {}
+    template_name = opts.get("template_name", "new_video")
+    requested_platforms = opts.get("platforms")
 
     video = dict(rows[0])
     template = await tmpl.get_template(template_name)
@@ -38,8 +47,17 @@ async def generate_posts(video_id: str, template_name: str = "new_video"):
         "thumbnail_path": video.get("thumbnail_path", ""),
     }
 
+    # Remove existing drafts for this video so regeneration replaces them
+    await db.execute(
+        "DELETE FROM social_posts WHERE video_id = ? AND status = 'draft'",
+        (video_id,),
+    )
+
     generated = {}
     for platform, config in template["platforms"].items():
+        if requested_platforms and platform not in requested_platforms:
+            continue
+
         template_text = config.get("template", "")
         if template_text:
             try:

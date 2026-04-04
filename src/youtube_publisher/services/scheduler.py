@@ -225,24 +225,33 @@ async def moderate_comments_job() -> None:
         logger.warning(f"Comment moderation job failed: {e}")
 
 
-def start_scheduler() -> None:
-    """Start the background scheduler."""
+def start_scheduler(
+    caption_interval: int | None = None,
+    comment_interval: int | None = None,
+) -> None:
+    """Start the background scheduler.
+
+    Intervals can be overridden (e.g. from DB settings). Falls back to config defaults.
+    """
+    cap_mins = caption_interval or CAPTION_CHECK_INTERVAL_MINUTES
+    mod_mins = comment_interval or COMMENT_CHECK_INTERVAL_MINUTES
+
     scheduler.add_job(
         check_captions_job,
         "interval",
-        minutes=CAPTION_CHECK_INTERVAL_MINUTES,
+        minutes=cap_mins,
         id="check_captions",
         replace_existing=True,
     )
     scheduler.add_job(
         moderate_comments_job,
         "interval",
-        minutes=COMMENT_CHECK_INTERVAL_MINUTES,
+        minutes=mod_mins,
         id="moderate_comments",
         replace_existing=True,
     )
     scheduler.start()
-    logger.info("Scheduler started")
+    logger.info(f"Scheduler started (captions every {cap_mins}m, moderation every {mod_mins}m)")
 
 
 def stop_scheduler() -> None:

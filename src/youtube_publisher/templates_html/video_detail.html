@@ -136,6 +136,10 @@
 
         <div class="card">
             <h3>Social Posts</h3>
+            <div id="social-platform-picker" style="display:none; margin-bottom: 0.75rem;">
+                <div id="platform-checkboxes" style="display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.5rem;"></div>
+                <button class="btn btn-sm btn-primary" onclick="generatePostsForSelected()">Generate for Selected</button>
+            </div>
             <div id="social-posts-area">
                 <p class="empty-state">Not generated yet</p>
             </div>
@@ -189,6 +193,18 @@ async function loadVideo() {
         document.getElementById('st-views').textContent = stats.viewCount || '0';
         document.getElementById('st-likes').textContent = stats.likeCount || '0';
         document.getElementById('st-comments').textContent = stats.commentCount || '0';
+
+        // Show YouTube processing status
+        const ytStatus = video.youtube_data.status || {};
+        const uploadStatus = ytStatus.uploadStatus;
+        if (uploadStatus && uploadStatus !== 'processed') {
+            const processingEl = document.getElementById('st-status');
+            processingEl.textContent = video.status + ' (' + uploadStatus + ')';
+            processingEl.className = 'badge badge-uploaded';
+        }
+    }
+    if (video.youtube_data_error) {
+        showToast('Could not fetch YouTube data: ' + video.youtube_data_error, 'error');
     }
 
     // Schedule info
@@ -243,6 +259,15 @@ async function loadComments() {
     const area = document.getElementById('comments-area');
     try {
         const resp = await fetch(`/api/videos/${videoId}/comments?max_results=20`);
+        if (!resp.ok) {
+            const err = await resp.json();
+            if (resp.status === 403) {
+                area.innerHTML = `<p class="empty-state">Comments are disabled on this video. <a href="https://studio.youtube.com/video/${videoId}/edit" target="_blank" style="color: var(--accent);">Enable in YouTube Studio</a></p>`;
+            } else {
+                area.innerHTML = '<p class="empty-state">Could not load comments.</p>';
+            }
+            return;
+        }
         const threads = await resp.json();
         if (threads.length === 0) {
             area.innerHTML = '<p class="empty-state">No comments yet.</p>';
@@ -263,36 +288,120 @@ async function loadComments() {
     }
 }
 
+// Cache of platform config status
+let platformConfigs = {};
+
+async function loadPlatformConfigs() {
+    try {
+        const resp = await fetch('/api/settings/social');
+        platformConfigs = await resp.json();
+    } catch (e) {
+        platformConfigs = {};
+    }
+}
+
 async function loadSocialPosts() {
     const area = document.getElementById('social-posts-area');
+    const picker = document.getElementById('social-platform-picker');
+
+    await loadPlatformConfigs();
+
     try {
         const resp = await fetch(`/api/social/posts/${videoId}`);
         const posts = await resp.json();
+
         if (posts.length === 0) {
-            area.innerHTML = '<p class="empty-state">Not generated yet. Click "Generate Social Posts".</p>';
+            // Show platform picker for generation
+            showPlatformPicker();
+            area.innerHTML = '<p class="empty-state">Select platforms above, then generate posts.</p>';
             return;
         }
-        area.innerHTML = posts.map(p => `
-            <div class="social-post-card">
-                <div class="social-post-header">
-                    <span class="platform-badge platform-${p.platform}">${p.platform}</span>
-                    <span class="badge badge-${p.status}">${p.status}</span>
-                </div>
-                <textarea class="social-post-text" data-id="${p.id}" rows="4">${p.content}</textarea>
-                <div class="social-post-actions">
+
+        picker.style.display = 'none';
+
+        // Check which platforms have posts already
+        const postedPlatforms = new Set(posts.map(p => p.platform));
+        const hasUnsent = posts.some(p => p.status !== 'posted');
+
+        let html = '';
+        const hasApproved = posts.some(p => p.status === 'approved');
+        const hasDraft = posts.some(p => p.status === 'draft');
+        if (hasUnsent) {
+            html += `<div style="margin-bottom: 0.75rem; display: flex; gap: 0.5rem;">
+                ${hasDraft ? '<button class="btn btn-sm btn-primary" onclick="approveAllPosts()">Approve All</button>' : ''}
+                ${hasApproved ? '<button class="btn btn-sm btn-success" onclick="sendAllPosts()">Send All Approved</button>' : ''}
+                <button class="btn btn-sm" onclick="regeneratePosts()">Regenerate</button>
+            </div>`;
+        }
+
+        html += posts.map(p => {
+            const config = platformConfigs[p.platform];
+            const isConfigured = config && config.configured;
+            const isPosted = p.status === 'posted';
+            const isFailed = p.status === 'failed';
+            const opacity = (!isConfigured && !isPosted) ? 'opacity: 0.6;' : '';
+
+            let statusBadge = `<span class="badge badge-${p.status}">${p.status}</span>`;
+            if (!isConfigured && !isPosted) {
+                statusBadge = `<span class="badge badge-draft" style="background: #6e4000; color: #ffa940;">not configured</span>`;
+            }
+
+            let actions = '';
+            if (isPosted) {
+                actions = `<span class="badge badge-published">Posted</span>`;
+                if (p.post_url) {
+                    actions += ` <a href="${p.post_url}" target="_blank" class="btn btn-sm">View</a>`;
+                }
+            } else {
+                const isApproved = p.status === 'approved';
+                actions = `
                     <button class="btn btn-sm" onclick="saveSocialPost(${p.id})">Save</button>
-                    <button class="btn btn-sm btn-primary" onclick="approvePost(${p.id})">Approve</button>
+                    ${!isApproved ? `<button class="btn btn-sm btn-primary" onclick="approvePost(${p.id})">Approve</button>` : ''}
                     <button class="btn btn-sm btn-success" onclick="sendPost(${p.id})"
-                        ${p.status === 'posted' ? 'disabled' : ''}>
-                        ${p.status === 'posted' ? 'Posted' : 'Send'}
-                    </button>
-                    ${p.post_url ? `<a href="${p.post_url}" target="_blank" class="btn btn-sm">View</a>` : ''}
+                        ${!isConfigured ? 'disabled title="Configure this platform in Settings first"' : ''}>
+                        Send
+                    </button>`;
+            }
+            if (isFailed && p.error) {
+                actions += `<span style="color: var(--danger); font-size: 0.8rem; margin-left: 0.5rem;" title="${p.error}">Failed</span>`;
+            }
+
+            return `
+                <div class="social-post-card" style="${opacity}">
+                    <div class="social-post-header">
+                        <span class="platform-badge platform-${p.platform}">${p.platform}</span>
+                        ${statusBadge}
+                    </div>
+                    <textarea class="social-post-text" data-id="${p.id}" rows="4" ${isPosted ? 'readonly' : ''}>${p.content}</textarea>
+                    <div class="social-post-actions">${actions}</div>
                 </div>
-            </div>
-        `).join('');
+            `;
+        }).join('');
+
+        area.innerHTML = html;
     } catch (e) {
         area.innerHTML = '<p class="empty-state">Could not load posts.</p>';
     }
+}
+
+function showPlatformPicker() {
+    const picker = document.getElementById('social-platform-picker');
+    const checkboxes = document.getElementById('platform-checkboxes');
+    picker.style.display = 'block';
+
+    const allPlatforms = ['twitter', 'bluesky', 'mastodon', 'linkedin', 'threads'];
+    checkboxes.innerHTML = allPlatforms.map(name => {
+        const config = platformConfigs[name];
+        const isConfigured = config && config.configured;
+        const checked = isConfigured ? 'checked' : '';
+        const label = isConfigured
+            ? `<span class="platform-badge platform-${name}">${name}</span>`
+            : `<span class="platform-badge platform-${name}" style="opacity: 0.5;">${name}</span> <span style="font-size: 0.75rem; color: #ffa940;">not configured</span>`;
+
+        return `<label style="display: flex; align-items: center; gap: 0.3rem; cursor: pointer;">
+            <input type="checkbox" name="platform" value="${name}" ${checked}> ${label}
+        </label>`;
+    }).join('');
 }
 
 // Metadata form
@@ -369,16 +478,57 @@ async function applyDescription() {
 }
 
 async function generatePosts() {
+    // If we have platform checkboxes, use the picker flow
+    const checkboxes = document.querySelectorAll('#platform-checkboxes input[name="platform"]');
+    if (checkboxes.length > 0) {
+        generatePostsForSelected();
+        return;
+    }
+    // Fallback: generate for all
+    await doGeneratePosts();
+}
+
+async function generatePostsForSelected() {
+    const checked = [...document.querySelectorAll('#platform-checkboxes input[name="platform"]:checked')]
+        .map(cb => cb.value);
+    if (checked.length === 0) {
+        showToast('Select at least one platform', 'error');
+        return;
+    }
+    await doGeneratePosts(checked);
+}
+
+async function regeneratePosts() {
+    await loadPlatformConfigs();
+    showPlatformPicker();
+    // Pre-check platforms that already have posts
+    const resp = await fetch(`/api/social/posts/${videoId}`);
+    const posts = await resp.json();
+    const existingPlatforms = new Set(posts.map(p => p.platform));
+    document.querySelectorAll('#platform-checkboxes input[name="platform"]').forEach(cb => {
+        cb.checked = existingPlatforms.has(cb.value);
+    });
+    document.getElementById('social-posts-area').innerHTML = '<p class="empty-state">Select platforms and click "Generate for Selected" to regenerate.</p>';
+}
+
+async function doGeneratePosts(platforms) {
     const btn = document.getElementById('btn-generate-posts');
     btn.disabled = true;
     btn.textContent = 'Generating...';
     try {
-        const resp = await fetch(`/api/social/generate-posts/${videoId}`, { method: 'POST' });
+        const body = {};
+        if (platforms) body.platforms = platforms;
+        const resp = await fetch(`/api/social/generate-posts/${videoId}`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        });
         if (resp.ok) {
             showToast('Social posts generated!', 'success');
             loadSocialPosts();
         } else {
-            showToast('Failed to generate posts', 'error');
+            const err = await resp.json();
+            showToast(err.detail || 'Failed to generate posts', 'error');
         }
     } finally {
         btn.disabled = false;
@@ -408,6 +558,21 @@ async function approvePost(postId) {
     }
 }
 
+async function approveAllPosts() {
+    const resp = await fetch(`/api/social/posts/${videoId}`);
+    const posts = await resp.json();
+    const drafts = posts.filter(p => p.status === 'draft');
+    for (const p of drafts) {
+        await fetch(`/api/social/posts/${p.id}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({status: 'approved'}),
+        });
+    }
+    showToast(`Approved ${drafts.length} post(s)`, 'success');
+    loadSocialPosts();
+}
+
 async function sendPost(postId) {
     const resp = await fetch(`/api/social/posts/${postId}/send`, { method: 'POST' });
     const result = await resp.json();
@@ -417,6 +582,43 @@ async function sendPost(postId) {
     } else {
         showToast(result.detail || 'Failed', 'error');
     }
+}
+
+async function sendAllPosts() {
+    if (!confirm('Send all approved social posts now?')) return;
+    const resp = await fetch(`/api/social/posts/${videoId}`);
+    const posts = await resp.json();
+    const unsent = posts.filter(p => p.status === 'approved');
+
+    let successes = 0;
+    let failures = 0;
+    for (const p of unsent) {
+        const config = platformConfigs[p.platform];
+        if (!config || !config.configured) continue;
+
+        // Save any edits first
+        const textarea = document.querySelector(`textarea[data-id="${p.id}"]`);
+        if (textarea) {
+            await fetch(`/api/social/posts/${p.id}`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({content: textarea.value}),
+            });
+        }
+
+        const sendResp = await fetch(`/api/social/posts/${p.id}/send`, { method: 'POST' });
+        if (sendResp.ok) {
+            const result = await sendResp.json();
+            showToast(`Posted to ${p.platform}! ${result.url || ''}`, 'success');
+            successes++;
+        } else {
+            const err = await sendResp.json();
+            showToast(`${p.platform} failed: ${err.detail || 'Unknown error'}`, 'error');
+            failures++;
+        }
+    }
+
+    loadSocialPosts();
 }
 
 async function publishVideo() {
@@ -482,9 +684,16 @@ async function cancelSchedule() {
 async function transcribeLocally() {
     const btn = document.getElementById('btn-transcribe');
     const model = document.getElementById('transcribe-model').value;
+    const area = document.getElementById('transcript-area');
     btn.disabled = true;
     btn.textContent = 'Transcribing...';
-    showToast(`Starting local transcription (${model})... This may take a few minutes.`, 'info');
+    area.innerHTML = `
+        <div class="transcription-progress" style="text-align: center; padding: 2rem;">
+            <div class="spinner" style="display: inline-block; width: 24px; height: 24px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite;"></div>
+            <p style="margin-top: 0.5rem; color: var(--text-muted);">Transcribing with ${model}... This may take several minutes.</p>
+            <style>@keyframes spin { to { transform: rotate(360deg); } }</style>
+        </div>
+    `;
 
     try {
         const resp = await fetch(`/api/videos/${videoId}/transcribe`, {
@@ -494,12 +703,14 @@ async function transcribeLocally() {
         });
         const result = await resp.json();
         if (resp.ok) {
-            showToast(`Transcribed! ${result.segments} segments via ${result.backend}`, 'success');
+            showToast(`Transcribed! ${result.segments} segments, ${result.word_count} words via ${result.backend}`, 'success');
             loadVideo();
         } else {
+            area.innerHTML = `<p class="empty-state" style="color: var(--danger);">Transcription failed: ${result.detail || 'Unknown error'}</p>`;
             showToast(result.detail || 'Transcription failed', 'error');
         }
     } catch (e) {
+        area.innerHTML = `<p class="empty-state" style="color: var(--danger);">Transcription failed: ${e.message}</p>`;
         showToast('Transcription failed: ' + e.message, 'error');
     } finally {
         btn.disabled = false;

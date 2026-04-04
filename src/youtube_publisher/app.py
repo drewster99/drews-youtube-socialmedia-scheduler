@@ -21,9 +21,16 @@ from youtube_publisher.services.templates import ensure_default_template
 async def lifespan(app: FastAPI):
     """Startup and shutdown."""
     ensure_dirs()
-    await get_db()
+    db = await get_db()
     await ensure_default_template()
-    start_scheduler()
+
+    # Read scheduler intervals from DB settings (saved via Settings UI), fall back to config defaults
+    settings_rows = await db.execute_fetchall("SELECT key, value FROM settings WHERE key IN ('comment_check_interval', 'caption_check_interval')")
+    db_settings = {r["key"]: r["value"] for r in settings_rows}
+    start_scheduler(
+        caption_interval=int(db_settings["caption_check_interval"]) if "caption_check_interval" in db_settings else None,
+        comment_interval=int(db_settings["comment_check_interval"]) if "comment_check_interval" in db_settings else None,
+    )
     await restore_scheduled_jobs()
     yield
     stop_scheduler()
@@ -52,34 +59,34 @@ app.include_router(settings_routes.router)
 # HTML pages
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    return html_templates.TemplateResponse("dashboard.html", {"request": request})
+    return html_templates.TemplateResponse(request, "dashboard.html")
 
 
 @app.get("/upload", response_class=HTMLResponse)
 async def upload_page(request: Request):
-    return html_templates.TemplateResponse("upload.html", {"request": request})
+    return html_templates.TemplateResponse(request, "upload.html")
 
 
 @app.get("/videos/{video_id}", response_class=HTMLResponse)
 async def video_detail_page(request: Request, video_id: str):
-    return html_templates.TemplateResponse("video_detail.html", {"request": request, "video_id": video_id})
+    return html_templates.TemplateResponse(request, "video_detail.html", context={"video_id": video_id})
 
 
 @app.get("/templates", response_class=HTMLResponse)
 async def templates_page(request: Request):
-    return html_templates.TemplateResponse("templates.html", {"request": request})
+    return html_templates.TemplateResponse(request, "templates.html")
 
 
 @app.get("/templates/{name}", response_class=HTMLResponse)
 async def template_edit_page(request: Request, name: str):
-    return html_templates.TemplateResponse("template_edit.html", {"request": request, "template_name": name})
+    return html_templates.TemplateResponse(request, "template_edit.html", context={"template_name": name})
 
 
 @app.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request):
-    return html_templates.TemplateResponse("settings.html", {"request": request})
+    return html_templates.TemplateResponse(request, "settings.html")
 
 
 @app.get("/moderation", response_class=HTMLResponse)
 async def moderation_page(request: Request):
-    return html_templates.TemplateResponse("moderation.html", {"request": request})
+    return html_templates.TemplateResponse(request, "moderation.html")

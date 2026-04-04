@@ -115,7 +115,10 @@ document.getElementById('upload-form').addEventListener('submit', async (e) => {
 
         if (resp.ok) {
             showToast('Video uploaded successfully!', 'success');
-            setTimeout(() => window.location.href = `/videos/${result.video_id}`, 1000);
+            if (result.thumbnail_error) {
+                showToast('Thumbnail failed: ' + result.thumbnail_error + '. You can set it later.', 'error');
+            }
+            setTimeout(() => window.location.href = `/videos/${result.video_id}`, 1500);
         } else {
             showToast(result.detail || 'Upload failed', 'error');
         }
