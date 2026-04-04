@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException
 
 from youtube_publisher.database import get_db
 from youtube_publisher.services import ai, social, templates as tmpl
+from youtube_publisher.services.scheduler import get_publish_lock
 
 router = APIRouter(prefix="/api/social", tags=["social"])
 
@@ -47,41 +48,45 @@ async def generate_posts(video_id: str, data: dict | None = None):
         "thumbnail_path": video.get("thumbnail_path", ""),
     }
 
-    # Remove existing drafts for this video so regeneration replaces them
-    await db.execute(
-        "DELETE FROM social_posts WHERE video_id = ? AND status = 'draft'",
-        (video_id,),
-    )
-
-    generated = {}
-    for platform, config in template["platforms"].items():
-        if requested_platforms and platform not in requested_platforms:
-            continue
-
-        template_text = config.get("template", "")
-        if template_text:
-            try:
-                rendered = tmpl.render_template(template_text, variables)
-            except Exception as e:
-                rendered = f"[Error generating: {e}]"
-        else:
-            rendered = ""
-
-        # Store as draft
+    # Acquire the per-video publish lock to prevent racing with a publish in progress.
+    # This ensures we don't delete/recreate posts while the scheduler is sending them.
+    lock = get_publish_lock(video_id)
+    async with lock:
+        # Remove existing drafts for this video so regeneration replaces them
         await db.execute(
-            """INSERT INTO social_posts (video_id, platform, content, media_type, status)
-            VALUES (?, ?, ?, ?, 'draft')""",
-            (video_id, platform, rendered, config.get("media", "thumbnail")),
+            "DELETE FROM social_posts WHERE video_id = ? AND status = 'draft'",
+            (video_id,),
         )
 
-        generated[platform] = {
-            "content": rendered,
-            "media": config.get("media", "thumbnail"),
-            "max_chars": config.get("max_chars", 500),
-        }
+        generated = {}
+        for platform, config in template["platforms"].items():
+            if requested_platforms and platform not in requested_platforms:
+                continue
 
-    await db.commit()
-    return generated
+            template_text = config.get("template", "")
+            if template_text:
+                try:
+                    rendered = tmpl.render_template(template_text, variables)
+                except Exception as e:
+                    rendered = f"[Error generating: {e}]"
+            else:
+                rendered = ""
+
+            # Store as draft
+            await db.execute(
+                """INSERT INTO social_posts (video_id, platform, content, media_type, status)
+                VALUES (?, ?, ?, ?, 'draft')""",
+                (video_id, platform, rendered, config.get("media", "thumbnail")),
+            )
+
+            generated[platform] = {
+                "content": rendered,
+                "media": config.get("media", "thumbnail"),
+                "max_chars": config.get("max_chars", 500),
+            }
+
+        await db.commit()
+        return generated
 
 
 @router.get("/posts/{video_id}")

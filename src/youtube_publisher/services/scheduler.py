@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -15,6 +16,16 @@ logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler()
 
+# Prevents concurrent publish + post regeneration from racing
+_publish_locks: dict[str, asyncio.Lock] = {}
+
+
+def get_publish_lock(video_id: str) -> asyncio.Lock:
+    """Get or create a per-video lock to prevent concurrent publish/regenerate races."""
+    if video_id not in _publish_locks:
+        _publish_locks[video_id] = asyncio.Lock()
+    return _publish_locks[video_id]
+
 
 async def publish_video_job(video_id: str) -> dict:
     """Publish a video and fire all approved social posts.
@@ -24,68 +35,82 @@ async def publish_video_job(video_id: str) -> dict:
     2. Send all approved social posts
     3. Log results
 
+    Uses a per-video lock to prevent races with post regeneration.
+
     Returns a summary dict.
     """
     from youtube_publisher.services.social import get_poster
 
-    db = await get_db()
-    results = {"video_id": video_id, "published": False, "social_results": {}}
+    lock = get_publish_lock(video_id)
+    async with lock:
+        db = await get_db()
+        results: dict = {"video_id": video_id, "published": False, "social_results": {}}
 
-    # Step 1: Flip to public
-    try:
-        youtube.update_video_metadata(video_id, privacy_status="public")
-        await db.execute(
-            """UPDATE videos SET privacy_status = 'public', status = 'published',
-            updated_at = datetime('now') WHERE id = ?""",
+        # Step 1: Flip to public
+        try:
+            youtube.update_video_metadata(video_id, privacy_status="public")
+            await db.execute(
+                """UPDATE videos SET privacy_status = 'public', status = 'published',
+                updated_at = datetime('now') WHERE id = ?""",
+                (video_id,),
+            )
+            await db.commit()
+            results["published"] = True
+            logger.info(f"Video {video_id} is now public")
+        except Exception as e:
+            logger.error(f"Failed to publish video {video_id}: {e}")
+            results["publish_error"] = str(e)
+            # Don't fire social posts if video didn't go public
+            return results
+
+        # Step 2: Fire all approved social posts
+        rows = await db.execute_fetchall(
+            "SELECT * FROM social_posts WHERE video_id = ? AND status = 'approved'",
             (video_id,),
         )
+
+        for row in rows:
+            post = dict(row)
+            platform = post["platform"]
+            post_id = post["id"]
+            poster = get_poster(platform)
+
+            # Accumulate as list per platform so multiple posts aren't lost
+            if platform not in results["social_results"]:
+                results["social_results"][platform] = []
+
+            if not await poster.is_configured():
+                results["social_results"][platform].append(
+                    {"post_id": post_id, "status": "skipped", "reason": "not configured"}
+                )
+                continue
+
+            try:
+                post_result = await poster.post(post["content"], post.get("media_path"))
+                await db.execute(
+                    """UPDATE social_posts
+                    SET status = 'posted', posted_at = datetime('now'), post_url = ?
+                    WHERE id = ?""",
+                    (post_result.get("url", ""), post_id),
+                )
+                results["social_results"][platform].append({
+                    "post_id": post_id,
+                    "status": "posted",
+                    "url": post_result.get("url", ""),
+                })
+                logger.info(f"Posted to {platform}: {post_result.get('url', '')}")
+            except Exception as e:
+                await db.execute(
+                    "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
+                    (str(e), post_id),
+                )
+                results["social_results"][platform].append(
+                    {"post_id": post_id, "status": "failed", "error": str(e)}
+                )
+                logger.error(f"Failed to post to {platform}: {e}")
+
         await db.commit()
-        results["published"] = True
-        logger.info(f"Video {video_id} is now public")
-    except Exception as e:
-        logger.error(f"Failed to publish video {video_id}: {e}")
-        results["publish_error"] = str(e)
-        # Don't fire social posts if video didn't go public
         return results
-
-    # Step 2: Fire all approved social posts
-    rows = await db.execute_fetchall(
-        "SELECT * FROM social_posts WHERE video_id = ? AND status = 'approved'",
-        (video_id,),
-    )
-
-    for row in rows:
-        post = dict(row)
-        platform = post["platform"]
-        poster = get_poster(platform)
-
-        if not await poster.is_configured():
-            results["social_results"][platform] = {"status": "skipped", "reason": "not configured"}
-            continue
-
-        try:
-            post_result = await poster.post(post["content"], post.get("media_path"))
-            await db.execute(
-                """UPDATE social_posts
-                SET status = 'posted', posted_at = datetime('now'), post_url = ?
-                WHERE id = ?""",
-                (post_result.get("url", ""), post["id"]),
-            )
-            results["social_results"][platform] = {
-                "status": "posted",
-                "url": post_result.get("url", ""),
-            }
-            logger.info(f"Posted to {platform}: {post_result.get('url', '')}")
-        except Exception as e:
-            await db.execute(
-                "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
-                (str(e), post["id"]),
-            )
-            results["social_results"][platform] = {"status": "failed", "error": str(e)}
-            logger.error(f"Failed to post to {platform}: {e}")
-
-    await db.commit()
-    return results
 
 
 async def schedule_publish(video_id: str, publish_at: datetime) -> str:

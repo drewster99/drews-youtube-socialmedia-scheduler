@@ -85,12 +85,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openWebUI() {
-        if case .running(let port) = serverManager.status {
-            NSWorkspace.shared.open(URL(string: "http://127.0.0.1:\(port)")!)
+        let port: Int
+        if case .running(let p) = serverManager.status {
+            port = p
         } else {
-            // Try default port
-            NSWorkspace.shared.open(URL(string: "http://127.0.0.1:8008")!)
+            port = ServerManager.defaultPort
         }
+
+        guard let url = URL(string: "http://127.0.0.1:\(port)") else { return }
+        NSWorkspace.shared.open(url)
     }
 
     @objc private func restartServer() {

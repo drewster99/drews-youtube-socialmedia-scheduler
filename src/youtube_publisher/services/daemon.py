@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from textwrap import dedent
+from xml.sax.saxutils import escape as xml_escape
 
 from youtube_publisher.config import DATA_DIR
 
@@ -27,25 +29,30 @@ LINUX_SERVICE_PATH = LINUX_SERVICE_DIR / "youtube-publisher.service"
 LOG_DIR = DATA_DIR / "logs"
 
 
-def _find_executable() -> str:
-    """Find the youtube-publisher executable path."""
-    # Check if we're running from a venv
+def _find_executable() -> list[str]:
+    """Find the youtube-publisher executable as a list of arguments.
+
+    Returns a list like ["/path/to/youtube-publisher"] or
+    ["/path/to/python", "-m", "youtube_publisher.main"].
+    Returning a list avoids path-splitting bugs when paths contain spaces.
+    """
     exe = shutil.which("youtube-publisher")
     if exe:
-        return exe
+        return [exe]
     # Fallback: use the current Python interpreter with the module
-    return f"{sys.executable} -m youtube_publisher.main"
+    return [sys.executable, "-m", "youtube_publisher.main"]
 
 
 def _generate_launchd_plist() -> str:
     """Generate a macOS LaunchAgent plist."""
-    exe = _find_executable()
+    parts = _find_executable()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Split exe into program arguments
-    parts = exe.split()
-
-    program_args = "\n".join(f"            <string>{p}</string>" for p in parts)
+    # XML-escape all interpolated values to prevent malformed plist
+    program_args = "\n".join(
+        f"            <string>{xml_escape(p)}</string>" for p in parts
+    )
+    log_dir_escaped = xml_escape(str(LOG_DIR))
 
     return dedent(f"""\
         <?xml version="1.0" encoding="UTF-8"?>
@@ -53,7 +60,7 @@ def _generate_launchd_plist() -> str:
         <plist version="1.0">
         <dict>
             <key>Label</key>
-            <string>{MACOS_AGENT_LABEL}</string>
+            <string>{xml_escape(MACOS_AGENT_LABEL)}</string>
 
             <key>ProgramArguments</key>
             <array>
@@ -73,10 +80,10 @@ def _generate_launchd_plist() -> str:
             <integer>10</integer>
 
             <key>StandardOutPath</key>
-            <string>{LOG_DIR}/stdout.log</string>
+            <string>{log_dir_escaped}/stdout.log</string>
 
             <key>StandardErrorPath</key>
-            <string>{LOG_DIR}/stderr.log</string>
+            <string>{log_dir_escaped}/stderr.log</string>
 
             <key>EnvironmentVariables</key>
             <dict>
@@ -93,8 +100,11 @@ def _generate_launchd_plist() -> str:
 
 def _generate_systemd_unit() -> str:
     """Generate a Linux systemd user service unit."""
-    exe = _find_executable()
+    parts = _find_executable()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # shlex.join properly quotes paths with spaces for systemd
+    exec_start = shlex.join(parts)
 
     return dedent(f"""\
         [Unit]
@@ -104,7 +114,7 @@ def _generate_systemd_unit() -> str:
 
         [Service]
         Type=simple
-        ExecStart={exe}
+        ExecStart={exec_start}
         Restart=on-failure
         RestartSec=10
         Environment=PATH=/usr/local/bin:/usr/bin:/bin
@@ -139,7 +149,7 @@ def _install_macos() -> dict:
 
     MACOS_AGENT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Unload existing if present
+    # Unload existing if present (ignore errors — may not be loaded)
     if MACOS_AGENT_PATH.exists():
         subprocess.run(
             ["launchctl", "bootout", f"gui/{os.getuid()}", str(MACOS_AGENT_PATH)],
@@ -163,8 +173,16 @@ def _install_macos() -> dict:
             text=True,
         )
 
+    if result.returncode != 0:
+        return {
+            "status": "error",
+            "platform": "macos",
+            "plist_path": str(MACOS_AGENT_PATH),
+            "message": f"Failed to load LaunchAgent: {result.stderr.strip() or 'unknown error'}",
+        }
+
     return {
-        "status": "ok" if result.returncode == 0 else "error",
+        "status": "ok",
         "platform": "macos",
         "plist_path": str(MACOS_AGENT_PATH),
         "log_dir": str(LOG_DIR),
@@ -186,15 +204,35 @@ def _install_linux() -> dict:
     LINUX_SERVICE_PATH.write_text(unit)
 
     # Reload systemd and enable
-    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+    reload_result = subprocess.run(
+        ["systemctl", "--user", "daemon-reload"],
+        capture_output=True,
+        text=True,
+    )
+    if reload_result.returncode != 0:
+        return {
+            "status": "error",
+            "platform": "linux",
+            "service_path": str(LINUX_SERVICE_PATH),
+            "message": f"Failed to reload systemd: {reload_result.stderr.strip() or 'unknown error'}",
+        }
+
     result = subprocess.run(
         ["systemctl", "--user", "enable", "--now", "youtube-publisher"],
         capture_output=True,
         text=True,
     )
 
+    if result.returncode != 0:
+        return {
+            "status": "error",
+            "platform": "linux",
+            "service_path": str(LINUX_SERVICE_PATH),
+            "message": f"Failed to enable service: {result.stderr.strip() or 'unknown error'}",
+        }
+
     return {
-        "status": "ok" if result.returncode == 0 else "error",
+        "status": "ok",
         "platform": "linux",
         "service_path": str(LINUX_SERVICE_PATH),
         "message": "systemd user service installed and started. Will auto-start on login.",

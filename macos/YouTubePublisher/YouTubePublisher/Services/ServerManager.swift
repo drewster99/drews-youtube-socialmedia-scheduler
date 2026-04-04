@@ -5,14 +5,23 @@ import Foundation
 class ServerManager {
     static let shared = ServerManager()
 
+    /// Default server port — single source of truth for Swift side.
+    /// Must match YTP_PORT passed to the Python process below.
+    static let defaultPort = 8008
+
     static let dataDir: URL = {
         let dir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".youtube-publisher")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            // Fatal during startup — can't run without a data directory
+            fatalError("Failed to create data directory at \(dir.path): \(error)")
+        }
         return dir
     }()
 
-    enum ServerStatus {
+    enum ServerStatus: Equatable {
         case starting
         case running(port: Int)
         case stopped
@@ -24,7 +33,8 @@ class ServerManager {
 
     private var process: Process?
     private var outputPipe: Pipe?
-    private let port: Int = 8008
+    private var logHandle: FileHandle?
+    private let port: Int = ServerManager.defaultPort
 
     private init() {}
 
@@ -65,14 +75,42 @@ class ServerManager {
         setStatus(.starting)
 
         let logDir = Self.dataDir.appendingPathComponent("logs")
-        try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        do {
+            try FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        } catch {
+            setStatus(.error("Failed to create log directory: \(error.localizedDescription)"))
+            return
+        }
 
         let proc = Process()
         proc.executableURL = python
         proc.arguments = ["-m", "youtube_publisher.main"]
 
-        // Set up environment
-        var env = ProcessInfo.processInfo.environment
+        // Whitelist safe environment variables instead of inheriting everything.
+        // This prevents leaking unrelated sensitive env vars from the parent process.
+        let parentEnv = ProcessInfo.processInfo.environment
+        var env: [String: String] = [:]
+
+        // System essentials
+        let safeKeys = ["HOME", "USER", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "SHELL", "TERM"]
+        for key in safeKeys {
+            if let value = parentEnv[key] {
+                env[key] = value
+            }
+        }
+
+        // Pass through app-specific vars (YTP_*, ANTHROPIC_*) and network proxy vars
+        let passThroughPrefixes = ["YTP_", "ANTHROPIC_"]
+        let passThroughExact: Set = [
+            "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+            "http_proxy", "https_proxy", "no_proxy",
+            "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
+        ]
+        for (key, value) in parentEnv {
+            if passThroughExact.contains(key) || passThroughPrefixes.contains(where: { key.hasPrefix($0) }) {
+                env[key] = value
+            }
+        }
         env["PYTHONHOME"] = python.deletingLastPathComponent().deletingLastPathComponent().path
         env["PYTHONPATH"] = sourcePath.path
         env["YTP_HOST"] = "127.0.0.1"
@@ -80,7 +118,7 @@ class ServerManager {
         env["YTP_DATA_DIR"] = Self.dataDir.path
         // Ensure FFmpeg is findable
         let extraPaths = ["/opt/homebrew/bin", "/usr/local/bin"]
-        env["PATH"] = (extraPaths + [env["PATH"] ?? ""]).joined(separator: ":")
+        env["PATH"] = (extraPaths + [parentEnv["PATH"] ?? "/usr/bin:/bin"]).joined(separator: ":")
         proc.environment = env
 
         // Capture output for logging
@@ -89,29 +127,32 @@ class ServerManager {
         proc.standardError = pipe
         outputPipe = pipe
 
-        // Log server output to file
+        // Open log file handle once and keep it open for the server's lifetime
         let logFile = logDir.appendingPathComponent("server.log")
-        let logHandle = try? FileHandle(forWritingTo: logFile)
-        if logHandle == nil {
+        if !FileManager.default.fileExists(atPath: logFile.path) {
             FileManager.default.createFile(atPath: logFile.path, contents: nil)
+        }
+        do {
+            let handle = try FileHandle(forWritingTo: logFile)
+            handle.seekToEndOfFile()
+            self.logHandle = handle
+        } catch {
+            // Non-fatal: server can run without logging
+            NSLog("WARNING: Could not open log file at \(logFile.path): \(error)")
         }
 
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
 
-            // Write to log file
-            if let logHandle = try? FileHandle(forWritingTo: logFile) {
-                logHandle.seekToEndOfFile()
-                logHandle.write(data)
-                logHandle.closeFile()
-            }
+            // Write to log file (handle kept open)
+            self?.logHandle?.write(data)
 
             // Check for server ready message
             if let output = String(data: data, encoding: .utf8) {
                 if output.contains("Uvicorn running") || output.contains("Application startup complete") {
                     DispatchQueue.main.async {
-                        self?.setStatus(.running(port: self?.port ?? 8008))
+                        self?.setStatus(.running(port: self?.port ?? ServerManager.defaultPort))
                     }
                 }
             }
@@ -119,7 +160,11 @@ class ServerManager {
 
         proc.terminationHandler = { [weak self] process in
             DispatchQueue.main.async {
-                if process.terminationStatus != 0 && self?.status != nil {
+                // Close the log file handle
+                self?.logHandle?.closeFile()
+                self?.logHandle = nil
+
+                if process.terminationStatus != 0 {
                     self?.setStatus(.error("Server exited with code \(process.terminationStatus)"))
                 } else {
                     self?.setStatus(.stopped)
@@ -132,11 +177,10 @@ class ServerManager {
             try proc.run()
             process = proc
 
-            // If server doesn't report ready within 10 seconds, assume it's running
+            // If server doesn't report ready within 10 seconds, verify via HTTP health check
             DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
-                if case .starting = self?.status {
-                    self?.setStatus(.running(port: self?.port ?? 8008))
-                }
+                guard let self, case .starting = self.status else { return }
+                self.performHealthCheck()
             }
         } catch {
             setStatus(.error("Failed to start: \(error.localizedDescription)"))
@@ -157,6 +201,30 @@ class ServerManager {
                 proc.terminate()  // SIGTERM
             }
         }
+    }
+
+    /// Verify the server is actually responding before marking it as running.
+    private func performHealthCheck() {
+        let url = URL(string: "http://127.0.0.1:\(port)/")
+        guard let url else {
+            setStatus(.error("Invalid health check URL"))
+            return
+        }
+
+        let task = URLSession.shared.dataTask(with: url) { [weak self] _, response, error in
+            DispatchQueue.main.async {
+                guard let self, case .starting = self.status else { return }
+
+                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode < 500 {
+                    self.setStatus(.running(port: self.port))
+                } else if let error {
+                    self.setStatus(.error("Server not responding: \(error.localizedDescription)"))
+                } else {
+                    self.setStatus(.error("Server returned unexpected response"))
+                }
+            }
+        }
+        task.resume()
     }
 
     private func setStatus(_ newStatus: ServerStatus) {

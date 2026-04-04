@@ -41,14 +41,22 @@ def _keychain_set(service: str, account: str, value: str) -> bool:
             ["security", "delete-generic-password", "-s", service, "-a", account],
             capture_output=True,
         )
-        # -T "" allows any app by this user to access without prompting.
-        # This is needed for the launchd background agent to access credentials.
+        # -T "" allows any app running as this user to access without prompting.
+        # This is required for the launchd background agent, which runs as the user
+        # but outside an interactive session — macOS would otherwise block Keychain
+        # access with a UI prompt that no one can answer.
+        #
+        # SECURITY TRADEOFF: this means any process running under this user account
+        # can read these credentials without prompting. If tighter access control is
+        # needed, replace "" with the full path to the specific binary that should
+        # have access (e.g. -T /path/to/youtube-publisher), but note that this will
+        # break if the binary location changes (e.g. after venv recreation).
         result = subprocess.run(
             [
                 "security", "add-generic-password",
                 "-s", service, "-a", account, "-w", value,
                 "-U",   # update if exists
-                "-T", "",  # allow access from all apps by this user
+                "-T", "",  # allow access from all apps by this user (see above)
             ],
             capture_output=True,
             text=True,

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import platform
 import re
 import subprocess
@@ -86,6 +87,9 @@ class TranscriptionResult:
 
     def _word_level_srt(self, max_words: int) -> str:
         """Generate SRT with word-level timing for shorter subtitle lines."""
+        if max_words < 1:
+            raise ValueError(f"max_words must be >= 1, got {max_words}")
+
         words = self.all_words
         if not words:
             return self.to_srt()
@@ -95,11 +99,12 @@ class TranscriptionResult:
         i = 0
         while i < len(words):
             chunk = words[i : i + max_words]
-            start = _format_srt_time(chunk[0].start)
-            end = _format_srt_time(chunk[-1].end)
-            text = " ".join(w.word.strip() for w in chunk)
-            lines.append(f"{idx}\n{start} --> {end}\n{text}\n")
-            idx += 1
+            text = " ".join(w.word.strip() for w in chunk).strip()
+            if text:
+                start = _format_srt_time(chunk[0].start)
+                end = _format_srt_time(chunk[-1].end)
+                lines.append(f"{idx}\n{start} --> {end}\n{text}\n")
+                idx += 1
             i += max_words
         return "\n".join(lines)
 
@@ -158,7 +163,9 @@ def _format_vtt_time(seconds: float) -> str:
 
 def _extract_audio(video_path: Path) -> Path:
     """Extract audio from video to a temp WAV file (16kHz mono, required by Whisper)."""
-    audio_path = Path(tempfile.mktemp(suffix=".wav"))
+    fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    audio_path = Path(tmp_path)
     subprocess.run(
         [
             "ffmpeg", "-y",
@@ -306,7 +313,9 @@ def _try_whisper_cpp(audio_path: Path, model: str, language: str | None) -> Tran
     logger.info(f"Transcribing with whisper.cpp (model: {model})")
 
     # Output as JSON for structured parsing
-    output_base = Path(tempfile.mktemp())
+    fd, tmp_path = tempfile.mkstemp()
+    os.close(fd)
+    output_base = Path(tmp_path)
 
     cmd = [
         binary,
@@ -319,6 +328,9 @@ def _try_whisper_cpp(audio_path: Path, model: str, language: str | None) -> Tran
         cmd.extend(["-l", language])
 
     subprocess.run(cmd, check=True, capture_output=True)
+
+    # Clean up the base temp file (whisper.cpp writes to output_base.json instead)
+    output_base.unlink(missing_ok=True)
 
     json_path = Path(f"{output_base}.json")
     if not json_path.exists():

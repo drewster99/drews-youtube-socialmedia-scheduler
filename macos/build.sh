@@ -130,10 +130,39 @@ mkdir -p "$PYTHON_EMBED_DIR"
 # Download if not cached
 PYTHON_STANDALONE_URL="https://github.com/indygreg/python-build-standalone/releases/download/20241219/cpython-${PYTHON_FULL_VERSION}+20241219-aarch64-apple-darwin-install_only_stripped.tar.gz"
 PYTHON_CACHE="$BUILD_DIR/python-standalone.tar.gz"
+# SHA256 of cpython-3.12.8+20241219-aarch64-apple-darwin-install_only_stripped.tar.gz
+# To update: download the file, run `shasum -a 256 <file>`, and paste the hash here.
+PYTHON_SHA256=""
 
 if [ ! -f "$PYTHON_CACHE" ]; then
     echo "Downloading standalone Python ${PYTHON_FULL_VERSION}..."
     curl -L -o "$PYTHON_CACHE" "$PYTHON_STANDALONE_URL"
+fi
+
+if [ -n "$PYTHON_SHA256" ]; then
+    echo "Verifying download checksum..."
+    if command -v shasum &>/dev/null; then
+        ACTUAL_SHA256=$(shasum -a 256 "$PYTHON_CACHE" | awk '{print $1}')
+    elif command -v sha256sum &>/dev/null; then
+        ACTUAL_SHA256=$(sha256sum "$PYTHON_CACHE" | awk '{print $1}')
+    else
+        echo "WARNING: Neither shasum nor sha256sum found — skipping checksum verification"
+        ACTUAL_SHA256="$PYTHON_SHA256"
+    fi
+
+    if [ "$ACTUAL_SHA256" != "$PYTHON_SHA256" ]; then
+        echo "ERROR: SHA256 checksum mismatch!"
+        echo "  Expected: $PYTHON_SHA256"
+        echo "  Got:      $ACTUAL_SHA256"
+        echo "The downloaded file may be corrupted or tampered with."
+        echo "Delete $PYTHON_CACHE and try again, or update PYTHON_SHA256 if the release changed."
+        exit 1
+    fi
+    echo "Checksum verified."
+else
+    echo "WARNING: PYTHON_SHA256 is not set — skipping checksum verification."
+    echo "  To enable verification, run: shasum -a 256 $PYTHON_CACHE"
+    echo "  Then set PYTHON_SHA256 in this script."
 fi
 
 echo "Extracting Python..."

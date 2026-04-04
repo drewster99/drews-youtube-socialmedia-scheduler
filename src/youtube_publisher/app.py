@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -16,6 +17,8 @@ from youtube_publisher.routers import auth_routes, video_routes, social_routes, 
 from youtube_publisher.services.scheduler import restore_scheduled_jobs, start_scheduler, stop_scheduler
 from youtube_publisher.services.templates import ensure_default_template
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -27,10 +30,21 @@ async def lifespan(app: FastAPI):
     # Read scheduler intervals from DB settings (saved via Settings UI), fall back to config defaults
     settings_rows = await db.execute_fetchall("SELECT key, value FROM settings WHERE key IN ('comment_check_interval', 'caption_check_interval')")
     db_settings = {r["key"]: r["value"] for r in settings_rows}
-    start_scheduler(
-        caption_interval=int(db_settings["caption_check_interval"]) if "caption_check_interval" in db_settings else None,
-        comment_interval=int(db_settings["comment_check_interval"]) if "comment_check_interval" in db_settings else None,
-    )
+
+    caption_interval = None
+    comment_interval = None
+    try:
+        if "caption_check_interval" in db_settings:
+            caption_interval = int(db_settings["caption_check_interval"])
+    except (ValueError, TypeError):
+        logger.warning("Invalid caption_check_interval in settings, using default")
+    try:
+        if "comment_check_interval" in db_settings:
+            comment_interval = int(db_settings["comment_check_interval"])
+    except (ValueError, TypeError):
+        logger.warning("Invalid comment_check_interval in settings, using default")
+
+    start_scheduler(caption_interval=caption_interval, comment_interval=comment_interval)
     await restore_scheduled_jobs()
     yield
     stop_scheduler()
