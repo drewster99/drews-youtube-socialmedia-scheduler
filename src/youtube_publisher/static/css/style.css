@@ -241,6 +241,80 @@ body {
 .badge-posted { background: var(--success); color: #fff; }
 .badge-failed { background: var(--danger); color: #fff; }
 
+/* "Not scheduled" badge: amber, more prominent than a muted draft chip. */
+.schedule-badge-unset {
+    background: var(--warning);
+    color: #000;
+    font-size: 0.85rem;
+    padding: 0.25rem 0.7rem;
+}
+
+/* Click-to-reveal scheduling pill, used in place of an always-visible
+   datetime-local input when nothing is scheduled yet. */
+.schedule-pill {
+    display: inline-block;
+    padding: 0.5rem 0.9rem;
+    border-radius: var(--radius-sm);
+    border: 1px dashed var(--warning);
+    background: transparent;
+    color: var(--warning);
+    font-weight: 500;
+    cursor: pointer;
+    text-align: center;
+}
+.schedule-pill:hover {
+    background: rgba(210, 153, 34, 0.08);
+}
+.schedule-pill-empty::before {
+    content: "📅  ";
+}
+
+/* Duration + tier row sits in the lower-left corner of the player card,
+   directly beneath the embedded iframe. */
+.video-meta-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-top: 0.6rem;
+    justify-content: flex-start;
+}
+.video-duration {
+    font-variant-numeric: tabular-nums;
+    color: var(--text-primary, #fff);
+    font-size: 1.15rem;
+    font-weight: 600;
+}
+.tier-hook    { background: #f97316; color: #000; }  /* orange — shortest teaser */
+.tier-short   { background: #22d3ee; color: #000; }  /* cyan — Shorts shelf candidate */
+.tier-segment { background: #8b5cf6; color: #fff; }  /* purple — longer segment */
+
+/* Transcribe card layout: title on its own line, then one-line sentence with
+   inline dropdowns, then a left-justified action button. */
+.transcribe-controls {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin: 0.5rem 0 0.75rem;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+}
+.transcribe-controls select { flex: 0 0 auto; }
+.transcribe-action {
+    display: flex;
+    justify-content: flex-start;
+    margin-bottom: 0.75rem;
+}
+
+/* Breathing room between a card's content and its bottom action button —
+   e.g. "Apply" under the Generated Description pre block. */
+.card-action-row {
+    margin-top: 0.75rem;
+    display: flex;
+    gap: 0.5rem;
+    justify-content: flex-start;
+}
+
 /* Platform badges */
 .platform-badge {
     display: inline-block;

@@ -253,15 +253,29 @@ async def generate_description(video_id: str, data: dict | None = None):
         raise HTTPException(400, "No transcript available yet. Wait for captions or upload one.")
 
     extra = (data or {}).get("extra_instructions", "")
-    description = ai.generate_seo_description(
-        title=video["title"],
-        transcript=transcript,
-        extra_instructions=extra,
-    )
+    try:
+        description = ai.generate_seo_description(
+            title=video["title"],
+            transcript=transcript,
+            extra_instructions=extra,
+        )
+    except Exception as e:
+        # Surface Anthropic auth / rate-limit / transport failures as a clean 502
+        # instead of bubbling up as an uncaught 500 (which breaks the JSON client).
+        msg = str(e)
+        if "authentication_error" in msg or "invalid x-api-key" in msg or "401" in msg:
+            raise HTTPException(
+                502,
+                "Anthropic API key rejected (401). Open Settings and replace it "
+                "with a valid key from console.anthropic.com (starts with sk-ant-).",
+            )
+        raise HTTPException(502, f"Claude API call failed: {msg}")
 
-    # Compose full description with pinned links
+    # Compose full description with pinned links appended at the end — keeps
+    # the AI-written hook at the top (which is what viewers see in the collapsed
+    # description on YouTube) and pushes boilerplate links below.
     pinned = video.get("pinned_links", "")
-    full_description = f"{pinned}\n\n{description}" if pinned else description
+    full_description = f"{description}\n\n{pinned}" if pinned else description
 
     # Store generated description
     await db.execute(

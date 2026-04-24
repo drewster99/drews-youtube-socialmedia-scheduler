@@ -16,7 +16,7 @@ def upload_video(
     title: str,
     description: str = "",
     tags: list[str] | None = None,
-    category_id: str = "22",  # "People & Blogs"
+    category_id: str = "28",  # "Science & Technology" — default for this dev-focused channel
     privacy_status: str = "unlisted",
     publish_at: str | None = None,
     made_for_kids: bool = False,

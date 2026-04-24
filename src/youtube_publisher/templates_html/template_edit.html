@@ -18,9 +18,11 @@
 
     <div class="template-help card">
         <h4>Template Syntax</h4>
-        <p><code>{"{{variable}}"}</code> — replaced with a value (title, url, tags, description_short, etc.)</p>
-        <p><code>{"{{ai: prompt text here}}"}</code> — sent to Claude to generate content. Variables inside AI blocks are resolved first.</p>
-        <p>Example: <code>{"{{ai: Write a punchy tweet about {{title}} }}"}</code></p>
+        {% raw %}
+        <p><code>{{variable}}</code> — replaced with a value (title, url, tags, description_short, etc.)</p>
+        <p><code>{{ai: prompt text here}}</code> — sent to Claude to generate content. Variables inside AI blocks are resolved first.</p>
+        <p>Example: <code>{{ai: Write a punchy tweet about {{title}} }}</code></p>
+        {% endraw %}
     </div>
 
     <div id="platform-editors">

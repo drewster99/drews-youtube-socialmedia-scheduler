@@ -209,8 +209,11 @@ ALL_PLATFORMS = list(_POSTERS.keys())
 # Per-platform field definitions for the settings UI
 PLATFORM_FIELDS: dict[str, list[dict]] = {
     "twitter": [
-        {"key": "api_key", "label": "API Key", "type": "text", "secret": True},
-        {"key": "api_secret", "label": "API Secret", "type": "password", "secret": True},
+        # Labels match the X / twitter developer portal's OAuth 1.0 Keys panel at
+        # developer.x.com so users can copy values straight across without guessing
+        # which "API Key" means which. Storage keys stay snake_case for back-compat.
+        {"key": "api_key", "label": "Consumer Key", "type": "text", "secret": True},
+        {"key": "api_secret", "label": "Consumer Secret", "type": "password", "secret": True},
         {"key": "access_token", "label": "Access Token", "type": "text", "secret": True},
         {"key": "access_token_secret", "label": "Access Token Secret", "type": "password", "secret": True},
     ],

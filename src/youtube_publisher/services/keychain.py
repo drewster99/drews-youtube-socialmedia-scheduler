@@ -34,29 +34,30 @@ def _is_macos() -> bool:
 
 
 def _keychain_set(service: str, account: str, value: str) -> bool:
-    """Store a value in macOS Keychain."""
+    """Store a value in macOS Keychain.
+
+    We delete + re-add (rather than using -U alone) so that stale ACL entries
+    from prior runs don't accumulate. The new item is created with
+    `-T /usr/bin/security` trusted, which means later reads via
+    `security find-generic-password` (the same Apple-signed binary, run as a
+    subprocess from Python) don't trigger "app wants to use your confidential
+    information" prompts.
+
+    `-T ""` — the previous value — sounds like "allow all apps" but actually
+    produces an empty trusted-app ACL, forcing macOS to prompt every read.
+    """
     try:
-        # Delete existing (ignore errors)
+        # Delete existing (ignore errors) so the new ACL replaces any stale one.
         subprocess.run(
             ["security", "delete-generic-password", "-s", service, "-a", account],
             capture_output=True,
         )
-        # -T "" allows any app running as this user to access without prompting.
-        # This is required for the launchd background agent, which runs as the user
-        # but outside an interactive session — macOS would otherwise block Keychain
-        # access with a UI prompt that no one can answer.
-        #
-        # SECURITY TRADEOFF: this means any process running under this user account
-        # can read these credentials without prompting. If tighter access control is
-        # needed, replace "" with the full path to the specific binary that should
-        # have access (e.g. -T /path/to/youtube-publisher), but note that this will
-        # break if the binary location changes (e.g. after venv recreation).
         result = subprocess.run(
             [
                 "security", "add-generic-password",
                 "-s", service, "-a", account, "-w", value,
-                "-U",   # update if exists
-                "-T", "",  # allow access from all apps by this user (see above)
+                "-U",                        # update if exists (belt-and-suspenders after delete)
+                "-T", "/usr/bin/security",   # trust the CLI we use to read it back
             ],
             capture_output=True,
             text=True,

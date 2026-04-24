@@ -78,6 +78,23 @@
 
 {% block scripts %}
 <script>
+function toLocalInputValue(date) {
+    const pad = n => String(n).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+         + `T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+// Prefill Schedule Publish with a real, clearly-future default so Safari
+// doesn't show a misleading empty-input placeholder.
+(() => {
+    const input = document.getElementById('publish_at');
+    if (!input) return;
+    const d = new Date();
+    d.setHours(d.getHours() + 1, 0, 0, 0);
+    input.value = toLocalInputValue(d);
+    input.min = toLocalInputValue(new Date());
+})();
+
 // File name display
 document.getElementById('video_file').addEventListener('change', (e) => {
     document.getElementById('video-file-name').textContent = e.target.files[0]?.name || '';
@@ -105,6 +122,13 @@ document.getElementById('upload-form').addEventListener('submit', async (e) => {
     progress.style.display = 'block';
 
     const formData = new FormData(e.target);
+
+    // datetime-local inputs are TZ-naive; replace with ISO+offset so the
+    // server doesn't treat local wall-time as UTC.
+    const rawPublishAt = formData.get('publish_at');
+    if (rawPublishAt) {
+        formData.set('publish_at', new Date(rawPublishAt).toISOString());
+    }
 
     try {
         const resp = await fetch('/api/videos/upload', {

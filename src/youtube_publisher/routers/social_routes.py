@@ -7,8 +7,25 @@ import json
 from fastapi import APIRouter, HTTPException
 
 from youtube_publisher.database import get_db
-from youtube_publisher.services import ai, social, templates as tmpl
+from youtube_publisher.services import ai, social, templates as tmpl, youtube
 from youtube_publisher.services.scheduler import get_publish_lock
+
+
+def _tier_from_iso_duration(iso: str | None) -> str:
+    """Map an ISO-8601 duration (e.g. PT3M31S) to our tier naming."""
+    if not iso:
+        return ""
+    import re
+    m = re.match(r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$", iso)
+    if not m:
+        return ""
+    h, mnt, s = (int(v) if v else 0 for v in m.groups())
+    total = h * 3600 + mnt * 60 + s
+    if total < 50:
+        return "hook"
+    if total <= 75:
+        return "short"
+    return "segment"
 
 router = APIRouter(prefix="/api/social", tags=["social"])
 
@@ -37,6 +54,15 @@ async def generate_posts(video_id: str, data: dict | None = None):
 
     # Build variables
     tags = json.loads(video.get("tags", "[]"))
+
+    tier = ""
+    try:
+        yt = youtube.get_video(video_id)
+        iso_dur = (yt or {}).get("contentDetails", {}).get("duration")
+        tier = _tier_from_iso_duration(iso_dur)
+    except Exception:
+        tier = ""
+
     variables = {
         "title": video["title"],
         "url": f"https://youtu.be/{video_id}",
@@ -46,6 +72,7 @@ async def generate_posts(video_id: str, data: dict | None = None):
         "tags": ", ".join(tags),
         "hashtags": " ".join(f"#{t.replace(' ', '')}" for t in tags[:5]),
         "thumbnail_path": video.get("thumbnail_path", ""),
+        "tier": tier,
     }
 
     # Acquire the per-video publish lock to prevent racing with a publish in progress.

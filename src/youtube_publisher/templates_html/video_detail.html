@@ -18,6 +18,7 @@
             <div class="video-player" id="video-player">
                 <p>Loading player...</p>
             </div>
+            <div id="video-meta-row" class="video-meta-row" style="display:none;"></div>
         </div>
 
         <div class="card">
@@ -35,42 +36,39 @@
                     <label>Tags</label>
                     <input type="text" id="meta-tags" name="tags">
                 </div>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>Privacy</label>
-                        <select id="meta-privacy" name="privacy_status">
-                            <option value="unlisted">Unlisted</option>
-                            <option value="private">Private</option>
-                            <option value="public">Public</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>Scheduled Publish</label>
-                        <input type="datetime-local" id="meta-publish-at" name="publish_at">
-                    </div>
+                <div class="form-group">
+                    <label>Privacy</label>
+                    <select id="meta-privacy" name="privacy_status">
+                        <option value="unlisted">Unlisted</option>
+                        <option value="private">Private</option>
+                        <option value="public">Public</option>
+                    </select>
                 </div>
                 <button type="submit" class="btn btn-primary">Save Metadata</button>
             </form>
         </div>
 
         <div class="card">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-                <h2>Transcript</h2>
-                <div style="display: flex; gap: 0.5rem; align-items: center;">
+            <h2>Transcript</h2>
+            <div class="transcribe-controls">
+                <span>Transcribe with</span>
+                <select id="transcribe-backend" class="btn btn-sm" style="background: var(--bg-input); padding: 0.3rem 0.5rem;"></select>
+                <span id="transcribe-model-chooser">
+                    using model
                     <select id="transcribe-model" class="btn btn-sm" style="background: var(--bg-input); padding: 0.3rem 0.5rem;">
-                        <option value="large-v3">large-v3 (best)</option>
-                        <option value="medium">medium (faster)</option>
-                        <option value="small">small (fast)</option>
-                        <option value="base">base (fastest)</option>
+                        <option value="large-v3">large-v3 — best (~3.0 GB)</option>
+                        <option value="medium">medium — faster (~1.5 GB)</option>
+                        <option value="small">small — fast (~460 MB)</option>
+                        <option value="base">base — fastest (~140 MB)</option>
+                        <option value="tiny">tiny — lowest quality (~75 MB)</option>
                     </select>
-                    <button class="btn btn-sm btn-primary" id="btn-transcribe" onclick="transcribeLocally()">
-                        Transcribe Locally
-                    </button>
-                </div>
+                </span>
+                <button class="btn btn-sm btn-success" id="btn-transcribe" onclick="transcribeLocally()" style="margin-left: auto;">
+                    Transcribe
+                </button>
             </div>
-            <div id="transcribe-backends" style="margin-bottom: 0.5rem; font-size: 0.8rem; color: var(--text-muted);"></div>
             <div id="transcript-area">
-                <p class="empty-state">No transcript available yet. Click "Transcribe Locally" or wait for YouTube auto-captions.</p>
+                <p class="empty-state">No transcript available yet. Click "Transcribe" or wait for YouTube auto-captions.</p>
             </div>
         </div>
 
@@ -98,13 +96,19 @@
         <div class="card">
             <h3>Schedule Publish + Social Posts</h3>
             <div id="schedule-info" style="margin-bottom: 0.5rem;"></div>
-            <div class="form-group" style="margin-bottom: 0.5rem;">
-                <label>Publish Date & Time</label>
-                <input type="datetime-local" id="schedule-datetime">
+            <div id="schedule-collapsed">
+                <button type="button" class="schedule-pill schedule-pill-empty" onclick="scheduleReveal()" style="width: 100%;">Not scheduled — click to set</button>
             </div>
-            <div class="form-actions">
-                <button class="btn btn-sm btn-primary" onclick="schedulePublish()">Schedule</button>
-                <button class="btn btn-sm btn-danger" id="btn-cancel-schedule" onclick="cancelSchedule()" style="display:none;">Cancel Schedule</button>
+            <div id="schedule-expanded" style="display:none;">
+                <div class="form-group" style="margin-bottom: 0.5rem;">
+                    <label>Publish Date & Time</label>
+                    <input type="datetime-local" id="schedule-datetime">
+                </div>
+                <div class="form-actions">
+                    <button class="btn btn-sm btn-primary" onclick="schedulePublish()">Schedule</button>
+                    <button class="btn btn-sm btn-secondary" onclick="scheduleCollapse()">Cancel</button>
+                    <button class="btn btn-sm btn-danger" id="btn-cancel-schedule" onclick="cancelSchedule()" style="display:none;">Cancel Schedule</button>
+                </div>
             </div>
             <small style="color: var(--text-muted); display: block; margin-top: 0.5rem;">
                 At the scheduled time: video goes public + all approved social posts fire simultaneously.
@@ -129,9 +133,11 @@
             <div id="gen-desc-area">
                 <p class="empty-state">Not generated yet</p>
             </div>
-            <button class="btn btn-sm" id="btn-apply-desc" onclick="applyDescription()" style="display:none;">
-                Apply to YouTube
-            </button>
+            <div class="card-action-row">
+                <button class="btn btn-sm" id="btn-apply-desc" onclick="applyDescription()" style="display:none;">
+                    Apply
+                </button>
+            </div>
         </div>
 
         <div class="card">
@@ -160,11 +166,75 @@
 <script>
 const videoId = '{{ video_id }}';
 
+// Build a datetime-local-compatible string (YYYY-MM-DDTHH:mm) for the given Date,
+// in the browser's local timezone.
+function toLocalInputValue(date) {
+    const pad = n => String(n).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+         + `T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+// Default for an un-scheduled input: now + 1h, rounded up to the next :00.
+function defaultScheduleValue() {
+    const d = new Date();
+    d.setHours(d.getHours() + 1, 0, 0, 0);
+    return toLocalInputValue(d);
+}
+
+// Parse YouTube's ISO-8601 duration (e.g. "PT3M31S", "PT27S") to total seconds.
+function parseIsoDuration(iso) {
+    if (!iso) return null;
+    const m = iso.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$/);
+    if (!m) return null;
+    return (parseInt(m[1] || 0) * 3600) + (parseInt(m[2] || 0) * 60) + parseFloat(m[3] || 0);
+}
+
+function formatDuration(sec) {
+    if (sec == null) return '';
+    const s = Math.round(sec);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const r = s % 60;
+    const pad = n => String(n).padStart(2, '0');
+    return h > 0 ? `${h}:${pad(m)}:${pad(r)}` : `${m}:${pad(r)}`;
+}
+
+// Tier classification per show plan: Hook <50s, Short 50-75s, Segment >75s.
+function tierFor(sec) {
+    if (sec == null) return null;
+    if (sec < 50)  return {label: 'Hook',    cls: 'tier-hook'};
+    if (sec <= 75) return {label: 'Short',   cls: 'tier-short'};
+    return               {label: 'Segment', cls: 'tier-segment'};
+}
+
+// Right-side "Schedule Publish" card: collapsed pill <-> expanded picker.
+function scheduleReveal() {
+    const input = document.getElementById('schedule-datetime');
+    if (!input.value) input.value = defaultScheduleValue();
+    document.getElementById('schedule-collapsed').style.display = 'none';
+    document.getElementById('schedule-expanded').style.display = 'block';
+}
+function scheduleCollapse() {
+    document.getElementById('schedule-expanded').style.display = 'none';
+    document.getElementById('schedule-collapsed').style.display = 'block';
+}
+
 async function loadVideo() {
     const resp = await fetch(`/api/videos/${videoId}`);
     const video = await resp.json();
 
     document.getElementById('video-title').textContent = video.title;
+    const metaRow = document.getElementById('video-meta-row');
+    const durSec = parseIsoDuration(video.youtube_data?.contentDetails?.duration);
+    if (durSec != null) {
+        const tier = tierFor(durSec);
+        metaRow.innerHTML = `<span class="badge ${tier.cls}">${tier.label}</span>`
+                          + `<span class="video-duration">${formatDuration(durSec)}</span>`;
+        metaRow.style.display = 'flex';
+    } else {
+        metaRow.innerHTML = '';
+        metaRow.style.display = 'none';
+    }
 
     // Player
     document.getElementById('video-player').innerHTML = `
@@ -178,9 +248,6 @@ async function loadVideo() {
     const tags = video.tags ? JSON.parse(video.tags) : [];
     document.getElementById('meta-tags').value = tags.join(', ');
     document.getElementById('meta-privacy').value = video.privacy_status;
-    if (video.publish_at) {
-        document.getElementById('meta-publish-at').value = video.publish_at.slice(0, 16);
-    }
 
     // Status panel
     document.getElementById('st-status').textContent = video.status;
@@ -210,18 +277,30 @@ async function loadVideo() {
     // Schedule info
     const scheduleInfo = document.getElementById('schedule-info');
     const cancelBtn = document.getElementById('btn-cancel-schedule');
-    if (video.status === 'scheduled' && video.publish_at) {
+    document.getElementById('schedule-datetime').min = toLocalInputValue(new Date());
+    const ytPrivacy = video.youtube_data?.status?.privacyStatus;
+    const ytIsPublic = ytPrivacy === 'public';
+    if (video.status === 'scheduled' && video.publish_at && !ytIsPublic) {
         const pubDate = new Date(video.publish_at);
-        scheduleInfo.innerHTML = `<span class="badge badge-captioned">Scheduled</span>
+        scheduleInfo.innerHTML = `<span class="badge badge-scheduled">Scheduled</span>
             <span style="margin-left: 0.5rem;">${pubDate.toLocaleString()}</span>`;
         cancelBtn.style.display = 'inline-flex';
-        document.getElementById('schedule-datetime').value = video.publish_at.slice(0, 16);
-    } else if (video.status === 'published') {
-        scheduleInfo.innerHTML = '<span class="badge badge-published">Published</span>';
+        document.getElementById('schedule-datetime').value = toLocalInputValue(pubDate);
+        scheduleReveal();
+    } else if (video.status === 'published' || ytIsPublic) {
+        const ytPublishedAt = video.youtube_data?.status?.publishAt
+                           || video.youtube_data?.snippet?.publishedAt
+                           || video.publish_at;
+        const when = ytPublishedAt ? new Date(ytPublishedAt).toLocaleString() : '';
+        scheduleInfo.innerHTML = `<span class="badge badge-published">Published</span>`
+                               + (when ? ` <span style="margin-left: 0.5rem;">${when}</span>` : '');
         cancelBtn.style.display = 'none';
+        document.getElementById('schedule-collapsed').style.display = 'none';
+        document.getElementById('schedule-expanded').style.display = 'none';
     } else {
-        scheduleInfo.innerHTML = '<span class="badge badge-draft">Not scheduled</span>';
+        scheduleInfo.innerHTML = '<span class="badge schedule-badge-unset">Not scheduled</span>';
         cancelBtn.style.display = 'none';
+        scheduleCollapse();
     }
 
     // Thumbnail
@@ -310,17 +389,21 @@ async function loadSocialPosts() {
         const resp = await fetch(`/api/social/posts/${videoId}`);
         const posts = await resp.json();
 
+        const existingPlatforms = new Set(posts.map(p => p.platform));
+        const allPlatforms = ['twitter', 'bluesky', 'mastodon', 'linkedin', 'threads'];
+        const missingPlatforms = allPlatforms.filter(n => !existingPlatforms.has(n));
+
+        if (missingPlatforms.length > 0) {
+            showPlatformPicker(missingPlatforms);
+        } else {
+            picker.style.display = 'none';
+        }
+
         if (posts.length === 0) {
-            // Show platform picker for generation
-            showPlatformPicker();
             area.innerHTML = '<p class="empty-state">Select platforms above, then generate posts.</p>';
             return;
         }
 
-        picker.style.display = 'none';
-
-        // Check which platforms have posts already
-        const postedPlatforms = new Set(posts.map(p => p.platform));
         const hasUnsent = posts.some(p => p.status !== 'posted');
 
         let html = '';
@@ -348,9 +431,8 @@ async function loadSocialPosts() {
 
             let actions = '';
             if (isPosted) {
-                actions = `<span class="badge badge-published">Posted</span>`;
                 if (p.post_url) {
-                    actions += ` <a href="${p.post_url}" target="_blank" class="btn btn-sm">View</a>`;
+                    actions = `<a href="${p.post_url}" target="_blank" class="btn btn-sm" style="margin-left: auto;">View</a>`;
                 }
             } else {
                 const isApproved = p.status === 'approved';
@@ -384,12 +466,12 @@ async function loadSocialPosts() {
     }
 }
 
-function showPlatformPicker() {
+function showPlatformPicker(only) {
     const picker = document.getElementById('social-platform-picker');
     const checkboxes = document.getElementById('platform-checkboxes');
     picker.style.display = 'block';
 
-    const allPlatforms = ['twitter', 'bluesky', 'mastodon', 'linkedin', 'threads'];
+    const allPlatforms = only && only.length ? only : ['twitter', 'bluesky', 'mastodon', 'linkedin', 'threads'];
     checkboxes.innerHTML = allPlatforms.map(name => {
         const config = platformConfigs[name];
         const isConfigured = config && config.configured;
@@ -412,7 +494,6 @@ document.getElementById('metadata-form').addEventListener('submit', async (e) =>
         description: document.getElementById('meta-description').value,
         tags: document.getElementById('meta-tags').value.split(',').map(t => t.trim()).filter(Boolean),
         privacy_status: document.getElementById('meta-privacy').value,
-        publish_at: document.getElementById('meta-publish-at').value || null,
     };
     const resp = await fetch(`/api/videos/${videoId}`, {
         method: 'PUT',
@@ -446,22 +527,23 @@ async function generateDescription() {
     btn.disabled = true;
     btn.textContent = 'Generating...';
     try {
+        // Global fetch wrapper in app.js auto-surfaces non-OK responses and
+        // network errors as toasts; don't duplicate that here.
         const resp = await fetch(`/api/videos/${videoId}/generate-description`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({}),
         });
-        const result = await resp.json();
         if (resp.ok) {
+            const result = await resp.json();
             document.getElementById('gen-desc-area').innerHTML = `
                 <pre class="generated-text">${result.description}</pre>
             `;
             document.getElementById('btn-apply-desc').style.display = 'block';
             showToast('Description generated!', 'success');
-        } else {
-            showToast(result.detail || 'Failed to generate', 'error');
         }
-    } finally {
+    } catch (_) { /* toast already shown by global wrapper */ }
+    finally {
         btn.disabled = false;
         btn.textContent = 'Generate Description';
     }
@@ -547,10 +629,13 @@ async function saveSocialPost(postId) {
 }
 
 async function approvePost(postId) {
+    const textarea = document.querySelector(`textarea[data-id="${postId}"]`);
+    const body = {status: 'approved'};
+    if (textarea) body.content = textarea.value;
     const resp = await fetch(`/api/social/posts/${postId}`, {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({status: 'approved'}),
+        body: JSON.stringify(body),
     });
     if (resp.ok) {
         showToast('Approved', 'success');
@@ -563,10 +648,13 @@ async function approveAllPosts() {
     const posts = await resp.json();
     const drafts = posts.filter(p => p.status === 'draft');
     for (const p of drafts) {
+        const textarea = document.querySelector(`textarea[data-id="${p.id}"]`);
+        const body = {status: 'approved'};
+        if (textarea) body.content = textarea.value;
         await fetch(`/api/social/posts/${p.id}`, {
             method: 'PUT',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({status: 'approved'}),
+            body: JSON.stringify(body),
         });
     }
     showToast(`Approved ${drafts.length} post(s)`, 'success');
@@ -574,6 +662,19 @@ async function approveAllPosts() {
 }
 
 async function sendPost(postId) {
+    const textarea = document.querySelector(`textarea[data-id="${postId}"]`);
+    const body = {status: 'approved'};
+    if (textarea) body.content = textarea.value;
+    const saveResp = await fetch(`/api/social/posts/${postId}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+    });
+    if (!saveResp.ok) {
+        showToast('Failed to save before sending', 'error');
+        return;
+    }
+
     const resp = await fetch(`/api/social/posts/${postId}/send`, { method: 'POST' });
     const result = await resp.json();
     if (resp.ok) {
@@ -656,10 +757,13 @@ async function schedulePublish() {
         showToast('Pick a date and time first', 'error');
         return;
     }
+    // datetime-local is naive; send ISO with the browser's current offset so
+    // the server doesn't misread it as UTC.
+    const iso = new Date(dt).toISOString();
     const resp = await fetch(`/api/videos/${videoId}/schedule`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({publish_at: dt}),
+        body: JSON.stringify({publish_at: iso}),
     });
     const result = await resp.json();
     if (resp.ok) {
@@ -684,48 +788,82 @@ async function cancelSchedule() {
 async function transcribeLocally() {
     const btn = document.getElementById('btn-transcribe');
     const model = document.getElementById('transcribe-model').value;
+    const backend = document.getElementById('transcribe-backend').value;
     const area = document.getElementById('transcript-area');
     btn.disabled = true;
     btn.textContent = 'Transcribing...';
+    const backendDesc = backend === 'macos-speech'
+        ? 'Apple Speech framework'
+        : `${backend || 'auto'} · model ${model}`;
+    const hint = backend === 'macos-speech'
+        ? 'Usually a few seconds for short clips.'
+        : 'Model download on first use — can take a minute for large-v3.';
     area.innerHTML = `
         <div class="transcription-progress" style="text-align: center; padding: 2rem;">
             <div class="spinner" style="display: inline-block; width: 24px; height: 24px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite;"></div>
-            <p style="margin-top: 0.5rem; color: var(--text-muted);">Transcribing with ${model}... This may take several minutes.</p>
+            <p style="margin-top: 0.5rem; color: var(--text-muted);">Transcribing with ${backendDesc}… ${hint}</p>
             <style>@keyframes spin { to { transform: rotate(360deg); } }</style>
         </div>
     `;
 
     try {
+        const body = {model};
+        if (backend) body.backend = backend;
         const resp = await fetch(`/api/videos/${videoId}/transcribe`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({model}),
+            body: JSON.stringify(body),
         });
-        const result = await resp.json();
         if (resp.ok) {
+            const result = await resp.json();
+            window._lastTranscriptBackend = `${result.backend} · model: ${result.model || model}`;
             showToast(`Transcribed! ${result.segments} segments, ${result.word_count} words via ${result.backend}`, 'success');
             loadVideo();
+            loadTranscriptionBackends();
         } else {
-            area.innerHTML = `<p class="empty-state" style="color: var(--danger);">Transcription failed: ${result.detail || 'Unknown error'}</p>`;
-            showToast(result.detail || 'Transcription failed', 'error');
+            area.innerHTML = `<p class="empty-state" style="color: var(--danger);">Transcription failed (HTTP ${resp.status})</p>`;
         }
-    } catch (e) {
-        area.innerHTML = `<p class="empty-state" style="color: var(--danger);">Transcription failed: ${e.message}</p>`;
-        showToast('Transcription failed: ' + e.message, 'error');
+    } catch (_) {
+        area.innerHTML = `<p class="empty-state" style="color: var(--danger);">Transcription failed — see toast.</p>`;
     } finally {
         btn.disabled = false;
-        btn.textContent = 'Transcribe Locally';
+        btn.textContent = 'Transcribe';
     }
+}
+
+const BACKEND_DISPLAY = {
+    'mlx-whisper':    'MLX Whisper',
+    'faster-whisper': 'Faster Whisper',
+    'whisper.cpp':    'whisper.cpp',
+    'macos-speech':   'Apple Speech',
+};
+function backendLabel(id) { return BACKEND_DISPLAY[id] || id; }
+
+function syncModelChooserVisibility() {
+    const backend = document.getElementById('transcribe-backend').value;
+    const chooser = document.getElementById('transcribe-model-chooser');
+    // Apple Speech uses Apple's own model and ignores the Whisper model picker.
+    chooser.style.display = backend === 'macos-speech' ? 'none' : '';
 }
 
 async function loadTranscriptionBackends() {
     try {
-        const resp = await fetch('/api/videos/transcription-backends');
+        const resp = await fetch('/api/videos/transcription-backends', {_silent: true});
         const backends = await resp.json();
-        const el = document.getElementById('transcribe-backends');
-        el.innerHTML = 'Backends: ' + backends.map(b =>
-            `<span style="color: ${b.status === 'available' ? 'var(--success)' : 'var(--text-muted)'};">${b.name} (${b.status})</span>`
-        ).join(' · ');
+        const sel = document.getElementById('transcribe-backend');
+        const existing = sel.value;
+        const available = backends.filter(b => b.status === 'available');
+        sel.innerHTML = available.length
+            ? available.map(b => `<option value="${b.name}">${backendLabel(b.name)}</option>`).join('')
+            : '<option value="">(no backends installed)</option>';
+        // Default selection: previous choice > Apple Speech > first available.
+        let pick = '';
+        if (existing && available.some(b => b.name === existing)) pick = existing;
+        else if (available.some(b => b.name === 'macos-speech'))  pick = 'macos-speech';
+        else pick = available[0]?.name || '';
+        sel.value = pick;
+        syncModelChooserVisibility();
+        sel.onchange = syncModelChooserVisibility;
     } catch {}
 }
 

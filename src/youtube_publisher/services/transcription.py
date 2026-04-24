@@ -375,37 +375,96 @@ def _try_macos_speech(audio_path: Path, language: str | None) -> TranscriptionRe
 import Foundation
 import Speech
 
-let semaphore = DispatchSemaphore(value: 0)
-let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "{locale}"))!
+func log(_ s: String) {{ fputs("[apple-speech] \\(s)\\n", stderr) }}
+
+enum SpeechErr: Error {{ case notAuthorized, noRecognizer, notAvailable, timedOut }}
+
+log("starting; audio=\\"{audio_path}\\" locale={locale}")
+
+let status = await withCheckedContinuation {{ (continuation: CheckedContinuation<SFSpeechRecognizerAuthorizationStatus, Never>) in
+    SFSpeechRecognizer.requestAuthorization {{ authStatus in
+        continuation.resume(returning: authStatus)
+    }}
+}}
+log("authorization status=\\(status.rawValue)")
+guard status == .authorized else {{
+    log("ERROR: authorization denied — grant in System Settings → Privacy & Security → Speech Recognition")
+    exit(2)
+}}
+
+guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "{locale}")) else {{
+    log("ERROR: no recognizer for locale {locale}")
+    exit(3)
+}}
+guard recognizer.isAvailable else {{
+    log("ERROR: recognizer not available for locale {locale} — ensure the locale is downloaded in System Settings → Keyboard → Dictation")
+    exit(3)
+}}
+log("recognizer ready; on-device support=\\(recognizer.supportsOnDeviceRecognition)")
+
 let url = URL(fileURLWithPath: "{audio_path}")
 let request = SFSpeechURLRecognitionRequest(url: url)
 request.shouldReportPartialResults = false
-
-var resultJSON: [[String: Any]] = []
-
-recognizer.recognitionTask(with: request) {{ result, error in
-    if let error = error {{
-        fputs("Error: \\(error)\\n", stderr)
-        semaphore.signal()
-        return
-    }}
-    guard let result = result, result.isFinal else {{ return }}
-
-    for segment in result.bestTranscription.segments {{
-        resultJSON.append([
-            "start": segment.timestamp,
-            "end": segment.timestamp + segment.duration,
-            "text": segment.substring
-        ])
-    }}
-    semaphore.signal()
+if #available(macOS 10.15, *), recognizer.supportsOnDeviceRecognition {{
+    request.requiresOnDeviceRecognition = true
+    log("using on-device recognition")
+}} else {{
+    log("falling back to network recognition")
 }}
 
-semaphore.wait()
+func runRecognition() async throws -> [[String: Any]] {{
+    try await withCheckedThrowingContinuation {{ (continuation: CheckedContinuation<[[String: Any]], Error>) in
+        var resumed = false
+        let resumeOnce: (Result<[[String: Any]], Error>) -> Void = {{ outcome in
+            if resumed {{ return }}
+            resumed = true
+            continuation.resume(with: outcome)
+        }}
 
-if let data = try? JSONSerialization.data(withJSONObject: resultJSON),
-   let str = String(data: data, encoding: .utf8) {{
-    print(str)
+        log("starting recognition task…")
+        let task = recognizer.recognitionTask(with: request) {{ result, error in
+            if let error = error {{
+                log("recognition error: \\(error)")
+                resumeOnce(.failure(error))
+                return
+            }}
+            guard let result = result else {{ log("callback with nil result"); return }}
+            if result.isFinal {{
+                log("final result received (\\(result.bestTranscription.segments.count) segments)")
+                var out: [[String: Any]] = []
+                for segment in result.bestTranscription.segments {{
+                    out.append([
+                        "start": segment.timestamp,
+                        "end": segment.timestamp + segment.duration,
+                        "text": segment.substring
+                    ])
+                }}
+                resumeOnce(.success(out))
+            }} else {{
+                log("interim result — waiting for final")
+            }}
+        }}
+
+        DispatchQueue.global().asyncAfter(deadline: .now() + 120) {{
+            if !resumed {{
+                log("ERROR: timed out after 120s (state=\\(task.state.rawValue))")
+                task.cancel()
+                resumeOnce(.failure(SpeechErr.timedOut))
+            }}
+        }}
+    }}
+}}
+
+do {{
+    let resultJSON = try await runRecognition()
+    log("done; emitting JSON")
+    if let data = try? JSONSerialization.data(withJSONObject: resultJSON),
+       let str = String(data: data, encoding: .utf8) {{
+        print(str)
+    }}
+}} catch {{
+    log("ERROR: recognition failed: \\(error)")
+    exit(4)
 }}
 """
 
@@ -418,8 +477,15 @@ if let data = try? JSONSerialization.data(withJSONObject: resultJSON),
             timeout=600,  # 10 minute timeout
         )
 
+        # Surface the Swift helper's diagnostic lines (prefixed [apple-speech])
+        # so the server log shows progress regardless of success.
+        if result.stderr:
+            for line in result.stderr.splitlines():
+                if line.strip():
+                    logger.info("SFSpeechRecognizer: %s", line)
+
         if result.returncode != 0:
-            logger.warning(f"SFSpeechRecognizer failed: {result.stderr}")
+            logger.warning(f"SFSpeechRecognizer exited rc={result.returncode}: {result.stderr}")
             return None
 
         data = json.loads(result.stdout.strip())

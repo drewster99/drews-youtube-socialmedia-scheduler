@@ -85,6 +85,7 @@ def generate_social_post(
     tags: list[str] | None = None,
     max_chars: int = 280,
     custom_prompt: str = "",
+    tier: str | None = None,
 ) -> str:
     """Generate a social media post for a specific platform."""
     client = get_client()
@@ -97,12 +98,19 @@ def generate_social_post(
         "threads": "Casual, engaging. Under 500 chars.",
     }
 
+    tier_guidance = {
+        "hook":    "Tier: Hook (teaser clip under 50s) — tease, don't spoil.",
+        "short":   "Tier: Short (50-75s) — punchy, self-contained highlight.",
+        "segment": "Tier: Segment (3-5 min) — deeper dive, invite viewers to explore.",
+    }
+
     prompt = custom_prompt or f"""Write a {platform} post announcing a new YouTube video.
 
 Title: {title}
-Description: {description[:500]}
+Description: {description}
 URL: {url}
 Tags: {', '.join(tags or [])}
+{tier_guidance.get((tier or '').lower(), '')}
 
 Platform guidance: {platform_guidance.get(platform, '')}
 Max characters: {max_chars}
