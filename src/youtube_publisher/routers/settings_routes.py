@@ -22,6 +22,7 @@ from youtube_publisher.services.social import (
     ALL_PLATFORMS,
     PLATFORM_DESCRIPTIONS,
     PLATFORM_FIELDS,
+    PLATFORM_SETUP_GUIDES,
     get_poster,
 )
 
@@ -110,6 +111,7 @@ async def list_social_platforms():
         result[platform] = {
             "configured": await poster.is_configured(),
             "description": PLATFORM_DESCRIPTIONS.get(platform, ""),
+            "setup_guide": PLATFORM_SETUP_GUIDES.get(platform, []),
             "fields": fields,
             "stored": stored,
             "storage": get_storage_type(),
@@ -141,6 +143,7 @@ async def get_social_config(platform: str):
     return {
         "configured": await poster.is_configured(),
         "description": PLATFORM_DESCRIPTIONS.get(platform, ""),
+        "setup_guide": PLATFORM_SETUP_GUIDES.get(platform, []),
         "fields": fields,
         "stored": stored,
         "storage": get_storage_type(),

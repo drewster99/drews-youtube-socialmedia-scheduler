@@ -42,7 +42,8 @@
         <input type="password" id="anthropic-api-key" placeholder="sk-ant-..." autocomplete="off">
     </div>
     <div class="form-actions">
-        <button class="btn btn-primary" onclick="saveAnthropicKey()">Save</button>
+        <button class="btn btn-primary" id="btn-save-anthropic" onclick="saveAnthropicKey()">Save</button>
+        <button class="btn btn-secondary" id="btn-edit-anthropic" onclick="editAnthropicKey()" style="display:none;">Edit</button>
         <button class="btn btn-danger" id="btn-remove-anthropic" onclick="removeAnthropicKey()" style="display:none;">Remove</button>
     </div>
 </div>
@@ -145,15 +146,34 @@ async function loadAnthropicStatus() {
 
     storageEl.textContent = data.storage === 'keychain' ? 'macOS Keychain' : 'encrypted secrets file';
 
+    const input = document.getElementById('anthropic-api-key');
+    const saveBtn = document.getElementById('btn-save-anthropic');
+    const editBtn = document.getElementById('btn-edit-anthropic');
+
     if (data.configured) {
-        el.innerHTML = `<span class="badge badge-published">Configured</span>
+        el.innerHTML = `<span class="badge badge-published">Connected</span>
             <span style="color: var(--text-muted); font-size: 0.8rem; margin-left: 0.5rem;">${data.masked_key}</span>`;
         removeBtn.style.display = 'inline-flex';
-        document.getElementById('anthropic-api-key').placeholder = 'Enter new key to replace...';
+        input.placeholder = 'Enter new key to replace...';
+        input.disabled = true;
+        input.value = '';
+        saveBtn.style.display = 'none';
+        editBtn.style.display = 'inline-flex';
     } else {
         el.innerHTML = `<span class="badge badge-draft">Not configured</span>`;
         removeBtn.style.display = 'none';
+        input.disabled = false;
+        saveBtn.style.display = 'inline-flex';
+        editBtn.style.display = 'none';
     }
+}
+
+function editAnthropicKey() {
+    const input = document.getElementById('anthropic-api-key');
+    input.disabled = false;
+    input.focus();
+    document.getElementById('btn-save-anthropic').style.display = 'inline-flex';
+    document.getElementById('btn-edit-anthropic').style.display = 'none';
 }
 
 async function saveAnthropicKey() {
@@ -216,6 +236,9 @@ async function loadSocialPlatforms() {
             return rows;
         }, []);
 
+        const locked = !!config.configured;
+        const disabledAttr = locked ? 'disabled' : '';
+
         const fieldRows = fieldPairs.map(pair => `
             <div class="form-row">
                 ${pair.map(f => `
@@ -225,24 +248,154 @@ async function loadSocialPlatforms() {
                             data-platform="${name}" data-key="${f.key}"
                             value="${config.stored[f.key] || ''}"
                             placeholder="${f.placeholder || ''}"
-                            autocomplete="off">
+                            autocomplete="off" ${disabledAttr}>
                     </div>
                 `).join('')}
             </div>
         `).join('');
 
+        const primaryBtn = locked
+            ? `<button class="btn btn-sm btn-secondary" onclick="editSocialConfig('${name}')">Edit</button>`
+            : `<button class="btn btn-sm btn-primary" onclick="saveSocialConfig('${name}')">Save</button>`;
+
+        let oauthBtn = '';
+        if (!locked) {
+            if (name === 'linkedin') {
+                oauthBtn = `<button class="btn btn-sm btn-success" onclick="connectLinkedIn()" style="margin-left: 0.5rem;">Connect with LinkedIn</button>`;
+            } else if (name === 'threads') {
+                oauthBtn = `<button class="btn btn-sm btn-success" onclick="exchangeThreadsToken()" style="margin-left: 0.5rem;">Exchange Short-Lived Token</button>`;
+            }
+        }
+
+        const guide = Array.isArray(config.setup_guide) ? config.setup_guide : [];
+        const guideHtml = guide.length ? `
+            <div class="setup-guide" id="setup-guide-${name}" style="display:none;">
+                <ol>${guide.map(step => `<li>${linkifyText(escapeHtml(step))}</li>`).join('')}</ol>
+            </div>` : '';
+        const helpToggle = guide.length
+            ? `<button class="btn-icon" title="Setup instructions" onclick="toggleSetupGuide('${name}')">ⓘ</button>`
+            : '';
+
         return `
-            <div class="social-platform-config" id="config-${name}">
+            <div class="social-platform-config" id="config-${name}" data-locked="${locked}">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
-                    <h3><span class="platform-badge platform-${name}">${name}</span> ${statusBadge}</h3>
+                    <h3>
+                        <span class="platform-badge platform-${name}">${name}</span>
+                        ${statusBadge}
+                        ${helpToggle}
+                    </h3>
                     ${config.configured ? `<button class="btn btn-sm btn-danger" onclick="disconnectSocial('${name}')">Disconnect</button>` : ''}
                 </div>
                 <p class="help-text">${config.description} <span style="color: var(--text-muted);">Secrets stored in ${storageNote}.</span></p>
+                ${guideHtml}
                 ${fieldRows}
-                <button class="btn btn-sm btn-primary" onclick="saveSocialConfig('${name}')">Save</button>
+                ${primaryBtn}
+                ${oauthBtn}
             </div>
         `;
     }).join('');
+}
+
+async function connectLinkedIn() {
+    const clientId = prompt('LinkedIn Client ID\n\n(From https://www.linkedin.com/developers/apps → your app → Auth tab → Application credentials)');
+    if (!clientId) return;
+    const clientSecret = prompt('LinkedIn Primary Client Secret\n\n(Same location as Client ID)');
+    if (!clientSecret) return;
+
+    const origin = window.location.origin;
+    const resp = await fetch('/api/oauth/linkedin/start', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            client_id: clientId.trim(),
+            client_secret: clientSecret.trim(),
+            origin,
+        }),
+    });
+    if (!resp.ok) {
+        const err = await resp.json().catch(() => ({detail: 'unknown'}));
+        showToast('Failed to start OAuth: ' + (err.detail || resp.status), 'error');
+        return;
+    }
+    const {auth_url, redirect_uri} = await resp.json();
+
+    showToast(`Opening LinkedIn… Make sure ${redirect_uri} is in your app's OAuth 2.0 redirect URLs.`, 'info');
+    const popup = window.open(auth_url, 'linkedin-oauth', 'width=720,height=780');
+    if (!popup) {
+        showToast('Popup blocked. Allow popups for this page and click Connect again.', 'error');
+    }
+}
+
+async function exchangeThreadsToken() {
+    const appSecret = prompt('Threads App Secret\n\n(developers.facebook.com → your app → App settings → Basic → App Secret)');
+    if (!appSecret) return;
+    const shortToken = prompt('Short-lived Access Token\n\nGet it from https://developers.facebook.com/tools/explorer/\n1. Pick your app top-right\n2. Add permissions: threads_basic, threads_content_publish\n3. Click Generate Access Token, accept consent\n4. Copy the token here');
+    if (!shortToken) return;
+
+    showToast('Exchanging for long-lived token…', 'info');
+    const resp = await fetch('/api/oauth/threads/exchange', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            app_secret: appSecret.trim(),
+            short_lived_token: shortToken.trim(),
+        }),
+    });
+    if (!resp.ok) {
+        const err = await resp.json().catch(() => ({detail: 'unknown'}));
+        showToast('Exchange failed: ' + (err.detail || resp.status), 'error');
+        return;
+    }
+    const result = await resp.json();
+    const days = Math.round((result.expires_in || 0) / 86400);
+    showToast(`Threads connected as @${result.username || result.user_id} (token valid ~${days} days)`, 'success');
+    loadSocialPlatforms();
+}
+
+window.addEventListener('message', (ev) => {
+    if (!ev.data || ev.data.source !== 'oauth') return;
+    const platform = ev.data.platform;
+    const nice = platform ? (platform.charAt(0).toUpperCase() + platform.slice(1)) : 'Platform';
+    if (ev.data.ok) {
+        showToast(`${nice} connected!`, 'success');
+        loadSocialPlatforms();
+    } else {
+        showToast(`${nice} connection failed — see popup.`, 'error');
+    }
+});
+
+function toggleSetupGuide(name) {
+    const el = document.getElementById(`setup-guide-${name}`);
+    if (!el) return;
+    el.style.display = (el.style.display === 'none' || !el.style.display) ? 'block' : 'none';
+}
+
+function escapeHtml(s) {
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function linkifyText(s) {
+    return s.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+}
+
+function editSocialConfig(platform) {
+    const card = document.getElementById(`config-${platform}`);
+    if (!card) return;
+    card.querySelectorAll(`input[data-platform="${platform}"]`).forEach(inp => {
+        inp.disabled = false;
+    });
+    const editBtn = card.querySelector('button.btn-secondary');
+    if (editBtn) {
+        editBtn.textContent = 'Save';
+        editBtn.className = 'btn btn-sm btn-primary';
+        editBtn.setAttribute('onclick', `saveSocialConfig('${platform}')`);
+    }
+    card.dataset.locked = 'false';
 }
 
 async function saveSocialConfig(platform) {

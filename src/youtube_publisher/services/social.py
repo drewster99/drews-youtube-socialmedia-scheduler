@@ -244,6 +244,49 @@ PLATFORM_DESCRIPTIONS: dict[str, str] = {
     "threads": "Requires Meta developer app with threads_publish scope.",
 }
 
+# Detailed per-platform setup walkthroughs, shown in the Settings UI behind an
+# info toggle. Each list is rendered as ordered steps. Links are left as plain
+# URLs; the UI auto-linkifies http(s) occurrences.
+PLATFORM_SETUP_GUIDES: dict[str, list[str]] = {
+    "twitter": [
+        "Sign up at https://developer.x.com and subscribe to Basic tier ($200/mo) or Pay-Per-Use with credits — Free tier cannot post.",
+        "Projects & Apps → Create App inside a Project (standalone apps cannot call POST /2/tweets).",
+        "Settings → User authentication settings → Edit. Set App permissions to Read and write. Save.",
+        "Back on Keys and tokens: regenerate Access Token and Access Token Secret after changing permissions (existing tokens keep the old read-only grant).",
+        "Paste Consumer Key, Consumer Secret, Access Token, and Access Token Secret below.",
+    ],
+    "bluesky": [
+        "Open https://bsky.app/settings/app-passwords (Settings → Privacy and security → App passwords).",
+        "Click Add App Password, name it (e.g. Youtube Publisher), leave DM access unchecked, Create.",
+        "Copy the generated password — shown only once, format xxxx-xxxx-xxxx-xxxx.",
+        "Handle field: your full handle like yourname.bsky.social (no @).",
+        "App Password field: paste the generated password.",
+    ],
+    "mastodon": [
+        "Sign in at your Mastodon instance (e.g. https://mastodon.social).",
+        "Preferences → Development → New Application (https://mastodon.social/settings/applications/new).",
+        "Name it, leave Redirect URI default, check scopes write:statuses and write:media, submit.",
+        "Open the new app and copy Your access token.",
+        "Instance URL: https://mastodon.social (or your instance, no trailing slash). Access Token: paste.",
+    ],
+    "linkedin": [
+        "Create an app at https://www.linkedin.com/developers/apps. Must be associated with a LinkedIn Page you admin (create one at https://www.linkedin.com/company/setup/new/ if needed). Upload a 100x100 logo.",
+        "Products tab → add Share on LinkedIn (grants w_member_social) and Sign In with LinkedIn using OpenID Connect (grants openid profile). Both auto-approve in seconds.",
+        "Auth tab → OAuth 2.0 settings → add redirect URL http://localhost:8008/ and Update. Note the Client ID and Primary Client Secret at the top.",
+        "Get an auth code: open this URL in a browser (replace <CLIENT_ID>): https://www.linkedin.com/oauth/v2/authorization?response_type=code&client_id=<CLIENT_ID>&redirect_uri=http://localhost:8008/&scope=openid%20profile%20w_member_social&state=abc — click Allow. Browser fails to load the redirect target; copy the code= value from the address bar.",
+        "Exchange code for access token: curl -X POST https://www.linkedin.com/oauth/v2/accessToken -d grant_type=authorization_code -d code='<CODE>' -d redirect_uri=http://localhost:8008/ -d client_id='<CLIENT_ID>' -d client_secret='<CLIENT_SECRET>' — copy the access_token from the JSON response (valid ~60 days).",
+        "Get Person URN: curl -H 'Authorization: Bearer <TOKEN>' https://api.linkedin.com/v2/userinfo — copy the sub value and prefix it with urn:li:person: (e.g. urn:li:person:abc12345).",
+        "Paste Access Token and Person URN below. Note: tokens expire in 60 days — redo the last three steps when posts start returning 401.",
+    ],
+    "threads": [
+        "Create a Meta developer app at https://developers.facebook.com/apps → Other → Business → Create. Open the app and add the Threads API product from Use cases.",
+        "Add yourself as a Threads tester: App roles → Roles → Add People → Threads Tester. Accept the invite at https://www.threads.net/settings/privacy (Invitations).",
+        "Open the Graph API Explorer at https://developers.facebook.com/tools/explorer/. Top-right: pick your app. Add permissions threads_basic and threads_content_publish. Click Generate Access Token and accept consent. Copy the short-lived token.",
+        "App settings → Basic — click Show next to App Secret and copy it.",
+        "Click the green Exchange Short-Lived Token button below. Paste the App Secret and the short-lived token. The app exchanges for a 60-day long-lived token, fetches your user_id + username, and stores everything in Keychain.",
+    ],
+}
+
 
 def get_poster(platform: str) -> SocialPoster:
     """Get the poster instance for a platform."""

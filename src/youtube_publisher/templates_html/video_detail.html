@@ -449,7 +449,7 @@ async function loadSocialPosts() {
             }
 
             return `
-                <div class="social-post-card" style="${opacity}">
+                <div class="social-post-card" data-post-card="${p.id}" style="${opacity}">
                     <div class="social-post-header">
                         <span class="platform-badge platform-${p.platform}">${p.platform}</span>
                         ${statusBadge}
@@ -618,28 +618,46 @@ async function doGeneratePosts(platforms) {
     }
 }
 
+function setPostCardBusy(postId, busy) {
+    const card = document.querySelector(`.social-post-card[data-post-card="${postId}"]`);
+    if (!card) return;
+    card.querySelectorAll('button').forEach(b => { b.disabled = !!busy; });
+    card.style.pointerEvents = busy ? 'none' : '';
+    card.style.opacity = busy ? '0.6' : '';
+}
+
 async function saveSocialPost(postId) {
     const textarea = document.querySelector(`textarea[data-id="${postId}"]`);
-    const resp = await fetch(`/api/social/posts/${postId}`, {
-        method: 'PUT',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({content: textarea.value}),
-    });
-    if (resp.ok) showToast('Saved', 'success');
+    setPostCardBusy(postId, true);
+    try {
+        const resp = await fetch(`/api/social/posts/${postId}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({content: textarea.value}),
+        });
+        if (resp.ok) showToast('Saved', 'success');
+    } finally {
+        setPostCardBusy(postId, false);
+    }
 }
 
 async function approvePost(postId) {
     const textarea = document.querySelector(`textarea[data-id="${postId}"]`);
     const body = {status: 'approved'};
     if (textarea) body.content = textarea.value;
-    const resp = await fetch(`/api/social/posts/${postId}`, {
-        method: 'PUT',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(body),
-    });
-    if (resp.ok) {
-        showToast('Approved', 'success');
-        loadSocialPosts();
+    setPostCardBusy(postId, true);
+    try {
+        const resp = await fetch(`/api/social/posts/${postId}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        });
+        if (resp.ok) {
+            showToast('Approved', 'success');
+            loadSocialPosts();
+        }
+    } finally {
+        setPostCardBusy(postId, false);
     }
 }
 
@@ -665,23 +683,28 @@ async function sendPost(postId) {
     const textarea = document.querySelector(`textarea[data-id="${postId}"]`);
     const body = {status: 'approved'};
     if (textarea) body.content = textarea.value;
-    const saveResp = await fetch(`/api/social/posts/${postId}`, {
-        method: 'PUT',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(body),
-    });
-    if (!saveResp.ok) {
-        showToast('Failed to save before sending', 'error');
-        return;
-    }
+    setPostCardBusy(postId, true);
+    try {
+        const saveResp = await fetch(`/api/social/posts/${postId}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        });
+        if (!saveResp.ok) {
+            showToast('Failed to save before sending', 'error');
+            return;
+        }
 
-    const resp = await fetch(`/api/social/posts/${postId}/send`, { method: 'POST' });
-    const result = await resp.json();
-    if (resp.ok) {
-        showToast(`Posted! ${result.url || ''}`, 'success');
-        loadSocialPosts();
-    } else {
-        showToast(result.detail || 'Failed', 'error');
+        const resp = await fetch(`/api/social/posts/${postId}/send`, { method: 'POST' });
+        const result = await resp.json();
+        if (resp.ok) {
+            showToast(`Posted! ${result.url || ''}`, 'success');
+            loadSocialPosts();
+        } else {
+            showToast(result.detail || 'Failed', 'error');
+        }
+    } finally {
+        setPostCardBusy(postId, false);
     }
 }
 

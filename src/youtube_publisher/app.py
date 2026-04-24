@@ -13,7 +13,7 @@ from fastapi.templating import Jinja2Templates
 
 from youtube_publisher.config import UPLOAD_DIR, ensure_dirs
 from youtube_publisher.database import close_db, get_db
-from youtube_publisher.routers import auth_routes, video_routes, social_routes, template_routes, settings_routes
+from youtube_publisher.routers import auth_routes, video_routes, social_routes, template_routes, settings_routes, oauth_routes
 from youtube_publisher.services.scheduler import restore_scheduled_jobs, start_scheduler, stop_scheduler
 from youtube_publisher.services.templates import ensure_default_template
 
@@ -68,6 +68,7 @@ app.include_router(video_routes.router)
 app.include_router(social_routes.router)
 app.include_router(template_routes.router)
 app.include_router(settings_routes.router)
+app.include_router(oauth_routes.router)
 
 
 # HTML pages
