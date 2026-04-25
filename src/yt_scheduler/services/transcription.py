@@ -545,14 +545,40 @@ def transcribe(
         ]
 
         if backend:
-            # Use specific backend
+            # User explicitly picked a backend — surface its specific failure
+            # rather than auto-falling-back (which would hide the real cause).
             backends = [(n, fn) for n, fn in backends if n == backend]
             if not backends:
                 raise ValueError(
                     f"Unknown backend: {backend}. "
                     "Available: mlx-whisper, faster-whisper, whisper.cpp, macos-speech"
                 )
+            name, try_fn = backends[0]
+            try:
+                result = try_fn()
+            except Exception as e:
+                hint = ""
+                if name == "macos-speech":
+                    hint = (
+                        " — macOS likely killed the helper for privacy. Open "
+                        "System Settings → Privacy & Security → Speech "
+                        "Recognition and enable access for Drew's YT "
+                        "Scheduler. If that doesn't help, switch the "
+                        "Transcribe-with picker to faster-whisper."
+                    )
+                raise RuntimeError(f"Backend {name} failed: {e}{hint}") from e
+            if not (result and result.segments):
+                raise RuntimeError(
+                    f"Backend {name} returned no segments — the audio may "
+                    "have been empty or unintelligible."
+                )
+            logger.info(
+                "Transcription complete (%s): %d segments, %d characters",
+                name, len(result.segments), len(result.text),
+            )
+            return result
 
+        # Auto-pick: first backend that succeeds wins; failures are logged.
         for name, try_fn in backends:
             try:
                 result = try_fn()

@@ -115,6 +115,10 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
     <false/>
     <key>NSSupportsSuddenTermination</key>
     <false/>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Drew's YT Scheduler uses on-device Speech Recognition to transcribe your videos. The audio stays on this Mac.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Drew's YT Scheduler uses Speech Recognition on local video files; macOS classifies this as microphone access.</string>
 </dict>
 </plist>
 PLIST
