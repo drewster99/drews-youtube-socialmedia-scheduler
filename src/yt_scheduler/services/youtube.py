@@ -167,6 +167,66 @@ def download_caption(caption_id: str, fmt: str = "srt") -> str:
     return youtube.captions().download(id=caption_id, tfmt=fmt).execute().decode("utf-8")
 
 
+# --- Video file download (for re-transcribing imported videos) -------------
+
+
+def download_video_file(video_id: str, target_dir: "Path | str") -> "Path":
+    """Pull the video file off YouTube via yt-dlp.
+
+    Used when the user wants to transcribe an imported video locally —
+    Apple Speech / Whisper backends need a local file path. Picks the
+    smallest reasonable mp4 (audio is what the transcribers use; we don't
+    need 4K) to minimise download time + disk usage.
+
+    Returns the absolute path to the downloaded file. Raises RuntimeError
+    if yt-dlp isn't installed or the download fails.
+    """
+    from pathlib import Path
+
+    try:
+        import yt_dlp
+    except ImportError as exc:  # pragma: no cover — dependency probe
+        raise RuntimeError(
+            "yt-dlp is not installed. Install with: "
+            "pip install -e \".[youtube-download]\""
+        ) from exc
+
+    target_dir = Path(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    out_template = str(target_dir / f"{video_id}.%(ext)s")
+
+    options = {
+        "format": "best[height<=720][ext=mp4]/best[ext=mp4]/best",
+        "outtmpl": out_template,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        # Don't write metadata or thumbnail sidecars — we already have those.
+        "writethumbnail": False,
+        "writeinfojson": False,
+        "writedescription": False,
+        "writesubtitles": False,
+    }
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=True)
+        downloaded_path = ydl.prepare_filename(info)
+
+    path = Path(downloaded_path)
+    if not path.exists():
+        # yt-dlp sometimes finalises with a different extension than the
+        # template suggests; pick the latest matching file in the dir.
+        candidates = sorted(
+            target_dir.glob(f"{video_id}.*"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if not candidates:
+            raise RuntimeError(f"yt-dlp finished but no file found for {video_id}")
+        path = candidates[-1]
+    return path.resolve()
+
+
 # --- Comments ---
 
 

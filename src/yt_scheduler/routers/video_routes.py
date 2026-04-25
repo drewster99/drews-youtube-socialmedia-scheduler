@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 from pathlib import Path
@@ -278,7 +279,33 @@ async def transcribe_video(video_id: str, data: dict | None = None):
     video = dict(rows[0])
     video_file = video.get("video_file_path")
     if not video_file or not Path(video_file).exists():
-        raise HTTPException(400, "Video file not found locally. Cannot transcribe.")
+        # For imported videos we don't keep a local copy by default. Pull it
+        # on demand via yt-dlp so Apple Speech / Whisper has a file to read.
+        if video.get("imported_from_youtube"):
+            try:
+                downloaded = await asyncio.to_thread(
+                    youtube.download_video_file, video_id, UPLOAD_DIR
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    400,
+                    "Could not download video for re-transcription "
+                    f"({exc}). Install yt-dlp with: "
+                    "pip install -e \".[youtube-download]\""
+                ) from exc
+            video_file = str(downloaded)
+            await db.execute(
+                "UPDATE videos SET video_file_path = ?, updated_at = datetime('now') "
+                "WHERE id = ?",
+                (video_file, video_id),
+            )
+            await db.commit()
+        else:
+            raise HTTPException(
+                400,
+                "Video file not found locally. Re-upload the video to "
+                "enable on-device transcription.",
+            )
 
     opts = data or {}
     try:

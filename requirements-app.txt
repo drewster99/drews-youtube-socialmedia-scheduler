@@ -20,3 +20,7 @@ Mastodon.py>=1.8
 
 # Transcription (faster-whisper works on both Intel and Apple Silicon)
 faster-whisper>=1.0
+
+# YouTube video download — needed when the user re-transcribes an imported
+# (no-local-file) video locally with Apple Speech / Whisper.
+yt-dlp>=2024.12
