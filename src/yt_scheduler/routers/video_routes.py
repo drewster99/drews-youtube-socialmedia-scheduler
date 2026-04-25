@@ -109,8 +109,15 @@ async def upload_video(
     pinned_links: str = Form(""),
     privacy_status: str = Form("unlisted"),
     publish_at: str = Form(""),
+    project_slug: str = Form("default"),
 ):
-    """Upload a video to YouTube and track it."""
+    """Upload a video to YouTube and track it inside a project."""
+    from yt_scheduler.services import projects as project_service
+
+    project = await project_service.get_project_by_slug(project_slug)
+    if project is None:
+        raise HTTPException(404, f"Project '{project_slug}' not found")
+
     db = await get_db()
 
     # Save video file locally
@@ -157,12 +164,13 @@ async def upload_video(
 
     # Track in database
     await db.execute(
-        """INSERT INTO videos (id, title, description, tags, privacy_status, publish_at,
+        """INSERT INTO videos (id, project_id, title, description, tags, privacy_status, publish_at,
            thumbnail_path, video_file_path, pinned_links, status,
            duration_seconds, tier)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'uploaded', ?, ?)""",
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uploaded', ?, ?)""",
         (
             video_id,
+            project["id"],
             title,
             description,
             json.dumps(tag_list),
@@ -187,7 +195,9 @@ async def upload_video(
 
     # Fire the configured upload-column auto-actions in the background; the
     # HTTP response should not block on transcription / Claude calls.
-    await auto_actions.run_post_create_actions(video_id, project_id=1, source="upload")
+    await auto_actions.run_post_create_actions(
+        video_id, project_id=project["id"], source="upload"
+    )
 
     resp = {"status": "ok", "video_id": video_id, "youtube_url": youtube_url}
     if thumbnail_error:

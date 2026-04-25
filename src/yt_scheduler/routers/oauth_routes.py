@@ -574,6 +574,8 @@ async def mastodon_callback(
     store_secret("mastodon", "access_token", access_token)
     store_secret("mastodon", "client_id", pending["client_id"])
     store_secret("mastodon", "client_secret", pending["client_secret"])
+    if handle:
+        store_secret("mastodon", "username", handle)
 
     return _result_page(True, f"Mastodon connected as {handle or 'user'}.", platform="mastodon")
 

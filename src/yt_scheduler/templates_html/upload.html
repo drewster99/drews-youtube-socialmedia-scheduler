@@ -130,6 +130,11 @@ document.getElementById('thumbnail_file').addEventListener('change', (e) => {
 });
 
 // Upload form
+// Pick up the current project from ?project_slug=… so the upload binds to
+// the right project. Falls back to "default" so a direct visit to /upload
+// still works.
+const uploadProjectSlug = new URLSearchParams(window.location.search).get('project_slug') || 'default';
+
 document.getElementById('upload-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const btn = document.getElementById('upload-btn');
@@ -140,6 +145,7 @@ document.getElementById('upload-form').addEventListener('submit', async (e) => {
     progress.style.display = 'block';
 
     const formData = new FormData(e.target);
+    formData.set('project_slug', uploadProjectSlug);
 
     // datetime-local inputs are TZ-naive; replace with ISO+offset so the
     // server doesn't treat local wall-time as UTC.
@@ -160,7 +166,7 @@ document.getElementById('upload-form').addEventListener('submit', async (e) => {
             if (result.thumbnail_error) {
                 showToast('Thumbnail failed: ' + result.thumbnail_error + '. You can set it later.', 'error');
             }
-            setTimeout(() => window.location.href = `/projects/default/videos/${result.video_id}`, 1500);
+            setTimeout(() => window.location.href = `/projects/${uploadProjectSlug}/videos/${result.video_id}`, 1500);
         } else {
             showToast(result.detail || 'Upload failed', 'error');
         }

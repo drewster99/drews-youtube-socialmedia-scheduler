@@ -1013,10 +1013,14 @@ dialog.modal-tall { max-height: 86vh; overflow-y: auto; }
 .transcript-alt-preview {
     font-size: 0.75rem;
     color: var(--text-muted);
-    background: transparent;
-    padding: 0;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.5rem 0.6rem;
     margin: 0 0 0.4rem 0;
     white-space: pre-wrap;
+    max-height: 12rem;
+    overflow-y: auto;
 }
 
 /* Dirty-field outline on video detail metadata form */
@@ -1062,6 +1066,11 @@ dialog.modal-tall { max-height: 86vh; overflow-y: auto; }
     display: inline-block;
     color: var(--text-muted);
     margin-right: 0.4rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    font-variant-numeric: tabular-nums;
+    /* Reserve enough width for the longest "Sat 12/31 11:59pm" form so each
+       row's verb and links line up vertically. */
+    min-width: 9.5rem;
 }
 .event-log a { color: var(--accent); text-decoration: none; }
 .event-log a:hover { text-decoration: underline; }

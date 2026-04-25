@@ -438,7 +438,7 @@ function renderTranscriptAlternates() {
                 ${t.source_detail ? ` <span class="pill">${escapeHtml(t.source_detail)}</span>` : ''}
                 <time>${fmtEventDate(t.created_at)}</time>
             </div>
-            <pre class="transcript-alt-preview">${escapeHtml((t.text || '').slice(0, 240))}${(t.text || '').length > 240 ? '…' : ''}</pre>
+            <pre class="transcript-alt-preview">${escapeHtml(t.text || '')}</pre>
             <button type="button" class="btn btn-sm" onclick="useAlternate(${t.id})">Use this</button>
         </div>
     `).join('');
@@ -495,7 +495,14 @@ async function saveTranscriptSelection() {
         }),
     });
     if (resp.ok) {
-        showToast('Transcript saved', 'success');
+        const result = await resp.json();
+        if (result.youtube_status === 'uploaded') {
+            showToast('Transcript saved + uploaded to YouTube as captions', 'success');
+        } else if (result.youtube_status === 'failed') {
+            showToast('Transcript saved locally — YouTube caption upload failed: ' + (result.youtube_error || 'unknown'), 'error');
+        } else {
+            showToast('Transcript saved', 'success');
+        }
         closeTranscriptModal();
         await loadVideo();
     }

@@ -41,9 +41,17 @@ logger = logging.getLogger(__name__)
 Source = Literal["upload", "import"]
 
 
+# Holding strong references to scheduled tasks so the asyncio loop's GC
+# doesn't collect them before they finish — see the warning in
+# https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
+_pending_tasks: set[asyncio.Task] = set()
+
+
 async def run_post_create_actions(video_id: str, project_id: int, source: Source) -> None:
     """Schedule the auto-action chain. Returns immediately; work runs in tasks."""
-    asyncio.create_task(_run_chain(video_id, project_id, source))
+    task = asyncio.create_task(_run_chain(video_id, project_id, source))
+    _pending_tasks.add(task)
+    task.add_done_callback(_pending_tasks.discard)
 
 
 async def _run_chain(video_id: str, project_id: int, source: Source) -> None:

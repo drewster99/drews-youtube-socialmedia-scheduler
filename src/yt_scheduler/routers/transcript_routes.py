@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+
 from fastapi import APIRouter, HTTPException
 
 from yt_scheduler.database import get_db
-from yt_scheduler.services import events, transcripts
+from yt_scheduler.services import events, transcripts, youtube
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/videos/{video_id}/transcripts", tags=["transcripts"])
 
@@ -48,6 +53,7 @@ async def set_active(video_id: str, payload: dict) -> dict:
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
+    youtube_result: dict[str, str] = {}
     if old_text != text:
         await events.record_event(
             video_id,
@@ -55,4 +61,22 @@ async def set_active(video_id: str, payload: dict) -> dict:
             {"transcript": {"old": old_text, "new": text}},
         )
 
-    return {"status": "ok", **result}
+        # Push the active transcript to YouTube as a user-uploaded caption
+        # track. Treats this as a YouTube metadata update — the user expects
+        # transcript edits to round-trip back to YouTube. Failure (auth /
+        # quota / non-uploaded video) is non-fatal: we log and surface the
+        # reason in the response so the toast can show it.
+        try:
+            yt_caption = await asyncio.to_thread(youtube.upload_caption, video_id, text)
+            youtube_result = {
+                "youtube_caption_id": yt_caption.get("id", ""),
+                "youtube_status": "uploaded",
+            }
+        except Exception as exc:
+            logger.warning("Caption upload to YouTube failed for %s: %s", video_id, exc)
+            youtube_result = {
+                "youtube_status": "failed",
+                "youtube_error": str(exc),
+            }
+
+    return {"status": "ok", **result, **youtube_result}

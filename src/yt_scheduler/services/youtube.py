@@ -167,6 +167,77 @@ def download_caption(caption_id: str, fmt: str = "srt") -> str:
     return youtube.captions().download(id=caption_id, tfmt=fmt).execute().decode("utf-8")
 
 
+# YouTube auto-captions live on a track owned by YouTube (ASR) that we can't
+# overwrite. Our own uploads create / update a separate user-owned track that
+# we tag with this name so we can find it again on subsequent saves.
+_OUR_CAPTION_TRACK_NAME = "Drew's YT Scheduler"
+
+
+def upload_caption(
+    video_id: str,
+    srt_text: str,
+    language: str = "en",
+    name: str = _OUR_CAPTION_TRACK_NAME,
+) -> dict:
+    """Push a transcript to YouTube as a user-uploaded caption track.
+
+    Looks for an existing track with our app's name on this video and
+    updates it if found; otherwise inserts a new one. Body is the raw SRT
+    we already store as the canonical transcript shape — no conversion
+    needed.
+
+    Returns the caption resource (with ``id``) on success.
+    """
+    from io import BytesIO
+
+    from googleapiclient.http import MediaIoBaseUpload
+
+    if not srt_text.strip():
+        raise ValueError("Refusing to upload an empty caption body.")
+
+    youtube = get_youtube_service()
+    media = MediaIoBaseUpload(
+        BytesIO(srt_text.encode("utf-8")),
+        mimetype="application/octet-stream",
+        resumable=False,
+    )
+
+    # Look for an existing track with our name so we update instead of
+    # piling up duplicates on each save.
+    existing = list_captions(video_id)
+    ours = next(
+        (c for c in existing if c.get("snippet", {}).get("name") == name),
+        None,
+    )
+
+    if ours is not None:
+        return youtube.captions().update(
+            part="snippet",
+            body={
+                "id": ours["id"],
+                "snippet": {
+                    "videoId": video_id,
+                    "language": language,
+                    "name": name,
+                },
+            },
+            media_body=media,
+        ).execute()
+
+    return youtube.captions().insert(
+        part="snippet",
+        body={
+            "snippet": {
+                "videoId": video_id,
+                "language": language,
+                "name": name,
+                "isDraft": False,
+            },
+        },
+        media_body=media,
+    ).execute()
+
+
 # --- Video file download (for re-transcribing imported videos) -------------
 
 

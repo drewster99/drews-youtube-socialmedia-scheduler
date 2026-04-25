@@ -60,7 +60,7 @@ async function loadVideos() {
 }
 
 document.getElementById('upload-btn').addEventListener('click', () => {
-    window.location.href = '/upload';
+    window.location.href = `/upload?project_slug=${encodeURIComponent(projectSlug)}`;
 });
 
 async function loadAvailableImports() {
