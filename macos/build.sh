@@ -9,18 +9,36 @@ set -euo pipefail
 #   - Embedded Python runtime (python.org framework build)
 #   - All Python dependencies pre-installed
 #   - Your Python source code
-#   - Code signed & notarized
+#   - Code signed (auto if a Developer ID cert is found in Keychain) and
+#     optionally notarized
 #
 # Prerequisites:
+#   - macOS host (this script can only build on Darwin — see error below)
 #   - Xcode (with swift CLI)
-#   - An Apple Developer ID certificate in your Keychain
 #   - Python 3.12+ on your build machine (only used during build)
+#   - Optional: a Developer ID Application cert in Keychain to sign +
+#     notarize (without it, you'll re-grant TCC permissions on every rebuild)
 #
 # Usage:
-#   ./build.sh                    # Build only
-#   ./build.sh --sign             # Build + code sign
-#   ./build.sh --sign --notarize  # Build + sign + notarize
+#   ./build.sh                    # Build (auto-signs if a cert is found)
+#   ./build.sh --no-sign          # Force unsigned build
+#   ./build.sh --notarize         # Build + sign + notarize
 # ============================================================================
+
+# This script is macOS-only — Swift, codesign, security CLI, and the
+# python.org standalone tarball we extract are all Darwin/x86_64+arm64.
+# For Linux/Windows deployment, install the Python package directly:
+#   pip install -e ".[social,dev,transcription,youtube-download]"
+#   yt-scheduler
+# Background service installation on Linux is handled by
+# ``yt-scheduler install`` (systemd user unit; see services/daemon.py).
+HOST_OS="$(uname -s)"
+if [ "$HOST_OS" != "Darwin" ]; then
+    echo "ERROR: macos/build.sh only runs on macOS (current: $HOST_OS)."
+    echo "       For Linux: pip install -e \".[social,dev,transcription,youtube-download]\"
+                            then  yt-scheduler install   # background systemd unit"
+    exit 1
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR/.."
@@ -32,25 +50,60 @@ SWIFT_TARGET="DrewsYTScheduler"
 PYTHON_VERSION="3.12"
 PYTHON_FULL_VERSION="3.12.8"
 
-# Signing config — change these to your values
+# Signing config
 DEVELOPER_ID="${DEVELOPER_ID:-}"
 TEAM_ID="${TEAM_ID:-}"
 BUNDLE_ID="com.nuclearcyborg.drews-socialmedia-scheduler"
 NOTARIZE_PROFILE="${NOTARIZE_PROFILE:-YTScheduler}"  # stored via `xcrun notarytool store-credentials`
 
-SIGN=false
+# Default: sign if a Developer ID cert is available; otherwise skip silently.
+# Auto-discover the signing identity unless one was passed via env var.
+SIGN=
 NOTARIZE=false
+FORCE_NO_SIGN=false
 
 for arg in "$@"; do
     case $arg in
-        --sign) SIGN=true ;;
-        --notarize) NOTARIZE=true; SIGN=true ;;
+        --sign)        SIGN=true ;;          # explicit on (no-op when auto-detect already turned it on)
+        --no-sign)     FORCE_NO_SIGN=true ;; # explicit off — useful for repro builds
+        --notarize)    NOTARIZE=true; SIGN=true ;;
     esac
 done
 
+if [ -z "$DEVELOPER_ID" ]; then
+    DEVELOPER_ID=$(security find-identity -v -p codesigning 2>/dev/null \
+        | grep "Developer ID Application" \
+        | head -1 \
+        | sed 's/.*"\(.*\)".*/\1/' \
+        || true)
+fi
+
+if [ "$FORCE_NO_SIGN" = true ]; then
+    SIGN=false
+    DEVELOPER_ID=""
+elif [ -z "${SIGN:-}" ]; then
+    if [ -n "$DEVELOPER_ID" ]; then
+        SIGN=true
+    else
+        SIGN=false
+    fi
+fi
+
+if [ "$SIGN" = true ] && [ -z "$DEVELOPER_ID" ]; then
+    echo "ERROR: --sign requested but no Developer ID Application cert found."
+    echo "       Open Keychain Access or run: security find-identity -v -p codesigning"
+    echo "       Or pass DEVELOPER_ID=\"Developer ID Application: Name (TEAMID)\"."
+    exit 1
+fi
+
 echo "=== Drew's YT Scheduler Build ==="
 echo "Building in: $BUILD_DIR"
-echo "Sign: $SIGN | Notarize: $NOTARIZE"
+if [ "$SIGN" = true ]; then
+    echo "Signing as: $DEVELOPER_ID"
+else
+    echo "Signing: skipped (pass --sign with a cert in Keychain to enable; expect TCC re-prompts on every rebuild)"
+fi
+echo "Notarize: $NOTARIZE"
 
 # Clean
 rm -rf "$BUILD_DIR"
@@ -248,16 +301,6 @@ echo "Bundle size after stripping: $BUNDLE_SIZE"
 if [ "$SIGN" = true ]; then
     echo ""
     echo "=== Step 7: Code signing ==="
-
-    if [ -z "$DEVELOPER_ID" ]; then
-        # Try to find a Developer ID certificate
-        DEVELOPER_ID=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
-        if [ -z "$DEVELOPER_ID" ]; then
-            echo "ERROR: No Developer ID certificate found. Set DEVELOPER_ID env var."
-            exit 1
-        fi
-    fi
-
     echo "Signing with: $DEVELOPER_ID"
 
     # Sign all .so and .dylib files first (innermost to outermost)
