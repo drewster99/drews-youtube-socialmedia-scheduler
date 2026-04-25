@@ -1,0 +1,323 @@
+{% extends "base.html" %}
+{% block title %}Socials from template — Drew's YT Scheduler{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Socials from template</h1>
+    <div class="header-actions" id="top-actions">
+        <button class="btn" id="btn-cancel" onclick="cancelComposer()">Cancel</button>
+        <button class="btn btn-primary" id="btn-post-now" onclick="postNowAll()" disabled>Post now</button>
+        <button class="btn btn-primary" id="btn-schedule" onclick="openScheduleModal()" disabled>Schedule</button>
+        <button class="btn btn-primary" id="btn-done" onclick="cancelComposer()" style="display:none;">Done</button>
+    </div>
+</div>
+
+<section class="card" id="picker-card">
+    <div class="card-header"><h2>Pick template + accounts</h2></div>
+    <div class="card-body">
+        <div class="form-row">
+            <div class="form-group">
+                <label>Template</label>
+                <select id="template-picker"></select>
+                <small id="template-hint" class="form-hint"></small>
+            </div>
+        </div>
+        <div class="form-group">
+            <label>Configured accounts</label>
+            <div id="account-checkboxes" class="account-checkboxes">
+                <p class="empty-state">Loading…</p>
+            </div>
+        </div>
+        <div class="form-group">
+            <label>User message <code>{{user_message}}</code></label>
+            <textarea id="user-message" rows="2" placeholder="Free-form text passed to the template as {{user_message}}."></textarea>
+        </div>
+        <div class="form-actions">
+            <button class="btn" onclick="cancelComposer()">Cancel</button>
+            <button class="btn btn-primary" id="btn-generate" onclick="generatePreviews()">Generate</button>
+        </div>
+    </div>
+</section>
+
+<section id="preview-cards" class="compose-preview"></section>
+
+<dialog id="schedule-dialog" class="modal modal-wide">
+    <form method="dialog">
+        <h3>Schedule posts</h3>
+        <p class="form-hint">Each unposted card will be scheduled, spaced by the per-project inter-post interval. The first one fires at this time.</p>
+        <input type="datetime-local" id="schedule-when">
+        <div class="modal-actions">
+            <button value="cancel" class="btn">Cancel</button>
+            <button value="submit" class="btn btn-primary" id="btn-schedule-confirm">Schedule</button>
+        </div>
+    </form>
+</dialog>
+
+<dialog id="confirm-dialog" class="modal">
+    <form method="dialog">
+        <h3 id="confirm-title">Are you sure?</h3>
+        <p id="confirm-body"></p>
+        <div class="modal-actions">
+            <button value="cancel" class="btn">No</button>
+            <button value="confirm" class="btn btn-primary" id="btn-confirm-yes">Yes</button>
+        </div>
+    </form>
+</dialog>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const params = new URLSearchParams(window.location.search);
+const videoId = params.get('video_id');
+if (!videoId) {
+    document.querySelector('.page-header h1').textContent = 'Socials from template — missing video_id';
+}
+
+let templates = [];
+let accounts = [];
+let posts = [];     // post ids/state per platform after Generate
+let postingSettings = null;
+
+function projectSlugFromBody() {
+    return "{{ current_project.slug if current_project else 'default' }}";
+}
+const projectSlug = projectSlugFromBody();
+
+async function loadInitial() {
+    const [tplResp, socResp, postingResp] = await Promise.all([
+        fetch('/api/templates'),
+        fetch('/api/settings/social'),
+        fetch(`/api/projects/${projectSlug}/posting-settings`),
+    ]);
+    templates = tplResp.ok ? await tplResp.json() : [];
+    const socData = socResp.ok ? await socResp.json() : {};
+    accounts = Object.entries(socData)
+        .filter(([_, v]) => v.configured)
+        .map(([name]) => name);
+    postingSettings = postingResp.ok ? await postingResp.json() : null;
+
+    populateTemplatePicker();
+    populateAccountCheckboxes();
+}
+
+function populateTemplatePicker() {
+    const sel = document.getElementById('template-picker');
+    if (!templates.length) {
+        sel.innerHTML = '<option value="">No templates available</option>';
+        return;
+    }
+    sel.innerHTML = templates.map(t =>
+        `<option value="${t.name}">${t.name}${t.description ? ' — ' + t.description : ''}</option>`
+    ).join('');
+    if (templates.length === 1) {
+        document.getElementById('template-hint').textContent =
+            `Only one template available — auto-selected.`;
+    }
+}
+
+function populateAccountCheckboxes() {
+    const wrap = document.getElementById('account-checkboxes');
+    if (!accounts.length) {
+        wrap.innerHTML = '<p class="empty-state">No social accounts configured. Configure them in <a href="/settings">General settings</a>.</p>';
+        return;
+    }
+    wrap.innerHTML = accounts.map(name => `
+        <label class="account-row">
+            <input type="checkbox" name="account" value="${name}" checked>
+            <span class="platform-badge platform-${name}">${name}</span>
+        </label>
+    `).join('');
+}
+
+function selectedAccounts() {
+    return Array.from(document.querySelectorAll('input[name="account"]:checked'))
+        .map(box => box.value);
+}
+
+async function generatePreviews() {
+    const platforms = selectedAccounts();
+    if (!platforms.length) {
+        showToast('Pick at least one account.', 'error');
+        return;
+    }
+    const templateName = document.getElementById('template-picker').value;
+    const userMessage = document.getElementById('user-message').value;
+
+    document.getElementById('btn-generate').disabled = true;
+    const resp = await fetch(`/api/social/generate-posts/${videoId}`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            template_name: templateName,
+            platforms: platforms,
+            user_message: userMessage,
+        }),
+    });
+    document.getElementById('btn-generate').disabled = false;
+    if (!resp.ok) {
+        showToast('Generation failed.', 'error');
+        return;
+    }
+    document.getElementById('picker-card').style.display = 'none';
+
+    const postsResp = await fetch(`/api/social/posts/${videoId}`);
+    posts = postsResp.ok ? await postsResp.json() : [];
+    renderPreviews();
+    document.getElementById('btn-post-now').disabled = false;
+    document.getElementById('btn-schedule').disabled = false;
+}
+
+function renderPreviews() {
+    const container = document.getElementById('preview-cards');
+    if (!posts.length) {
+        container.innerHTML = '<p class="empty-state">No posts generated.</p>';
+        return;
+    }
+    container.innerHTML = posts.map(p => {
+        const isPosted = p.status === 'posted';
+        const isFailed = p.status === 'failed';
+        const cls = isFailed ? 'compose-card error' : 'compose-card';
+        return `
+        <div class="${cls}" data-post-id="${p.id}" data-platform="${p.platform}">
+            <div class="compose-header">
+                <label class="compose-include">
+                    <input type="checkbox" name="include" data-id="${p.id}" ${isPosted ? 'disabled' : 'checked'}>
+                    <span class="platform-badge platform-${p.platform}">${p.platform}</span>
+                </label>
+                <span class="compose-status">${
+                    isPosted ? 'Posted ' + new Date(p.posted_at).toLocaleString() :
+                    isFailed ? 'Error: ' + (p.error || 'unknown') : ''
+                }</span>
+            </div>
+            <textarea data-id="${p.id}" rows="4" ${isPosted ? 'disabled' : ''}>${(p.content || '').replace(/</g,'&lt;')}</textarea>
+            <div class="compose-actions">
+                <button class="btn btn-sm btn-outline-primary" onclick="postOne(${p.id})" ${isPosted ? 'disabled' : ''}>Post now</button>
+            </div>
+        </div>`;
+    }).join('');
+
+    for (const cb of container.querySelectorAll('input[name="include"]')) {
+        cb.addEventListener('change', () => {
+            const card = cb.closest('.compose-card');
+            const ta = card.querySelector('textarea');
+            ta.disabled = !cb.checked;
+            card.classList.toggle('disabled', !cb.checked);
+        });
+    }
+}
+
+async function persistEdits() {
+    const tasks = [];
+    for (const ta of document.querySelectorAll('.compose-card textarea')) {
+        if (ta.disabled) continue;
+        const id = Number(ta.dataset.id);
+        tasks.push(fetch(`/api/social/posts/${id}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({content: ta.value}),
+        }));
+    }
+    await Promise.all(tasks);
+}
+
+async function postOne(postId) {
+    if (!confirm('Post this now?')) return;
+    await persistEdits();
+    const resp = await fetch(`/api/social/posts/${postId}/send`, { method: 'POST' });
+    if (resp.ok) {
+        showToast('Posted', 'success');
+    } else {
+        const err = await resp.json().catch(() => ({}));
+        showToast('Failed: ' + (err.detail || resp.status), 'error');
+    }
+    await refresh();
+}
+
+async function postNowAll() {
+    if (!confirm('Post every checked card now?')) return;
+    await persistEdits();
+    // Approve checked posts then send-all
+    const includedIds = Array.from(document.querySelectorAll('input[name="include"]:checked'))
+        .map(cb => Number(cb.dataset.id));
+    for (const id of includedIds) {
+        await fetch(`/api/social/posts/${id}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({status: 'approved'}),
+        });
+    }
+    const resp = await fetch(`/api/social/posts/${videoId}/send-all`, { method: 'POST' });
+    if (resp.ok) showToast('Done', 'success');
+    await refresh();
+    maybeShowDone();
+}
+
+function openScheduleModal() {
+    const dialog = document.getElementById('schedule-dialog');
+    const input = document.getElementById('schedule-when');
+    const delay = (postingSettings?.post_video_delay_minutes || 15) * 60 * 1000;
+    const target = new Date(Date.now() + delay);
+    input.value = toLocalInputValue(target);
+    dialog.showModal();
+}
+
+document.getElementById('btn-schedule-confirm').addEventListener('click', async (event) => {
+    event.preventDefault();
+    const raw = document.getElementById('schedule-when').value;
+    if (!raw) return;
+    let when = new Date(raw);
+    if (when <= new Date()) {
+        const delay = (postingSettings?.post_video_delay_minutes || 15) * 60 * 1000;
+        when = new Date(Date.now() + delay);
+    }
+    const spacingMs = (postingSettings?.inter_post_spacing_minutes || 5) * 60 * 1000;
+
+    await persistEdits();
+    const includedIds = Array.from(document.querySelectorAll('input[name="include"]:checked'))
+        .map(cb => Number(cb.dataset.id));
+
+    let i = 0;
+    for (const postId of includedIds) {
+        const at = new Date(when.getTime() + i * spacingMs);
+        await fetch(`/api/social/posts/${postId}/schedule`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({scheduled_at: at.toISOString()}),
+        });
+        i++;
+    }
+    document.getElementById('schedule-dialog').close();
+    showToast(`Scheduled ${includedIds.length} posts`, 'success');
+    await refresh();
+    maybeShowDone();
+});
+
+async function refresh() {
+    const postsResp = await fetch(`/api/social/posts/${videoId}`);
+    posts = postsResp.ok ? await postsResp.json() : [];
+    renderPreviews();
+}
+
+function maybeShowDone() {
+    const remaining = posts.filter(p => p.status !== 'posted' && p.status !== 'approved');
+    if (!remaining.length) {
+        document.getElementById('btn-cancel').style.display = 'none';
+        document.getElementById('btn-post-now').style.display = 'none';
+        document.getElementById('btn-schedule').style.display = 'none';
+        document.getElementById('btn-done').style.display = 'inline-flex';
+    }
+}
+
+function cancelComposer() {
+    if (!confirm('Cancel? Anything not posted or scheduled will be discarded.')) return;
+    window.history.back();
+}
+
+function toLocalInputValue(date) {
+    const pad = n => String(n).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+loadInitial();
+</script>
+{% endblock %}

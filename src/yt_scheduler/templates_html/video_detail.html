@@ -1,0 +1,1268 @@
+{% extends "base.html" %}
+{% block title %}Video Detail — Drew's YT Scheduler{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1 id="video-title">Loading...</h1>
+    <div class="header-actions">
+        <a class="btn btn-secondary" href="javascript:void(0)" onclick="openSocialsComposer()">Socials from template</a>
+        <button class="btn btn-secondary" id="btn-generate-posts" onclick="generatePosts()">Generate social posts</button>
+        <button class="btn btn-primary" id="btn-publish" onclick="publishVideo()">Publish + post now</button>
+    </div>
+</div>
+
+<div class="detail-grid">
+    <!-- Left column: video player + info -->
+    <div class="detail-main">
+        <div class="card">
+            <div class="video-player" id="video-player">
+                <p>Loading player...</p>
+            </div>
+            <div id="video-meta-row" class="video-meta-row" style="display:none;">
+                <div class="video-meta-left" id="video-meta-left"></div>
+                <div class="video-meta-right">
+                    <button type="button" class="btn btn-sm btn-icon-text" id="btn-open-transcript" onclick="openTranscriptModal()">
+                        <span aria-hidden="true">📝</span> Transcript
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>YouTube metadata</h2>
+            <form id="metadata-form">
+                <div class="form-group" data-field="title">
+                    <label>Title</label>
+                    <input type="text" id="meta-title" name="title">
+                </div>
+                <div class="form-group" data-field="description">
+                    <label>Description</label>
+                    <textarea id="meta-description" name="description" rows="8"></textarea>
+                    <div class="description-actions">
+                        <button type="button" class="btn btn-sm" id="btn-regenerate-desc" onclick="regenerateDescription()" style="display:none;">Regenerate</button>
+                    </div>
+                </div>
+                <div class="form-group" data-field="tags">
+                    <label>Tags</label>
+                    <input type="text" id="meta-tags" name="tags">
+                </div>
+                <div class="form-group" data-field="privacy_status">
+                    <label>Privacy</label>
+                    <select id="meta-privacy" name="privacy_status">
+                        <option value="unlisted">Unlisted</option>
+                        <option value="private">Private</option>
+                        <option value="public">Public</option>
+                    </select>
+                </div>
+                <div class="metadata-actions">
+                    <button type="button" class="btn btn-outline-primary" id="btn-revert-meta" onclick="revertMetadata()" disabled>Revert changes</button>
+                    <button type="submit" class="btn btn-primary" id="btn-save-meta" disabled>Update to YouTube</button>
+                </div>
+            </form>
+        </div>
+
+        <div class="card">
+            <h2>Transcript</h2>
+            <div class="transcribe-controls">
+                <span>Transcribe with</span>
+                <select id="transcribe-backend" class="btn btn-sm" style="background: var(--bg-input); padding: 0.3rem 0.5rem;"></select>
+                <span id="transcribe-model-chooser">
+                    using model
+                    <select id="transcribe-model" class="btn btn-sm" style="background: var(--bg-input); padding: 0.3rem 0.5rem;">
+                        <option value="large-v3">large-v3 — best (~3.0 GB)</option>
+                        <option value="medium">medium — faster (~1.5 GB)</option>
+                        <option value="small">small — fast (~460 MB)</option>
+                        <option value="base">base — fastest (~140 MB)</option>
+                        <option value="tiny">tiny — lowest quality (~75 MB)</option>
+                    </select>
+                </span>
+                <button class="btn btn-sm btn-success" id="btn-transcribe" onclick="transcribeLocally()" style="margin-left: auto;">
+                    Transcribe
+                </button>
+            </div>
+            <div id="transcript-area">
+                <p class="empty-state">No transcript available yet. Click "Transcribe" or wait for YouTube auto-captions.</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Comments</h2>
+            <div id="comments-area">
+                <p class="loading">Loading comments...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Right column: status, thumbnail, social posts -->
+    <div class="detail-sidebar">
+        <div class="card">
+            <h3>Status</h3>
+            <div id="video-status" class="status-panel">
+                <div class="status-row"><span>Status:</span> <span class="badge" id="st-status">—</span></div>
+                <div class="status-row"><span>Privacy:</span> <span class="badge" id="st-privacy">—</span></div>
+                <div class="status-row"><span>Views:</span> <span id="st-views">—</span></div>
+                <div class="status-row"><span>Likes:</span> <span id="st-likes">—</span></div>
+                <div class="status-row"><span>Comments:</span> <span id="st-comments">—</span></div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Schedule Publish + Social Posts</h3>
+            <div id="schedule-info" style="margin-bottom: 0.5rem;"></div>
+            <div id="schedule-collapsed">
+                <button type="button" class="schedule-pill schedule-pill-empty" onclick="scheduleReveal()" style="width: 100%;">Not scheduled — click to set</button>
+            </div>
+            <div id="schedule-expanded" style="display:none;">
+                <div class="form-group" style="margin-bottom: 0.5rem;">
+                    <label>Publish Date & Time</label>
+                    <input type="datetime-local" id="schedule-datetime">
+                </div>
+                <div class="form-actions">
+                    <button class="btn btn-sm btn-primary" onclick="schedulePublish()">Schedule</button>
+                    <button class="btn btn-sm btn-secondary" onclick="scheduleCollapse()">Cancel</button>
+                    <button class="btn btn-sm btn-danger" id="btn-cancel-schedule" onclick="cancelSchedule()" style="display:none;">Cancel Schedule</button>
+                </div>
+            </div>
+            <small style="color: var(--text-muted); display: block; margin-top: 0.5rem;">
+                At the scheduled time: video goes public + all approved social posts fire simultaneously.
+            </small>
+        </div>
+
+        <div class="card">
+            <h3>Thumbnail</h3>
+            <div id="thumbnail-area" class="thumbnail-area">
+                <p>No thumbnail</p>
+            </div>
+            <form id="thumb-form" style="margin-top: 0.5rem;">
+                <input type="file" id="thumb-file" accept="image/*" style="display:none;">
+                <button type="button" class="btn btn-sm" onclick="document.getElementById('thumb-file').click()">
+                    Change Thumbnail
+                </button>
+            </form>
+        </div>
+
+        <div class="card">
+            <h3>Log</h3>
+            <div id="log-area" class="event-log">
+                <p class="loading">Loading...</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Social posts</h3>
+            <div id="social-platform-picker" style="display:none; margin-bottom: 0.75rem;">
+                <div id="platform-checkboxes" style="display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.5rem;"></div>
+                <button class="btn btn-sm btn-primary" onclick="generatePostsForSelected()">Generate for Selected</button>
+            </div>
+            <div id="social-posts-area">
+                <p class="empty-state">Not generated yet</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Community post (copy/paste)</h3>
+            <div id="community-post" class="community-post">
+                <textarea id="community-text" rows="3" readonly></textarea>
+                <button class="btn btn-sm" onclick="copyToClipboard('community-text')">Copy</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<dialog id="field-diff-dialog" class="modal modal-wide">
+    <form method="dialog">
+        <h3><span id="diff-field-name"></span></h3>
+        <p class="form-hint">Updated <span id="diff-when"></span></p>
+        <div class="diff-body"></div>
+        <div class="modal-actions">
+            <button class="btn btn-primary">Close</button>
+        </div>
+    </form>
+</dialog>
+
+<dialog id="transcript-dialog" class="modal modal-wide modal-tall">
+    <h3>Transcript</h3>
+    <div id="transcript-current-meta" class="transcript-meta"></div>
+    <textarea id="transcript-current-text" rows="12" class="transcript-editor"></textarea>
+    <h4 class="transcript-alt-header">Alternate transcripts</h4>
+    <div id="transcript-alternates" class="transcript-alternates">
+        <p class="empty-state">None yet — generate one with the Transcribe button or wait for YouTube auto-captions.</p>
+    </div>
+    <div class="modal-actions">
+        <button type="button" class="btn" onclick="closeTranscriptModal()">Cancel</button>
+        <button type="button" class="btn btn-primary" id="btn-save-transcript" onclick="saveTranscriptSelection()">Save changes</button>
+    </div>
+</dialog>
+
+<dialog id="scheduled-post-dialog" class="modal modal-wide">
+    <form method="dialog">
+        <h3>Scheduled <span id="sched-platform"></span> post</h3>
+        <p class="form-hint">For <span id="sched-when"></span></p>
+        <pre id="sched-text" class="diff-body"></pre>
+        <div class="modal-actions">
+            <button class="btn btn-primary">Close</button>
+        </div>
+    </form>
+</dialog>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const videoId = '{{ video_id }}';
+const projectSlug = "{{ current_project.slug }}";
+
+// Last loaded snapshot of metadata fields, used by Revert + dirty tracking.
+let metaSnapshot = { title: '', description: '', tags: '', privacy_status: 'unlisted' };
+let videoData = null;
+
+// Build a datetime-local-compatible string (YYYY-MM-DDTHH:mm) for the given Date,
+// in the browser's local timezone.
+function toLocalInputValue(date) {
+    const pad = n => String(n).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+         + `T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+// Default for an un-scheduled input: now + 1h, rounded up to the next :00.
+function defaultScheduleValue() {
+    const d = new Date();
+    d.setHours(d.getHours() + 1, 0, 0, 0);
+    return toLocalInputValue(d);
+}
+
+// Parse YouTube's ISO-8601 duration (e.g. "PT3M31S", "PT27S") to total seconds.
+function parseIsoDuration(iso) {
+    if (!iso) return null;
+    const m = iso.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$/);
+    if (!m) return null;
+    return (parseInt(m[1] || 0) * 3600) + (parseInt(m[2] || 0) * 60) + parseFloat(m[3] || 0);
+}
+
+function formatDuration(sec) {
+    if (sec == null) return '';
+    const s = Math.round(sec);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const r = s % 60;
+    const pad = n => String(n).padStart(2, '0');
+    return h > 0 ? `${h}:${pad(m)}:${pad(r)}` : `${m}:${pad(r)}`;
+}
+
+// Tier classification per spec: hook <50s, short 50–180s, segment 180–720s, video ≥720s.
+function tierFor(sec) {
+    if (sec == null) return null;
+    if (sec < 50)  return {label: 'Hook',    cls: 'tier-hook'};
+    if (sec < 180) return {label: 'Short',   cls: 'tier-short'};
+    if (sec < 720) return {label: 'Segment', cls: 'tier-segment'};
+    return               {label: 'Video',   cls: 'tier-video'};
+}
+
+// Right-side "Schedule Publish" card: collapsed pill <-> expanded picker.
+function scheduleReveal() {
+    const input = document.getElementById('schedule-datetime');
+    if (!input.value) input.value = defaultScheduleValue();
+    document.getElementById('schedule-collapsed').style.display = 'none';
+    document.getElementById('schedule-expanded').style.display = 'block';
+}
+function scheduleCollapse() {
+    document.getElementById('schedule-expanded').style.display = 'none';
+    document.getElementById('schedule-collapsed').style.display = 'block';
+}
+
+async function loadVideo() {
+    const resp = await fetch(`/api/videos/${videoId}`);
+    const video = await resp.json();
+    videoData = video;
+
+    document.getElementById('video-title').textContent = video.title;
+    const metaRow = document.getElementById('video-meta-row');
+    const metaLeft = document.getElementById('video-meta-left');
+    const durSec = parseIsoDuration(video.youtube_data?.contentDetails?.duration);
+    if (durSec != null) {
+        const tier = tierFor(durSec);
+        metaLeft.innerHTML = `<span class="badge ${tier.cls}">${tier.label}</span>`
+                            + `<span class="video-duration">${formatDuration(durSec)}</span>`;
+    } else {
+        metaLeft.innerHTML = '';
+    }
+    metaRow.style.display = 'flex';
+
+    // Player
+    document.getElementById('video-player').innerHTML = `
+        <iframe width="100%" height="400" src="https://www.youtube.com/embed/${videoId}"
+            frameborder="0" allowfullscreen></iframe>
+    `;
+
+    // Metadata form
+    document.getElementById('meta-title').value = video.title;
+    document.getElementById('meta-description').value = video.description || '';
+    const tags = video.tags ? JSON.parse(video.tags) : [];
+    document.getElementById('meta-tags').value = tags.join(', ');
+    document.getElementById('meta-privacy').value = video.privacy_status;
+
+    metaSnapshot = {
+        title: video.title || '',
+        description: video.description || '',
+        tags: tags.join(', '),
+        privacy_status: video.privacy_status || 'unlisted',
+    };
+    refreshDirtyState();
+    updateRegenerateVisibility();
+
+    // Status panel
+    document.getElementById('st-status').textContent = video.status;
+    document.getElementById('st-status').className = `badge badge-${video.status}`;
+    document.getElementById('st-privacy').textContent = video.privacy_status;
+    document.getElementById('st-privacy').className = `badge badge-${video.privacy_status}`;
+
+    if (video.youtube_data) {
+        const stats = video.youtube_data.statistics || {};
+        document.getElementById('st-views').textContent = stats.viewCount || '0';
+        document.getElementById('st-likes').textContent = stats.likeCount || '0';
+        document.getElementById('st-comments').textContent = stats.commentCount || '0';
+
+        // Show YouTube processing status
+        const ytStatus = video.youtube_data.status || {};
+        const uploadStatus = ytStatus.uploadStatus;
+        if (uploadStatus && uploadStatus !== 'processed') {
+            const processingEl = document.getElementById('st-status');
+            processingEl.textContent = video.status + ' (' + uploadStatus + ')';
+            processingEl.className = 'badge badge-uploaded';
+        }
+    }
+    if (video.youtube_data_error) {
+        showToast('Could not fetch YouTube data: ' + video.youtube_data_error, 'error');
+    }
+
+    // Schedule info
+    const scheduleInfo = document.getElementById('schedule-info');
+    const cancelBtn = document.getElementById('btn-cancel-schedule');
+    document.getElementById('schedule-datetime').min = toLocalInputValue(new Date());
+    const ytPrivacy = video.youtube_data?.status?.privacyStatus;
+    const ytIsPublic = ytPrivacy === 'public';
+    if (video.status === 'scheduled' && video.publish_at && !ytIsPublic) {
+        const pubDate = new Date(video.publish_at);
+        scheduleInfo.innerHTML = `<span class="badge badge-scheduled">Scheduled</span>
+            <span style="margin-left: 0.5rem;">${pubDate.toLocaleString()}</span>`;
+        cancelBtn.style.display = 'inline-flex';
+        document.getElementById('schedule-datetime').value = toLocalInputValue(pubDate);
+        scheduleReveal();
+    } else if (video.status === 'published' || ytIsPublic) {
+        const ytPublishedAt = video.youtube_data?.status?.publishAt
+                           || video.youtube_data?.snippet?.publishedAt
+                           || video.publish_at;
+        const when = ytPublishedAt ? new Date(ytPublishedAt).toLocaleString() : '';
+        scheduleInfo.innerHTML = `<span class="badge badge-published">Published</span>`
+                               + (when ? ` <span style="margin-left: 0.5rem;">${when}</span>` : '');
+        cancelBtn.style.display = 'none';
+        document.getElementById('schedule-collapsed').style.display = 'none';
+        document.getElementById('schedule-expanded').style.display = 'none';
+    } else {
+        scheduleInfo.innerHTML = '<span class="badge schedule-badge-unset">Not scheduled</span>';
+        cancelBtn.style.display = 'none';
+        scheduleCollapse();
+    }
+
+    // Thumbnail
+    if (video.thumbnail_path) {
+        document.getElementById('thumbnail-area').innerHTML = `
+            <img src="/uploads/${video.thumbnail_path.split('/').pop()}" alt="Thumbnail">
+        `;
+    }
+
+    // Transcript
+    if (video.transcript) {
+        document.getElementById('transcript-area').innerHTML = `
+            <textarea id="transcript-text" rows="12" class="transcript-editor">${video.transcript}</textarea>
+        `;
+    }
+
+    // Community post
+    const communityText = `NEW UPLOAD: ${video.title}\nhttps://youtu.be/${videoId}`;
+    document.getElementById('community-text').value = communityText;
+
+    // Load social posts + per-video log
+    loadSocialPosts();
+    loadComments();
+    loadEventLog();
+}
+
+// --- Transcript chooser modal ---------------------------------------------
+
+let transcriptAlternates = [];
+let chosenTranscriptId = null;
+let originalTranscriptText = '';
+
+async function openTranscriptModal() {
+    const dialog = document.getElementById('transcript-dialog');
+    const meta = document.getElementById('transcript-current-meta');
+    const editor = document.getElementById('transcript-current-text');
+
+    // Pull current snapshot from the loaded video data + alternates from API.
+    const currentText = videoData?.transcript || '';
+    editor.value = currentText;
+    originalTranscriptText = currentText;
+    chosenTranscriptId = videoData?.transcript_id || null;
+
+    const source = videoData?.transcript_source || 'unknown';
+    const isEdited = !!videoData?.transcript_is_edited;
+    const created = videoData?.transcript_created_at;
+    const updated = videoData?.transcript_updated_at;
+    meta.innerHTML = `
+        <span><strong>Source:</strong> ${escapeHtml(source)}${isEdited ? ' <span class="pill">edited</span>' : ''}</span>
+        ${created ? `<span><strong>Created:</strong> ${fmtEventDate(created)}</span>` : ''}
+        ${updated ? `<span><strong>Updated:</strong> ${fmtEventDate(updated)}</span>` : ''}
+    `;
+
+    try {
+        const resp = await fetch(`/api/videos/${videoId}/transcripts`);
+        transcriptAlternates = resp.ok ? await resp.json() : [];
+    } catch (_) {
+        transcriptAlternates = [];
+    }
+    renderTranscriptAlternates();
+    dialog.showModal();
+}
+
+function renderTranscriptAlternates() {
+    const list = document.getElementById('transcript-alternates');
+    const items = transcriptAlternates.filter(t => t.id !== chosenTranscriptId);
+    if (!items.length) {
+        list.innerHTML = '<p class="empty-state">No alternates yet.</p>';
+        return;
+    }
+    list.innerHTML = items.map(t => `
+        <div class="transcript-alt">
+            <div class="transcript-alt-meta">
+                <strong>${escapeHtml(t.source)}</strong>
+                ${t.source_detail ? ` <span class="pill">${escapeHtml(t.source_detail)}</span>` : ''}
+                <time>${fmtEventDate(t.created_at)}</time>
+            </div>
+            <pre class="transcript-alt-preview">${escapeHtml((t.text || '').slice(0, 240))}${(t.text || '').length > 240 ? '…' : ''}</pre>
+            <button type="button" class="btn btn-sm" onclick="useAlternate(${t.id})">Use this</button>
+        </div>
+    `).join('');
+}
+
+function useAlternate(transcriptId) {
+    const alt = transcriptAlternates.find(t => t.id === transcriptId);
+    if (!alt) return;
+    chosenTranscriptId = alt.id;
+    document.getElementById('transcript-current-text').value = alt.text || '';
+    renderTranscriptAlternates();
+}
+
+function closeTranscriptModal() {
+    document.getElementById('transcript-dialog').close();
+}
+
+async function saveTranscriptSelection() {
+    const editor = document.getElementById('transcript-current-text');
+    const text = editor.value;
+
+    let chosenId = chosenTranscriptId;
+    if (!chosenId) {
+        // No source row exists yet — create a user_edited row server-side.
+        const create = await fetch(`/api/videos/${videoId}/transcripts/active`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                transcript_id: 0,
+                text,
+                is_edited: text !== originalTranscriptText,
+            }),
+        });
+        // Server-side requires a real transcript_id; this branch is a no-op
+        // until the user has at least one transcript row. Surface a hint.
+        if (!create.ok) {
+            showToast('No transcript yet — run Transcribe first to create one.', 'error');
+            return;
+        }
+        await loadVideo();
+        closeTranscriptModal();
+        return;
+    }
+
+    const altMatch = transcriptAlternates.find(t => t.id === chosenId);
+    const isEdited = !altMatch || altMatch.text !== text;
+    const resp = await fetch(`/api/videos/${videoId}/transcripts/active`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            transcript_id: chosenId,
+            text,
+            is_edited: isEdited,
+        }),
+    });
+    if (resp.ok) {
+        showToast('Transcript saved', 'success');
+        closeTranscriptModal();
+        await loadVideo();
+    }
+}
+
+// --- Per-video log ---------------------------------------------------------
+
+function fmtEventDate(iso) {
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return iso;
+    const dow = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][date.getDay()];
+    const now = new Date();
+    const sameYear = date.getFullYear() === now.getFullYear();
+    const datePart = sameYear
+        ? `${date.getMonth() + 1}/${date.getDate()}`
+        : `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;
+    let h = date.getHours();
+    const m = String(date.getMinutes()).padStart(2, '0');
+    const ampm = h >= 12 ? 'pm' : 'am';
+    h = h % 12 || 12;
+    return `${dow} ${datePart} ${h}:${m}${ampm}`;
+}
+
+function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s)
+        .replaceAll('&','&amp;')
+        .replaceAll('<','&lt;')
+        .replaceAll('>','&gt;')
+        .replaceAll('"','&quot;');
+}
+
+function renderEvent(ev) {
+    const ts = `<time class="event-ts">${fmtEventDate(ev.created_at)}</time>`;
+    const tier = ev.payload?.tier ? ` (${escapeHtml(ev.payload.tier)})` : '';
+    const ytLink = (ev.payload?.url)
+        ? `<a href="${escapeHtml(ev.payload.url)}" target="_blank" rel="noopener">[YouTube]</a>`
+        : '[YouTube]';
+    switch (ev.type) {
+        case 'created':
+            return `${ts} <span>New create${tier}</span>`;
+        case 'imported':
+            return `${ts} <span>New import${tier} ${ytLink}</span>`;
+        case 'uploaded':
+            return `${ts} <span>Uploaded ${ytLink}</span>`;
+        case 'metadata_updated': {
+            const fields = Object.keys(ev.payload || {});
+            if (!fields.length) return `${ts} <span>Updated</span>`;
+            const links = fields.map(f =>
+                `<a href="#" class="event-field-link" data-event-id="${ev.id}" data-field="${escapeHtml(f)}">${escapeHtml(f)}</a>`
+            ).join(', ');
+            return `${ts} <span>Updated [${links}]</span>`;
+        }
+        case 'publish_scheduled': {
+            const when = ev.payload?.publish_at ? fmtEventDate(ev.payload.publish_at) : '?';
+            return `${ts} <span>Schedule publish &lt;${when}&gt; ${ytLink}</span>`;
+        }
+        case 'published':
+            return `${ts} <span>Video published ${ytLink}</span>`;
+        case 'social_post_scheduled': {
+            const platform = ev.payload?.platform || 'social';
+            return `${ts} <span>Social post scheduled [<a href="#" class="event-platform-link" data-event-id="${ev.id}">${escapeHtml(platform)}</a>]</span>`;
+        }
+        case 'social_post_published': {
+            const platform = ev.payload?.platform || 'social';
+            const url = ev.payload?.post_url;
+            return `${ts} <span>Social post published [${
+                url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener">${escapeHtml(platform)}</a>`
+                    : escapeHtml(platform)
+            }]</span>`;
+        }
+        default:
+            return `${ts} <span>${escapeHtml(ev.type)}</span>`;
+    }
+}
+
+let eventCache = [];
+
+async function loadEventLog() {
+    const area = document.getElementById('log-area');
+    try {
+        const resp = await fetch(`/api/videos/${videoId}/events`);
+        if (!resp.ok) {
+            area.innerHTML = '<p class="empty-state">Could not load log.</p>';
+            return;
+        }
+        const events = await resp.json();
+        eventCache = events;
+        if (!events.length) {
+            area.innerHTML = '<p class="empty-state">No activity yet.</p>';
+            return;
+        }
+        area.innerHTML = events.map(renderEvent).join('<br>');
+    } catch (e) {
+        area.innerHTML = '<p class="empty-state">Could not load log.</p>';
+    }
+}
+
+document.addEventListener('click', (event) => {
+    const fieldLink = event.target.closest?.('.event-field-link');
+    if (fieldLink) {
+        event.preventDefault();
+        const eventId = Number(fieldLink.dataset.eventId);
+        const field = fieldLink.dataset.field;
+        const ev = eventCache.find(e => e.id === eventId);
+        if (ev) showFieldDiffModal(ev, field);
+        return;
+    }
+    const platformLink = event.target.closest?.('.event-platform-link');
+    if (platformLink) {
+        event.preventDefault();
+        const eventId = Number(platformLink.dataset.eventId);
+        const ev = eventCache.find(e => e.id === eventId);
+        if (ev) showScheduledPostModal(ev);
+    }
+});
+
+function showFieldDiffModal(event, field) {
+    const dialog = document.getElementById('field-diff-dialog');
+    document.getElementById('diff-field-name').textContent = field;
+    document.getElementById('diff-when').textContent = fmtEventDate(event.created_at);
+    const change = event.payload?.[field];
+    if (!change) {
+        dialog.querySelector('.diff-body').textContent = '(no change recorded)';
+    } else {
+        const before = formatDiffValue(change.old);
+        const after = formatDiffValue(change.new);
+        dialog.querySelector('.diff-body').innerHTML = `
+            <div class="diff-section"><h4>Before</h4><pre>${escapeHtml(before)}</pre></div>
+            <div class="diff-section"><h4>After</h4><pre>${escapeHtml(after)}</pre></div>
+        `;
+    }
+    dialog.showModal();
+}
+
+function showScheduledPostModal(event) {
+    const dialog = document.getElementById('scheduled-post-dialog');
+    document.getElementById('sched-platform').textContent = event.payload?.platform || '';
+    document.getElementById('sched-when').textContent = event.payload?.scheduled_at ? fmtEventDate(event.payload.scheduled_at) : '';
+    document.getElementById('sched-text').textContent = event.payload?.text || '(no text saved)';
+    dialog.showModal();
+}
+
+function formatDiffValue(value) {
+    if (Array.isArray(value)) return value.join(', ');
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'object') return JSON.stringify(value, null, 2);
+    return String(value);
+}
+
+async function loadComments() {
+    const area = document.getElementById('comments-area');
+    try {
+        const resp = await fetch(`/api/videos/${videoId}/comments?max_results=20`);
+        if (!resp.ok) {
+            const err = await resp.json();
+            if (resp.status === 403) {
+                area.innerHTML = `<p class="empty-state">Comments are disabled on this video. <a href="https://studio.youtube.com/video/${videoId}/edit" target="_blank" style="color: var(--accent);">Enable in YouTube Studio</a></p>`;
+            } else {
+                area.innerHTML = '<p class="empty-state">Could not load comments.</p>';
+            }
+            return;
+        }
+        const threads = await resp.json();
+        if (threads.length === 0) {
+            area.innerHTML = '<p class="empty-state">No comments yet.</p>';
+            return;
+        }
+        area.innerHTML = threads.map(t => {
+            const c = t.snippet.topLevelComment.snippet;
+            return `
+                <div class="comment">
+                    <strong>${c.authorDisplayName}</strong>
+                    <span class="comment-date">${new Date(c.publishedAt).toLocaleDateString()}</span>
+                    <p>${c.textDisplay}</p>
+                </div>
+            `;
+        }).join('');
+    } catch (e) {
+        area.innerHTML = '<p class="empty-state">Could not load comments.</p>';
+    }
+}
+
+// Cache of platform config status
+let platformConfigs = {};
+
+async function loadPlatformConfigs() {
+    try {
+        const resp = await fetch('/api/settings/social');
+        platformConfigs = await resp.json();
+    } catch (e) {
+        platformConfigs = {};
+    }
+}
+
+async function loadSocialPosts() {
+    const area = document.getElementById('social-posts-area');
+    const picker = document.getElementById('social-platform-picker');
+
+    await loadPlatformConfigs();
+
+    try {
+        const resp = await fetch(`/api/social/posts/${videoId}`);
+        const posts = await resp.json();
+
+        const existingPlatforms = new Set(posts.map(p => p.platform));
+        const allPlatforms = ['twitter', 'bluesky', 'mastodon', 'linkedin', 'threads'];
+        const missingPlatforms = allPlatforms.filter(n => !existingPlatforms.has(n));
+
+        if (missingPlatforms.length > 0) {
+            showPlatformPicker(missingPlatforms);
+        } else {
+            picker.style.display = 'none';
+        }
+
+        if (posts.length === 0) {
+            area.innerHTML = '<p class="empty-state">Select platforms above, then generate posts.</p>';
+            return;
+        }
+
+        const hasUnsent = posts.some(p => p.status !== 'posted');
+
+        let html = '';
+        const hasApproved = posts.some(p => p.status === 'approved');
+        const hasDraft = posts.some(p => p.status === 'draft');
+        if (hasUnsent) {
+            html += `<div style="margin-bottom: 0.75rem; display: flex; gap: 0.5rem;">
+                ${hasDraft ? '<button class="btn btn-sm btn-primary" onclick="approveAllPosts()">Approve All</button>' : ''}
+                ${hasApproved ? '<button class="btn btn-sm btn-success" onclick="sendAllPosts()">Send All Approved</button>' : ''}
+                <button class="btn btn-sm" onclick="regeneratePosts()">Regenerate</button>
+            </div>`;
+        }
+
+        html += posts.map(p => {
+            const config = platformConfigs[p.platform];
+            const isConfigured = config && config.configured;
+            const isPosted = p.status === 'posted';
+            const isFailed = p.status === 'failed';
+            const opacity = (!isConfigured && !isPosted) ? 'opacity: 0.6;' : '';
+
+            let statusBadge = `<span class="badge badge-${p.status}">${p.status}</span>`;
+            if (!isConfigured && !isPosted) {
+                statusBadge = `<span class="badge badge-draft" style="background: #6e4000; color: #ffa940;">not configured</span>`;
+            }
+
+            let actions = '';
+            if (isPosted) {
+                if (p.post_url) {
+                    actions = `<a href="${p.post_url}" target="_blank" class="btn btn-sm" style="margin-left: auto;">View</a>`;
+                }
+            } else {
+                const isApproved = p.status === 'approved';
+                actions = `
+                    <button class="btn btn-sm" onclick="saveSocialPost(${p.id})">Save</button>
+                    ${!isApproved ? `<button class="btn btn-sm btn-primary" onclick="approvePost(${p.id})">Approve</button>` : ''}
+                    <button class="btn btn-sm btn-success" onclick="sendPost(${p.id})"
+                        ${!isConfigured ? 'disabled title="Configure this platform in Settings first"' : ''}>
+                        Send
+                    </button>`;
+            }
+            if (isFailed && p.error) {
+                actions += `<span style="color: var(--danger); font-size: 0.8rem; margin-left: 0.5rem;" title="${p.error}">Failed</span>`;
+            }
+
+            return `
+                <div class="social-post-card" data-post-card="${p.id}" style="${opacity}">
+                    <div class="social-post-header">
+                        <span class="platform-badge platform-${p.platform}">${p.platform}</span>
+                        ${statusBadge}
+                    </div>
+                    <textarea class="social-post-text" data-id="${p.id}" rows="4" ${isPosted ? 'readonly' : ''}>${p.content}</textarea>
+                    <div class="social-post-actions">${actions}</div>
+                </div>
+            `;
+        }).join('');
+
+        area.innerHTML = html;
+    } catch (e) {
+        area.innerHTML = '<p class="empty-state">Could not load posts.</p>';
+    }
+}
+
+function showPlatformPicker(only) {
+    const picker = document.getElementById('social-platform-picker');
+    const checkboxes = document.getElementById('platform-checkboxes');
+    picker.style.display = 'block';
+
+    const allPlatforms = only && only.length ? only : ['twitter', 'bluesky', 'mastodon', 'linkedin', 'threads'];
+    checkboxes.innerHTML = allPlatforms.map(name => {
+        const config = platformConfigs[name];
+        const isConfigured = config && config.configured;
+        const checked = isConfigured ? 'checked' : '';
+        const label = isConfigured
+            ? `<span class="platform-badge platform-${name}">${name}</span>`
+            : `<span class="platform-badge platform-${name}" style="opacity: 0.5;">${name}</span> <span style="font-size: 0.75rem; color: #ffa940;">not configured</span>`;
+
+        return `<label style="display: flex; align-items: center; gap: 0.3rem; cursor: pointer;">
+            <input type="checkbox" name="platform" value="${name}" ${checked}> ${label}
+        </label>`;
+    }).join('');
+}
+
+// --- Metadata dirty tracking + Save / Revert -------------------------------
+
+const metaFieldIds = {
+    title: 'meta-title',
+    description: 'meta-description',
+    tags: 'meta-tags',
+    privacy_status: 'meta-privacy',
+};
+
+function readMetaForm() {
+    return {
+        title: document.getElementById('meta-title').value,
+        description: document.getElementById('meta-description').value,
+        tags: document.getElementById('meta-tags').value,
+        privacy_status: document.getElementById('meta-privacy').value,
+    };
+}
+
+function refreshDirtyState() {
+    const current = readMetaForm();
+    let anyDirty = false;
+    for (const [field, id] of Object.entries(metaFieldIds)) {
+        const wrapper = document.querySelector(`.form-group[data-field="${field}"]`);
+        if (!wrapper) continue;
+        const dirty = current[field] !== metaSnapshot[field];
+        wrapper.classList.toggle('field-dirty', dirty);
+        if (dirty) anyDirty = true;
+    }
+    document.getElementById('btn-save-meta').disabled = !anyDirty;
+    document.getElementById('btn-revert-meta').disabled = !anyDirty;
+}
+
+for (const id of Object.values(metaFieldIds)) {
+    document.getElementById(id).addEventListener('input', refreshDirtyState);
+    document.getElementById(id).addEventListener('change', refreshDirtyState);
+}
+
+function revertMetadata() {
+    document.getElementById('meta-title').value = metaSnapshot.title;
+    document.getElementById('meta-description').value = metaSnapshot.description;
+    document.getElementById('meta-tags').value = metaSnapshot.tags;
+    document.getElementById('meta-privacy').value = metaSnapshot.privacy_status;
+    refreshDirtyState();
+}
+
+document.getElementById('metadata-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const current = readMetaForm();
+    const data = {
+        title: current.title,
+        description: current.description,
+        tags: current.tags.split(',').map(t => t.trim()).filter(Boolean),
+        privacy_status: current.privacy_status,
+    };
+    const resp = await fetch(`/api/videos/${videoId}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(data),
+    });
+    if (resp.ok) {
+        showToast('Updated to YouTube', 'success');
+        await loadVideo();  // refreshes snapshot + log
+    }
+});
+
+// --- Regenerate description -----------------------------------------------
+
+function updateRegenerateVisibility() {
+    const btn = document.getElementById('btn-regenerate-desc');
+    if (!btn || !videoData) return;
+    const imported = !!videoData.imported_from_youtube;
+    const transcriptUpdated = videoData.transcript_updated_at;
+    const descriptionGenAt = videoData.description_generated_at;
+    const transcriptNewer = transcriptUpdated && descriptionGenAt
+        ? new Date(transcriptUpdated) > new Date(descriptionGenAt)
+        : (transcriptUpdated && !descriptionGenAt);
+    btn.style.display = (imported || transcriptNewer) ? 'inline-flex' : 'none';
+}
+
+async function regenerateDescription() {
+    const btn = document.getElementById('btn-regenerate-desc');
+    btn.disabled = true;
+    const oldText = btn.textContent;
+    btn.textContent = 'Generating...';
+    try {
+        const resp = await fetch(`/api/videos/${videoId}/generate-description`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({}),
+        });
+        if (resp.ok) {
+            const result = await resp.json();
+            // Drop the new description into the editor as a dirty edit; user
+            // saves with "Update to YouTube" or rolls back with Revert.
+            document.getElementById('meta-description').value = result.description;
+            refreshDirtyState();
+            showToast('Description regenerated — review and save', 'info');
+        }
+    } finally {
+        btn.disabled = false;
+        btn.textContent = oldText;
+    }
+}
+
+// Thumbnail upload
+document.getElementById('thumb-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const formData = new FormData();
+    formData.append('file', file);
+    const resp = await fetch(`/api/videos/${videoId}/set-thumbnail`, {
+        method: 'POST',
+        body: formData,
+    });
+    if (resp.ok) {
+        showToast('Thumbnail updated', 'success');
+        loadVideo();
+    } else {
+        showToast('Failed to update thumbnail', 'error');
+    }
+});
+
+function openSocialsComposer() {
+    window.location.href = `/projects/${projectSlug}/socials-compose?video_id=${videoId}`;
+}
+
+async function generatePosts() {
+    // If we have platform checkboxes, use the picker flow
+    const checkboxes = document.querySelectorAll('#platform-checkboxes input[name="platform"]');
+    if (checkboxes.length > 0) {
+        generatePostsForSelected();
+        return;
+    }
+    // Fallback: generate for all
+    await doGeneratePosts();
+}
+
+async function generatePostsForSelected() {
+    const checked = [...document.querySelectorAll('#platform-checkboxes input[name="platform"]:checked')]
+        .map(cb => cb.value);
+    if (checked.length === 0) {
+        showToast('Select at least one platform', 'error');
+        return;
+    }
+    await doGeneratePosts(checked);
+}
+
+async function regeneratePosts() {
+    await loadPlatformConfigs();
+    showPlatformPicker();
+    // Pre-check platforms that already have posts
+    const resp = await fetch(`/api/social/posts/${videoId}`);
+    const posts = await resp.json();
+    const existingPlatforms = new Set(posts.map(p => p.platform));
+    document.querySelectorAll('#platform-checkboxes input[name="platform"]').forEach(cb => {
+        cb.checked = existingPlatforms.has(cb.value);
+    });
+    document.getElementById('social-posts-area').innerHTML = '<p class="empty-state">Select platforms and click "Generate for Selected" to regenerate.</p>';
+}
+
+async function doGeneratePosts(platforms) {
+    const btn = document.getElementById('btn-generate-posts');
+    btn.disabled = true;
+    btn.textContent = 'Generating...';
+    try {
+        const body = {};
+        if (platforms) body.platforms = platforms;
+        const resp = await fetch(`/api/social/generate-posts/${videoId}`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        });
+        if (resp.ok) {
+            showToast('Social posts generated!', 'success');
+            loadSocialPosts();
+        } else {
+            const err = await resp.json();
+            showToast(err.detail || 'Failed to generate posts', 'error');
+        }
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Generate Social Posts';
+    }
+}
+
+function setPostCardBusy(postId, busy) {
+    const card = document.querySelector(`.social-post-card[data-post-card="${postId}"]`);
+    if (!card) return;
+    card.querySelectorAll('button').forEach(b => { b.disabled = !!busy; });
+    card.style.pointerEvents = busy ? 'none' : '';
+    card.style.opacity = busy ? '0.6' : '';
+}
+
+async function saveSocialPost(postId) {
+    const textarea = document.querySelector(`textarea[data-id="${postId}"]`);
+    setPostCardBusy(postId, true);
+    try {
+        const resp = await fetch(`/api/social/posts/${postId}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({content: textarea.value}),
+        });
+        if (resp.ok) showToast('Saved', 'success');
+    } finally {
+        setPostCardBusy(postId, false);
+    }
+}
+
+async function approvePost(postId) {
+    const textarea = document.querySelector(`textarea[data-id="${postId}"]`);
+    const body = {status: 'approved'};
+    if (textarea) body.content = textarea.value;
+    setPostCardBusy(postId, true);
+    try {
+        const resp = await fetch(`/api/social/posts/${postId}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        });
+        if (resp.ok) {
+            showToast('Approved', 'success');
+            loadSocialPosts();
+        }
+    } finally {
+        setPostCardBusy(postId, false);
+    }
+}
+
+async function approveAllPosts() {
+    const resp = await fetch(`/api/social/posts/${videoId}`);
+    const posts = await resp.json();
+    const drafts = posts.filter(p => p.status === 'draft');
+    for (const p of drafts) {
+        const textarea = document.querySelector(`textarea[data-id="${p.id}"]`);
+        const body = {status: 'approved'};
+        if (textarea) body.content = textarea.value;
+        await fetch(`/api/social/posts/${p.id}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        });
+    }
+    showToast(`Approved ${drafts.length} post(s)`, 'success');
+    loadSocialPosts();
+}
+
+async function sendPost(postId) {
+    const textarea = document.querySelector(`textarea[data-id="${postId}"]`);
+    const body = {status: 'approved'};
+    if (textarea) body.content = textarea.value;
+    setPostCardBusy(postId, true);
+    try {
+        const saveResp = await fetch(`/api/social/posts/${postId}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        });
+        if (!saveResp.ok) {
+            showToast('Failed to save before sending', 'error');
+            return;
+        }
+
+        const resp = await fetch(`/api/social/posts/${postId}/send`, { method: 'POST' });
+        const result = await resp.json();
+        if (resp.ok) {
+            showToast(`Posted! ${result.url || ''}`, 'success');
+            loadSocialPosts();
+        } else {
+            showToast(result.detail || 'Failed', 'error');
+        }
+    } finally {
+        setPostCardBusy(postId, false);
+    }
+}
+
+async function sendAllPosts() {
+    if (!confirm('Send all approved social posts now?')) return;
+    const resp = await fetch(`/api/social/posts/${videoId}`);
+    const posts = await resp.json();
+    const unsent = posts.filter(p => p.status === 'approved');
+
+    let successes = 0;
+    let failures = 0;
+    for (const p of unsent) {
+        const config = platformConfigs[p.platform];
+        if (!config || !config.configured) continue;
+
+        // Save any edits first
+        const textarea = document.querySelector(`textarea[data-id="${p.id}"]`);
+        if (textarea) {
+            await fetch(`/api/social/posts/${p.id}`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({content: textarea.value}),
+            });
+        }
+
+        const sendResp = await fetch(`/api/social/posts/${p.id}/send`, { method: 'POST' });
+        if (sendResp.ok) {
+            const result = await sendResp.json();
+            showToast(`Posted to ${p.platform}! ${result.url || ''}`, 'success');
+            successes++;
+        } else {
+            const err = await sendResp.json();
+            showToast(`${p.platform} failed: ${err.detail || 'Unknown error'}`, 'error');
+            failures++;
+        }
+    }
+
+    loadSocialPosts();
+}
+
+async function publishVideo() {
+    if (!confirm('Publish this video NOW and fire all approved social posts? This cannot be undone easily.')) return;
+    const btn = document.getElementById('btn-publish');
+    btn.disabled = true;
+    btn.textContent = 'Publishing...';
+    try {
+        const resp = await fetch(`/api/videos/${videoId}/publish`, { method: 'POST' });
+        const result = await resp.json();
+        if (resp.ok && result.published) {
+            showToast('Video is now public!', 'success');
+            // Report social results
+            for (const [platform, res] of Object.entries(result.social_results || {})) {
+                if (res.status === 'posted') {
+                    showToast(`Posted to ${platform}!`, 'success');
+                } else if (res.status === 'failed') {
+                    showToast(`${platform} failed: ${res.error}`, 'error');
+                }
+            }
+            loadVideo();
+            loadSocialPosts();
+        } else {
+            showToast(result.publish_error || 'Failed to publish', 'error');
+        }
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Publish + Post Now';
+    }
+}
+
+async function schedulePublish() {
+    const dt = document.getElementById('schedule-datetime').value;
+    if (!dt) {
+        showToast('Pick a date and time first', 'error');
+        return;
+    }
+    // datetime-local is naive; send ISO with the browser's current offset so
+    // the server doesn't misread it as UTC.
+    const iso = new Date(dt).toISOString();
+    const resp = await fetch(`/api/videos/${videoId}/schedule`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({publish_at: iso}),
+    });
+    const result = await resp.json();
+    if (resp.ok) {
+        showToast(`Scheduled! Video + social posts will fire at ${new Date(result.publish_at).toLocaleString()}`, 'success');
+        loadVideo();
+    } else {
+        showToast(result.detail || 'Failed to schedule', 'error');
+    }
+}
+
+async function cancelSchedule() {
+    if (!confirm('Cancel the scheduled publish?')) return;
+    const resp = await fetch(`/api/videos/${videoId}/schedule`, {method: 'DELETE'});
+    if (resp.ok) {
+        showToast('Schedule cancelled', 'success');
+        loadVideo();
+    } else {
+        showToast('Failed to cancel', 'error');
+    }
+}
+
+async function transcribeLocally() {
+    const btn = document.getElementById('btn-transcribe');
+    const model = document.getElementById('transcribe-model').value;
+    const backend = document.getElementById('transcribe-backend').value;
+    const area = document.getElementById('transcript-area');
+    btn.disabled = true;
+    btn.textContent = 'Transcribing...';
+    const backendDesc = backend === 'macos-speech'
+        ? 'Apple Speech framework'
+        : `${backend || 'auto'} · model ${model}`;
+    const hint = backend === 'macos-speech'
+        ? 'Usually a few seconds for short clips.'
+        : 'Model download on first use — can take a minute for large-v3.';
+    area.innerHTML = `
+        <div class="transcription-progress" style="text-align: center; padding: 2rem;">
+            <div class="spinner" style="display: inline-block; width: 24px; height: 24px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite;"></div>
+            <p style="margin-top: 0.5rem; color: var(--text-muted);">Transcribing with ${backendDesc}… ${hint}</p>
+            <style>@keyframes spin { to { transform: rotate(360deg); } }</style>
+        </div>
+    `;
+
+    try {
+        const body = {model};
+        if (backend) body.backend = backend;
+        const resp = await fetch(`/api/videos/${videoId}/transcribe`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        });
+        if (resp.ok) {
+            const result = await resp.json();
+            window._lastTranscriptBackend = `${result.backend} · model: ${result.model || model}`;
+            showToast(`Transcribed! ${result.segments} segments, ${result.word_count} words via ${result.backend}`, 'success');
+            loadVideo();
+            loadTranscriptionBackends();
+        } else {
+            area.innerHTML = `<p class="empty-state" style="color: var(--danger);">Transcription failed (HTTP ${resp.status})</p>`;
+        }
+    } catch (_) {
+        area.innerHTML = `<p class="empty-state" style="color: var(--danger);">Transcription failed — see toast.</p>`;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Transcribe';
+    }
+}
+
+const BACKEND_DISPLAY = {
+    'mlx-whisper':    'MLX Whisper',
+    'faster-whisper': 'Faster Whisper',
+    'whisper.cpp':    'whisper.cpp',
+    'macos-speech':   'Apple Speech',
+};
+function backendLabel(id) { return BACKEND_DISPLAY[id] || id; }
+
+function syncModelChooserVisibility() {
+    const backend = document.getElementById('transcribe-backend').value;
+    const chooser = document.getElementById('transcribe-model-chooser');
+    // Apple Speech uses Apple's own model and ignores the Whisper model picker.
+    chooser.style.display = backend === 'macos-speech' ? 'none' : '';
+}
+
+async function loadTranscriptionBackends() {
+    try {
+        const resp = await fetch('/api/videos/transcription-backends', {_silent: true});
+        const backends = await resp.json();
+        const sel = document.getElementById('transcribe-backend');
+        const existing = sel.value;
+        const available = backends.filter(b => b.status === 'available');
+        sel.innerHTML = available.length
+            ? available.map(b => `<option value="${b.name}">${backendLabel(b.name)}</option>`).join('')
+            : '<option value="">(no backends installed)</option>';
+        // Default selection: previous choice > Apple Speech > first available.
+        let pick = '';
+        if (existing && available.some(b => b.name === existing)) pick = existing;
+        else if (available.some(b => b.name === 'macos-speech'))  pick = 'macos-speech';
+        else pick = available[0]?.name || '';
+        sel.value = pick;
+        syncModelChooserVisibility();
+        sel.onchange = syncModelChooserVisibility;
+    } catch {}
+}
+
+function copyToClipboard(elementId) {
+    const el = document.getElementById(elementId);
+    el.select();
+    navigator.clipboard.writeText(el.value);
+    showToast('Copied to clipboard!', 'success');
+}
+
+loadVideo();
+loadTranscriptionBackends();
+</script>
+{% endblock %}

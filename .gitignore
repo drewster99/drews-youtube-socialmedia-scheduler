@@ -24,3 +24,11 @@ uploads/
 *.swp
 *.swo
 .DS_Store
+
+# Swift Package Manager build artefacts
+macos/DrewsYTScheduler/.build/
+macos/DrewsYTScheduler/.swiftpm/
+macos/DrewsYTScheduler/Package.resolved
+
+# macOS .app build output
+macos/build/

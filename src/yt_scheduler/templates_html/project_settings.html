@@ -1,0 +1,224 @@
+{% extends "base.html" %}
+{% block title %}{{ current_project.name }} settings — Drew's YT Scheduler{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>{{ current_project.name }} / Project settings</h1>
+</div>
+
+<section class="card">
+    <div class="card-header"><h2>Project name</h2></div>
+    <div class="card-body">
+        <label>Display name
+            <input type="text" id="project-name" value="{{ current_project.name }}" maxlength="80">
+        </label>
+        <p class="form-hint">URL slug <code>{{ current_project.slug }}</code> is permanent.</p>
+        <button class="btn btn-primary" id="rename-btn">Save</button>
+    </div>
+</section>
+
+<section class="card">
+    <div class="card-header"><h2>Auto-actions</h2></div>
+    <div class="card-body">
+        <p class="form-hint">Each column controls what runs when a video is uploaded directly vs. imported from YouTube.</p>
+        <table class="auto-actions-matrix">
+            <thead><tr><th></th><th>Uploads</th><th>Imports</th></tr></thead>
+            <tbody id="auto-actions-body"></tbody>
+        </table>
+        <button class="btn btn-primary" id="save-auto-actions" style="margin-top: 1rem;">Save auto-actions</button>
+    </div>
+</section>
+
+<section class="card">
+    <div class="card-header"><h2>Posting to social media</h2></div>
+    <div class="card-body">
+        <div class="form-row">
+            <label>Default template — video<input type="text" id="dt-video"></label>
+            <label>Default template — segment<input type="text" id="dt-segment"></label>
+            <label>Default template — short<input type="text" id="dt-short"></label>
+            <label>Default template — hook<input type="text" id="dt-hook"></label>
+        </div>
+        <div class="form-row">
+            <label>Minutes after video posting before socials fire<input type="number" id="post-delay" min="0" value="15"></label>
+            <label>Minutes between social postings<input type="number" id="post-spacing" min="0" value="5"></label>
+        </div>
+        <button class="btn btn-primary" id="save-posting" style="margin-top: 1rem;">Save posting settings</button>
+    </div>
+</section>
+
+<section class="card">
+    <div class="card-header"><h2>YouTube channel</h2></div>
+    <div class="card-body">
+        <p>YouTube authentication is managed in <a href="/settings">General settings</a>. Per-project channel selection arrives with Phase 1.5 (OAuth 2.0 migration).</p>
+    </div>
+</section>
+
+<section class="card">
+    <div class="card-header"><h2>Social media accounts</h2></div>
+    <div class="card-body">
+        <p>Decoupled social accounts arrive with the OAuth 2.0 migration. Existing per-platform credentials are configured in <a href="/settings">General settings</a> for now.</p>
+    </div>
+</section>
+
+{% if current_project.slug != 'default' %}
+<section class="card danger-zone">
+    <div class="card-header"><h2>Danger zone</h2></div>
+    <div class="card-body">
+        <button class="btn btn-danger" id="delete-btn">Delete project</button>
+        <p class="form-hint">Deleting a project removes its videos, templates, blocklist, and logs. Social accounts attached to it are kept (they may be reused by other projects).</p>
+    </div>
+</section>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+const slug = "{{ current_project.slug }}";
+
+const AUTO_FIELDS = [
+    {key: 'auto_transcribe', label: 'Auto-transcribe'},
+    {key: 'auto_description', label: 'Auto-description from transcript'},
+    {key: 'auto_tags', label: 'Auto-tags'},
+    {key: 'auto_tags_include_title', label: '— include title', sub: true},
+    {key: 'auto_tags_include_description', label: '— include description', sub: true},
+    {key: 'auto_tags_include_transcript', label: '— include transcript', sub: true},
+    {key: 'auto_thumbnail', label: 'Auto-thumbnail (when none provided)'},
+];
+
+const SOCIAL_PLATFORMS = ['twitter', 'bluesky', 'mastodon', 'linkedin', 'threads'];
+
+let autoActions = null;
+let postingSettings = null;
+
+function renderMatrix() {
+    const body = document.getElementById('auto-actions-body');
+    let rows = AUTO_FIELDS.map(field => `
+        <tr class="${field.sub ? 'sub-row' : ''}">
+            <th>${field.label}</th>
+            <td><input type="checkbox" data-col="upload" data-key="${field.key}" ${autoActions.upload[field.key] ? 'checked' : ''}></td>
+            <td><input type="checkbox" data-col="import" data-key="${field.key}" ${autoActions.import[field.key] ? 'checked' : ''}></td>
+        </tr>
+    `).join('');
+
+    rows += `
+        <tr>
+            <th>Auto-tags mode</th>
+            <td><select data-col="upload" data-key="auto_tags_mode">
+                <option value="replace" ${autoActions.upload.auto_tags_mode === 'replace' ? 'selected' : ''}>Replace</option>
+                <option value="add" ${autoActions.upload.auto_tags_mode === 'add' ? 'selected' : ''}>Add</option>
+            </select></td>
+            <td><select data-col="import" data-key="auto_tags_mode">
+                <option value="replace" ${autoActions.import.auto_tags_mode === 'replace' ? 'selected' : ''}>Replace</option>
+                <option value="add" ${autoActions.import.auto_tags_mode === 'add' ? 'selected' : ''}>Add</option>
+            </select></td>
+        </tr>
+    `;
+
+    rows += `<tr><th colspan="3" class="matrix-section">Auto-generate socials</th></tr>`;
+    for (const platform of SOCIAL_PLATFORMS) {
+        rows += `
+            <tr class="sub-row">
+                <th>— ${platform}</th>
+                <td><input type="checkbox" data-col="upload" data-key="socials.${platform}" ${autoActions.upload.auto_socials?.[platform] ? 'checked' : ''}></td>
+                <td><input type="checkbox" data-col="import" data-key="socials.${platform}" ${autoActions.import.auto_socials?.[platform] ? 'checked' : ''}></td>
+            </tr>
+        `;
+    }
+
+    body.innerHTML = rows;
+}
+
+async function loadAutoActions() {
+    const resp = await fetch(`/api/projects/${slug}/auto-actions`);
+    if (resp.ok) {
+        autoActions = await resp.json();
+        renderMatrix();
+    }
+}
+
+async function loadPostingSettings() {
+    const resp = await fetch(`/api/projects/${slug}/posting-settings`);
+    if (resp.ok) {
+        postingSettings = await resp.json();
+        document.getElementById('dt-video').value = postingSettings.default_template_video || 'new_video';
+        document.getElementById('dt-segment').value = postingSettings.default_template_segment || 'new_video';
+        document.getElementById('dt-short').value = postingSettings.default_template_short || 'new_video';
+        document.getElementById('dt-hook').value = postingSettings.default_template_hook || 'new_video';
+        document.getElementById('post-delay').value = postingSettings.post_video_delay_minutes ?? 15;
+        document.getElementById('post-spacing').value = postingSettings.inter_post_spacing_minutes ?? 5;
+    }
+}
+
+document.getElementById('save-auto-actions').addEventListener('click', async () => {
+    const inputs = document.querySelectorAll('#auto-actions-body [data-col]');
+    const next = { upload: { ...autoActions.upload }, import: { ...autoActions.import } };
+    for (const col of ['upload', 'import']) {
+        next[col].auto_socials = { ...(autoActions[col].auto_socials || {}) };
+    }
+    inputs.forEach(input => {
+        const col = input.dataset.col;
+        const key = input.dataset.key;
+        const value = input.type === 'checkbox' ? input.checked : input.value;
+        if (key.startsWith('socials.')) {
+            const platform = key.substring('socials.'.length);
+            next[col].auto_socials[platform] = value;
+        } else {
+            next[col][key] = value;
+        }
+    });
+    const resp = await fetch(`/api/projects/${slug}/auto-actions`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(next),
+    });
+    if (resp.ok) {
+        autoActions = await resp.json();
+        showToast('Auto-actions saved', 'success');
+        renderMatrix();
+    }
+});
+
+document.getElementById('save-posting').addEventListener('click', async () => {
+    const next = {
+        default_template_video: document.getElementById('dt-video').value || 'new_video',
+        default_template_segment: document.getElementById('dt-segment').value || 'new_video',
+        default_template_short: document.getElementById('dt-short').value || 'new_video',
+        default_template_hook: document.getElementById('dt-hook').value || 'new_video',
+        post_video_delay_minutes: Number(document.getElementById('post-delay').value) || 15,
+        inter_post_spacing_minutes: Number(document.getElementById('post-spacing').value) || 5,
+    };
+    const resp = await fetch(`/api/projects/${slug}/posting-settings`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(next),
+    });
+    if (resp.ok) {
+        postingSettings = await resp.json();
+        showToast('Posting settings saved', 'success');
+    }
+});
+
+document.getElementById('rename-btn').addEventListener('click', async () => {
+    const name = document.getElementById('project-name').value.trim();
+    if (!name) return;
+    const resp = await fetch(`/api/projects/${slug}`, {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name}),
+    });
+    if (resp.ok) showToast('Project renamed', 'success');
+});
+
+const deleteBtn = document.getElementById('delete-btn');
+if (deleteBtn) {
+    deleteBtn.addEventListener('click', async () => {
+        if (!confirm('Delete this project and everything in it? Social accounts attached to it will not be deleted.')) return;
+        const resp = await fetch(`/api/projects/${slug}`, {method: 'DELETE'});
+        if (resp.ok) window.location.href = '/';
+    });
+}
+
+loadAutoActions();
+loadPostingSettings();
+</script>
+{% endblock %}

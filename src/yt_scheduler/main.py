@@ -1,0 +1,68 @@
+"""Entry point for the Drew's YT Scheduler application."""
+
+from __future__ import annotations
+
+import json
+import sys
+
+import uvicorn
+
+from yt_scheduler.config import HOST, PORT
+
+
+def main():
+    """Run the application or handle CLI commands."""
+    args = sys.argv[1:]
+
+    if not args or args[0] == "serve" or args[0] == "--reload":
+        # Default: run the web server
+        uvicorn.run(
+            "yt_scheduler.app:app",
+            host=HOST,
+            port=PORT,
+            reload="--reload" in args,
+        )
+
+    elif args[0] == "install":
+        from yt_scheduler.services.daemon import install_service
+        result = install_service()
+        print(json.dumps(result, indent=2))
+        if result.get("commands"):
+            print("\nUseful commands:")
+            for name, cmd in result["commands"].items():
+                print(f"  {name}: {cmd}")
+
+    elif args[0] == "uninstall":
+        from yt_scheduler.services.daemon import uninstall_service
+        result = uninstall_service()
+        print(json.dumps(result, indent=2))
+
+    elif args[0] == "status":
+        from yt_scheduler.services.daemon import get_service_status
+        result = get_service_status()
+        print(json.dumps(result, indent=2))
+
+    elif args[0] == "auth":
+        from yt_scheduler.config import ensure_dirs
+        ensure_dirs()
+        from yt_scheduler.services.auth import run_oauth_flow
+        client_secrets = args[1] if len(args) > 1 else None
+        run_oauth_flow(client_secrets)
+        print("Authentication successful!")
+
+    else:
+        print("Drew's YT Scheduler")
+        print()
+        print("Commands:")
+        print("  yt-scheduler              Start the web server (default)")
+        print("  yt-scheduler serve         Start the web server")
+        print("  yt-scheduler install       Install as background service (launchd/systemd)")
+        print("  yt-scheduler uninstall     Remove background service")
+        print("  yt-scheduler status        Check service status")
+        print("  yt-scheduler auth [path]   Run YouTube OAuth flow")
+        print()
+        print(f"Web UI: http://{HOST}:{PORT}")
+
+
+if __name__ == "__main__":
+    main()

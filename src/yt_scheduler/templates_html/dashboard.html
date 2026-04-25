@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+{% block title %}{{ current_project.name }} / Dashboard — Drew's YT Scheduler{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>{{ current_project.name }} / Dashboard</h1>
+    <button class="btn btn-primary" id="upload-btn">Upload new video</button>
+</div>
+
+<div class="section">
+    <h2>Your videos</h2>
+    <div id="video-list" class="video-grid">
+        <p class="loading">Loading videos...</p>
+    </div>
+</div>
+
+<div class="section">
+    <h2>YouTube videos available to import</h2>
+    <div id="import-list" class="video-grid">
+        <p class="loading">Checking YouTube...</p>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const projectSlug = "{{ current_project.slug }}";
+
+async function loadVideos() {
+    const container = document.getElementById('video-list');
+    try {
+        const resp = await fetch('/api/videos');
+        const videos = await resp.json();
+
+        if (videos.length === 0) {
+            container.innerHTML = '<p class="empty-state">No videos yet.</p>';
+            return;
+        }
+
+        container.innerHTML = videos.map(v => `
+            <a href="/projects/${projectSlug}/videos/${v.id}" class="video-card">
+                <div class="video-thumb">
+                    ${v.thumbnail_path
+                        ? `<img src="/uploads/${v.thumbnail_path.split('/').pop()}" alt="${v.title}">`
+                        : '<div class="thumb-placeholder">No thumbnail</div>'}
+                </div>
+                <div class="video-info">
+                    <h3>${v.title}</h3>
+                    <div class="video-meta">
+                        <span class="badge badge-${v.status}">${v.status}</span>
+                        <span class="badge badge-${v.privacy_status}">${v.privacy_status}</span>
+                    </div>
+                    <time>${new Date(v.created_at).toLocaleDateString()}</time>
+                </div>
+            </a>
+        `).join('');
+    } catch (e) {
+        container.innerHTML = '<p class="error">Failed to load videos.</p>';
+    }
+}
+
+document.getElementById('upload-btn').addEventListener('click', () => {
+    window.location.href = '/upload';
+});
+
+async function loadAvailableImports() {
+    const container = document.getElementById('import-list');
+    try {
+        const resp = await fetch(`/api/projects/${projectSlug}/imports/available?max_results=25`, {_silent: true});
+        if (!resp.ok) {
+            container.innerHTML = '<p class="empty-state">Connect a YouTube account in <a href="/settings">General settings</a> to see imports.</p>';
+            return;
+        }
+        const items = await resp.json();
+        if (!items.length) {
+            container.innerHTML = '<p class="empty-state">No new YouTube videos to import.</p>';
+            return;
+        }
+        container.innerHTML = items.map(v => {
+            const embed = v.embeddable
+                ? `<iframe src="https://www.youtube.com/embed/${v.video_id}" frameborder="0" allowfullscreen></iframe>`
+                : (v.thumbnail_url ? `<img src="${v.thumbnail_url}" alt="${v.title}">` : '<div class="thumb-placeholder">No thumbnail</div>');
+            return `
+                <div class="video-card import-card">
+                    <div class="video-thumb">${embed}</div>
+                    <div class="video-info">
+                        <h3>${v.title}</h3>
+                        <div class="video-meta">
+                            <span class="badge badge-${v.privacy_status || 'unlisted'}">${v.privacy_status || 'unknown'}</span>
+                            <time>${v.published_at ? new Date(v.published_at).toLocaleDateString() : ''}</time>
+                        </div>
+                        <button class="btn btn-sm btn-primary" data-import-id="${v.video_id}">+ Import</button>
+                    </div>
+                </div>
+            `;
+        }).join('');
+        for (const btn of container.querySelectorAll('[data-import-id]')) {
+            btn.addEventListener('click', async () => {
+                const id = btn.dataset.importId;
+                btn.disabled = true;
+                btn.textContent = 'Importing...';
+                const resp = await fetch(`/api/projects/${projectSlug}/imports/import`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({video_id: id}),
+                });
+                if (resp.ok) {
+                    showToast('Imported', 'success');
+                    loadVideos();
+                    loadAvailableImports();
+                }
+            });
+        }
+    } catch (e) {
+        container.innerHTML = '<p class="empty-state">Could not load imports.</p>';
+    }
+}
+
+loadVideos();
+loadAvailableImports();
+</script>
+{% endblock %}

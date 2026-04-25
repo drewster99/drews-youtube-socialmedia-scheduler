@@ -1,0 +1,247 @@
+{% extends "base.html" %}
+{% block title %}Edit Template — Drew's YT Scheduler{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Template: <span id="template-name">{{ template_name }}</span></h1>
+    <div class="header-actions">
+        <button class="btn btn-primary" onclick="saveTemplate()">Save Template</button>
+        <button class="btn btn-danger" onclick="deleteTemplate()">Delete</button>
+    </div>
+</div>
+
+<div class="form-card">
+    <div class="form-group">
+        <label>Description</label>
+        <input type="text" id="template-desc" placeholder="What this template is for...">
+    </div>
+
+    <div class="form-group">
+        <label>Applies to</label>
+        <div id="applies-to-chips" class="applies-to-chips">
+            <label class="chip"><input type="checkbox" name="applies_to" value="hook" checked> Hook</label>
+            <label class="chip"><input type="checkbox" name="applies_to" value="short" checked> Short</label>
+            <label class="chip"><input type="checkbox" name="applies_to" value="segment" checked> Segment</label>
+            <label class="chip"><input type="checkbox" name="applies_to" value="video" checked> Video</label>
+        </div>
+        <small class="form-hint">This template only suggests for videos in the selected tiers. At least one must be checked.</small>
+    </div>
+
+    <div class="template-help card">
+        <h4>Template syntax</h4>
+        {% raw %}
+        <p><code>{{variable}}</code> — replaced with a value (title, url, description, description_short, description_medium, tags, hashtags, transcript, tier, user_message, …).</p>
+        <p><code>{{ai: prompt text here}}</code> — sent to Claude to generate content. Variables inside AI blocks are resolved first.</p>
+        <p>Example: <code>{{ai: Write a punchy tweet about {{title}} }}</code></p>
+        {% endraw %}
+    </div>
+
+    <div id="platform-editors">
+        <!-- Populated by JS -->
+    </div>
+
+    <button class="btn btn-secondary" onclick="addPlatform()">+ Add Platform</button>
+</div>
+
+<div class="card" style="margin-top: 1rem;">
+    <h3>Preview</h3>
+    <div class="form-row">
+        <div class="form-group">
+            <label>Test title</label>
+            <input type="text" id="preview-title" value="How to build a YouTube app" placeholder="Test title">
+        </div>
+        <div class="form-group">
+            <label>Test URL</label>
+            <input type="text" id="preview-url" value="https://youtu.be/abc123" placeholder="Test URL">
+        </div>
+        <div class="form-group">
+            <label>Test tags</label>
+            <input type="text" id="preview-tags" value="python, tutorial, coding" placeholder="Test tags">
+        </div>
+    </div>
+    <div class="form-group">
+        <label>Test description</label>
+        <textarea id="preview-description" rows="3" placeholder="Test description">A great tutorial about building apps with Python and FastAPI.</textarea>
+    </div>
+    <div class="form-group">
+        <label>Test user_message</label>
+        <input type="text" id="preview-user-message" value="Just shipped this!" placeholder="Test user message">
+    </div>
+    <button class="btn btn-secondary" onclick="previewAll()">Preview all platforms</button>
+    <div id="preview-results"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const projectSlug = "{{ current_project.slug }}";
+const templateName = '{{ template_name }}';
+const ALL_PLATFORMS = ['twitter', 'bluesky', 'mastodon', 'linkedin', 'threads'];
+let platforms = {};
+
+function renderPlatformEditors() {
+    const container = document.getElementById('platform-editors');
+    container.innerHTML = Object.entries(platforms).map(([name, config]) => `
+        <div class="platform-editor card" id="editor-${name}">
+            <div class="platform-editor-header">
+                <span class="platform-badge platform-${name}">${name}</span>
+                <button class="btn btn-sm btn-danger" onclick="removePlatform('${name}')">Remove</button>
+            </div>
+            <div class="form-group">
+                <label>Template</label>
+                <textarea id="tmpl-${name}" rows="6" class="code-editor">${config.template || ''}</textarea>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Media</label>
+                    <select id="media-${name}">
+                        <option value="thumbnail" ${config.media === 'thumbnail' ? 'selected' : ''}>Thumbnail</option>
+                        <option value="full_video" ${config.media === 'full_video' ? 'selected' : ''}>Full video (recommended for hooks)</option>
+                        <option value="clip" ${(config.media || '').startsWith('clip') ? 'selected' : ''}>Video clip</option>
+                        <option value="gif" ${(config.media || '').startsWith('gif') ? 'selected' : ''}>GIF</option>
+                        <option value="none" ${config.media === 'none' ? 'selected' : ''}>None</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Max Characters</label>
+                    <input type="number" id="chars-${name}" value="${config.max_chars || 280}">
+                </div>
+            </div>
+        </div>
+    `).join('');
+}
+
+function addPlatform() {
+    const available = ALL_PLATFORMS.filter(p => !(p in platforms));
+    if (available.length === 0) {
+        showToast('All platforms added', 'info');
+        return;
+    }
+    const name = prompt(`Add platform:\nAvailable: ${available.join(', ')}`);
+    if (!name || !ALL_PLATFORMS.includes(name)) return;
+    platforms[name] = {template: '', media: 'thumbnail', max_chars: 280};
+    renderPlatformEditors();
+}
+
+function removePlatform(name) {
+    delete platforms[name];
+    renderPlatformEditors();
+}
+
+function collectPlatformData() {
+    const result = {};
+    for (const name of Object.keys(platforms)) {
+        result[name] = {
+            template: document.getElementById(`tmpl-${name}`)?.value || '',
+            media: document.getElementById(`media-${name}`)?.value || 'thumbnail',
+            max_chars: parseInt(document.getElementById(`chars-${name}`)?.value || '280'),
+        };
+    }
+    return result;
+}
+
+function readAppliesTo() {
+    return Array.from(document.querySelectorAll('input[name="applies_to"]:checked'))
+        .map(box => box.value);
+}
+
+async function saveTemplate() {
+    const appliesTo = readAppliesTo();
+    if (!appliesTo.length) {
+        showToast('Pick at least one tier in "Applies to"', 'error');
+        return;
+    }
+    const data = {
+        name: templateName,
+        description: document.getElementById('template-desc').value,
+        platforms: collectPlatformData(),
+        applies_to: appliesTo,
+    };
+
+    const resp = await fetch('/api/templates', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(data),
+    });
+
+    if (resp.ok) showToast('Template saved!', 'success');
+    else showToast('Failed to save', 'error');
+}
+
+async function deleteTemplate() {
+    if (!confirm(`Delete template "${templateName}"?`)) return;
+    await fetch(`/api/templates/${templateName}`, {method: 'DELETE'});
+    window.location.href = '/templates';
+}
+
+async function previewAll() {
+    const container = document.getElementById('preview-results');
+    const description = document.getElementById('preview-description').value;
+    const userMessage = document.getElementById('preview-user-message').value;
+    const variables = {
+        title: document.getElementById('preview-title').value,
+        url: document.getElementById('preview-url').value,
+        tags: document.getElementById('preview-tags').value,
+        hashtags: document.getElementById('preview-tags').value.split(',').map(t => `#${t.trim()}`).join(' '),
+        description: description,
+        description_short: description.slice(0, 150),
+        description_medium: description.slice(0, 500),
+        user_message: userMessage,
+        transcript: 'Test transcript content.',
+        tier: 'video',
+    };
+
+    const platformData = collectPlatformData();
+    container.innerHTML = '<p class="loading">Generating previews (AI blocks may take a moment)...</p>';
+
+    const results = [];
+    for (const [name, config] of Object.entries(platformData)) {
+        try {
+            const resp = await fetch('/api/templates/preview', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({template: config.template, variables}),
+            });
+            const result = await resp.json();
+            results.push({name, rendered: result.rendered || result.error || 'Error'});
+        } catch (e) {
+            results.push({name, rendered: `Error: ${e.message}`});
+        }
+    }
+
+    container.innerHTML = results.map(r => `
+        <div class="preview-card">
+            <span class="platform-badge platform-${r.name}">${r.name}</span>
+            <pre>${r.rendered}</pre>
+            <small>${r.rendered.length} characters</small>
+        </div>
+    `).join('');
+}
+
+// Load existing template
+async function loadTemplate() {
+    let appliesTo = ['hook', 'short', 'segment', 'video'];
+    try {
+        const resp = await fetch(`/api/templates/${templateName}`);
+        if (resp.ok) {
+            const data = await resp.json();
+            document.getElementById('template-desc').value = data.description || '';
+            platforms = data.platforms || {};
+            if (Array.isArray(data.applies_to) && data.applies_to.length) {
+                appliesTo = data.applies_to;
+            }
+        } else {
+            platforms = {};
+        }
+    } catch {
+        platforms = {};
+    }
+    document.querySelectorAll('input[name="applies_to"]').forEach(box => {
+        box.checked = appliesTo.includes(box.value);
+    });
+    renderPlatformEditors();
+}
+
+loadTemplate();
+</script>
+{% endblock %}

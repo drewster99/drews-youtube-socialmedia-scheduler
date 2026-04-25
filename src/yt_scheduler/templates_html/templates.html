@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Templates — Drew's YT Scheduler{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>{{ current_project.name }} / Templates</h1>
+    <button class="btn btn-primary" onclick="createTemplate()">New template</button>
+</div>
+
+<div id="template-list" class="template-grid">
+    <p class="loading">Loading templates...</p>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const projectSlug = "{{ current_project.slug }}";
+
+async function loadTemplates() {
+    const container = document.getElementById('template-list');
+    const resp = await fetch('/api/templates');
+    const templates = await resp.json();
+
+    if (templates.length === 0) {
+        container.innerHTML = '<p class="empty-state">No templates yet.</p>';
+        return;
+    }
+
+    container.innerHTML = templates.map(t => `
+        <a href="/projects/${projectSlug}/templates/${t.name}" class="template-card card">
+            <h3>${t.name}</h3>
+            <p>${t.description || 'No description'}</p>
+            <div class="platform-tags">
+                ${Object.keys(t.platforms || {}).map(p =>
+                    `<span class="platform-badge platform-${p}">${p}</span>`
+                ).join('')}
+            </div>
+        </a>
+    `).join('');
+}
+
+function createTemplate() {
+    const name = prompt('Template name (e.g., "new_video", "premiere"):');
+    if (!name) return;
+    window.location.href = `/projects/${projectSlug}/templates/${name}`;
+}
+
+loadTemplates();
+</script>
+{% endblock %}

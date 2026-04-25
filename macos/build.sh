@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ============================================================================
-# YouTube Publisher — macOS App Build Script
+# Drew's YT Scheduler — macOS App Build Script
 #
 # Creates a fully self-contained .app bundle with:
 #   - Swift menubar app
@@ -25,16 +25,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR/.."
 BUILD_DIR="$SCRIPT_DIR/build"
-APP_NAME="YouTube Publisher"
+APP_NAME="Drew's YT Scheduler"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
+SWIFT_PACKAGE_DIR="$SCRIPT_DIR/DrewsYTScheduler"
+SWIFT_TARGET="DrewsYTScheduler"
 PYTHON_VERSION="3.12"
 PYTHON_FULL_VERSION="3.12.8"
 
 # Signing config — change these to your values
 DEVELOPER_ID="${DEVELOPER_ID:-}"
 TEAM_ID="${TEAM_ID:-}"
-BUNDLE_ID="com.youtube-publisher.app"
-NOTARIZE_PROFILE="${NOTARIZE_PROFILE:-YouTubePublisher}"  # stored via `xcrun notarytool store-credentials`
+BUNDLE_ID="com.nuclearcyborg.drews-socialmedia-scheduler"
+NOTARIZE_PROFILE="${NOTARIZE_PROFILE:-YTScheduler}"  # stored via `xcrun notarytool store-credentials`
 
 SIGN=false
 NOTARIZE=false
@@ -46,7 +48,7 @@ for arg in "$@"; do
     esac
 done
 
-echo "=== YouTube Publisher Build ==="
+echo "=== Drew's YT Scheduler Build ==="
 echo "Building in: $BUILD_DIR"
 echo "Sign: $SIGN | Notarize: $NOTARIZE"
 
@@ -60,10 +62,10 @@ mkdir -p "$BUILD_DIR"
 echo ""
 echo "=== Step 1: Building Swift app ==="
 
-cd "$SCRIPT_DIR/YouTubePublisher"
+cd "$SWIFT_PACKAGE_DIR"
 swift build -c release --arch arm64 --arch x86_64 2>&1 | tail -5
 
-SWIFT_BINARY=$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/YouTubePublisher
+SWIFT_BINARY=$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/$SWIFT_TARGET
 
 if [ ! -f "$SWIFT_BINARY" ]; then
     echo "ERROR: Swift build failed"
@@ -81,7 +83,7 @@ echo "=== Step 2: Creating app bundle ==="
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
-cp "$SWIFT_BINARY" "$APP_BUNDLE/Contents/MacOS/YouTubePublisher"
+cp "$SWIFT_BINARY" "$APP_BUNDLE/Contents/MacOS/$SWIFT_TARGET"
 
 # Info.plist
 cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
@@ -90,9 +92,9 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>YouTube Publisher</string>
+    <string>Drew's YT Scheduler</string>
     <key>CFBundleDisplayName</key>
-    <string>YouTube Publisher</string>
+    <string>Drew's YT Scheduler</string>
     <key>CFBundleIdentifier</key>
     <string>$BUNDLE_ID</string>
     <key>CFBundleVersion</key>
@@ -100,7 +102,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
     <key>CFBundleShortVersionString</key>
     <string>0.1.0</string>
     <key>CFBundleExecutable</key>
-    <string>YouTubePublisher</string>
+    <string>$SWIFT_TARGET</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
@@ -197,11 +199,15 @@ echo "Dependencies installed."
 echo ""
 echo "=== Step 5: Copying Python source ==="
 
-PYTHON_SRC_DIR="$APP_BUNDLE/Contents/Resources/youtube_publisher_src"
+PYTHON_SRC_DIR="$APP_BUNDLE/Contents/Resources/yt_scheduler_src"
 mkdir -p "$PYTHON_SRC_DIR"
 
 # Copy the source as a proper package
-cp -R "$PROJECT_DIR/src/youtube_publisher" "$PYTHON_SRC_DIR/"
+cp -R "$PROJECT_DIR/src/yt_scheduler" "$PYTHON_SRC_DIR/"
+
+# Bundle the migration .sql files inside the package so the runner finds them
+# at runtime regardless of where Python imports it from.
+cp -R "$PROJECT_DIR/migrations" "$PYTHON_SRC_DIR/yt_scheduler/_migrations"
 
 echo "Source copied to: $PYTHON_SRC_DIR"
 

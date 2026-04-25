@@ -1,143 +1,131 @@
-# YouTube Publisher
+# Drew's YT Scheduler
 
-A local web app for managing YouTube video publishing with AI-powered descriptions and cross-platform social media posting.
+A local web app for managing YouTube video publishing across multiple projects, with AI-powered descriptions, multiple transcript backends, tier-aware templates, per-video activity logs, and cross-platform social media scheduling.
 
-## What It Does
+## What it does
 
-1. **Upload & Prepare** — Upload video to YouTube as unlisted, set title/tags/thumbnail
-2. **AI Description** — Auto-captions arrive → transcript is downloaded → Claude generates an SEO-friendly description → prepends your pinned links
-3. **Social Posts** — Generate platform-specific posts from templates with `{{variable}}` and `{{ai: prompt}}` blocks
-4. **Scheduled Publish** — Set a publish time; video goes public automatically
-5. **Comment Moderation** — Background job polls for comments matching your keyword blocklist and removes them
-6. **Community Post** — Generates a copy/paste community post (YouTube API doesn't support creating these programmatically)
+1. **Multiple projects** — Each project pairs a YouTube channel with its own social accounts, templates, blocklist, and auto-action settings. Home page lists all projects + recent activity + upcoming scheduled items.
+2. **Upload or import** — Upload new videos directly, or import existing ones from YouTube. Imported videos pull description, tags, thumbnail (downloaded locally), and the YouTube transcript when available.
+3. **Tier-aware** — Videos are auto-classified by duration (hook < 50s, short 50–180s, segment 180–720s, video ≥ 720s). Each template declares which tiers it applies to.
+4. **Multi-transcript** — Each video can hold transcripts from YouTube auto-captions, mlx-whisper (per model), faster-whisper, whisper.cpp, macOS SFSpeechRecognizer, plus a user-edited version. Pick the active one in the chooser modal.
+5. **AI everywhere, prompts editable** — SEO description, tag generation, and per-platform social copy run through Claude. The prompt bodies live in `prompt_templates` and are editable like any other template.
+6. **Auto-actions** — Per-project matrix (Uploads | Imports) for: auto-transcribe, auto-description, auto-tags (add vs replace), auto-thumbnail (ffmpeg keyframe at 25%), per-platform auto-gen-socials. Wiring rules: tags + description fire only on first transcript set; socials fire only on first description set.
+7. **Per-video log** — Right-sidebar activity feed: created / imported / uploaded / metadata_updated (per-field diff modal) / publish_scheduled / published / social_post_scheduled (in-app modal of saved text) / social_post_published (link to live post).
+8. **Scheduled publish + scheduled socials** — Schedule the video itself, plus per-post social scheduling via APScheduler `DateTrigger` jobs. Re-schedule pattern holds a per-post lock so two concurrent reschedules can't double-fire.
+9. **Comment moderation** — Per-project keyword/regex blocklist. Run-now button surfaces actual results. Background job runs on a configurable interval.
+10. **Built-in OAuth 2.0** — Twitter/X (PKCE), Mastodon (per-instance dynamic registration), LinkedIn (Authorization Code), Threads (token exchange). One-click "Connect with …" buttons in General Settings.
+11. **macOS menubar app** — Optional self-contained `.app` bundle that embeds Python and the package, runs the FastAPI server in the background, and shows a play-rectangle icon in the menu bar (Open web UI / Restart server / View logs / Quit).
 
 ## Setup
 
-### 1. Prerequisites
+### Prerequisites
 
 - Python 3.11+
-- FFmpeg (for clip/GIF extraction): `brew install ffmpeg`
+- FFmpeg (for clip/GIF extraction + auto-thumbnail keyframes): `brew install ffmpeg`
 - A Google Cloud project with YouTube Data API v3 enabled
 
-### 2. Google Cloud Setup
+### Google Cloud setup
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a project (or use existing)
-3. Enable **YouTube Data API v3**
-4. Go to **APIs & Services → Credentials**
-5. Create **OAuth 2.0 Client ID** → Application type: **Desktop app**
-6. Download the JSON file (this is your `client_secret.json`)
+1. Create a project at [Google Cloud Console](https://console.cloud.google.com/).
+2. Enable **YouTube Data API v3**.
+3. **APIs & Services → Credentials → Create OAuth 2.0 Client ID** → Application type **Desktop app**.
+4. Download the JSON; that's your `client_secret.json`.
 
-### 3. Install
+### Install (Python / web UI)
 
 ```bash
-git clone https://github.com/drewster99/youtube-mpc-server.git
-cd youtube-mpc-server
+git clone https://github.com/drewster99/drews-youtube-socialmedia-scheduler.git
+cd drews-youtube-socialmedia-scheduler
 
 python -m venv .venv
 source .venv/bin/activate
+pip install -e ".[social,dev,transcription-mlx]"
 
-pip install -e ".[social,dev]"
+cp .env.example .env  # then edit and set ANTHROPIC_API_KEY
+yt-scheduler            # serves http://127.0.0.1:8008
 ```
 
-### 4. Configure
+### Install (macOS .app)
 
 ```bash
-cp .env.example .env
-# Edit .env and add your ANTHROPIC_API_KEY
+macos/build.sh
+open "macos/build/Drew's YT Scheduler.app"
 ```
 
-### 5. Run
+The build embeds a relocatable Python 3.12 + all deps, copies the source + migrations into `Contents/Resources/yt_scheduler_src/`, and produces a ~360 MB self-contained `.app`. The menu-bar icon is a play-rectangle ▶︎ in the top-right.
 
-```bash
-youtube-publisher
-```
+## Configuration
 
-Open http://127.0.0.1:8008 in your browser.
+Environment variables (loaded from `.env`; legacy `YTP_*` names are honoured as a fallback):
 
-### 6. Authenticate with YouTube
-
-1. Go to **Settings** in the web UI
-2. Upload your `client_secret.json`
-3. Click **Authenticate with YouTube**
-4. Complete the Google OAuth flow in the browser
-
-### 7. Configure Social Media (optional)
-
-In **Settings**, add credentials for each platform you want to post to:
-
-| Platform | What You Need |
-|----------|--------------|
-| **Twitter/X** | API Key, API Secret, Access Token, Access Token Secret (requires Basic plan, $100/mo) |
-| **Bluesky** | Handle + App Password (free, create at bsky.app → Settings → App Passwords) |
-| **Mastodon** | Instance URL + Access Token (free, create app in instance Settings → Development) |
-| **LinkedIn** | Access Token + Person URN (requires approved LinkedIn app) |
-| **Threads** | Access Token + User ID (requires Meta developer app) |
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ANTHROPIC_API_KEY` | — | Claude API key (also configurable from Settings) |
+| `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Default Claude model. Override per install via Settings → Anthropic → Model name (stored in DB). |
+| `DYS_HOST` | `127.0.0.1` | Bind address |
+| `DYS_PORT` | `8008` | Server port |
+| `DYS_DATA_DIR` | `~/.drews-yt-scheduler` | Data directory (legacy `~/.youtube-publisher` is auto-renamed on first run) |
+| `DYS_COMMENT_CHECK_MINUTES` | `30` | Moderation poll interval |
+| `DYS_CAPTION_CHECK_MINUTES` | `15` | Auto-caption poll interval |
 
 ## Usage
 
-### Typical Workflow
+### Typical workflow
 
-1. **Upload** — Go to Upload, fill in title/tags/thumbnail, upload video as unlisted
-2. **Wait for captions** — The app polls YouTube every 15 minutes for auto-generated captions
-3. **Generate description** — Once captions arrive, click "Generate Description" on the video detail page. Review and edit the AI-generated SEO description. Click "Apply to YouTube."
-4. **Generate social posts** — Click "Generate Social Posts" to create platform-specific posts from your template. Review, edit, approve each one.
-5. **Publish** — Either set a scheduled publish time or click "Publish Now"
-6. **Post to socials** — Send approved posts to each platform
-7. **Copy community post** — Copy the pre-formatted community post text
+1. **Add a project** — Home → Add project. Each project has its own dashboard, templates, moderation, and settings.
+2. **Authenticate YouTube** — General Settings → upload `client_secret.json`. (Per-project OAuth keying is in place; UI flow lands with future polish.)
+3. **Connect socials** — General Settings → "Connect with X / Mastodon / LinkedIn / Threads". Bluesky uses a handle + app password.
+4. **Configure auto-actions** — Project Settings → toggle the Uploads | Imports matrix and the Posting-to-social-media defaults.
+5. **Upload or import** — Dashboard → "Upload new video", or pick from "YouTube videos available to import".
+6. **Compose socials from a template** — Video detail → "Socials from template" → pick template, check accounts, write `{{user_message}}`, Generate. Edit each card individually, then Post now or Schedule.
+7. **Publish** — Either schedule the video itself (dashed-amber pill on the detail screen) or click "Publish + post now" to flip privacy to public + fire all approved socials immediately.
 
 ### Templates
 
-Templates live in the **Templates** section. Each template defines per-platform post formats with:
+Templates live under each project at `Project / Templates`. Each defines per-platform post formats with:
 
-- **`{{variable}}`** — Replaced with video metadata (title, url, tags, etc.)
-- **`{{ai: prompt}}`** — Sent to Claude for AI generation. Variables inside are resolved first.
+- **`{{variable}}`** — Substituted from video metadata. Available: `title`, `url`, `description`, `description_short` (first 150), `description_medium` (first 500), `tags`, `hashtags`, `thumbnail_path`, `tier`, `transcript`, `user_message`.
+- **`{{ai: prompt}}`** — Sent to Claude. Variables inside are substituted first.
+- **Applies to** — Chip selector for which tiers (hook / short / segment / video) the template targets.
+- **Media** — `thumbnail | full_video | clip | gif | none`. Hook-tier templates default to `full_video`; others to `thumbnail`.
 
-Example:
+Two templates ship by default per project: `new_video` (full announcement scaffold) and `new_message` (`{{user_message}}` only — useful for one-off posts).
+
+### Prompt templates
+
+LLM prompts (description-from-transcript, tags-from-metadata, …) flow through the same template engine and are seeded with editable defaults in `prompt_templates`. Modify via the API or edit directly; missing rows fall back to a hard-coded seed.
+
+### Comment moderation
+
+Project / Moderation → Add keywords (plain or regex). "Run check now" actually runs and returns counts. Background polling fires on the interval set in General Settings.
+
+## Project structure
+
 ```
-{{ai: Write a punchy tweet about "{{title}}" that's under 280 chars}}
-
-{{url}}
-```
-
-### Comment Moderation
-
-Add keywords in **Moderation → Blocked Keywords**. The background job checks every 30 minutes and rejects matching comments. Supports plain text matching and regex patterns.
-
-## Project Structure
-
-```
-src/youtube_publisher/
-├── app.py              # FastAPI app setup
-├── main.py             # Entry point
-├── config.py           # Configuration
-├── database.py         # SQLite schema and access
-├── routers/            # API routes
-│   ├── auth_routes.py
-│   ├── video_routes.py
-│   ├── social_routes.py
-│   ├── template_routes.py
-│   └── settings_routes.py
-├── services/           # Business logic
-│   ├── auth.py         # YouTube OAuth
-│   ├── youtube.py      # YouTube API wrapper
-│   ├── ai.py           # Claude API
-│   ├── templates.py    # Template engine
-│   ├── social.py       # Social media posting
-│   ├── media.py        # FFmpeg clip/GIF extraction
-│   ├── moderation.py   # Comment moderation
-│   └── scheduler.py    # Background jobs
-├── static/             # CSS, JS
-└── templates_html/     # Jinja2 HTML templates
+src/yt_scheduler/
+├── app.py                 FastAPI setup, lifespan, page routes
+├── main.py                CLI entry (yt-scheduler / serve / install / auth / status)
+├── config.py              Env vars + data-dir migration
+├── database.py            aiosqlite handle, runs migrations on first connect
+├── migrations.py          Migration runner (NNN_*.sql in /migrations or _migrations/)
+├── models/                Pydantic models for routes
+├── routers/               FastAPI routers (project / video / transcript / social / template / settings / oauth / import)
+├── services/              auth, youtube, ai, templates, prompts, social, social_identity,
+│                          scheduler, moderation, transcription, transcripts, tiers,
+│                          imports, project_settings, projects, events, auto_actions,
+│                          keychain, daemon, media
+├── static/                CSS + vanilla JS
+└── templates_html/        Jinja2 pages (home, dashboard, video_detail, templates, template_edit,
+                           moderation, settings, project_settings, upload, socials_compose, base)
+migrations/                001_baseline → 007_scheduled_posts
+macos/                     Swift menubar app + build.sh
+tests/                     pytest suite (88 tests)
 ```
 
-## API Quota Notes
+## API quota notes
 
-YouTube API has a daily quota of 10,000 units. Key costs:
-- Video upload: **100 units**
-- Metadata update: **50 units**
-- List comments: **1 unit**
-- Caption operations: **50–450 units**
-- Search: **100 units**
+YouTube Data API daily quota is 10,000 units. Notable costs: video upload 100, metadata update 50, list comments 1, caption operations 50–450, search 100. The app minimizes by batching and caching locally.
 
-The app minimizes quota usage by batching requests and caching data locally.
+## License
+
+See `LICENSE` (or repository settings).

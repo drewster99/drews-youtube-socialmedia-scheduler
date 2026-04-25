@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Drew's YT Scheduler{% endblock %}</title>
+    <link rel="icon" type="image/png" href="/static/img/icon.png">
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="logo">
+            <h2>YT Scheduler</h2>
+        </div>
+        <ul>
+            <li><a href="/" class="nav-link">Home</a></li>
+            {% if current_project %}
+            <li class="nav-section-label" data-project="{{ current_project.slug }}">{{ current_project.name }}</li>
+            <li><a href="/projects/{{ current_project.slug }}" class="nav-link nav-sub">Dashboard</a></li>
+            <li><a href="/projects/{{ current_project.slug }}/moderation" class="nav-link nav-sub">Moderation</a></li>
+            <li><a href="/projects/{{ current_project.slug }}/templates" class="nav-link nav-sub">Templates</a></li>
+            <li><a href="/projects/{{ current_project.slug }}/settings" class="nav-link nav-sub">Project settings</a></li>
+            {% endif %}
+            <li class="nav-divider"></li>
+            <li><a href="/settings" class="nav-link">General settings</a></li>
+        </ul>
+        <div class="auth-status" id="auth-status">
+            <span class="status-dot"></span>
+            <span>Checking...</span>
+        </div>
+    </nav>
+
+    <main class="content">
+        {% block content %}{% endblock %}
+    </main>
+
+    <div id="toast-container"></div>
+
+    <script src="/static/js/app.js"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

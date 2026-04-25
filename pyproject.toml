@@ -1,5 +1,5 @@
 [project]
-name = "youtube-publisher"
+name = "yt-scheduler"
 version = "0.1.0"
 description = "YouTube video publishing pipeline with AI-powered descriptions and social cross-posting"
 requires-python = ">=3.11"
@@ -38,7 +38,7 @@ dev = [
 ]
 
 [project.scripts]
-youtube-publisher = "youtube_publisher.main:main"
+yt-scheduler = "yt_scheduler.main:main"
 
 [build-system]
 requires = ["setuptools>=75", "wheel"]
@@ -50,3 +50,8 @@ where = ["src"]
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+

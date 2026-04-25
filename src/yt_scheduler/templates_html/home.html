@@ -1,0 +1,182 @@
+{% extends "base.html" %}
+{% block title %}Home — Drew's YT Scheduler{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Home</h1>
+</div>
+
+<div class="home-grid">
+    <section class="card">
+        <div class="card-header">
+            <h2>Upcoming</h2>
+        </div>
+        <div id="upcoming-list" class="event-list">
+            <p class="loading">Loading...</p>
+        </div>
+    </section>
+
+    <section class="card">
+        <div class="card-header">
+            <h2>Recent</h2>
+        </div>
+        <div id="recent-list" class="event-list">
+            <p class="loading">Loading...</p>
+        </div>
+    </section>
+
+    <section class="card home-projects">
+        <div class="card-header">
+            <h2>Projects</h2>
+            <button class="btn btn-primary btn-sm" id="add-project-btn">Add project</button>
+        </div>
+        <div id="project-list" class="project-grid">
+            <p class="loading">Loading projects...</p>
+        </div>
+    </section>
+</div>
+
+<dialog id="add-project-dialog" class="modal">
+    <form method="dialog">
+        <h3>Add project</h3>
+        <label>
+            Project name
+            <input type="text" id="new-project-name" required maxlength="80" autofocus>
+        </label>
+        <div class="modal-actions">
+            <button value="cancel" class="btn">Cancel</button>
+            <button value="submit" id="confirm-add-project" class="btn btn-primary">Create</button>
+        </div>
+    </form>
+</dialog>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadProjects() {
+    const container = document.getElementById('project-list');
+    try {
+        const resp = await fetch('/api/projects');
+        const projects = await resp.json();
+
+        if (!projects.length) {
+            container.innerHTML = '<p class="empty-state">No projects yet.</p>';
+            return;
+        }
+
+        container.innerHTML = projects.map(p => `
+            <a href="/projects/${p.slug}" class="project-card">
+                <h3>${p.name}</h3>
+                <div class="project-stats">
+                    <span><strong>${p.video_count ?? 0}</strong> videos</span>
+                    <span><strong>${p.scheduled_count ?? 0}</strong> scheduled</span>
+                </div>
+                <time>created ${new Date(p.created_at).toLocaleDateString()}</time>
+            </a>
+        `).join('');
+    } catch (e) {
+        container.innerHTML = '<p class="error">Failed to load projects.</p>';
+    }
+}
+
+function fmtWhen(iso) {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    const dow = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()];
+    const sameYear = d.getFullYear() === new Date().getFullYear();
+    const datePart = sameYear
+        ? `${d.getMonth() + 1}/${d.getDate()}`
+        : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    let h = d.getHours();
+    const m = String(d.getMinutes()).padStart(2, '0');
+    const ampm = h >= 12 ? 'pm' : 'am';
+    h = h % 12 || 12;
+    return `${dow} ${datePart} ${h}:${m}${ampm}`;
+}
+
+async function loadUpcoming() {
+    const container = document.getElementById('upcoming-list');
+    try {
+        const resp = await fetch('/api/projects/upcoming?limit=7');
+        const items = resp.ok ? await resp.json() : [];
+        if (!items.length) {
+            container.innerHTML = '<p class="empty-state">No scheduled items yet.</p>';
+            return;
+        }
+        container.innerHTML = items.map(i => `
+            <div class="event-row">
+                <span class="event-when">${fmtWhen(i.publish_at)}</span>
+                <a href="/projects/${i.project_slug}/videos/${i.video_id}">${i.title}</a>
+                <span class="event-project">${i.project_name}</span>
+            </div>
+        `).join('');
+    } catch (e) {
+        container.innerHTML = '<p class="empty-state">Could not load upcoming items.</p>';
+    }
+}
+
+function eventVerb(type) {
+    return {
+        created: 'New create',
+        imported: 'New import',
+        uploaded: 'Uploaded',
+        metadata_updated: 'Updated',
+        publish_scheduled: 'Schedule publish',
+        published: 'Video published',
+        social_post_scheduled: 'Social post scheduled',
+        social_post_published: 'Social post published',
+    }[type] || type;
+}
+
+async function loadRecent() {
+    const container = document.getElementById('recent-list');
+    try {
+        const resp = await fetch('/api/projects/recent-events?limit=7');
+        const items = resp.ok ? await resp.json() : [];
+        if (!items.length) {
+            container.innerHTML = '<p class="empty-state">No recent activity yet.</p>';
+            return;
+        }
+        container.innerHTML = items.map(i => `
+            <div class="event-row">
+                <span class="event-when">${fmtWhen(i.created_at)}</span>
+                <span>${eventVerb(i.type)}</span>
+                <a href="/projects/${i.project_slug}/videos/${i.video_id}">${i.video_title}</a>
+                <span class="event-project">${i.project_name}</span>
+            </div>
+        `).join('');
+    } catch (e) {
+        container.innerHTML = '<p class="empty-state">Could not load activity.</p>';
+    }
+}
+
+const dialog = document.getElementById('add-project-dialog');
+document.getElementById('add-project-btn').addEventListener('click', () => {
+    document.getElementById('new-project-name').value = '';
+    dialog.showModal();
+});
+
+document.getElementById('confirm-add-project').addEventListener('click', async (event) => {
+    const name = document.getElementById('new-project-name').value.trim();
+    if (!name) {
+        event.preventDefault();
+        return;
+    }
+    event.preventDefault();
+    const resp = await fetch('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+    });
+    if (resp.ok) {
+        const project = await resp.json();
+        dialog.close();
+        window.location.href = `/projects/${project.slug}`;
+    }
+});
+
+loadProjects();
+loadUpcoming();
+loadRecent();
+</script>
+{% endblock %}
