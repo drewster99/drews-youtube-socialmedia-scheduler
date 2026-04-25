@@ -896,6 +896,36 @@ dialog.modal input[type="text"] {
 
 .danger-zone .card-header h2 { color: var(--danger); }
 
+#build-mismatch-banner {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    background: #d29922;
+    color: #0d1117;
+    padding: 0.6rem 1rem;
+    font-size: 0.85rem;
+    z-index: 2000;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+}
+#build-mismatch-banner button {
+    background: #0d1117;
+    color: #f1f1f1;
+    border: 0;
+    border-radius: 4px;
+    padding: 0.3rem 0.8rem;
+    cursor: pointer;
+}
+#build-mismatch-banner .build-ids {
+    margin-left: auto;
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 0.75rem;
+    opacity: 0.7;
+}
+
 .auto-actions-matrix { width: 100%; border-collapse: collapse; }
 .auto-actions-matrix th { text-align: left; font-weight: 500; padding: 0.4rem 0.6rem; }
 .auto-actions-matrix td { text-align: center; padding: 0.4rem; }

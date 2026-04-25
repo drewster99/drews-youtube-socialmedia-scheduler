@@ -53,6 +53,13 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+yt_scheduler = [
+    "static/**/*",
+    "templates_html/**/*",
+    "_migrations/*.sql",
+]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 100

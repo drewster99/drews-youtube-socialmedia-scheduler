@@ -12,11 +12,11 @@
     <key>com.apple.security.files.user-selected.read-write</key>
     <true/>
 
-    <!-- Allow accessing the Keychain -->
-    <key>com.apple.security.keychain-access-groups</key>
-    <array>
-        <string>$(AppIdentifierPrefix)com.youtube-publisher.app</string>
-    </array>
+    <!-- Keychain entries are written via the `security` CLI under generic
+         service IDs (com.nuclearcyborg.drews-socialmedia-scheduler.*). We do
+         not declare a keychain-access-group because we don't share entries
+         with other apps. -->
+
 
     <!-- Allow spawning subprocesses (Python, FFmpeg) -->
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>

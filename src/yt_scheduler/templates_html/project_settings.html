@@ -9,10 +9,15 @@
 <section class="card">
     <div class="card-header"><h2>Project name</h2></div>
     <div class="card-body">
-        <label>Display name
+        <div class="form-group">
+            <label for="project-name">Display name</label>
             <input type="text" id="project-name" value="{{ current_project.name }}" maxlength="80">
-        </label>
-        <p class="form-hint">URL slug <code>{{ current_project.slug }}</code> is permanent.</p>
+        </div>
+        <p class="form-hint">
+            This project lives at <code>/projects/{{ current_project.slug }}/</code> in the URL bar.
+            That path component (the &ldquo;slug&rdquo;) is fixed for the lifetime of the project &mdash;
+            renaming below changes only the display name, not the URL.
+        </p>
         <button class="btn btn-primary" id="rename-btn">Save</button>
     </div>
 </section>

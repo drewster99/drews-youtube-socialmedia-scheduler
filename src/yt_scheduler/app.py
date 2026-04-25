@@ -10,7 +10,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.middleware.base import BaseHTTPMiddleware
 
+from yt_scheduler import build_info
 from yt_scheduler.config import UPLOAD_DIR, ensure_dirs
 from yt_scheduler.database import close_db, get_db
 from yt_scheduler.routers import (
@@ -39,10 +41,34 @@ from yt_scheduler.services.templates import ensure_default_template
 logger = logging.getLogger(__name__)
 
 
+_BUILD_HEADER = "X-DYS-Build-Id"
+_BUILD_KIND_HEADER = "X-DYS-Build-Kind"
+
+
+class BuildIdentityMiddleware(BaseHTTPMiddleware):
+    """Stamps every response with our build_id and warns when the inbound
+    ``X-DYS-Build-Id`` header doesn't match — that means a client tab (or the
+    .app shell) was loaded against a different server build than the one
+    answering now.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        ours = build_info.BUILD_ID
+        their_id = request.headers.get(_BUILD_HEADER)
+        if their_id and their_id != ours:
+            logger.warning(
+                "Build mismatch: client sent %r, server is %r (kind=%s, version=%s)",
+                their_id, ours, build_info.BUILD_KIND, build_info.VERSION,
+            )
+        response = await call_next(request)
+        response.headers[_BUILD_HEADER] = ours
+        response.headers[_BUILD_KIND_HEADER] = build_info.BUILD_KIND
+        return response
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown."""
-    ensure_dirs()
     db = await get_db()
     await ensure_default_project()
     await ensure_default_template()
@@ -74,7 +100,18 @@ async def lifespan(app: FastAPI):
     await close_db()
 
 
-app = FastAPI(title="Drew's YT Scheduler", version="0.1.0", lifespan=lifespan)
+app = FastAPI(
+    title="Drew's YT Scheduler",
+    version=build_info.VERSION,
+    lifespan=lifespan,
+)
+app.add_middleware(BuildIdentityMiddleware)
+
+# StaticFiles validates the upload dir at mount time, so we have to ensure
+# it exists before the mount below. Migration runs in the lifespan instead —
+# triggering it at module load means a stray ``python -c "import yt_scheduler.app"``
+# touches real data, which is a footgun.
+ensure_dirs()
 
 # Static files and templates
 static_dir = Path(__file__).parent / "static"
@@ -84,6 +121,13 @@ app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 html_templates = Jinja2Templates(directory=str(templates_dir))
+
+
+@app.get("/api/build")
+async def api_build():
+    """Build identity for the .app + browser to compare against their own."""
+    return build_info.as_dict()
+
 
 # API routes
 app.include_router(project_routes.router)

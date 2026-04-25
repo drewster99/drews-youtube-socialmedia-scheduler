@@ -7,10 +7,7 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "DrewsYTScheduler",
-            path: "DrewsYTScheduler",
-            resources: [
-                .copy("Resources"),
-            ]
+            path: "DrewsYTScheduler"
         ),
     ]
 )

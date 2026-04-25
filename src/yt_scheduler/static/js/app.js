@@ -14,24 +14,45 @@ function showToast(message, type = 'info') {
     }, duration);
 }
 
-/* Global fetch wrapper: surface API failures as toasts automatically.
+/* Global fetch wrapper: surface API failures as toasts automatically AND
+ * track build identity across responses.
  *
- * Policy: every non-2xx response AND every network error produces a toast,
- * unless the caller opts out with `_silent: true` on the init object. Existing
- * callers that inspect `resp.ok` and show their own toast still work — the
- * original Response is returned unchanged and callers can read the body as
- * before (we peek via `.clone()` so the stream isn't consumed).
+ * Build identity:
+ *   - Every response carries an X-DYS-Build-Id header (added by the server's
+ *     BuildIdentityMiddleware). The first response we see "captures" the
+ *     server's identity. If a later response carries a different id, the
+ *     server has been rebuilt while this tab was open — we surface a banner
+ *     telling the user to reload, and start sending the previous id back to
+ *     the server in X-DYS-Build-Id so the server's logs show "client X is
+ *     stale". The header is also included in every subsequent request.
+ *
+ * Toasts:
+ *   Every non-2xx response and every network error produces a toast unless
+ *   the caller opts out with `_silent: true` on the init object. Original
+ *   Response is returned unchanged.
  *
  * Error message priority: JSON `.detail` → JSON `.message` → first 200 chars
  * of the raw text body → `HTTP <status>`.
  */
 (() => {
     const origFetch = window.fetch.bind(window);
+    let knownBuildId = null;
+    let bannerShown = false;
+
     window.fetch = async (input, init = {}) => {
         const silent = init && init._silent;
         if (init && '_silent' in init) {
             init = { ...init };
             delete init._silent;
+        }
+        // Echo our last-known build id back to the server so its mismatch
+        // logging knows where the request came from.
+        if (knownBuildId) {
+            const headers = new Headers(init.headers || {});
+            if (!headers.has('X-DYS-Build-Id')) {
+                headers.set('X-DYS-Build-Id', knownBuildId);
+            }
+            init = { ...init, headers };
         }
         let resp;
         try {
@@ -39,6 +60,15 @@ function showToast(message, type = 'info') {
         } catch (e) {
             if (!silent) showToast(`Network error: ${e.message || e}`, 'error');
             throw e;
+        }
+        const serverBuild = resp.headers.get('X-DYS-Build-Id');
+        if (serverBuild) {
+            if (!knownBuildId) {
+                knownBuildId = serverBuild;
+            } else if (serverBuild !== knownBuildId && !bannerShown) {
+                bannerShown = true;
+                showBuildMismatchBanner(knownBuildId, serverBuild);
+            }
         }
         if (!resp.ok && !silent) {
             let detail = '';
@@ -57,6 +87,17 @@ function showToast(message, type = 'info') {
         }
         return resp;
     };
+
+    function showBuildMismatchBanner(oldId, newId) {
+        const banner = document.createElement('div');
+        banner.id = 'build-mismatch-banner';
+        banner.innerHTML = `
+            <span>The server was rebuilt — this page is out of sync. Reload to load the new UI.</span>
+            <button onclick="window.location.reload()">Reload</button>
+            <span class="build-ids">${oldId.slice(0, 8)} → ${newId.slice(0, 8)}</span>
+        `;
+        document.body.appendChild(banner);
+    }
 })();
 
 // Auth status in sidebar

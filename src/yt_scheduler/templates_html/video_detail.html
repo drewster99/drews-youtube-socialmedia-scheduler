@@ -21,6 +21,9 @@
             <div id="video-meta-row" class="video-meta-row" style="display:none;">
                 <div class="video-meta-left" id="video-meta-left"></div>
                 <div class="video-meta-right">
+                    <button type="button" class="btn btn-sm btn-icon-text" id="btn-copy-url" onclick="copyVideoURL()">
+                        <span aria-hidden="true">🔗</span> Copy URL
+                    </button>
                     <button type="button" class="btn btn-sm btn-icon-text" id="btn-open-transcript" onclick="openTranscriptModal()">
                         <span aria-hidden="true">📝</span> Transcript
                     </button>
@@ -385,6 +388,16 @@ async function loadVideo() {
     loadSocialPosts();
     loadComments();
     loadEventLog();
+}
+
+async function copyVideoURL() {
+    const url = `https://www.youtube.com/watch?v=${videoId}`;
+    try {
+        await navigator.clipboard.writeText(url);
+        showToast(`Copied ${url}`, 'success');
+    } catch (e) {
+        showToast(`Could not copy URL: ${e.message || e}`, 'error');
+    }
 }
 
 // --- Transcript chooser modal ---------------------------------------------
