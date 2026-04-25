@@ -65,18 +65,54 @@ async function loadProjects() {
         }
 
         container.innerHTML = projects.map(p => `
-            <a href="/projects/${p.slug}" class="project-card">
-                <h3>${p.name}</h3>
-                <div class="project-stats">
-                    <span><strong>${p.video_count ?? 0}</strong> videos</span>
-                    <span><strong>${p.scheduled_count ?? 0}</strong> scheduled</span>
-                </div>
-                <time>created ${new Date(p.created_at).toLocaleDateString()}</time>
-            </a>
+            <div class="project-card-wrap">
+                <a href="/projects/${p.slug}" class="project-card">
+                    <h3>${escapeHtml(p.name)}</h3>
+                    <div class="project-stats">
+                        <span><strong>${p.video_count ?? 0}</strong> videos</span>
+                        <span><strong>${p.scheduled_count ?? 0}</strong> scheduled</span>
+                    </div>
+                    <time>created ${new Date(p.created_at).toLocaleDateString()}</time>
+                </a>
+                <button type="button" class="project-card-rename"
+                        data-slug="${p.slug}" data-name="${escapeHtml(p.name)}"
+                        title="Rename project">✎</button>
+            </div>
         `).join('');
+
+        for (const btn of container.querySelectorAll('.project-card-rename')) {
+            btn.addEventListener('click', async (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                const slug = btn.dataset.slug;
+                const current = btn.dataset.name;
+                const next = prompt(`Rename project (URL slug "${slug}" stays the same):`, current);
+                if (!next || !next.trim() || next.trim() === current) return;
+                const resp = await fetch(`/api/projects/${slug}`, {
+                    method: 'PATCH',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name: next.trim()}),
+                });
+                if (resp.ok) {
+                    showToast('Project renamed', 'success');
+                    loadProjects();
+                } else {
+                    showToast('Rename failed', 'error');
+                }
+            });
+        }
     } catch (e) {
         container.innerHTML = '<p class="error">Failed to load projects.</p>';
     }
+}
+
+function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
 }
 
 function fmtWhen(iso) {

@@ -206,7 +206,14 @@ document.getElementById('rename-btn').addEventListener('click', async () => {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({name}),
     });
-    if (resp.ok) showToast('Project renamed', 'success');
+    if (resp.ok) {
+        showToast('Project renamed', 'success');
+        // Reload so the sidebar header, page title, and dashboard title pick
+        // up the new name. URL slug is unchanged so the path still resolves.
+        setTimeout(() => window.location.reload(), 300);
+    } else {
+        showToast('Rename failed', 'error');
+    }
 });
 
 const deleteBtn = document.getElementById('delete-btn');
