@@ -29,6 +29,7 @@ from yt_scheduler.services.auth import (
     has_client_secret,
     store_credentials,
 )
+from yt_scheduler.services import bluesky_oauth
 from yt_scheduler.services.projects import slugify
 from yt_scheduler.services.social_credentials import (
     display_name_for,
@@ -1066,3 +1067,153 @@ def _success_payload(cred: dict, project_slug: str | None) -> dict:
         "label": cred["label"],
         "project_slug": project_slug,
     }
+
+
+# --- Bluesky AT-proto OAuth ------------------------------------------------
+
+BLUESKY_REDIRECT_PATH = "/api/oauth/bluesky/callback"
+
+# Pending Bluesky auth state, keyed by ``state``. Held in-process only;
+# server restarts between start and callback force a re-auth.
+_bluesky_pending: dict[str, bluesky_oauth.PendingAuth] = {}
+
+
+@router.post("/bluesky/start")
+async def bluesky_start(data: dict):
+    """Begin a Bluesky AT-proto OAuth flow.
+
+    Body shape::
+
+        {
+          "handle": "alice.bsky.social",
+          "origin": "http://127.0.0.1:8008",
+          "project_slug": "<optional, binds default on success>"
+        }
+
+    Returns ``{"auth_url": "https://bsky.social/oauth/authorize?..."}``.
+    Caller pre-opens a popup and redirects it to ``auth_url``.
+    """
+    handle = bluesky_oauth.normalise_handle(data.get("handle") or "")
+    origin = (data.get("origin") or "").rstrip("/")
+    project_slug = (data.get("project_slug") or "").strip() or None
+    if not handle:
+        raise HTTPException(400, "A valid Bluesky handle is required (e.g. alice.bsky.social)")
+    if not origin:
+        raise HTTPException(400, "origin is required")
+
+    redirect_uri = f"{origin}{BLUESKY_REDIRECT_PATH}"
+    code_verifier, _challenge = bluesky_oauth.make_pkce_pair()
+    state = secrets.token_urlsafe(24)
+    private_key_pem = bluesky_oauth.generate_keypair_pem()
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        try:
+            identity = await bluesky_oauth.resolve_identity(handle, client)
+        except (ValueError, httpx.HTTPError) as exc:
+            raise HTTPException(400, f"Could not resolve {handle}: {exc}") from exc
+        try:
+            auth_meta = await bluesky_oauth.discover_auth_server_for_pds(
+                identity.pds, client
+            )
+        except (ValueError, httpx.HTTPError) as exc:
+            raise HTTPException(
+                400,
+                f"Could not discover authorization server for PDS {identity.pds}: {exc}",
+            ) from exc
+
+        pending = bluesky_oauth.PendingAuth(
+            handle=identity.handle,
+            did=identity.did,
+            pds=identity.pds,
+            auth_server=auth_meta,
+            redirect_uri=redirect_uri,
+            code_verifier=code_verifier,
+            state=state,
+            private_key_pem=private_key_pem,
+            project_slug=project_slug,
+        )
+        try:
+            request_uri = await bluesky_oauth.push_authorization_request(pending, client)
+        except (RuntimeError, httpx.HTTPError) as exc:
+            raise HTTPException(400, f"PAR failed: {exc}") from exc
+
+    _gc_pending()
+    _bluesky_pending[state] = pending
+
+    auth_url = bluesky_oauth.authorization_redirect_url(pending, request_uri)
+    return {"auth_url": auth_url}
+
+
+@router.get("/bluesky/callback", response_class=HTMLResponse)
+async def bluesky_callback(
+    code: str | None = None,
+    state: str | None = None,
+    iss: str | None = None,
+    error: str | None = None,
+    error_description: str | None = None,
+):
+    if error:
+        return _result_page(
+            False,
+            f"Bluesky denied authorization: {error} — {error_description or ''}",
+            platform="bluesky",
+        )
+    if not code or not state:
+        return _result_page(False, "Missing code or state.", platform="bluesky")
+
+    pending = _bluesky_pending.pop(state, None)
+    if pending is None:
+        return _result_page(
+            False,
+            "Unknown or expired OAuth state. Click Connect with Bluesky again.",
+            platform="bluesky",
+        )
+
+    if iss and iss.rstrip("/") != pending.auth_server.issuer.rstrip("/"):
+        return _result_page(
+            False,
+            f"Issuer mismatch: callback claimed {iss}, expected {pending.auth_server.issuer}.",
+            platform="bluesky",
+        )
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        try:
+            tokens = await bluesky_oauth.exchange_code_for_tokens(pending, code, client)
+        except (RuntimeError, httpx.HTTPError) as exc:
+            return _result_page(
+                False, f"Token exchange failed: {exc}", platform="bluesky"
+            )
+
+    sub = tokens.get("sub") or pending.did
+    if sub != pending.did:
+        logger.warning(
+            "Bluesky OAuth: token sub %s does not match pre-resolved DID %s; trusting sub",
+            sub, pending.did,
+        )
+
+    bundle = bluesky_oauth.credentialed_bundle(
+        handle=pending.handle,
+        did=sub,
+        pds=pending.pds,
+        auth_server_issuer=pending.auth_server.issuer,
+        token_endpoint=pending.auth_server.token_endpoint,
+        redirect_uri=pending.redirect_uri,
+        private_key_pem=pending.private_key_pem,
+        access_token=tokens["access_token"],
+        refresh_token=tokens.get("refresh_token", ""),
+        expires_in=int(tokens.get("expires_in") or 7200),
+        dpop_nonce=pending.dpop_nonce,
+    )
+    cred = await _persist_oauth_credential(
+        platform="bluesky",
+        provider_account_id=sub,
+        username=pending.handle,
+        bundle=bundle,
+        project_slug=pending.project_slug,
+    )
+    return _result_page(
+        True,
+        f"Connected as @{pending.handle}.",
+        platform="bluesky",
+        payload=_success_payload(cred, pending.project_slug),
+    )

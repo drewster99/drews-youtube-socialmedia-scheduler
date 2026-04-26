@@ -327,31 +327,204 @@ class TwitterPoster(SocialPoster):
 
 class BlueskyPoster(SocialPoster):
     platform = "bluesky"
-    required_keys = ["handle", "app_password"]
+    # OAuth-only: a Bluesky bundle must contain the per-credential ES256
+    # key, the access/refresh tokens, the resolved PDS, and the AS's token
+    # endpoint (so we can refresh without re-discovery). app_password is
+    # gone; credentials that pre-date OAuth are wiped on boot.
+    required_keys = [
+        "auth_method",
+        "handle",
+        "did",
+        "pds",
+        "private_key_pem",
+        "access_token",
+        "refresh_token",
+        "token_endpoint",
+        "redirect_uri",
+    ]
 
     async def post(self, text: str, media_path: str | None = None) -> dict:
+        from datetime import datetime, timezone
+
+        from yt_scheduler.services import bluesky_oauth
+        from yt_scheduler.services.social_credentials import save_bundle
+
         creds = self._get_creds()
+        if creds.get("auth_method") != "oauth":
+            raise RuntimeError(
+                "Bluesky credential is not OAuth-authenticated. "
+                "Click Connect with Bluesky in Settings to re-authenticate."
+            )
 
-        try:
-            from atproto import Client
-
-            client = Client()
-            client.login(creds["handle"], creds["app_password"])
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            await self._ensure_fresh_token(creds, client, bluesky_oauth, save_bundle)
 
             embed = None
             if media_path and Path(media_path).exists():
-                with open(media_path, "rb") as f:
-                    img_data = f.read()
-                upload = client.upload_blob(img_data)
+                blob = await self._upload_blob(creds, Path(media_path), client, bluesky_oauth, save_bundle)
                 embed = {
                     "$type": "app.bsky.embed.images",
-                    "images": [{"alt": "Video thumbnail", "image": upload.blob}],
+                    "images": [{"alt": "Video thumbnail", "image": blob}],
                 }
 
-            response = client.send_post(text=text, embed=embed)
-            return {"url": f"https://bsky.app/profile/{creds['handle']}", "id": str(response.uri)}
-        except Exception as e:
-            raise RuntimeError(f"Bluesky post failed: {e}") from e
+            record = {
+                "$type": "app.bsky.feed.post",
+                "text": text,
+                "createdAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            if embed is not None:
+                record["embed"] = embed
+
+            create_url = f"{creds['pds'].rstrip('/')}/xrpc/com.atproto.repo.createRecord"
+
+            async def _do() -> httpx.Response:
+                proof = bluesky_oauth.sign_dpop_proof(
+                    creds["private_key_pem"], "POST", create_url,
+                    nonce=creds.get("dpop_nonce"),
+                    access_token=creds["access_token"],
+                )
+                return await client.post(
+                    create_url,
+                    headers={
+                        "Authorization": f"DPoP {creds['access_token']}",
+                        "DPoP": proof,
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "repo": creds["did"],
+                        "collection": "app.bsky.feed.post",
+                        "record": record,
+                    },
+                )
+
+            resp = await _do()
+            if resp.status_code in (400, 401):
+                if await self._handle_dpop_or_token_error(resp, creds, client, bluesky_oauth, save_bundle):
+                    resp = await _do()
+
+            if resp.status_code not in (200, 201):
+                raise RuntimeError(
+                    f"Bluesky createRecord failed: HTTP {resp.status_code} {resp.text}"
+                )
+
+            self._stash_nonce(creds, resp, save_bundle)
+
+        body = resp.json() or {}
+        uri = body.get("uri", "")
+        rkey = uri.split("/")[-1] if uri else ""
+        return {
+            "url": f"https://bsky.app/profile/{creds['handle']}/post/{rkey}",
+            "id": uri,
+        }
+
+    @staticmethod
+    def _stash_nonce(creds: dict, resp: httpx.Response, save_bundle) -> None:
+        new_nonce = resp.headers.get("DPoP-Nonce")
+        if new_nonce and new_nonce != creds.get("dpop_nonce"):
+            creds["dpop_nonce"] = new_nonce
+            save_bundle("bluesky", creds["uuid"], creds)
+
+    async def _handle_dpop_or_token_error(
+        self,
+        resp: httpx.Response,
+        creds: dict,
+        client: httpx.AsyncClient,
+        bluesky_oauth,
+        save_bundle,
+    ) -> bool:
+        """Return True if the caller should retry the original request."""
+        try:
+            body = resp.json() or {}
+        except Exception:
+            return False
+        err = body.get("error", "")
+        if err == "use_dpop_nonce":
+            nonce = resp.headers.get("DPoP-Nonce")
+            if nonce:
+                creds["dpop_nonce"] = nonce
+                save_bundle("bluesky", creds["uuid"], creds)
+                return True
+        if resp.status_code == 401 or err in ("invalid_token", "expired_token"):
+            await self._refresh_access_token(creds, client, bluesky_oauth, save_bundle)
+            return True
+        return False
+
+    async def _ensure_fresh_token(
+        self, creds: dict, client: httpx.AsyncClient, bluesky_oauth, save_bundle,
+    ) -> None:
+        expires_at = int(creds.get("expires_at") or 0)
+        if expires_at and expires_at - 60 > int(time.time()):
+            return
+        if not creds.get("refresh_token"):
+            return
+        await self._refresh_access_token(creds, client, bluesky_oauth, save_bundle)
+
+    async def _refresh_access_token(
+        self, creds: dict, client: httpx.AsyncClient, bluesky_oauth, save_bundle,
+    ) -> None:
+        result = await bluesky_oauth.refresh_tokens(
+            refresh_token=creds["refresh_token"],
+            private_key_pem=creds["private_key_pem"],
+            token_endpoint=creds["token_endpoint"],
+            redirect_uri=creds["redirect_uri"],
+            nonce=creds.get("dpop_nonce"),
+            client=client,
+        )
+        creds["access_token"] = result["access_token"]
+        if result.get("refresh_token"):
+            creds["refresh_token"] = result["refresh_token"]
+        if result.get("expires_in"):
+            creds["expires_at"] = int(time.time()) + int(result["expires_in"])
+        if result.get("dpop_nonce"):
+            creds["dpop_nonce"] = result["dpop_nonce"]
+        save_bundle("bluesky", creds["uuid"], creds)
+
+    async def _upload_blob(
+        self, creds: dict, path: Path, client: httpx.AsyncClient, bluesky_oauth, save_bundle,
+    ) -> dict:
+        url = f"{creds['pds'].rstrip('/')}/xrpc/com.atproto.repo.uploadBlob"
+        mime, _ = mimetypes.guess_type(path.name)
+        mime = mime or "application/octet-stream"
+        data = path.read_bytes()
+
+        async def _do() -> httpx.Response:
+            proof = bluesky_oauth.sign_dpop_proof(
+                creds["private_key_pem"], "POST", url,
+                nonce=creds.get("dpop_nonce"),
+                access_token=creds["access_token"],
+            )
+            return await client.post(
+                url,
+                headers={
+                    "Authorization": f"DPoP {creds['access_token']}",
+                    "DPoP": proof,
+                    "Content-Type": mime,
+                },
+                content=data,
+            )
+
+        resp = await _do()
+        if resp.status_code in (400, 401):
+            if await self._handle_dpop_or_token_error(resp, creds, client, bluesky_oauth, save_bundle):
+                resp = await _do()
+
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"Bluesky uploadBlob failed: HTTP {resp.status_code} {resp.text}"
+            )
+
+        self._stash_nonce(creds, resp, save_bundle)
+        body = resp.json() or {}
+        blob = body.get("blob")
+        if not isinstance(blob, dict):
+            raise RuntimeError(f"uploadBlob returned no blob: {body}")
+        return blob
+
+    @classmethod
+    def bundle_is_configured(cls, bundle: dict) -> bool:
+        if bundle.get("auth_method") != "oauth":
+            return False
+        return all(bundle.get(k) for k in cls.required_keys)
 
 
 class MastodonPoster(SocialPoster):
@@ -476,8 +649,14 @@ PLATFORM_FIELDS: dict[str, list[dict]] = {
         {"key": "username", "label": "Username", "type": "text", "secret": False},
     ],
     "bluesky": [
-        {"key": "handle", "label": "Handle", "type": "text", "secret": False, "placeholder": "you.bsky.social"},
-        {"key": "app_password", "label": "App Password", "type": "password", "secret": True},
+        # OAuth-only. Connect with Bluesky populates handle/did/pds and the
+        # tokens; the displayed values here are read-only and masked where
+        # they're sensitive (private_key_pem, tokens).
+        {"key": "handle", "label": "Handle", "type": "text", "secret": False},
+        {"key": "did", "label": "DID", "type": "text", "secret": False},
+        {"key": "pds", "label": "PDS endpoint", "type": "text", "secret": False},
+        {"key": "access_token", "label": "Access token", "type": "password", "secret": True},
+        {"key": "refresh_token", "label": "Refresh token", "type": "password", "secret": True},
     ],
     "mastodon": [
         {"key": "instance_url", "label": "Instance URL", "type": "text", "secret": False, "placeholder": "https://mastodon.social"},
@@ -496,7 +675,7 @@ PLATFORM_FIELDS: dict[str, list[dict]] = {
 
 PLATFORM_DESCRIPTIONS: dict[str, str] = {
     "twitter": "Click 'Connect with X (OAuth 2.0)' below. Requires a paid X API tier (Free tier can't post). Posts and media uploads use the v2 API.",
-    "bluesky": "Use an App Password from bsky.app → Settings → App Passwords. Free.",
+    "bluesky": "Click 'Connect with Bluesky' below and enter your handle (e.g. you.bsky.social). Bluesky's OAuth flow handles the rest. Free.",
     "mastodon": "Create an app in your instance's Settings → Development → New Application. Free.",
     "linkedin": "Requires LinkedIn app with w_member_social scope. Get person URN from /v2/me.",
     "threads": "Requires Meta developer app with threads_publish scope.",
@@ -515,11 +694,11 @@ PLATFORM_SETUP_GUIDES: dict[str, list[str]] = {
         "Click Connect with X (OAuth 2.0) below and paste those values when prompted.",
     ],
     "bluesky": [
-        "Open https://bsky.app/settings/app-passwords (Settings → Privacy and security → App passwords).",
-        "Click Add App Password, name it (e.g. Youtube Publisher), leave DM access unchecked, Create.",
-        "Copy the generated password — shown only once, format xxxx-xxxx-xxxx-xxxx.",
-        "Handle field: your full handle like yourname.bsky.social (no @).",
-        "App Password field: paste the generated password.",
+        "Click Connect with Bluesky below.",
+        "Enter your handle when prompted (e.g. yourname.bsky.social — no @).",
+        "A popup opens to bsky.social. Sign in and approve the requested scopes.",
+        "When you land back here you're done — no app password to copy or paste.",
+        "Tokens auto-refresh. If Bluesky revokes them or you sign out remotely, the credential will show 'needs re-auth' and you can click Connect again.",
     ],
     "mastodon": [
         "Sign in at your Mastodon instance (e.g. https://mastodon.social).",

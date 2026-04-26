@@ -17,12 +17,12 @@ dependencies = [
     "httpx>=0.28,<1",
     "aiosqlite>=0.20,<1",
     "python-dotenv>=1.0,<2",
+    "cryptography>=42,<46",
 ]
 
 [project.optional-dependencies]
 social = [
     "tweepy>=4.14,<5",
-    "atproto>=0.0.55,<1",
     "Mastodon.py>=1.8,<2",
 ]
 # yt-dlp lets us download a video file on demand when the user asks to

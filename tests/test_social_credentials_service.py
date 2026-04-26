@@ -222,9 +222,22 @@ async def test_get_first_active_credential(app_db) -> None:
 
 async def test_get_poster_for_account_round_trip(app_db) -> None:
     creds, social, _db = app_db
+    # Bluesky bundles must carry the full OAuth shape post-Phase F. The
+    # round-trip here doesn't exercise an actual post — it only verifies
+    # that the poster reads its bundle back and reports as configured.
     row = await creds.upsert_credential(
         "bluesky", "did:plc:abc", "me.bsky.social",
-        {"handle": "me.bsky.social", "app_password": "secret"},
+        {
+            "auth_method": "oauth",
+            "handle": "me.bsky.social",
+            "did": "did:plc:abc",
+            "pds": "https://example.test",
+            "private_key_pem": "fake-pem",
+            "access_token": "tok",
+            "refresh_token": "rfr",
+            "token_endpoint": "https://example.test/token",
+            "redirect_uri": "http://127.0.0.1:8008/api/oauth/bluesky/callback",
+        },
     )
     poster = await social.get_poster_for_account(row["id"])
     assert poster.platform == "bluesky"

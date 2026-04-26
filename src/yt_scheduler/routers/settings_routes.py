@@ -185,11 +185,14 @@ async def get_social_config(platform: str):
 
 def _provider_id_from_paste(platform: str, data: dict) -> tuple[str | None, str | None]:
     """Derive a stable id + display username from a paste-form payload, for
-    platforms that don't go through OAuth (Bluesky). Returns (None, None)
-    when the data doesn't carry enough to identify the account."""
+    platforms whose paste form predates OAuth. Bluesky is OAuth-only and
+    rejects this path explicitly to avoid resurrecting app-password
+    bundles."""
     if platform == "bluesky":
-        handle = (data.get("handle") or "").strip()
-        return (handle or None), (handle or None)
+        # OAuth-only. The Settings UI no longer sends paste-form payloads
+        # for Bluesky — Connect with Bluesky → /api/oauth/bluesky/start
+        # is the only way to create a credential.
+        return None, None
     if platform == "threads":
         user_id = (data.get("user_id") or "").strip()
         username = (data.get("username") or "").strip()
@@ -214,11 +217,20 @@ async def update_social_config(platform: str, data: dict):
     """Update social media credentials for a platform.
 
     When an active credential exists, the paste-form fields are merged
-    into its existing bundle. Otherwise (Bluesky and other paste-only
-    platforms) a new credential row is created.
+    into its existing bundle. Otherwise (other paste-only platforms) a
+    new credential row is created. Bluesky is OAuth-only and rejects this
+    path outright so an arbitrary form payload can't pollute the OAuth
+    bundle's keys (e.g. resurrect ``app_password`` alongside the access
+    token).
     """
     if platform not in ALL_PLATFORMS:
         raise HTTPException(400, f"Unknown platform: {platform}")
+    if platform == "bluesky":
+        raise HTTPException(
+            400,
+            "Bluesky is OAuth-only. Use POST /api/oauth/bluesky/start "
+            "(Connect with Bluesky in Settings).",
+        )
 
     fresh_values = {k: v for k, v in data.items() if v}
     if not fresh_values:

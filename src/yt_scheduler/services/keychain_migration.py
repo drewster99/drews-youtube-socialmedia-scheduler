@@ -38,6 +38,7 @@ from yt_scheduler.services.keychain import (
 logger = logging.getLogger(__name__)
 
 MIGRATION_MARKER_KEY = "_migrated_v8"
+BLUESKY_OAUTH_MARKER_KEY = "_migrated_v9_oauth_only"
 CREDENTIAL_KEY_PREFIX = "cred."
 PLATFORMS = ("twitter", "mastodon", "linkedin", "threads", "bluesky")
 
@@ -219,6 +220,60 @@ async def _migrate_platform(platform: str) -> None:
     )
 
 
+async def _wipe_bluesky_app_password_bundles() -> None:
+    """One-shot drop of pre-OAuth Bluesky bundles.
+
+    With Phase F, Bluesky is OAuth-only. Any bundle that doesn't carry
+    ``auth_method == "oauth"`` is from the app-password era and would
+    fail at post time with a confusing error. We delete the Keychain
+    bundle and soft-delete the row so the UI prompts the user to
+    re-connect via the new Connect with Bluesky flow.
+    """
+    if load_secret("bluesky", BLUESKY_OAUTH_MARKER_KEY):
+        return
+
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT id, uuid, credentials_ref FROM social_accounts "
+        "WHERE platform = 'bluesky' AND deleted_at IS NULL"
+    )
+    rows = await cursor.fetchall()
+    wiped = 0
+    for row in rows:
+        uuid = row["uuid"]
+        if uuid.startswith("__pending__:"):
+            continue
+        bundle_raw = load_secret("bluesky", f"{CREDENTIAL_KEY_PREFIX}{uuid}")
+        keep = False
+        if bundle_raw:
+            try:
+                bundle = json.loads(bundle_raw)
+                if isinstance(bundle, dict) and bundle.get("auth_method") == "oauth":
+                    keep = True
+            except json.JSONDecodeError:
+                pass
+        if keep:
+            continue
+        delete_secret("bluesky", f"{CREDENTIAL_KEY_PREFIX}{uuid}")
+        await db.execute(
+            "UPDATE social_accounts SET deleted_at = datetime('now') WHERE id = ?",
+            (int(row["id"]),),
+        )
+        await db.execute(
+            "DELETE FROM project_social_defaults WHERE social_account_id = ?",
+            (int(row["id"]),),
+        )
+        wiped += 1
+    if wiped:
+        await db.commit()
+        logger.info(
+            "Bluesky OAuth migration: soft-deleted %d app-password credential(s)",
+            wiped,
+        )
+
+    store_secret("bluesky", BLUESKY_OAUTH_MARKER_KEY, "1")
+
+
 async def migrate_to_per_credential_bundles() -> None:
     """Run migration for every supported platform. Idempotent."""
     for platform in PLATFORMS:
@@ -229,3 +284,9 @@ async def migrate_to_per_credential_bundles() -> None:
                 "Keychain migration for %s failed (will retry next boot): %s",
                 platform, exc,
             )
+    try:
+        await _wipe_bluesky_app_password_bundles()
+    except Exception as exc:
+        logger.warning(
+            "Bluesky OAuth-only wipe failed (will retry next boot): %s", exc
+        )

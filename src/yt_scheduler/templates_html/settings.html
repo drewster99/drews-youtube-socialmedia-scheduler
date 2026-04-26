@@ -264,7 +264,7 @@ function renderPlatformCard(name, config, accounts) {
         : `<div class="credentials-list">${accounts.map(c => renderCredentialRow(c)).join('')}</div>`;
 
     const addButton = renderAddAccountButton(name);
-    const blueskyForm = name === 'bluesky' ? renderBlueskyPasteForm(name) : '';
+    const blueskyForm = '';
     const threadsExchange = name === 'threads'
         ? `<p class="form-hint" style="margin-top: 0.75rem;">
               Local installs can also paste a short-lived token from the Graph API Explorer:
@@ -325,32 +325,9 @@ function renderAddAccountButton(name) {
     } else if (name === 'threads') {
         return `<button class="btn btn-sm btn-success" onclick="connectThreads()">+ Add account</button>`;
     } else if (name === 'bluesky') {
-        // Bluesky paste form is rendered inline; the button just scrolls the form into view.
-        return `<button class="btn btn-sm btn-success" onclick="document.getElementById('bluesky-handle').focus()">+ Add account</button>`;
+        return `<button class="btn btn-sm btn-success" onclick="connectBluesky()">+ Add account</button>`;
     }
     return '';
-}
-
-function renderBlueskyPasteForm(name) {
-    return `
-        <div class="bluesky-paste-form" style="margin-top: 0.75rem; padding: 0.75rem; background: var(--bg-elevated); border-radius: 6px;">
-            <h4 style="margin:0 0 0.5rem 0; font-size: 0.95rem;">Add Bluesky account</h4>
-            <p class="form-hint" style="margin: 0 0 0.5rem 0;">
-                AT-proto OAuth is coming. For now, paste a handle + app password from
-                bsky.app → Settings → App Passwords.
-            </p>
-            <div class="form-row">
-                <div class="form-group">
-                    <label>Handle</label>
-                    <input id="bluesky-handle" type="text" placeholder="you.bsky.social" autocomplete="off">
-                </div>
-                <div class="form-group">
-                    <label>App password</label>
-                    <input id="bluesky-app-password" type="password" placeholder="xxxx-xxxx-xxxx-xxxx" autocomplete="off">
-                </div>
-            </div>
-            <button class="btn btn-sm btn-primary" onclick="saveBlueskyAccount()">Save Bluesky account</button>
-        </div>`;
 }
 
 async function connectLinkedIn() {
@@ -424,23 +401,16 @@ async function exchangeThreadsToken() {
     }
 }
 
-async function saveBlueskyAccount() {
-    const handle = document.getElementById('bluesky-handle').value.trim();
-    const password = document.getElementById('bluesky-app-password').value.trim();
-    if (!handle || !password) {
-        showToast('Both fields are required', 'error');
-        return;
-    }
-    const resp = await fetch('/api/settings/social/bluesky', {
-        method: 'PUT',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({handle, app_password: password}),
-    });
-    if (resp.ok) {
-        showToast(`Bluesky account @${handle} saved`, 'success');
-        document.getElementById('bluesky-handle').value = '';
-        document.getElementById('bluesky-app-password').value = '';
-        loadSocialPlatforms();
+async function connectBluesky() {
+    const handle = prompt('Your Bluesky handle (e.g. you.bsky.social — no @):');
+    if (!handle) return;
+    try {
+        await openOAuthPopup('/api/oauth/bluesky/start', {
+            origin: window.location.origin,
+            handle: handle.trim(),
+        });
+    } catch (err) {
+        // openOAuthPopup already showed a toast.
     }
 }
 
