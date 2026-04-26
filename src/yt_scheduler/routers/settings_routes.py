@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 from fastapi import APIRouter, HTTPException
 
 from yt_scheduler.config import (
@@ -12,10 +14,8 @@ from yt_scheduler.config import (
 from yt_scheduler.database import get_db
 from yt_scheduler.services import moderation
 from yt_scheduler.services.keychain import (
-    delete_all_secrets,
     delete_secret,
     get_storage_type,
-    load_all_secrets,
     store_secret,
 )
 from yt_scheduler.services.social import (
@@ -24,6 +24,14 @@ from yt_scheduler.services.social import (
     PLATFORM_FIELDS,
     PLATFORM_SETUP_GUIDES,
     get_poster,
+)
+from yt_scheduler.services.social_credentials import (
+    get_first_active_credential,
+    list_credentials,
+    load_bundle,
+    save_bundle,
+    soft_delete_credential,
+    upsert_credential,
 )
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -112,33 +120,44 @@ async def delete_anthropic_key():
 # --- Social Media Credentials ---
 
 
+async def _bundle_view_for_platform(platform: str) -> dict:
+    """Return the active credential's bundle (or empty dict) for legacy
+    settings UI rendering. The Phase A→C transitional view always reflects
+    the first active credential."""
+    cred = await get_first_active_credential(platform)
+    if cred is None:
+        return {}
+    return load_bundle(platform, cred["uuid"]) or {}
+
+
+def _stored_view(bundle: dict, fields: list[dict]) -> dict:
+    stored = {}
+    for field in fields:
+        key = field["key"]
+        value = bundle.get(key, "") or ""
+        if value and field.get("secret"):
+            stored[key] = (value[:4] + "...") if len(value) > 4 else "***"
+        elif value:
+            stored[key] = value
+        else:
+            stored[key] = ""
+    return stored
+
+
 @router.get("/social")
 async def list_social_platforms():
     """List all social platforms with their configuration status and field definitions."""
     result = {}
     for platform in ALL_PLATFORMS:
         poster = get_poster(platform)
-        creds = load_all_secrets(platform)
-
-        # Build masked view of stored credentials
+        bundle = await _bundle_view_for_platform(platform)
         fields = PLATFORM_FIELDS.get(platform, [])
-        stored = {}
-        for field in fields:
-            key = field["key"]
-            value = creds.get(key, "")
-            if value and field.get("secret"):
-                stored[key] = value[:4] + "..." if len(value) > 4 else "***"
-            elif value:
-                stored[key] = value
-            else:
-                stored[key] = ""
-
         result[platform] = {
             "configured": await poster.is_configured(),
             "description": PLATFORM_DESCRIPTIONS.get(platform, ""),
             "setup_guide": PLATFORM_SETUP_GUIDES.get(platform, []),
             "fields": fields,
-            "stored": stored,
+            "stored": _stored_view(bundle, fields),
             "storage": get_storage_type(),
         }
     return result
@@ -151,54 +170,111 @@ async def get_social_config(platform: str):
         raise HTTPException(400, f"Unknown platform: {platform}")
 
     poster = get_poster(platform)
-    creds = load_all_secrets(platform)
+    bundle = await _bundle_view_for_platform(platform)
     fields = PLATFORM_FIELDS.get(platform, [])
-
-    stored = {}
-    for field in fields:
-        key = field["key"]
-        value = creds.get(key, "")
-        if value and field.get("secret"):
-            stored[key] = value[:4] + "..." if len(value) > 4 else "***"
-        elif value:
-            stored[key] = value
-        else:
-            stored[key] = ""
 
     return {
         "configured": await poster.is_configured(),
         "description": PLATFORM_DESCRIPTIONS.get(platform, ""),
         "setup_guide": PLATFORM_SETUP_GUIDES.get(platform, []),
         "fields": fields,
-        "stored": stored,
+        "stored": _stored_view(bundle, fields),
         "storage": get_storage_type(),
     }
+
+
+def _provider_id_from_paste(platform: str, data: dict) -> tuple[str | None, str | None]:
+    """Derive a stable id + display username from a paste-form payload, for
+    platforms that don't go through OAuth (Bluesky). Returns (None, None)
+    when the data doesn't carry enough to identify the account."""
+    if platform == "bluesky":
+        handle = (data.get("handle") or "").strip()
+        return (handle or None), (handle or None)
+    if platform == "threads":
+        user_id = (data.get("user_id") or "").strip()
+        username = (data.get("username") or "").strip()
+        return (user_id or None), (username or user_id or None)
+    if platform == "linkedin":
+        urn = (data.get("person_urn") or "").strip()
+        return (urn or None), (urn or None)
+    if platform == "mastodon":
+        instance = (data.get("instance_url") or "").strip().rstrip("/")
+        token = (data.get("access_token") or "").strip()
+        if instance and token:
+            host = urlparse(instance).netloc
+            return (f"paste:{host or instance}:{token[:8]}", f"mastodon@{host or instance}")
+        return None, None
+    if platform == "twitter":
+        return None, (data.get("username") or "").strip() or None
+    return None, None
 
 
 @router.put("/social/{platform}")
 async def update_social_config(platform: str, data: dict):
     """Update social media credentials for a platform.
 
-    Stores all values in Keychain (macOS) or encrypted secrets file.
+    When an active credential exists, the paste-form fields are merged
+    into its existing bundle. Otherwise (Bluesky and other paste-only
+    platforms) a new credential row is created.
     """
     if platform not in ALL_PLATFORMS:
         raise HTTPException(400, f"Unknown platform: {platform}")
 
-    for key, value in data.items():
-        if value:  # Don't store empty strings
-            store_secret(platform, key, value)
+    fresh_values = {k: v for k, v in data.items() if v}
+    if not fresh_values:
+        return {"status": "ok", "storage": get_storage_type()}
 
-    return {"status": "ok", "storage": get_storage_type()}
+    cred = await get_first_active_credential(platform)
+    if cred is not None:
+        bundle = load_bundle(platform, cred["uuid"]) or {}
+        bundle.update(fresh_values)
+        save_bundle(platform, cred["uuid"], bundle)
+        return {
+            "status": "ok",
+            "storage": get_storage_type(),
+            "social_account_id": cred["id"],
+            "uuid": cred["uuid"],
+        }
+
+    provider_id, username = _provider_id_from_paste(platform, data)
+    if not provider_id or not username:
+        raise HTTPException(
+            400,
+            f"Cannot create a {platform} credential from this form. "
+            "Use the OAuth flow instead.",
+        )
+    new_cred = await upsert_credential(
+        platform=platform,
+        provider_account_id=provider_id,
+        username=username,
+        bundle=fresh_values,
+    )
+    return {
+        "status": "ok",
+        "storage": get_storage_type(),
+        "social_account_id": new_cred["id"],
+        "uuid": new_cred["uuid"],
+    }
 
 
 @router.delete("/social/{platform}")
 async def delete_social_config(platform: str):
-    """Remove all credentials for a platform."""
+    """Soft-delete every active credential for a platform.
+
+    The Phase C settings redesign exposes per-credential delete; this
+    endpoint is the transitional 'wipe this platform' button kept around
+    for the existing legacy UI. Each removal is the same soft-delete used
+    elsewhere — bundles purged from Keychain, ``social_accounts`` rows
+    keep ``deleted_at`` set so any template slot that pointed at one
+    still shows 'Missing credential'.
+    """
     if platform not in ALL_PLATFORMS:
         raise HTTPException(400, f"Unknown platform: {platform}")
 
-    delete_all_secrets(platform)
-    return {"status": "ok"}
+    creds = await list_credentials(platform=platform, include_deleted=False)
+    for cred in creds:
+        await soft_delete_credential(cred["uuid"])
+    return {"status": "ok", "deleted": len(creds)}
 
 
 # --- Blocklist ---

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
+import logging
 import secrets
 import time
 from urllib.parse import urlencode, urlparse
@@ -19,7 +21,21 @@ import httpx
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 
-from yt_scheduler.services.keychain import load_secret, store_secret
+from yt_scheduler.config import YOUTUBE_SCOPES
+from yt_scheduler.database import get_db
+from yt_scheduler.services.auth import (
+    channel_id_from_credentials,
+    get_client_secret_dict,
+    has_client_secret,
+    store_credentials,
+)
+from yt_scheduler.services.projects import slugify
+from yt_scheduler.services.social_credentials import (
+    display_name_for,
+    upsert_credential,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/oauth", tags=["oauth"])
 
@@ -35,6 +51,8 @@ TWITTER_SCOPES = "tweet.read tweet.write users.read offline.access media.write"
 
 MASTODON_REDIRECT_PATH = "/api/oauth/mastodon/callback"
 MASTODON_SCOPES = "read write"
+
+YOUTUBE_REDIRECT_PATH = "/api/oauth/youtube/callback"
 
 # Pending OAuth starts keyed by state. Held in-process only: if the server
 # restarts between start and callback, the user has to re-click Connect.
@@ -55,12 +73,14 @@ def _gc_pending() -> None:
 async def linkedin_start(data: dict):
     """Begin the LinkedIn OAuth flow.
 
-    Request body: {"client_id": "...", "client_secret": "...", "origin": "http://127.0.0.1:8008"}
-    Returns: {"auth_url": "https://www.linkedin.com/oauth/v2/authorization?..."}
+    Request body: ``{"client_id": "...", "client_secret": "...",
+    "origin": "http://127.0.0.1:8008", "project_slug": "..." (optional)}``
+    Returns: ``{"auth_url": "https://www.linkedin.com/oauth/v2/authorization?..."}``
     """
     client_id = (data.get("client_id") or "").strip()
     client_secret = (data.get("client_secret") or "").strip()
     origin = (data.get("origin") or "").rstrip("/")
+    project_slug = (data.get("project_slug") or "").strip() or None
     if not client_id or not client_secret or not origin:
         raise HTTPException(400, "client_id, client_secret, and origin are required")
 
@@ -68,9 +88,11 @@ async def linkedin_start(data: dict):
     state = secrets.token_urlsafe(24)
     redirect_uri = f"{origin}{LINKEDIN_REDIRECT_PATH}"
     _pending[state] = {
+        "platform": "linkedin",
         "client_id": client_id,
         "client_secret": client_secret,
         "redirect_uri": redirect_uri,
+        "project_slug": project_slug,
         "ts": time.time(),
     }
 
@@ -133,20 +155,33 @@ async def linkedin_callback(code: str | None = None, state: str | None = None, e
     if ui.status_code != 200:
         return _result_page(False, f"/v2/userinfo failed ({ui.status_code}): {ui.text}")
 
-    sub = (ui.json() or {}).get("sub")
+    ui_data = ui.json() or {}
+    sub = ui_data.get("sub")
     if not sub:
         return _result_page(False, "userinfo response missing sub claim.")
     person_urn = f"urn:li:person:{sub}"
+    display_name = ui_data.get("name") or ui_data.get("email") or person_urn
 
-    # Persist to Keychain (or encrypted file on non-mac). We also stash
-    # client_id + client_secret so a future "Refresh" button could re-run the
-    # flow without the user pasting credentials again.
-    store_secret("linkedin", "access_token", access_token)
-    store_secret("linkedin", "person_urn", person_urn)
-    store_secret("linkedin", "client_id", pending["client_id"])
-    store_secret("linkedin", "client_secret", pending["client_secret"])
-
-    return _result_page(True, "LinkedIn connected. You can close this tab.", platform="linkedin")
+    bundle = {
+        "access_token": access_token,
+        "person_urn": person_urn,
+        "client_id": pending["client_id"],
+        "client_secret": pending["client_secret"],
+    }
+    cred = await _persist_oauth_credential(
+        platform="linkedin",
+        provider_account_id=sub,
+        username=display_name,
+        bundle=bundle,
+        project_slug=pending.get("project_slug"),
+        display_name=display_name,
+    )
+    return _result_page(
+        True,
+        f"LinkedIn connected as {display_name}.",
+        platform="linkedin",
+        payload=_success_payload(cred, pending.get("project_slug")),
+    )
 
 
 @router.post("/threads/start")
@@ -159,6 +194,7 @@ async def threads_start(data: dict):
     client_id = (data.get("client_id") or "").strip()
     client_secret = (data.get("client_secret") or "").strip()
     origin = (data.get("origin") or "").rstrip("/")
+    project_slug = (data.get("project_slug") or "").strip() or None
     if not client_id or not client_secret or not origin:
         raise HTTPException(400, "client_id, client_secret, and origin are required")
 
@@ -170,6 +206,7 @@ async def threads_start(data: dict):
         "client_id": client_id,
         "client_secret": client_secret,
         "redirect_uri": redirect_uri,
+        "project_slug": project_slug,
         "ts": time.time(),
     }
 
@@ -258,14 +295,29 @@ async def threads_callback(code: str | None = None, state: str | None = None, er
     if not user_id:
         return _result_page(False, "Could not resolve Threads user_id.", platform="threads")
 
-    store_secret("threads", "access_token", access_token)
-    store_secret("threads", "user_id", str(user_id))
+    bundle = {
+        "access_token": access_token,
+        "user_id": str(user_id),
+        "client_id": pending["client_id"],
+        "client_secret": pending["client_secret"],
+    }
     if username:
-        store_secret("threads", "username", username)
-    store_secret("threads", "client_id", pending["client_id"])
-    store_secret("threads", "client_secret", pending["client_secret"])
+        bundle["username"] = username
 
-    return _result_page(True, f"Threads connected as @{username or user_id}. You can close this tab.", platform="threads")
+    cred = await _persist_oauth_credential(
+        platform="threads",
+        provider_account_id=str(user_id),
+        username=username or str(user_id),
+        bundle=bundle,
+        project_slug=pending.get("project_slug"),
+        is_nickname=not username,
+    )
+    return _result_page(
+        True,
+        f"Threads connected as @{username or user_id}.",
+        platform="threads",
+        payload=_success_payload(cred, pending.get("project_slug")),
+    )
 
 
 @router.post("/threads/exchange")
@@ -324,13 +376,30 @@ async def threads_exchange(data: dict):
     if not user_id:
         raise HTTPException(502, "Response missing user id")
 
-    store_secret("threads", "access_token", access_token)
-    store_secret("threads", "user_id", str(user_id))
+    bundle = {
+        "access_token": access_token,
+        "user_id": str(user_id),
+        "client_secret": app_secret,
+    }
     if username:
-        store_secret("threads", "username", username)
-    store_secret("threads", "client_secret", app_secret)
+        bundle["username"] = username
 
-    return {"ok": True, "user_id": str(user_id), "username": username, "expires_in": long_data.get("expires_in")}
+    cred = await upsert_credential(
+        platform="threads",
+        provider_account_id=str(user_id),
+        username=username or str(user_id),
+        bundle=bundle,
+        is_nickname=not username,
+    )
+
+    return {
+        "ok": True,
+        "user_id": str(user_id),
+        "username": username,
+        "social_account_id": cred["id"],
+        "uuid": cred["uuid"],
+        "expires_in": long_data.get("expires_in"),
+    }
 
 
 # --- Twitter / X — OAuth 2.0 PKCE -----------------------------------------
@@ -355,6 +424,7 @@ async def twitter_start(data: dict):
     client_id = (data.get("client_id") or "").strip()
     client_secret = (data.get("client_secret") or "").strip()
     origin = (data.get("origin") or "").rstrip("/")
+    project_slug = (data.get("project_slug") or "").strip() or None
     if not client_id or not origin:
         raise HTTPException(400, "client_id and origin are required")
 
@@ -368,6 +438,7 @@ async def twitter_start(data: dict):
         "client_secret": client_secret,
         "redirect_uri": redirect_uri,
         "code_verifier": verifier,
+        "project_slug": project_slug,
         "ts": time.time(),
     }
 
@@ -431,8 +502,9 @@ async def twitter_callback(
     if not access_token:
         return _result_page(False, f"Missing access_token: {token_data}", platform="twitter")
 
-    # Fetch the @handle so the user can see which account they connected.
+    # Fetch the @handle + numeric id so we can identify the account stably.
     username = ""
+    user_id = ""
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             me = await client.get(
@@ -440,20 +512,44 @@ async def twitter_callback(
                 headers={"Authorization": f"Bearer {access_token}"},
             )
         if me.status_code == 200:
-            username = (me.json().get("data") or {}).get("username", "")
+            data = (me.json().get("data") or {})
+            username = data.get("username", "")
+            user_id = data.get("id", "")
     except Exception:
         pass
 
-    store_secret("twitter", "bearer_token", access_token)
-    if refresh_token:
-        store_secret("twitter", "refresh_token", refresh_token)
-    if pending.get("client_secret"):
-        store_secret("twitter", "client_secret", pending["client_secret"])
-    store_secret("twitter", "client_id", pending["client_id"])
-    if username:
-        store_secret("twitter", "username", username)
+    if not user_id:
+        return _result_page(
+            False,
+            "Could not resolve X user id. The provided OAuth scope must include users.read.",
+            platform="twitter",
+        )
 
-    return _result_page(True, f"X connected as @{username or '?'}.", platform="twitter")
+    bundle = {
+        "bearer_token": access_token,
+        "client_id": pending["client_id"],
+    }
+    if refresh_token:
+        bundle["refresh_token"] = refresh_token
+    if pending.get("client_secret"):
+        bundle["client_secret"] = pending["client_secret"]
+    if username:
+        bundle["username"] = username
+
+    cred = await _persist_oauth_credential(
+        platform="twitter",
+        provider_account_id=str(user_id),
+        username=username or str(user_id),
+        bundle=bundle,
+        project_slug=pending.get("project_slug"),
+        is_nickname=not username,
+    )
+    return _result_page(
+        True,
+        f"X connected as @{username or user_id}.",
+        platform="twitter",
+        payload=_success_payload(cred, pending.get("project_slug")),
+    )
 
 
 # --- Mastodon — per-instance dynamic client registration ------------------
@@ -470,6 +566,7 @@ async def mastodon_start(data: dict):
     """
     instance_raw = (data.get("instance_url") or "").strip().rstrip("/")
     origin = (data.get("origin") or "").rstrip("/")
+    project_slug = (data.get("project_slug") or "").strip() or None
     if not instance_raw or not origin:
         raise HTTPException(400, "instance_url and origin are required")
     parsed = urlparse(instance_raw if "://" in instance_raw else f"https://{instance_raw}")
@@ -507,6 +604,7 @@ async def mastodon_start(data: dict):
         "client_id": client_id,
         "client_secret": client_secret,
         "redirect_uri": redirect_uri,
+        "project_slug": project_slug,
         "ts": time.time(),
     }
 
@@ -559,6 +657,7 @@ async def mastodon_callback(
         return _result_page(False, "Mastodon response missing access_token.", platform="mastodon")
 
     handle = ""
+    account_id = ""
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             verify = await client.get(
@@ -566,25 +665,324 @@ async def mastodon_callback(
                 headers={"Authorization": f"Bearer {access_token}"},
             )
         if verify.status_code == 200:
-            handle = verify.json().get("acct") or verify.json().get("username") or ""
+            verify_data = verify.json()
+            handle = verify_data.get("acct") or verify_data.get("username") or ""
+            account_id = str(verify_data.get("id") or "")
     except Exception:
         pass
 
-    store_secret("mastodon", "instance_url", instance)
-    store_secret("mastodon", "access_token", access_token)
-    store_secret("mastodon", "client_id", pending["client_id"])
-    store_secret("mastodon", "client_secret", pending["client_secret"])
+    host = urlparse(instance).netloc
+    if handle and "@" not in handle and host:
+        handle = f"{handle}@{host}"
+
+    if not account_id:
+        return _result_page(
+            False,
+            "Could not resolve Mastodon account id. Check that the access token has the read scope.",
+            platform="mastodon",
+        )
+    provider_account_id = f"{account_id}@{host}" if host else account_id
+
+    bundle = {
+        "instance_url": instance,
+        "access_token": access_token,
+        "client_id": pending["client_id"],
+        "client_secret": pending["client_secret"],
+    }
     if handle:
-        store_secret("mastodon", "username", handle)
+        bundle["username"] = handle
 
-    return _result_page(True, f"Mastodon connected as {handle or 'user'}.", platform="mastodon")
+    cred = await _persist_oauth_credential(
+        platform="mastodon",
+        provider_account_id=provider_account_id,
+        username=handle or account_id,
+        bundle=bundle,
+        project_slug=pending.get("project_slug"),
+        is_nickname=not handle,
+    )
+    return _result_page(
+        True,
+        f"Mastodon connected as @{handle or account_id}.",
+        platform="mastodon",
+        payload=_success_payload(cred, pending.get("project_slug")),
+    )
 
 
-def _result_page(ok: bool, message: str, platform: str = "linkedin") -> HTMLResponse:
-    """Small self-contained HTML page shown in the popup/tab after callback."""
+# --- YouTube web OAuth -------------------------------------------------------
+#
+# Two start modes:
+#   * ``re_auth`` re-authenticates an existing project. Same channel id ⇒
+#     tokens are refreshed; different channel id ⇒ rejected (and the old
+#     tokens stay in place).
+#   * ``pre_create`` is the first step of the new-project wizard. The
+#     project row is INSERTed only when the OAuth callback resolves a
+#     channel id that isn't already claimed by another project. This keeps
+#     half-created projects out of the DB.
+
+
+@router.post("/youtube/start")
+async def youtube_start(data: dict):
+    """Begin the YouTube OAuth web flow.
+
+    Body shape (one of two modes):
+
+    * ``{"origin": "http://127.0.0.1:8008", "project_slug": "<existing>"}``
+      — re-authenticate the named project.
+    * ``{"origin": "...", "pre_create": {"name": "My new project"}}``
+      — wizard step 2: name was just typed; project row will be created
+      inside the callback if everything checks out.
+
+    Returns ``{"auth_url": "..."}``. Caller should pre-open a popup
+    (see ``openOAuthPopup`` helper in app.js) so the browser preserves
+    the user gesture.
+    """
+    origin = (data.get("origin") or "").rstrip("/")
+    if not origin:
+        raise HTTPException(400, "origin is required")
+    if not has_client_secret():
+        raise HTTPException(
+            400,
+            "No OAuth client configured. Upload your client_secret.json from "
+            "Settings before starting OAuth.",
+        )
+
+    mode_re_auth = (data.get("project_slug") or "").strip() or None
+    pre_create_blob = data.get("pre_create") or None
+    if mode_re_auth and pre_create_blob:
+        raise HTTPException(400, "Provide project_slug OR pre_create, not both")
+    if not mode_re_auth and not pre_create_blob:
+        raise HTTPException(400, "Provide project_slug or pre_create")
+
+    db = await get_db()
+    pre_create: dict | None = None
+
+    if mode_re_auth:
+        cursor = await db.execute(
+            "SELECT id FROM projects WHERE slug = ?", (mode_re_auth,)
+        )
+        if await cursor.fetchone() is None:
+            raise HTTPException(404, f"Project '{mode_re_auth}' not found")
+    else:
+        name = (pre_create_blob.get("name") or "").strip()
+        if not name:
+            raise HTTPException(400, "pre_create.name is required")
+        candidate_slug = slugify(name)
+        cursor = await db.execute(
+            "SELECT id FROM projects WHERE slug = ?", (candidate_slug,)
+        )
+        if await cursor.fetchone() is not None:
+            raise HTTPException(
+                400,
+                f"A project with slug '{candidate_slug}' already exists. "
+                "Pick a different name.",
+            )
+        pre_create = {"name": name, "slug": candidate_slug}
+
+    redirect_uri = f"{origin}{YOUTUBE_REDIRECT_PATH}"
+    config = get_client_secret_dict()
+    if config is None:
+        raise HTTPException(400, "Could not load client_secret config")
+
+    from google_auth_oauthlib.flow import Flow
+
+    try:
+        flow = Flow.from_client_config(
+            config, scopes=YOUTUBE_SCOPES, redirect_uri=redirect_uri,
+        )
+    except Exception as exc:
+        raise HTTPException(400, f"Invalid client_secret config: {exc}") from exc
+
+    state = secrets.token_urlsafe(24)
+    auth_url, _ = flow.authorization_url(
+        prompt="consent",
+        access_type="offline",
+        include_granted_scopes="true",
+        state=state,
+    )
+    _gc_pending()
+    _pending[state] = {
+        "platform": "youtube",
+        "mode": "re_auth" if mode_re_auth else "pre_create",
+        "project_slug": mode_re_auth,
+        "pre_create": pre_create,
+        "redirect_uri": redirect_uri,
+        "ts": time.time(),
+    }
+    return {"auth_url": auth_url}
+
+
+@router.get("/youtube/callback", response_class=HTMLResponse)
+async def youtube_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    error_description: str | None = None,
+):
+    if error:
+        return _result_page(
+            False,
+            f"Google denied authorization: {error} — {error_description or ''}",
+            platform="youtube",
+        )
+    if not code or not state:
+        return _result_page(False, "Missing code or state.", platform="youtube")
+
+    pending = _pending.pop(state, None)
+    if pending is None or pending.get("platform") != "youtube":
+        return _result_page(
+            False,
+            "Unknown or expired OAuth state. Click Connect again.",
+            platform="youtube",
+        )
+
+    config = get_client_secret_dict()
+    if config is None:
+        return _result_page(
+            False,
+            "client_secret config disappeared between start and callback.",
+            platform="youtube",
+        )
+
+    from google_auth_oauthlib.flow import Flow
+
+    try:
+        flow = Flow.from_client_config(
+            config, scopes=YOUTUBE_SCOPES, redirect_uri=pending["redirect_uri"],
+        )
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+    except Exception as exc:
+        return _result_page(
+            False, f"Token exchange failed: {exc}", platform="youtube"
+        )
+
+    channel_id, channel_title, channel_handle = channel_id_from_credentials(creds)
+    if not channel_id:
+        return _result_page(
+            False,
+            "Could not resolve a YouTube channel for these credentials.",
+            platform="youtube",
+        )
+
+    db = await get_db()
+
+    if pending["mode"] == "pre_create":
+        pre = pending["pre_create"] or {}
+        cursor = await db.execute(
+            "SELECT slug, name FROM projects WHERE youtube_channel_id = ?",
+            (channel_id,),
+        )
+        existing = await cursor.fetchone()
+        if existing is not None:
+            return _result_page(
+                False,
+                f"That YouTube channel ({channel_title or channel_id}) is already "
+                f"bound to project '{existing['name']}'.",
+                platform="youtube",
+            )
+
+        cursor = await db.execute(
+            "SELECT id FROM projects WHERE slug = ?", (pre["slug"],)
+        )
+        if await cursor.fetchone() is not None:
+            return _result_page(
+                False,
+                f"Project slug '{pre['slug']}' was claimed before this OAuth completed.",
+                platform="youtube",
+            )
+
+        cursor = await db.execute(
+            "INSERT INTO projects (name, slug, youtube_channel_id) VALUES (?, ?, ?)",
+            (pre["name"], pre["slug"], channel_id),
+        )
+        await db.commit()
+        project_id = int(cursor.lastrowid)
+        store_credentials(pre["slug"], creds)
+
+        from yt_scheduler.services.templates import ensure_default_template
+
+        await ensure_default_template(project_id=project_id)
+
+        return _result_page(
+            True,
+            f"Project '{pre['name']}' created and connected to {channel_title or channel_id}.",
+            platform="youtube",
+            payload={
+                "mode": "pre_create",
+                "slug": pre["slug"],
+                "name": pre["name"],
+                "channel_id": channel_id,
+                "channel_title": channel_title,
+                "channel_handle": channel_handle,
+                "project_id": project_id,
+            },
+        )
+
+    project_slug = pending.get("project_slug")
+    cursor = await db.execute(
+        "SELECT id, name, youtube_channel_id FROM projects WHERE slug = ?",
+        (project_slug,),
+    )
+    project = await cursor.fetchone()
+    if project is None:
+        return _result_page(
+            False,
+            f"Project '{project_slug}' was deleted before this OAuth completed.",
+            platform="youtube",
+        )
+
+    bound = project["youtube_channel_id"]
+    if bound and bound != channel_id:
+        return _result_page(
+            False,
+            f"This project is bound to channel {bound}, but you signed in as "
+            f"{channel_title or channel_id}. Re-authenticate using the bound channel "
+            "or create a new project for the new channel.",
+            platform="youtube",
+        )
+
+    if not bound:
+        await db.execute(
+            "UPDATE projects SET youtube_channel_id = ?, updated_at = datetime('now') "
+            "WHERE id = ?",
+            (channel_id, project["id"]),
+        )
+        await db.commit()
+
+    store_credentials(project_slug, creds)
+    return _result_page(
+        True,
+        f"{project['name']} re-connected to {channel_title or channel_id}.",
+        platform="youtube",
+        payload={
+            "mode": "re_auth",
+            "slug": project_slug,
+            "channel_id": channel_id,
+            "channel_title": channel_title,
+            "channel_handle": channel_handle,
+        },
+    )
+
+
+def _result_page(
+    ok: bool,
+    message: str,
+    platform: str = "linkedin",
+    payload: dict | None = None,
+) -> HTMLResponse:
+    """Small self-contained HTML page shown in the popup/tab after callback.
+
+    ``payload`` is merged into the postMessage body so the opener (settings
+    page or new-project wizard) can refresh its dropdowns from the
+    credential id without a separate fetch.
+    """
     color = "#3fb950" if ok else "#f85149"
     icon = "✓" if ok else "✕"
-    title = platform.capitalize() + " OAuth"
+    title = display_name_for(platform) + " OAuth"
+    message_payload = {"source": "oauth", "platform": platform, "ok": ok}
+    if payload:
+        message_payload.update(payload)
+    payload_json = json.dumps(message_payload)
     body = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>{title}</title>
 <style>
@@ -603,10 +1001,68 @@ def _result_page(ok: bool, message: str, platform: str = "linkedin") -> HTMLResp
   <button onclick="window.close()">Close</button>
 </div>
 <script>
-  // Notify the opener (the Settings page) so it can refresh status.
   if (window.opener) {{
-    try {{ window.opener.postMessage({{source: 'oauth', platform: '{platform}', ok: {str(ok).lower()} }}, '*'); }} catch (_) {{}}
+    try {{ window.opener.postMessage({payload_json}, '*'); }} catch (_) {{}}
   }}
 </script>
 </body></html>"""
     return HTMLResponse(body)
+
+
+async def _bind_project_default(
+    project_slug: str | None, platform: str, social_account_id: int
+) -> None:
+    """Set this credential as the project's default for the platform when
+    the start endpoint was given a ``project_slug``."""
+    if not project_slug:
+        return
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT id FROM projects WHERE slug = ?", (project_slug,)
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        logger.info("project default binding skipped: unknown slug %s", project_slug)
+        return
+    project_id = int(row["id"])
+    await db.execute(
+        "INSERT INTO project_social_defaults (project_id, platform, social_account_id) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(project_id, platform) DO UPDATE SET social_account_id = excluded.social_account_id",
+        (project_id, platform, social_account_id),
+    )
+    await db.commit()
+
+
+async def _persist_oauth_credential(
+    platform: str,
+    provider_account_id: str,
+    username: str,
+    bundle: dict,
+    project_slug: str | None,
+    is_nickname: bool = False,
+    display_name: str | None = None,
+) -> dict:
+    """Upsert the credential into ``social_accounts`` + Keychain bundle, and
+    bind to a project default if ``project_slug`` is set. Returns the
+    credential row dict (matching ``get_credential_by_uuid``)."""
+    cred = await upsert_credential(
+        platform=platform,
+        provider_account_id=provider_account_id,
+        username=username,
+        bundle=bundle,
+        is_nickname=is_nickname,
+        display_name=display_name,
+    )
+    await _bind_project_default(project_slug, platform, cred["id"])
+    return cred
+
+
+def _success_payload(cred: dict, project_slug: str | None) -> dict:
+    return {
+        "social_account_id": cred["id"],
+        "uuid": cred["uuid"],
+        "username": cred["username"],
+        "label": cred["label"],
+        "project_slug": project_slug,
+    }

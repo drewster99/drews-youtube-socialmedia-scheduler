@@ -56,10 +56,10 @@ AUTO_ACTION_DEFAULTS_IMPORT = {
 POSTING_DEFAULTS = {
     "post_video_delay_minutes": 15,
     "inter_post_spacing_minutes": 5,
-    "default_template_video": "new_video",
-    "default_template_segment": "new_video",
-    "default_template_short": "new_video",
-    "default_template_hook": "new_video",
+    "default_template_video": "announce_video",
+    "default_template_segment": "announce_video",
+    "default_template_short": "announce_video",
+    "default_template_hook": "announce_video",
 }
 
 

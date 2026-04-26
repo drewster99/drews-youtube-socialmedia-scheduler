@@ -39,12 +39,35 @@ async def publish_video_job(video_id: str) -> dict:
 
     Returns a summary dict.
     """
-    from yt_scheduler.services.social import get_poster
+    from yt_scheduler.services.social import (
+        get_poster,
+        get_poster_for_account,
+    )
+
+    async def _resolve_poster(post_row: dict, project_id: int):
+        sa_id = post_row.get("social_account_id")
+        if sa_id:
+            return await get_poster_for_account(int(sa_id))
+        cursor = await db.execute(
+            "SELECT social_account_id FROM project_social_defaults "
+            "WHERE project_id = ? AND platform = ?",
+            (project_id, post_row["platform"]),
+        )
+        default_row = await cursor.fetchone()
+        if default_row is not None and default_row["social_account_id"] is not None:
+            return await get_poster_for_account(int(default_row["social_account_id"]))
+        return get_poster(post_row["platform"])
 
     lock = get_publish_lock(video_id)
     async with lock:
         db = await get_db()
         results: dict = {"video_id": video_id, "published": False, "social_results": {}}
+
+        cursor = await db.execute(
+            "SELECT project_id FROM videos WHERE id = ?", (video_id,)
+        )
+        video_row = await cursor.fetchone()
+        project_id = int(video_row["project_id"]) if video_row else 1
 
         # Step 1: Flip to public
         try:
@@ -78,11 +101,17 @@ async def publish_video_job(video_id: str) -> dict:
             post = dict(row)
             platform = post["platform"]
             post_id = post["id"]
-            poster = get_poster(platform)
 
-            # Accumulate as list per platform so multiple posts aren't lost
             if platform not in results["social_results"]:
                 results["social_results"][platform] = []
+
+            try:
+                poster = await _resolve_poster(post, project_id)
+            except ValueError as exc:
+                results["social_results"][platform].append(
+                    {"post_id": post_id, "status": "skipped", "reason": str(exc)}
+                )
+                continue
 
             if not await poster.is_configured():
                 results["social_results"][platform].append(
@@ -141,7 +170,10 @@ def _post_lock(post_id: int) -> asyncio.Lock:
 
 async def _send_scheduled_post(post_id: int) -> None:
     """APScheduler-fired worker for an individual scheduled post."""
-    from yt_scheduler.services.social import get_poster
+    from yt_scheduler.services.social import (
+        get_poster,
+        get_poster_for_account,
+    )
 
     db = await get_db()
     rows = await db.execute_fetchall(
@@ -154,7 +186,36 @@ async def _send_scheduled_post(post_id: int) -> None:
     if post.get("status") == "posted":
         return  # Idempotent — already sent
 
-    poster = get_poster(post["platform"])
+    try:
+        sa_id = post.get("social_account_id")
+        if sa_id:
+            poster = await get_poster_for_account(int(sa_id))
+        else:
+            cursor = await db.execute(
+                "SELECT v.project_id FROM social_posts sp "
+                "JOIN videos v ON v.id = sp.video_id WHERE sp.id = ?",
+                (post_id,),
+            )
+            row = await cursor.fetchone()
+            project_id = int(row["project_id"]) if row else 1
+            cursor = await db.execute(
+                "SELECT social_account_id FROM project_social_defaults "
+                "WHERE project_id = ? AND platform = ?",
+                (project_id, post["platform"]),
+            )
+            default_row = await cursor.fetchone()
+            if default_row is not None and default_row["social_account_id"] is not None:
+                poster = await get_poster_for_account(int(default_row["social_account_id"]))
+            else:
+                poster = get_poster(post["platform"])
+    except ValueError as exc:
+        await db.execute(
+            "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
+            (f"credential resolution failed: {exc}", post_id),
+        )
+        await db.commit()
+        return
+
     if not await poster.is_configured():
         await db.execute(
             "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
@@ -432,9 +493,16 @@ async def moderate_comments_job() -> None:
     """Run comment moderation on all tracked videos."""
     try:
         results = await moderation.check_all_videos()
-        for video_id, actions in results.items():
+        actions_by_video = results.get("actions_by_video", {})
+        for video_id, actions in actions_by_video.items():
             if actions:
                 logger.info(f"Moderated {len(actions)} comments on video {video_id}")
+        if results.get("checked"):
+            logger.info(
+                "Moderation tick: checked %s, matched %s",
+                results.get("checked", 0),
+                results.get("matched", 0),
+            )
     except Exception as e:
         logger.warning(f"Comment moderation job failed: {e}")
 

@@ -16,10 +16,9 @@ cloud sync becomes real, swap to a project_uuid column and migrate.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import os
-import tempfile
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -264,3 +263,114 @@ def clear_credentials(project_slug: str = DEFAULT_PROJECT_SLUG) -> None:
 def clear_client_secret() -> None:
     """Remove the install-wide client_secret. Doesn't touch per-project tokens."""
     delete_secret(YOUTUBE_NAMESPACE, CLIENT_SECRET_KEY)
+
+
+# --- Web OAuth (used by the Phase E project wizard + project re-auth) -------
+
+
+def store_credentials(project_slug: str, creds: Credentials) -> None:
+    """Persist credentials under ``oauth.<project_slug>`` Keychain key.
+
+    Public wrapper around the internal helper so OAuth callbacks (web flow)
+    can save tokens once they've been validated against the project's
+    bound channel id.
+    """
+    _save_credentials(project_slug, creds)
+
+
+def channel_id_from_credentials(creds: Credentials) -> tuple[str | None, str | None, str | None]:
+    """Hit ``channels().list(mine=True)`` with the given credentials and
+    return ``(channel_id, channel_title, channel_handle)`` or all-None
+    when the API call fails."""
+    try:
+        service = build("youtube", "v3", credentials=creds)
+        result = service.channels().list(part="id,snippet", mine=True).execute()
+        items = result.get("items") or []
+        if not items:
+            return None, None, None
+        snippet = items[0].get("snippet", {})
+        return (
+            items[0].get("id"),
+            snippet.get("title"),
+            snippet.get("customUrl"),
+        )
+    except Exception as exc:
+        logger.warning("Channel lookup failed: %s", exc)
+        return None, None, None
+
+
+# --- Channel id resolution + backfill ---------------------------------------
+
+
+def resolve_channel_id(project_slug: str = DEFAULT_PROJECT_SLUG) -> str | None:
+    """Synchronous helper: return the channel id the credentials authenticate
+    as, or ``None`` when no creds or the API call fails."""
+    creds = get_credentials(project_slug)
+    if creds is None:
+        return None
+    try:
+        service = build("youtube", "v3", credentials=creds)
+        result = service.channels().list(part="id", mine=True).execute()
+        items = result.get("items") or []
+        if not items:
+            return None
+        return items[0].get("id")
+    except Exception as exc:
+        logger.warning(
+            "Channel id lookup failed for project %s: %s", project_slug, exc
+        )
+        return None
+
+
+async def backfill_channel_ids() -> None:
+    """For every project missing a ``youtube_channel_id`` but with stored
+    credentials, resolve the channel id and stamp it. Refuses to assign a
+    channel id that's already claimed by another project — those projects
+    are left ``NULL`` and the UI will prompt re-auth."""
+    from yt_scheduler.database import get_db
+
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT id, slug, youtube_channel_id FROM projects"
+    )
+    projects = list(await cursor.fetchall())
+    if not projects:
+        return
+
+    for project in projects:
+        if project["youtube_channel_id"]:
+            continue
+        slug = project["slug"]
+        try:
+            channel_id = await asyncio.to_thread(resolve_channel_id, slug)
+        except Exception as exc:
+            logger.info("Skipping channel id backfill for %s: %s", slug, exc)
+            continue
+        if not channel_id:
+            logger.info(
+                "Project %s has no usable YouTube credentials; skipping channel backfill",
+                slug,
+            )
+            continue
+
+        cursor = await db.execute(
+            "SELECT id, slug FROM projects "
+            "WHERE youtube_channel_id = ? AND id != ?",
+            (channel_id, project["id"]),
+        )
+        conflict = await cursor.fetchone()
+        if conflict is not None:
+            logger.warning(
+                "Channel id %s claimed by project %s; cannot assign to project %s. "
+                "User must re-authenticate one of them against a different channel.",
+                channel_id, conflict["slug"], slug,
+            )
+            continue
+
+        await db.execute(
+            "UPDATE projects SET youtube_channel_id = ?, updated_at = datetime('now') "
+            "WHERE id = ?",
+            (channel_id, project["id"]),
+        )
+        await db.commit()
+        logger.info("Stamped project %s with YouTube channel %s", slug, channel_id)

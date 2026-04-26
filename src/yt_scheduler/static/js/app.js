@@ -130,3 +130,55 @@ function highlightNav() {
 
 checkAuth();
 highlightNav();
+
+/* OAuth popup helper.
+ *
+ * Browsers block popups opened from inside an `await` chain because the
+ * user-gesture token doesn't survive past the first `await`. The fix is to
+ * call `window.open('about:blank', ...)` synchronously inside the click
+ * handler, then redirect the already-open window to the real auth URL once
+ * the start endpoint comes back.
+ *
+ * Usage:
+ *   await openOAuthPopup('/api/oauth/twitter/start',
+ *                        { client_id, client_secret, origin: location.origin });
+ *
+ * The promise resolves with the JSON response from the start endpoint or
+ * rejects with a string message that's already been shown as a toast.
+ * The popup itself postMessages back when the OAuth callback completes —
+ * callers should listen for `{source: 'oauth'}` messages on `window`.
+ */
+async function openOAuthPopup(startUrl, body, popupName = 'oauth') {
+    const popup = window.open('about:blank', popupName, 'width=720,height=780');
+    if (!popup) {
+        showToast('Popup blocked. Allow popups for this page and click again.', 'error');
+        throw 'popup_blocked';
+    }
+    try {
+        const resp = await fetch(startUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body || {}),
+            _silent: true,
+        });
+        if (!resp.ok) {
+            popup.close();
+            const errBody = await resp.text();
+            let detail = errBody;
+            try { detail = JSON.parse(errBody).detail || errBody; } catch {}
+            showToast('OAuth start failed: ' + detail, 'error');
+            throw detail;
+        }
+        const json = await resp.json();
+        if (!json.auth_url) {
+            popup.close();
+            showToast('OAuth start returned no auth_url', 'error');
+            throw 'no_auth_url';
+        }
+        popup.location.href = json.auth_url;
+        return json;
+    } catch (err) {
+        try { popup.close(); } catch {}
+        throw err;
+    }
+}

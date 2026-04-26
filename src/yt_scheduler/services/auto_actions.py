@@ -30,7 +30,6 @@ from yt_scheduler.services import (
     ai,
     events,
     project_settings,
-    social,
     templates as tmpl,
     transcripts as transcript_service,
     youtube,
@@ -327,7 +326,7 @@ async def _maybe_generate_socials(
 
     posting = await project_settings.get_posting_settings(project_id)
     tier = video.get("tier") or "video"
-    template_name = posting.get(f"default_template_{tier}") or "new_video"
+    template_name = posting.get(f"default_template_{tier}") or "announce_video"
 
     template = await tmpl.get_template(template_name, project_id=project_id)
     if not template:

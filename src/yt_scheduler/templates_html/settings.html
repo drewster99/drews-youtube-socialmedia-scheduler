@@ -7,7 +7,7 @@
 </div>
 
 <p class="form-hint" style="margin-bottom: 1rem;">
-    These settings apply across the whole app. Per-project things — auto-actions, default templates, posting delays —
+    These settings apply across the whole app. Per-project things — auto-actions, default templates, posting delays, and which account each project posts as —
     live on each project's Settings page.
 </p>
 
@@ -27,8 +27,9 @@
         <button class="btn btn-danger" onclick="doLogout()">Disconnect</button>
     </div>
     <p style="color: var(--text-muted); font-size: 0.8rem; margin-top: 0.75rem;">
-        To authenticate, run <code style="background: var(--bg-input); padding: 0.1rem 0.4rem; border-radius: 3px;">./run.sh auth</code> from the terminal.
-        You can optionally upload your client_secret.json here first.
+        YouTube credentials are bound to each project on its Settings page.
+        To authenticate the default project from the terminal, run
+        <code style="background: var(--bg-input); padding: 0.1rem 0.4rem; border-radius: 3px;">./run.sh auth</code>.
     </p>
 </div>
 
@@ -58,10 +59,13 @@
     </div>
 </div>
 
-<!-- Social Media Credentials -->
+<!-- Social Media Accounts -->
 <div class="card">
     <h2>Social media accounts</h2>
-    <p class="form-hint">Per-project decoupling arrives with the OAuth 2.0 migration. For now these credentials are shared across all projects.</p>
+    <p class="form-hint">
+        Each account below is global to the install. Each project picks one of these as the default for each platform from its
+        own Settings page; templates can override per-slot.
+    </p>
     <div id="social-platforms" class="social-settings">
         <p class="loading">Loading platforms...</p>
     </div>
@@ -82,10 +86,25 @@
         </div>
     </div>
     <button class="btn btn-primary" onclick="saveGeneralSettings()">Save intervals</button>
-    <p class="form-hint" style="margin-top: 1rem;">
-        Default pinned links moved to each project's Settings page.
-    </p>
 </div>
+
+<!-- Delete-credential confirmation dialog -->
+<dialog id="delete-credential-dialog" class="modal">
+    <div class="modal-content">
+        <h3>Remove this credential?</h3>
+        <p id="delete-credential-label" style="font-weight: 600;"></p>
+        <div id="delete-credential-dependents"></div>
+        <p class="form-hint" style="margin-top: 1rem;">
+            Removing this credential cannot be undone.
+            Any template slot pointing at it will show <em>"Missing credential"</em> until you replace it.
+            Project defaults will be cleared.
+        </p>
+        <div class="form-actions" style="margin-top: 1rem; justify-content: flex-end;">
+            <button class="btn btn-secondary" onclick="closeDeleteCredentialDialog()">Cancel</button>
+            <button class="btn btn-danger" id="btn-confirm-delete-credential">Remove credential</button>
+        </div>
+    </div>
+</dialog>
 {% endblock %}
 
 {% block scripts %}
@@ -189,8 +208,6 @@ async function saveAnthropicKey() {
         showToast(`Saved (key in ${where}, model in DB)`, 'success');
         document.getElementById('anthropic-api-key').value = '';
         loadAnthropicStatus();
-    } else {
-        showToast('Failed to save', 'error');
     }
 }
 
@@ -203,218 +220,288 @@ async function removeAnthropicKey() {
     }
 }
 
-// --- Social Media Platforms (dynamically rendered) ---
+// --- Social Media Accounts (multi-credential) ---
+
+const PLATFORM_ORDER = ['twitter', 'bluesky', 'mastodon', 'linkedin', 'threads'];
+const PLATFORM_DISPLAY_NAMES = {
+    twitter: 'X / Twitter', bluesky: 'Bluesky', mastodon: 'Mastodon',
+    linkedin: 'LinkedIn', threads: 'Threads',
+};
+
 async function loadSocialPlatforms() {
     const container = document.getElementById('social-platforms');
-    const resp = await fetch('/api/settings/social');
-    const platforms = await resp.json();
+    const [meta, creds] = await Promise.all([
+        fetch('/api/settings/social').then(r => r.json()),
+        fetch('/api/social-credentials').then(r => r.json()),
+    ]);
+    const credsByPlatform = {};
+    for (const p of PLATFORM_ORDER) credsByPlatform[p] = [];
+    for (const c of creds) {
+        if (!credsByPlatform[c.platform]) credsByPlatform[c.platform] = [];
+        credsByPlatform[c.platform].push(c);
+    }
 
-    container.innerHTML = Object.entries(platforms).map(([name, config]) => {
-        const statusBadge = config.configured
-            ? '<span class="badge badge-published">Connected</span>'
-            : '<span class="badge badge-draft">Not configured</span>';
-
-        const storageNote = config.storage === 'keychain' ? 'macOS Keychain' : 'encrypted file';
-
-        const fields = config.fields.map(f => `
-            <div class="form-group">
-                <label>${f.label}</label>
-                <input type="${f.type || 'text'}"
-                    data-platform="${name}" data-key="${f.key}"
-                    value="${config.stored[f.key] || ''}"
-                    placeholder="${f.placeholder || ''}"
-                    autocomplete="off">
-            </div>
-        `).join('');
-
-        // Group fields into rows of 2
-        const fieldPairs = config.fields.reduce((rows, f, i) => {
-            if (i % 2 === 0) rows.push([]);
-            rows[rows.length - 1].push(f);
-            return rows;
-        }, []);
-
-        const locked = !!config.configured;
-        const disabledAttr = locked ? 'disabled' : '';
-
-        const fieldRows = fieldPairs.map(pair => `
-            <div class="form-row">
-                ${pair.map(f => `
-                    <div class="form-group">
-                        <label>${f.label}</label>
-                        <input type="${f.type || 'text'}"
-                            data-platform="${name}" data-key="${f.key}"
-                            value="${config.stored[f.key] || ''}"
-                            placeholder="${f.placeholder || ''}"
-                            autocomplete="off" ${disabledAttr}>
-                    </div>
-                `).join('')}
-            </div>
-        `).join('');
-
-        const primaryBtn = locked
-            ? `<button class="btn btn-sm btn-secondary" onclick="editSocialConfig('${name}')">Edit</button>`
-            : `<button class="btn btn-sm btn-primary" onclick="saveSocialConfig('${name}')">Save</button>`;
-
-        let oauthBtn = '';
-        if (!locked) {
-            if (name === 'linkedin') {
-                oauthBtn = `<button class="btn btn-sm btn-success" onclick="connectLinkedIn()" style="margin-left: 0.5rem;">Connect with LinkedIn</button>`;
-            } else if (name === 'threads') {
-                oauthBtn = `<button class="btn btn-sm btn-success" onclick="exchangeThreadsToken()" style="margin-left: 0.5rem;">Exchange short-lived token</button>`;
-            } else if (name === 'twitter') {
-                oauthBtn = `<button class="btn btn-sm btn-success" onclick="connectTwitter()" style="margin-left: 0.5rem;">Connect with X (OAuth 2.0)</button>`;
-            } else if (name === 'mastodon') {
-                oauthBtn = `<button class="btn btn-sm btn-success" onclick="connectMastodon()" style="margin-left: 0.5rem;">Connect with Mastodon</button>`;
-            }
-        }
-
-        const guide = Array.isArray(config.setup_guide) ? config.setup_guide : [];
-        const guideHtml = guide.length ? `
-            <div class="setup-guide" id="setup-guide-${name}" style="display:none;">
-                <ol>${guide.map(step => `<li>${linkifyText(escapeHtml(step))}</li>`).join('')}</ol>
-            </div>` : '';
-        const helpToggle = guide.length
-            ? `<button class="btn-icon" title="Setup instructions" onclick="toggleSetupGuide('${name}')">ⓘ</button>`
-            : '';
-
-        return `
-            <div class="social-platform-config" id="config-${name}" data-locked="${locked}">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
-                    <h3>
-                        <span class="platform-badge platform-${name}">${name}</span>
-                        ${statusBadge}
-                        ${helpToggle}
-                    </h3>
-                    ${config.configured ? `<button class="btn btn-sm btn-danger" onclick="disconnectSocial('${name}')">Disconnect</button>` : ''}
-                </div>
-                <p class="help-text">${config.description} <span style="color: var(--text-muted);">Secrets stored in ${storageNote}.</span></p>
-                ${guideHtml}
-                ${fieldRows}
-                ${primaryBtn}
-                ${oauthBtn}
-            </div>
-        `;
+    container.innerHTML = PLATFORM_ORDER.map(name => {
+        const config = meta[name] || {fields: [], description: '', setup_guide: []};
+        const accounts = credsByPlatform[name] || [];
+        return renderPlatformCard(name, config, accounts);
     }).join('');
 }
 
-async function connectLinkedIn() {
-    const clientId = prompt('LinkedIn Client ID\n\n(From https://www.linkedin.com/developers/apps → your app → Auth tab → Application credentials)');
-    if (!clientId) return;
-    const clientSecret = prompt('LinkedIn Primary Client Secret\n\n(Same location as Client ID)');
-    if (!clientSecret) return;
+function renderPlatformCard(name, config, accounts) {
+    const display = PLATFORM_DISPLAY_NAMES[name] || name;
+    const guide = Array.isArray(config.setup_guide) ? config.setup_guide : [];
+    const guideHtml = guide.length ? `
+        <div class="setup-guide" id="setup-guide-${name}" style="display:none;">
+            <ol>${guide.map(step => `<li>${linkifyText(escapeHtml(step))}</li>`).join('')}</ol>
+        </div>` : '';
+    const helpToggle = guide.length
+        ? `<button class="btn-icon" title="Setup instructions" onclick="toggleSetupGuide('${name}')">ⓘ</button>`
+        : '';
 
-    const origin = window.location.origin;
-    const resp = await fetch('/api/oauth/linkedin/start', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
+    const accountList = accounts.length === 0
+        ? `<p class="form-hint" style="margin: 0.75rem 0;">No accounts connected.</p>`
+        : `<div class="credentials-list">${accounts.map(c => renderCredentialRow(c)).join('')}</div>`;
+
+    const addButton = renderAddAccountButton(name);
+    const blueskyForm = name === 'bluesky' ? renderBlueskyPasteForm(name) : '';
+    const threadsExchange = name === 'threads'
+        ? `<p class="form-hint" style="margin-top: 0.75rem;">
+              Local installs can also paste a short-lived token from the Graph API Explorer:
+              <button class="btn btn-sm btn-secondary" onclick="exchangeThreadsToken()">Exchange short-lived token</button>
+           </p>`
+        : '';
+
+    const countBadge = accounts.length
+        ? `<span class="badge badge-published">${accounts.length} connected</span>`
+        : `<span class="badge badge-draft">none</span>`;
+
+    return `
+    <div class="social-platform-card" id="platform-card-${name}">
+        <div class="platform-header" style="display:flex; justify-content:space-between; align-items:center; gap:0.75rem;">
+            <h3 style="margin:0;">
+                <span class="platform-badge platform-${name}">${escapeHtml(display)}</span>
+                ${countBadge}
+                ${helpToggle}
+            </h3>
+            <div>${addButton}</div>
+        </div>
+        <p class="help-text" style="margin-top:0.5rem;">${escapeHtml(config.description || '')}</p>
+        ${guideHtml}
+        ${accountList}
+        ${blueskyForm}
+        ${threadsExchange}
+    </div>`;
+}
+
+function renderCredentialRow(cred) {
+    const created = cred.created_at ? new Date(cred.created_at + 'Z').toLocaleDateString() : '';
+    return `
+        <div class="credential-row" data-uuid="${escapeHtml(cred.uuid)}"
+             style="display:flex; justify-content:space-between; align-items:center; padding:0.5rem 0.75rem; border:1px solid var(--border); border-radius:6px; margin-bottom:0.5rem;">
+            <div>
+                <div style="font-weight:600;">${escapeHtml(cred.label)}</div>
+                <div style="font-size:0.8rem; color:var(--text-muted);">
+                    ${cred.is_nickname ? '<em>nickname</em> · ' : ''}Connected ${escapeHtml(created)}
+                </div>
+            </div>
+            <div style="display:flex; gap:0.25rem;">
+                <button class="btn-icon" title="Refresh username from provider"
+                        onclick="refreshCredentialUsername('${escapeHtml(cred.uuid)}')">↻</button>
+                <button class="btn-icon" title="Remove"
+                        style="color: var(--danger);"
+                        onclick="confirmDeleteCredential('${escapeHtml(cred.uuid)}', '${escapeHtml(cred.label)}')">×</button>
+            </div>
+        </div>`;
+}
+
+function renderAddAccountButton(name) {
+    if (name === 'linkedin') {
+        return `<button class="btn btn-sm btn-success" onclick="connectLinkedIn()">+ Add account</button>`;
+    } else if (name === 'twitter') {
+        return `<button class="btn btn-sm btn-success" onclick="connectTwitter()">+ Add account</button>`;
+    } else if (name === 'mastodon') {
+        return `<button class="btn btn-sm btn-success" onclick="connectMastodon()">+ Add account</button>`;
+    } else if (name === 'threads') {
+        return `<button class="btn btn-sm btn-success" onclick="connectThreads()">+ Add account</button>`;
+    } else if (name === 'bluesky') {
+        // Bluesky paste form is rendered inline; the button just scrolls the form into view.
+        return `<button class="btn btn-sm btn-success" onclick="document.getElementById('bluesky-handle').focus()">+ Add account</button>`;
+    }
+    return '';
+}
+
+function renderBlueskyPasteForm(name) {
+    return `
+        <div class="bluesky-paste-form" style="margin-top: 0.75rem; padding: 0.75rem; background: var(--bg-elevated); border-radius: 6px;">
+            <h4 style="margin:0 0 0.5rem 0; font-size: 0.95rem;">Add Bluesky account</h4>
+            <p class="form-hint" style="margin: 0 0 0.5rem 0;">
+                AT-proto OAuth is coming. For now, paste a handle + app password from
+                bsky.app → Settings → App Passwords.
+            </p>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Handle</label>
+                    <input id="bluesky-handle" type="text" placeholder="you.bsky.social" autocomplete="off">
+                </div>
+                <div class="form-group">
+                    <label>App password</label>
+                    <input id="bluesky-app-password" type="password" placeholder="xxxx-xxxx-xxxx-xxxx" autocomplete="off">
+                </div>
+            </div>
+            <button class="btn btn-sm btn-primary" onclick="saveBlueskyAccount()">Save Bluesky account</button>
+        </div>`;
+}
+
+async function connectLinkedIn() {
+    const clientId = prompt('LinkedIn Client ID\n\n(developers.linkedin.com → your app → Auth tab → Application credentials)');
+    if (!clientId) return;
+    const clientSecret = prompt('LinkedIn Primary Client Secret');
+    if (!clientSecret) return;
+    try {
+        await openOAuthPopup('/api/oauth/linkedin/start', {
             client_id: clientId.trim(),
             client_secret: clientSecret.trim(),
-            origin,
-        }),
-    });
-    if (!resp.ok) {
-        const err = await resp.json().catch(() => ({detail: 'unknown'}));
-        showToast('Failed to start OAuth: ' + (err.detail || resp.status), 'error');
-        return;
-    }
-    const {auth_url, redirect_uri} = await resp.json();
-
-    showToast(`Opening LinkedIn… Make sure ${redirect_uri} is in your app's OAuth 2.0 redirect URLs.`, 'info');
-    const popup = window.open(auth_url, 'linkedin-oauth', 'width=720,height=780');
-    if (!popup) {
-        showToast('Popup blocked. Allow popups for this page and click Connect again.', 'error');
-    }
+            origin: window.location.origin,
+        }, 'linkedin-oauth');
+    } catch (_) {}
 }
 
 async function connectTwitter() {
-    const clientId = prompt('X / Twitter OAuth 2.0 Client ID\n\n(developer.x.com → your app → Keys and tokens → OAuth 2.0 Client ID and Client Secret)');
+    const clientId = prompt('X / Twitter OAuth 2.0 Client ID\n\n(developer.x.com → your app → Keys and tokens)');
     if (!clientId) return;
-    const clientSecret = prompt('Client Secret\n\n(Optional — leave blank for a public app. Required for confidential apps.)') || '';
-
-    const origin = window.location.origin;
-    const resp = await fetch('/api/oauth/twitter/start', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
+    const clientSecret = prompt('Client Secret\n\n(Optional — leave blank for a public app.)') || '';
+    try {
+        await openOAuthPopup('/api/oauth/twitter/start', {
             client_id: clientId.trim(),
             client_secret: clientSecret.trim(),
-            origin,
-        }),
-    });
-    if (!resp.ok) {
-        const err = await resp.json().catch(() => ({detail: 'unknown'}));
-        showToast('Failed to start OAuth: ' + (err.detail || resp.status), 'error');
-        return;
-    }
-    const {auth_url, redirect_uri} = await resp.json();
-    showToast(`Opening X… Make sure ${redirect_uri} is in your app's Callback URLs.`, 'info');
-    if (!window.open(auth_url, 'twitter-oauth', 'width=720,height=780')) {
-        showToast('Popup blocked. Allow popups for this page and click Connect again.', 'error');
-    }
+            origin: window.location.origin,
+        }, 'twitter-oauth');
+    } catch (_) {}
 }
 
 async function connectMastodon() {
     const instance = prompt('Mastodon instance URL\n\n(e.g. https://mastodon.social — the app will register itself there.)', 'https://mastodon.social');
     if (!instance) return;
-
-    const origin = window.location.origin;
-    const resp = await fetch('/api/oauth/mastodon/start', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
+    try {
+        await openOAuthPopup('/api/oauth/mastodon/start', {
             instance_url: instance.trim(),
-            origin,
-        }),
-    });
-    if (!resp.ok) {
-        const err = await resp.json().catch(() => ({detail: 'unknown'}));
-        showToast('Failed to register on Mastodon: ' + (err.detail || resp.status), 'error');
-        return;
-    }
-    const {auth_url} = await resp.json();
-    showToast('Opening Mastodon to authorize…', 'info');
-    if (!window.open(auth_url, 'mastodon-oauth', 'width=720,height=780')) {
-        showToast('Popup blocked.', 'error');
-    }
+            origin: window.location.origin,
+        }, 'mastodon-oauth');
+    } catch (_) {}
+}
+
+async function connectThreads() {
+    const clientId = prompt('Threads / Meta App Client ID\n\n(developers.facebook.com → your app → App settings → Basic)');
+    if (!clientId) return;
+    const clientSecret = prompt('Threads / Meta App Secret');
+    if (!clientSecret) return;
+    try {
+        await openOAuthPopup('/api/oauth/threads/start', {
+            client_id: clientId.trim(),
+            client_secret: clientSecret.trim(),
+            origin: window.location.origin,
+        }, 'threads-oauth');
+    } catch (_) {}
 }
 
 async function exchangeThreadsToken() {
     const appSecret = prompt('Threads App Secret\n\n(developers.facebook.com → your app → App settings → Basic → App Secret)');
     if (!appSecret) return;
-    const shortToken = prompt('Short-lived Access Token\n\nGet it from https://developers.facebook.com/tools/explorer/\n1. Pick your app top-right\n2. Add permissions: threads_basic, threads_content_publish\n3. Click Generate Access Token, accept consent\n4. Copy the token here');
+    const shortToken = prompt('Short-lived Access Token\n\nGet it from https://developers.facebook.com/tools/explorer/');
     if (!shortToken) return;
-
     showToast('Exchanging for long-lived token…', 'info');
     const resp = await fetch('/api/oauth/threads/exchange', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-            app_secret: appSecret.trim(),
-            short_lived_token: shortToken.trim(),
-        }),
+        body: JSON.stringify({app_secret: appSecret.trim(), short_lived_token: shortToken.trim()}),
     });
-    if (!resp.ok) {
-        const err = await resp.json().catch(() => ({detail: 'unknown'}));
-        showToast('Exchange failed: ' + (err.detail || resp.status), 'error');
+    if (resp.ok) {
+        const result = await resp.json();
+        const days = Math.round((result.expires_in || 0) / 86400);
+        showToast(`Threads connected as @${result.username || result.user_id} (token valid ~${days} days)`, 'success');
+        loadSocialPlatforms();
+    }
+}
+
+async function saveBlueskyAccount() {
+    const handle = document.getElementById('bluesky-handle').value.trim();
+    const password = document.getElementById('bluesky-app-password').value.trim();
+    if (!handle || !password) {
+        showToast('Both fields are required', 'error');
         return;
     }
-    const result = await resp.json();
-    const days = Math.round((result.expires_in || 0) / 86400);
-    showToast(`Threads connected as @${result.username || result.user_id} (token valid ~${days} days)`, 'success');
-    loadSocialPlatforms();
+    const resp = await fetch('/api/settings/social/bluesky', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({handle, app_password: password}),
+    });
+    if (resp.ok) {
+        showToast(`Bluesky account @${handle} saved`, 'success');
+        document.getElementById('bluesky-handle').value = '';
+        document.getElementById('bluesky-app-password').value = '';
+        loadSocialPlatforms();
+    }
+}
+
+async function refreshCredentialUsername(uuid) {
+    const resp = await fetch(`/api/social-credentials/${uuid}/refresh-username`, {method: 'POST'});
+    if (resp.ok) {
+        const data = await resp.json();
+        if (data.changed) {
+            showToast(`Username updated to ${data.username}`, 'success');
+        } else {
+            showToast(`Username is current (${data.username})`, 'info');
+        }
+        loadSocialPlatforms();
+    }
+}
+
+async function confirmDeleteCredential(uuid, label) {
+    const resp = await fetch(`/api/social-credentials/${uuid}`, {method: 'DELETE', _silent: true});
+    if (!resp.ok) {
+        showToast('Failed to load credential dependents', 'error');
+        return;
+    }
+    const payload = await resp.json();
+    document.getElementById('delete-credential-label').textContent = label;
+    const deps = payload.dependents || {projects: [], slots: []};
+    const projectsHtml = deps.projects.length === 0
+        ? '<li><em>No projects use this credential.</em></li>'
+        : deps.projects.map(p => `<li>Project <strong>${escapeHtml(p.name)}</strong> (${escapeHtml(p.platform)} default)</li>`).join('');
+    const slotsHtml = deps.slots.length === 0
+        ? '<li><em>No template slots reference this credential.</em></li>'
+        : deps.slots.map(s => `<li>Template <strong>${escapeHtml(s.template_name)}</strong> in <strong>${escapeHtml(s.project_name)}</strong> (${escapeHtml(s.platform)} slot)</li>`).join('');
+    document.getElementById('delete-credential-dependents').innerHTML = `
+        <p style="margin: 0.75rem 0 0.25rem 0; font-size: 0.9rem;">This credential is currently used by:</p>
+        <ul style="font-size: 0.85rem; color: var(--text-secondary);">${projectsHtml}${slotsHtml}</ul>`;
+    const btn = document.getElementById('btn-confirm-delete-credential');
+    btn.onclick = () => doDeleteCredential(uuid);
+    document.getElementById('delete-credential-dialog').showModal();
+}
+
+function closeDeleteCredentialDialog() {
+    document.getElementById('delete-credential-dialog').close();
+}
+
+async function doDeleteCredential(uuid) {
+    const resp = await fetch(`/api/social-credentials/${uuid}?confirm=1`, {method: 'DELETE'});
+    if (resp.ok) {
+        showToast('Credential removed', 'success');
+        closeDeleteCredentialDialog();
+        loadSocialPlatforms();
+    }
 }
 
 window.addEventListener('message', (ev) => {
     if (!ev.data || ev.data.source !== 'oauth') return;
     const platform = ev.data.platform;
-    const nice = platform ? (platform.charAt(0).toUpperCase() + platform.slice(1)) : 'Platform';
+    const nice = PLATFORM_DISPLAY_NAMES[platform] || platform || 'Platform';
     if (ev.data.ok) {
-        showToast(`${nice} connected!`, 'success');
+        showToast(`${nice} connected${ev.data.username ? ' as @' + ev.data.username : ''}!`, 'success');
         loadSocialPlatforms();
     } else {
-        showToast(`${nice} connection failed — see popup.`, 'error');
+        showToast(`${nice} connection failed — see popup for details.`, 'error');
     }
 });
 
@@ -425,7 +512,7 @@ function toggleSetupGuide(name) {
 }
 
 function escapeHtml(s) {
-    return String(s)
+    return String(s == null ? '' : s)
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
@@ -437,65 +524,9 @@ function linkifyText(s) {
     return s.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
 }
 
-function editSocialConfig(platform) {
-    const card = document.getElementById(`config-${platform}`);
-    if (!card) return;
-    card.querySelectorAll(`input[data-platform="${platform}"]`).forEach(inp => {
-        inp.disabled = false;
-    });
-    const editBtn = card.querySelector('button.btn-secondary');
-    if (editBtn) {
-        editBtn.textContent = 'Save';
-        editBtn.className = 'btn btn-sm btn-primary';
-        editBtn.setAttribute('onclick', `saveSocialConfig('${platform}')`);
-    }
-    card.dataset.locked = 'false';
-}
-
-async function saveSocialConfig(platform) {
-    const inputs = document.querySelectorAll(`[data-platform="${platform}"]`);
-    const data = {};
-    inputs.forEach(input => {
-        const val = input.value.trim();
-        // Don't send masked values back (they end with "...")
-        if (val && !val.endsWith('...')) {
-            data[input.dataset.key] = val;
-        }
-    });
-
-    if (Object.keys(data).length === 0) {
-        showToast('No new values to save (masked values are unchanged)', 'info');
-        return;
-    }
-
-    const resp = await fetch(`/api/settings/social/${platform}`, {
-        method: 'PUT',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(data),
-    });
-    if (resp.ok) {
-        const result = await resp.json();
-        const where = result.storage === 'keychain' ? 'Keychain' : 'secrets file';
-        showToast(`${platform} credentials saved to ${where}`, 'success');
-        loadSocialPlatforms();
-    } else {
-        showToast('Failed to save', 'error');
-    }
-}
-
-async function disconnectSocial(platform) {
-    if (!confirm(`Remove all ${platform} credentials?`)) return;
-    const resp = await fetch(`/api/settings/social/${platform}`, {method: 'DELETE'});
-    if (resp.ok) {
-        showToast(`${platform} disconnected`, 'success');
-        loadSocialPlatforms();
-    }
-}
-
 // --- General Settings ---
 async function saveGeneralSettings() {
     const data = {
-        default_pinned_links: document.getElementById('default-pinned-links').value,
         comment_check_interval: document.getElementById('comment-check-interval').value,
         caption_check_interval: document.getElementById('caption-check-interval').value,
     };
@@ -510,8 +541,6 @@ async function saveGeneralSettings() {
 async function loadSettings() {
     const resp = await fetch('/api/settings');
     const settings = await resp.json();
-    if (settings.default_pinned_links)
-        document.getElementById('default-pinned-links').value = settings.default_pinned_links;
     if (settings.comment_check_interval)
         document.getElementById('comment-check-interval').value = settings.comment_check_interval;
     if (settings.caption_check_interval)

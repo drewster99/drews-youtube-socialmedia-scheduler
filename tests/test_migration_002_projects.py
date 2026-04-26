@@ -37,7 +37,7 @@ async def _seed_baseline_with_data(conn: aiosqlite.Connection) -> None:
 async def test_migration_002_creates_project_tables(tmp_path: Path) -> None:
     db = tmp_path / "p.db"
     async with aiosqlite.connect(str(db)) as conn:
-        await apply_migrations(conn)
+        await apply_migrations(conn, target_version=2)
         cursor = await conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         )
@@ -55,7 +55,7 @@ async def test_migration_002_backfills_existing_data_into_default(tmp_path: Path
         # Pretend we're an existing install: create baseline schema directly.
         await _seed_baseline_with_data(conn)
         # Now run migrations: this stamps v1 and applies v2 with the backfill.
-        await apply_migrations(conn)
+        await apply_migrations(conn, target_version=2)
 
         cursor = await conn.execute(
             "SELECT id, name, slug FROM projects"
@@ -75,7 +75,7 @@ async def test_migration_002_backfills_existing_data_into_default(tmp_path: Path
 async def test_migration_002_default_project_unique(tmp_path: Path) -> None:
     db = tmp_path / "p.db"
     async with aiosqlite.connect(str(db)) as conn:
-        await apply_migrations(conn)
+        await apply_migrations(conn, target_version=2)
         with pytest.raises(aiosqlite.IntegrityError):
             await conn.execute(
                 "INSERT INTO projects (name, slug) VALUES ('Other', 'default')"
@@ -88,7 +88,7 @@ async def test_migration_002_cascade_delete_project_clears_videos(tmp_path: Path
     db = tmp_path / "p.db"
     async with aiosqlite.connect(str(db)) as conn:
         await _seed_baseline_with_data(conn)
-        await apply_migrations(conn)
+        await apply_migrations(conn, target_version=2)
         await conn.execute("PRAGMA foreign_keys = ON")
         await conn.execute("DELETE FROM projects WHERE id = 1")
         await conn.commit()
@@ -105,7 +105,7 @@ async def test_migration_002_social_accounts_survive_project_delete(tmp_path: Pa
     """social_accounts rows themselves should not cascade away when a project is deleted."""
     db = tmp_path / "p.db"
     async with aiosqlite.connect(str(db)) as conn:
-        await apply_migrations(conn)
+        await apply_migrations(conn, target_version=2)
         await conn.execute("PRAGMA foreign_keys = ON")
         # Add a project + social_account + attachment.
         await conn.execute(
@@ -135,7 +135,7 @@ async def test_migration_002_template_applies_to_default(tmp_path: Path) -> None
     db = tmp_path / "p.db"
     async with aiosqlite.connect(str(db)) as conn:
         await _seed_baseline_with_data(conn)
-        await apply_migrations(conn)
+        await apply_migrations(conn, target_version=2)
         cursor = await conn.execute("SELECT applies_to FROM templates")
         row = await cursor.fetchone()
         assert row[0] == '["hook","short","segment","video"]'

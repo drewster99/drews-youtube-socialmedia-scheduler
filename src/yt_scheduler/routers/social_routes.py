@@ -7,7 +7,7 @@ import json
 from fastapi import APIRouter, HTTPException
 
 from yt_scheduler.database import get_db
-from yt_scheduler.services import ai, social, templates as tmpl, youtube
+from yt_scheduler.services import social, templates as tmpl, youtube
 from yt_scheduler.services.scheduler import get_publish_lock
 from yt_scheduler.services.transcripts import srt_to_plain_text
 
@@ -28,7 +28,7 @@ async def generate_posts(video_id: str, data: dict | None = None):
     """Generate social media posts for a video using a template.
 
     Optional body params:
-        template_name: Template to use (default: "new_video")
+        template_name: Template to use (default: "announce_video")
         platforms: List of platform names to generate for (default: all in template)
     """
     db = await get_db()
@@ -37,13 +37,25 @@ async def generate_posts(video_id: str, data: dict | None = None):
         raise HTTPException(404, "Video not found")
 
     opts = data or {}
-    template_name = opts.get("template_name", "new_video")
+    template_name = opts.get("template_name", "announce_video")
     requested_platforms = opts.get("platforms")
 
     video = dict(rows[0])
-    template = await tmpl.get_template(template_name)
+    project_id = int(video.get("project_id") or 1)
+    template = await tmpl.get_template(template_name, project_id=project_id)
     if not template:
         raise HTTPException(404, f"Template '{template_name}' not found")
+
+    cursor = await db.execute(
+        "SELECT platform, social_account_id FROM project_social_defaults "
+        "WHERE project_id = ?",
+        (project_id,),
+    )
+    defaults: dict[str, int] = {
+        row["platform"]: int(row["social_account_id"])
+        for row in await cursor.fetchall()
+        if row["social_account_id"] is not None
+    }
 
     # Build variables
     tags = json.loads(video.get("tags", "[]"))
@@ -96,17 +108,19 @@ async def generate_posts(video_id: str, data: dict | None = None):
             else:
                 rendered = ""
 
-            # Store as draft
+            sa_id = defaults.get(platform)
             await db.execute(
-                """INSERT INTO social_posts (video_id, platform, content, media_type, status)
-                VALUES (?, ?, ?, ?, 'draft')""",
-                (video_id, platform, rendered, config.get("media", "thumbnail")),
+                """INSERT INTO social_posts
+                       (video_id, platform, content, media_type, status, social_account_id)
+                VALUES (?, ?, ?, ?, 'draft', ?)""",
+                (video_id, platform, rendered, config.get("media", "thumbnail"), sa_id),
             )
 
             generated[platform] = {
                 "content": rendered,
                 "media": config.get("media", "thumbnail"),
                 "max_chars": config.get("max_chars", 500),
+                "social_account_id": sa_id,
             }
 
         await db.commit()
@@ -151,6 +165,41 @@ async def update_post(post_id: int, data: dict):
     return {"status": "ok"}
 
 
+async def _resolve_poster_for_post(post: dict) -> social.SocialPoster:
+    """Pick the right poster for a row in ``social_posts``.
+
+    Routing order:
+    1. ``post.social_account_id`` if set → that exact credential.
+    2. Project default for the post's platform (resolved via the video's
+       ``project_id``).
+    3. The first active credential for the platform (legacy fallback).
+    """
+    sa_id = post.get("social_account_id")
+    if sa_id:
+        return await social.get_poster_for_account(int(sa_id))
+
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT v.project_id "
+        "FROM social_posts sp JOIN videos v ON v.id = sp.video_id "
+        "WHERE sp.id = ?",
+        (post["id"],),
+    )
+    row = await cursor.fetchone()
+    project_id = int(row["project_id"]) if row is not None else 1
+
+    cursor = await db.execute(
+        "SELECT social_account_id FROM project_social_defaults "
+        "WHERE project_id = ? AND platform = ?",
+        (project_id, post["platform"]),
+    )
+    default_row = await cursor.fetchone()
+    if default_row is not None and default_row["social_account_id"] is not None:
+        return await social.get_poster_for_account(int(default_row["social_account_id"]))
+
+    return social.get_poster(post["platform"])
+
+
 @router.post("/posts/{post_id}/send")
 async def send_post(post_id: int):
     """Send a single social post."""
@@ -160,10 +209,15 @@ async def send_post(post_id: int):
         raise HTTPException(404, "Post not found")
 
     post = dict(rows[0])
-    poster = social.get_poster(post["platform"])
+    try:
+        poster = await _resolve_poster_for_post(post)
+    except ValueError as exc:
+        raise HTTPException(400, f"{post['platform']}: {exc}") from exc
 
     if not await poster.is_configured():
-        raise HTTPException(400, f"{post['platform']} is not configured. Add credentials in Settings.")
+        raise HTTPException(
+            400, f"{post['platform']} is not configured. Add credentials in Settings."
+        )
 
     try:
         result = await poster.post(post["content"], post.get("media_path"))
@@ -233,7 +287,11 @@ async def send_all_posts(video_id: str):
     results = {}
     for row in rows:
         post = dict(row)
-        poster = social.get_poster(post["platform"])
+        try:
+            poster = await _resolve_poster_for_post(post)
+        except ValueError as exc:
+            results[post["platform"]] = {"status": "skipped", "reason": str(exc)}
+            continue
 
         if not await poster.is_configured():
             results[post["platform"]] = {"status": "skipped", "reason": "not configured"}

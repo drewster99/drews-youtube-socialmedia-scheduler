@@ -40,7 +40,7 @@ async function loadTemplates() {
 }
 
 function createTemplate() {
-    const name = prompt('Template name (e.g., "new_video", "premiere"):');
+    const name = prompt('Template name (e.g., "announce_video", "premiere"):');
     if (!name) return;
     window.location.href = `/projects/${projectSlug}/templates/${name}`;
 }

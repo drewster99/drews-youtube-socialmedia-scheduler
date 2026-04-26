@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import mimetypes
 import time
@@ -12,7 +13,6 @@ import httpx
 
 from yt_scheduler.services.keychain import (
     load_all_secrets,
-    load_secret,
     store_secret,
 )
 
@@ -57,10 +57,19 @@ async def _twitter_refresh_bearer(creds: dict[str, str]) -> str | None:
     new_bearer = payload.get("access_token")
     if not new_bearer:
         return None
-    store_secret("twitter", "bearer_token", new_bearer)
     new_refresh = payload.get("refresh_token")
+
+    creds["bearer_token"] = new_bearer
     if new_refresh:
-        store_secret("twitter", "refresh_token", new_refresh)
+        creds["refresh_token"] = new_refresh
+
+    cred_uuid = creds.get("uuid")
+    if cred_uuid:
+        store_secret("twitter", f"cred.{cred_uuid}", json.dumps(creds))
+    else:
+        store_secret("twitter", "bearer_token", new_bearer)
+        if new_refresh:
+            store_secret("twitter", "refresh_token", new_refresh)
     return new_bearer
 
 
@@ -208,24 +217,49 @@ async def _twitter_v2_upload(bearer_token: str, media_path: Path) -> str:
 
 
 class SocialPoster:
-    """Base class for social media platform posters."""
+    """Base class for social media platform posters.
+
+    A poster is bound to a single credential via its ``bundle`` dict at
+    construction time. The Phase A→B fallback path lets callers
+    instantiate without a bundle, in which case ``_get_creds()`` picks
+    the first active bundle for the platform — that path keeps existing
+    install-wide call sites working until they migrate to the
+    per-credential factories.
+    """
 
     platform: str = ""
 
-    # Keys that are secrets (stored in Keychain) vs. non-secrets (also in Keychain for simplicity)
-    # All platform config is stored securely since even handles can be sensitive.
     required_keys: list[str] = []
 
+    def __init__(self, bundle: dict | None = None) -> None:
+        self._bundle: dict | None = bundle
+
     def _get_creds(self) -> dict[str, str]:
-        """Load all credentials for this platform from Keychain/secrets."""
-        return load_all_secrets(self.platform)
+        """Return the bundle this poster is bound to, falling back to the
+        first active credential bundle for the platform when none is set.
+        """
+        if self._bundle is not None:
+            return self._bundle
+        secrets = load_all_secrets(self.platform)
+        for key, value in secrets.items():
+            if key.startswith("cred."):
+                try:
+                    return json.loads(value)
+                except json.JSONDecodeError:
+                    continue
+        return {k: v for k, v in secrets.items() if k != "_migrated_v8"}
+
+    @classmethod
+    def bundle_is_configured(cls, bundle: dict) -> bool:
+        """Check whether the given bundle has all keys this poster needs."""
+        return all(bundle.get(k) for k in cls.required_keys)
 
     async def post(self, text: str, media_path: str | None = None) -> dict:
         """Post content. Returns {"url": "...", "id": "..."} on success."""
         raise NotImplementedError
 
     async def is_configured(self) -> bool:
-        """Check if this platform has all required credentials."""
+        """Check if this poster's credentials are complete."""
         creds = self._get_creds()
         return all(creds.get(k) for k in self.required_keys)
 
@@ -514,8 +548,54 @@ PLATFORM_SETUP_GUIDES: dict[str, list[str]] = {
 
 
 def get_poster(platform: str) -> SocialPoster:
-    """Get the poster instance for a platform."""
+    """Return a poster bound to the platform's first active credential.
+
+    Phase A→B transitional helper. Send paths that know which credential
+    to use should call :func:`get_poster_for_account` instead.
+    """
     cls = _POSTERS.get(platform)
     if not cls:
         raise ValueError(f"Unknown platform: {platform}. Available: {ALL_PLATFORMS}")
     return cls()
+
+
+async def get_poster_for_account(social_account_id: int) -> SocialPoster:
+    """Build a poster bound to a specific ``social_accounts`` row."""
+    from yt_scheduler.services.social_credentials import (
+        get_credential_by_id,
+        load_bundle,
+    )
+
+    cred = await get_credential_by_id(social_account_id)
+    if cred is None:
+        raise ValueError(f"Credential {social_account_id} not found")
+    if cred.get("deleted_at") is not None:
+        raise ValueError(
+            f"Credential {social_account_id} ({cred['label']}) was deleted"
+        )
+
+    cls = _POSTERS.get(cred["platform"])
+    if not cls:
+        raise ValueError(f"Unknown platform: {cred['platform']}")
+
+    bundle = load_bundle(cred["platform"], cred["uuid"])
+    if bundle is None:
+        raise ValueError(
+            f"No bundle stored for credential {social_account_id} "
+            f"({cred['label']}) — the Keychain entry was likely deleted "
+            "out of band."
+        )
+    return cls(bundle=bundle)
+
+
+async def get_poster_for_uuid(platform: str, uuid: str) -> SocialPoster:
+    """Build a poster from an explicit (platform, credential UUID) pair."""
+    from yt_scheduler.services.social_credentials import load_bundle
+
+    cls = _POSTERS.get(platform)
+    if not cls:
+        raise ValueError(f"Unknown platform: {platform}. Available: {ALL_PLATFORMS}")
+    bundle = load_bundle(platform, uuid)
+    if bundle is None:
+        raise ValueError(f"No bundle stored at {platform}:cred.{uuid}")
+    return cls(bundle=bundle)

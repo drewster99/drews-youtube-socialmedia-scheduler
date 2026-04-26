@@ -21,10 +21,15 @@ from yt_scheduler.routers import (
     oauth_routes,
     project_routes,
     settings_routes,
+    social_credentials_routes,
     social_routes,
     template_routes,
     transcript_routes,
     video_routes,
+)
+from yt_scheduler.services.auth import backfill_channel_ids
+from yt_scheduler.services.keychain_migration import (
+    migrate_to_per_credential_bundles,
 )
 from yt_scheduler.services.projects import (
     DEFAULT_PROJECT_SLUG,
@@ -70,7 +75,9 @@ class BuildIdentityMiddleware(BaseHTTPMiddleware):
 async def lifespan(app: FastAPI):
     """Startup and shutdown."""
     db = await get_db()
+    await migrate_to_per_credential_bundles()
     await ensure_default_project()
+    await backfill_channel_ids()
     await ensure_default_template()
 
     # Read scheduler intervals from DB settings (saved via Settings UI), fall back to config defaults
@@ -138,6 +145,7 @@ app.include_router(social_routes.router)
 app.include_router(template_routes.router)
 app.include_router(settings_routes.router)
 app.include_router(oauth_routes.router)
+app.include_router(social_credentials_routes.router)
 app.include_router(import_routes.router)
 
 

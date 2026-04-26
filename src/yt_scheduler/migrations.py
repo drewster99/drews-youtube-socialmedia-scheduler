@@ -142,15 +142,23 @@ async def _table_names(conn: aiosqlite.Connection) -> set[str]:
 
 
 async def apply_migrations(
-    conn: aiosqlite.Connection, directory: Path = MIGRATIONS_DIR
+    conn: aiosqlite.Connection,
+    directory: Path = MIGRATIONS_DIR,
+    target_version: int | None = None,
 ) -> list[int]:
     """Apply pending migrations against `conn`.
 
     Returns the list of versions that were applied during this call. Existing
     databases whose schema already matches the baseline are stamped at version 1
     without re-running the SQL.
+
+    ``target_version`` is a test hook: when set, migrations newer than that
+    version are skipped, letting tests assert behaviour from a specific
+    historical migration without later ones reshaping the world.
     """
     migrations = discover_migrations(directory)
+    if target_version is not None:
+        migrations = [m for m in migrations if m.version <= target_version]
     if not migrations:
         # An empty migrations directory almost always means the SQL files
         # weren't bundled correctly — fail loudly rather than letting a half-

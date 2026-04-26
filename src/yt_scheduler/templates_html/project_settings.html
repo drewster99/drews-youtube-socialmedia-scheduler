@@ -54,14 +54,26 @@
 <section class="card">
     <div class="card-header"><h2>YouTube channel</h2></div>
     <div class="card-body">
-        <p>YouTube authentication is managed in <a href="/settings">General settings</a>. Per-project channel selection arrives with Phase 1.5 (OAuth 2.0 migration).</p>
+        <div id="yt-info">
+            <p class="loading">Checking…</p>
+        </div>
+        <div class="form-actions" style="margin-top: 1rem;">
+            <button class="btn btn-primary" id="yt-reauth-btn">Re-authenticate</button>
+        </div>
+        <p class="form-hint" style="margin-top: 0.5rem;">
+            Re-authentication must sign in as the same channel that this project is bound to.
+            Install-wide OAuth client credentials live in <a href="/settings">General settings</a>.
+        </p>
     </div>
 </section>
 
 <section class="card">
     <div class="card-header"><h2>Social media accounts</h2></div>
     <div class="card-body">
-        <p>Decoupled social accounts arrive with the OAuth 2.0 migration. Existing per-platform credentials are configured in <a href="/settings">General settings</a> for now.</p>
+        <p class="form-hint">Pick which credential this project posts as on each platform.
+            "(none)" leaves the platform unconfigured for auto-posting from this project.
+            Add or remove credentials in <a href="/settings">General settings</a>.</p>
+        <div id="social-defaults"></div>
     </div>
 </section>
 
@@ -145,10 +157,10 @@ async function loadPostingSettings() {
     const resp = await fetch(`/api/projects/${slug}/posting-settings`);
     if (resp.ok) {
         postingSettings = await resp.json();
-        document.getElementById('dt-video').value = postingSettings.default_template_video || 'new_video';
-        document.getElementById('dt-segment').value = postingSettings.default_template_segment || 'new_video';
-        document.getElementById('dt-short').value = postingSettings.default_template_short || 'new_video';
-        document.getElementById('dt-hook').value = postingSettings.default_template_hook || 'new_video';
+        document.getElementById('dt-video').value = postingSettings.default_template_video || 'announce_video';
+        document.getElementById('dt-segment').value = postingSettings.default_template_segment || 'announce_video';
+        document.getElementById('dt-short').value = postingSettings.default_template_short || 'announce_video';
+        document.getElementById('dt-hook').value = postingSettings.default_template_hook || 'announce_video';
         document.getElementById('post-delay').value = postingSettings.post_video_delay_minutes ?? 15;
         document.getElementById('post-spacing').value = postingSettings.inter_post_spacing_minutes ?? 5;
     }
@@ -185,10 +197,10 @@ document.getElementById('save-auto-actions').addEventListener('click', async () 
 
 document.getElementById('save-posting').addEventListener('click', async () => {
     const next = {
-        default_template_video: document.getElementById('dt-video').value || 'new_video',
-        default_template_segment: document.getElementById('dt-segment').value || 'new_video',
-        default_template_short: document.getElementById('dt-short').value || 'new_video',
-        default_template_hook: document.getElementById('dt-hook').value || 'new_video',
+        default_template_video: document.getElementById('dt-video').value || 'announce_video',
+        default_template_segment: document.getElementById('dt-segment').value || 'announce_video',
+        default_template_short: document.getElementById('dt-short').value || 'announce_video',
+        default_template_hook: document.getElementById('dt-hook').value || 'announce_video',
         post_video_delay_minutes: Number(document.getElementById('post-delay').value) || 15,
         inter_post_spacing_minutes: Number(document.getElementById('post-spacing').value) || 5,
     };
@@ -230,7 +242,129 @@ if (deleteBtn) {
     });
 }
 
+async function loadYouTube() {
+    const info = document.getElementById('yt-info');
+    const reauthBtn = document.getElementById('yt-reauth-btn');
+    info.innerHTML = '<p class="loading">Checking…</p>';
+    const resp = await fetch(`/api/projects/${slug}/youtube`, {_silent: true});
+    if (!resp.ok) {
+        info.innerHTML = '<p class="form-hint">Could not load channel info.</p>';
+        reauthBtn.textContent = 'Authenticate';
+        return;
+    }
+    const data = await resp.json();
+    if (!data.channel_id) {
+        info.innerHTML = '<span class="badge badge-draft">Not connected</span>';
+        reauthBtn.textContent = 'Authenticate';
+        reauthBtn.classList.add('btn-primary');
+        reauthBtn.classList.remove('btn-warning');
+        return;
+    }
+    const title = data.channel_title || data.channel_id;
+    const handle = data.channel_handle ? ` (${data.channel_handle})` : '';
+    if (data.needs_reauth) {
+        info.innerHTML = `<span class="badge badge-draft">Needs re-auth</span>
+            <span style="margin-left: 0.5rem;">Bound to <strong>${title}</strong>${handle}</span>
+            <p class="form-hint" style="margin-top: 0.25rem;">Stored credentials are missing or revoked. Re-authenticate to keep posting.</p>`;
+        reauthBtn.classList.add('btn-warning');
+        reauthBtn.classList.remove('btn-primary');
+    } else {
+        info.innerHTML = `<span class="badge badge-published">Connected</span>
+            <span style="margin-left: 0.5rem;">Posting as <strong>${title}</strong>${handle}</span>
+            <div style="color: var(--text-muted); font-size: 0.8rem; margin-top: 0.25rem;">
+                Channel id: <code>${data.channel_id}</code>
+            </div>`;
+        reauthBtn.classList.remove('btn-warning');
+        reauthBtn.classList.add('btn-primary');
+    }
+}
+
+document.getElementById('yt-reauth-btn').addEventListener('click', async () => {
+    try {
+        await openOAuthPopup('/api/oauth/youtube/start',
+            { origin: window.location.origin, project_slug: slug });
+    } catch (e) {
+        // openOAuthPopup already showed a toast.
+    }
+});
+
+const SOCIAL_DEFAULT_PLATFORMS = [
+    { key: 'twitter', label: 'X (Twitter)' },
+    { key: 'bluesky', label: 'Bluesky' },
+    { key: 'mastodon', label: 'Mastodon' },
+    { key: 'linkedin', label: 'LinkedIn' },
+    { key: 'threads', label: 'Threads' },
+];
+
+async function loadSocialDefaults() {
+    const root = document.getElementById('social-defaults');
+    root.innerHTML = '<p class="loading">Loading…</p>';
+    const [defaultsResp, ...credResps] = await Promise.all([
+        fetch(`/api/projects/${slug}/social-defaults`, {_silent: true}),
+        ...SOCIAL_DEFAULT_PLATFORMS.map(p =>
+            fetch(`/api/social-credentials?platform=${p.key}`, {_silent: true})),
+    ]);
+    if (!defaultsResp.ok) {
+        root.innerHTML = '<p class="form-hint">Could not load social defaults.</p>';
+        return;
+    }
+    const defaults = await defaultsResp.json();
+    const credsByPlatform = {};
+    for (let i = 0; i < SOCIAL_DEFAULT_PLATFORMS.length; i++) {
+        const platform = SOCIAL_DEFAULT_PLATFORMS[i].key;
+        credsByPlatform[platform] = credResps[i].ok ? await credResps[i].json() : [];
+    }
+    const rows = SOCIAL_DEFAULT_PLATFORMS.map(({ key, label }) => {
+        const credentials = credsByPlatform[key] || [];
+        const currentId = defaults[key] ? defaults[key].social_account_id : null;
+        const optionsHtml = ['<option value="">(none)</option>']
+            .concat(credentials.map(c =>
+                `<option value="${c.id}" ${c.id === currentId ? 'selected' : ''}>${c.label}</option>`
+            )).join('');
+        const isMissing = currentId && !credentials.some(c => c.id === currentId);
+        const missingNote = isMissing
+            ? '<span class="badge badge-draft" style="margin-left: 0.5rem;">Missing credential</span>'
+            : '';
+        return `
+            <div class="form-row" data-platform="${key}" style="align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
+                <label style="min-width: 8rem;">${label}</label>
+                <select data-platform="${key}" style="min-width: 18rem;">${optionsHtml}</select>
+                ${missingNote}
+            </div>
+        `;
+    }).join('');
+    root.innerHTML = rows;
+    root.querySelectorAll('select[data-platform]').forEach(select => {
+        select.addEventListener('change', () => saveSocialDefault(select.dataset.platform, select.value));
+    });
+}
+
+async function saveSocialDefault(platform, rawValue) {
+    const social_account_id = rawValue ? Number(rawValue) : null;
+    const resp = await fetch(`/api/projects/${slug}/social-defaults/${platform}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ social_account_id }),
+    });
+    if (resp.ok) {
+        showToast(`${platform} default saved`, 'success');
+    }
+}
+
+window.addEventListener('message', (event) => {
+    const data = event.data || {};
+    if (data.source !== 'oauth') return;
+    if (!data.ok) return;
+    if (data.platform === 'youtube') {
+        loadYouTube();
+    } else if (SOCIAL_DEFAULT_PLATFORMS.some(p => p.key === data.platform)) {
+        loadSocialDefaults();
+    }
+});
+
 loadAutoActions();
 loadPostingSettings();
+loadYouTube();
+loadSocialDefaults();
 </script>
 {% endblock %}
