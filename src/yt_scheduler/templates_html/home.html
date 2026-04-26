@@ -36,18 +36,55 @@
     </section>
 </div>
 
-<dialog id="add-project-dialog" class="modal">
-    <form method="dialog">
-        <h3>Add project</h3>
+<dialog id="add-project-dialog" class="modal modal-wide">
+    <div data-step="1">
+        <h3>New project — step 1 of 3: name</h3>
         <label>
             Project name
-            <input type="text" id="new-project-name" required maxlength="80" autofocus>
+            <input type="text" id="new-project-name" maxlength="80" autofocus>
         </label>
+        <p class="form-hint">
+            The project's URL slug is derived from the name and stays fixed for
+            its lifetime. You can rename it later.
+        </p>
         <div class="modal-actions">
-            <button value="cancel" class="btn">Cancel</button>
-            <button value="submit" id="confirm-add-project" class="btn btn-primary">Create</button>
+            <button class="btn" data-wizard-cancel>Cancel</button>
+            <button class="btn btn-primary" id="wizard-step1-next">Next: connect YouTube</button>
         </div>
-    </form>
+    </div>
+
+    <div data-step="2" hidden>
+        <h3>New project — step 2 of 3: connect YouTube</h3>
+        <p>
+            Sign in with the Google account that owns the YouTube channel for
+            <strong id="wizard-name-echo">this project</strong>. The channel id
+            you authenticate as becomes this project's permanent posting target.
+        </p>
+        <p class="form-hint">
+            The project row isn't created until OAuth completes successfully —
+            you can cancel safely at any time during this step.
+        </p>
+        <div id="wizard-step2-status" class="form-hint" style="margin-top: 0.5rem;"></div>
+        <div class="modal-actions">
+            <button class="btn" data-wizard-cancel>Cancel</button>
+            <button class="btn" id="wizard-step1-back">Back</button>
+            <button class="btn btn-primary" id="wizard-step2-connect">Connect with YouTube</button>
+        </div>
+    </div>
+
+    <div data-step="3" hidden>
+        <h3>New project — step 3 of 3: social defaults (optional)</h3>
+        <p>
+            Pick which credential <strong id="wizard-name-echo-3">this project</strong>
+            should post as on each platform. You can skip and configure these later
+            on the project's Settings page.
+        </p>
+        <div id="wizard-social-defaults"></div>
+        <div class="modal-actions">
+            <button class="btn" id="wizard-skip">Skip — open project</button>
+            <button class="btn btn-primary" id="wizard-finish">Save defaults &amp; open</button>
+        </div>
+    </div>
 </dialog>
 {% endblock %}
 
@@ -187,28 +224,177 @@ async function loadRecent() {
 }
 
 const dialog = document.getElementById('add-project-dialog');
-document.getElementById('add-project-btn').addEventListener('click', () => {
+
+const SOCIAL_DEFAULT_PLATFORMS = [
+    { key: 'twitter', label: 'X (Twitter)' },
+    { key: 'bluesky', label: 'Bluesky' },
+    { key: 'mastodon', label: 'Mastodon' },
+    { key: 'linkedin', label: 'LinkedIn' },
+    { key: 'threads', label: 'Threads' },
+];
+
+const wizard = {
+    name: '',
+    slug: null,         // populated after OAuth pre_create succeeds
+    project_id: null,
+    channel_title: '',
+    finishing: false,   // guards against duplicate Finish/Skip clicks
+};
+
+function setWizardStep(step) {
+    dialog.querySelectorAll('[data-step]').forEach(el => {
+        el.hidden = (Number(el.dataset.step) !== step);
+    });
+}
+
+function resetWizard() {
+    wizard.name = '';
+    wizard.slug = null;
+    wizard.project_id = null;
+    wizard.channel_title = '';
+    wizard.finishing = false;
     document.getElementById('new-project-name').value = '';
+    document.getElementById('wizard-step2-status').textContent = '';
+    document.getElementById('wizard-social-defaults').innerHTML = '';
+    setWizardStep(1);
+}
+
+document.getElementById('add-project-btn').addEventListener('click', () => {
+    resetWizard();
     dialog.showModal();
 });
 
-document.getElementById('confirm-add-project').addEventListener('click', async (event) => {
+dialog.querySelectorAll('[data-wizard-cancel]').forEach(btn => {
+    btn.addEventListener('click', (event) => {
+        event.preventDefault();
+        if (wizard.slug) {
+            // Project was already created in step 2 — direct to it instead of
+            // letting the user "cancel" away from existing data.
+            window.location.href = `/projects/${wizard.slug}`;
+            return;
+        }
+        dialog.close();
+    });
+});
+
+document.getElementById('wizard-step1-next').addEventListener('click', () => {
     const name = document.getElementById('new-project-name').value.trim();
     if (!name) {
-        event.preventDefault();
+        showToast('Project name is required', 'error');
         return;
     }
-    event.preventDefault();
-    const resp = await fetch('/api/projects', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name }),
-    });
-    if (resp.ok) {
-        const project = await resp.json();
-        dialog.close();
-        window.location.href = `/projects/${project.slug}`;
+    wizard.name = name;
+    document.getElementById('wizard-name-echo').textContent = name;
+    document.getElementById('wizard-name-echo-3').textContent = name;
+    setWizardStep(2);
+});
+
+document.getElementById('wizard-step1-back').addEventListener('click', () => {
+    setWizardStep(1);
+});
+
+document.getElementById('wizard-step2-connect').addEventListener('click', async () => {
+    const status = document.getElementById('wizard-step2-status');
+    status.textContent = 'Opening Google OAuth…';
+    try {
+        await openOAuthPopup('/api/oauth/youtube/start', {
+            origin: window.location.origin,
+            pre_create: { name: wizard.name },
+        });
+        status.textContent = 'Waiting for the popup to complete the flow…';
+    } catch (err) {
+        status.textContent = '';
+        // openOAuthPopup already showed a toast.
     }
+});
+
+window.addEventListener('message', async (event) => {
+    const data = event.data || {};
+    if (data.source !== 'oauth') return;
+    if (data.platform !== 'youtube') return;
+    if (!dialog.open) return;
+    if (!data.ok) {
+        document.getElementById('wizard-step2-status').textContent =
+            'OAuth failed. Try Connect again.';
+        return;
+    }
+    if (data.mode === 'pre_create') {
+        wizard.slug = data.slug;
+        wizard.project_id = data.project_id;
+        wizard.channel_title = data.channel_title || '';
+        document.getElementById('wizard-step2-status').textContent = '';
+        await renderWizardSocialDefaults();
+        setWizardStep(3);
+    }
+});
+
+async function renderWizardSocialDefaults() {
+    const container = document.getElementById('wizard-social-defaults');
+    container.innerHTML = '<p class="form-hint">Loading credentials…</p>';
+    const fetched = await Promise.all(SOCIAL_DEFAULT_PLATFORMS.map(async (p) => {
+        const resp = await fetch(`/api/social-credentials?platform=${p.key}`, {_silent: true});
+        return [p.key, resp.ok ? await resp.json() : []];
+    }));
+    const credsByPlatform = Object.fromEntries(fetched);
+    const rows = SOCIAL_DEFAULT_PLATFORMS.map(({ key, label }) => {
+        const credentials = credsByPlatform[key];
+        if (!credentials || !credentials.length) {
+            return `
+                <div class="form-row" style="align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
+                    <label style="min-width: 8rem;">${label}</label>
+                    <span class="form-hint">No credentials yet — add one in Settings</span>
+                </div>
+            `;
+        }
+        const options = ['<option value="">(none)</option>']
+            .concat(credentials.map(c =>
+                `<option value="${c.id}">${escapeHtml(c.label)}</option>`));
+        return `
+            <div class="form-row" style="align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
+                <label style="min-width: 8rem;">${label}</label>
+                <select data-wizard-platform="${key}" style="min-width: 18rem;">${options.join('')}</select>
+            </div>
+        `;
+    }).join('');
+    container.innerHTML = rows;
+}
+
+async function persistWizardSocialDefaults() {
+    const selects = dialog.querySelectorAll('[data-wizard-platform]');
+    const updates = [];
+    for (const select of selects) {
+        const platform = select.dataset.wizardPlatform;
+        const raw = select.value;
+        if (!raw) continue;
+        updates.push(fetch(
+            `/api/projects/${wizard.slug}/social-defaults/${platform}`,
+            {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ social_account_id: Number(raw) }),
+            },
+        ));
+    }
+    if (updates.length) await Promise.all(updates);
+}
+
+document.getElementById('wizard-skip').addEventListener('click', () => {
+    if (wizard.finishing) return;
+    wizard.finishing = true;
+    dialog.close();
+    window.location.href = `/projects/${wizard.slug}`;
+});
+
+document.getElementById('wizard-finish').addEventListener('click', async () => {
+    if (wizard.finishing) return;
+    wizard.finishing = true;
+    try {
+        await persistWizardSocialDefaults();
+    } catch {
+        // Toasts already shown by global fetch wrapper. Continue to project anyway.
+    }
+    dialog.close();
+    window.location.href = `/projects/${wizard.slug}`;
 });
 
 loadProjects();
