@@ -209,6 +209,40 @@ async def _resolve_poster_for_post(post: dict) -> social.SocialPoster:
     return social.get_poster(post["platform"])
 
 
+async def _credential_for_post(post: dict) -> dict | None:
+    """Resolve which credential row will be used to send this post — for
+    the pre-check that fails fast on a known-broken credential. Mirrors
+    the routing precedence in :func:`_resolve_poster_for_post` (slot
+    binding → project default → first active for platform)."""
+    from yt_scheduler.services.social_credentials import (
+        get_credential_by_id,
+        get_first_active_credential,
+    )
+
+    db = await get_db()
+    sa_id = post.get("social_account_id")
+    if sa_id:
+        return await get_credential_by_id(int(sa_id))
+
+    cursor = await db.execute(
+        "SELECT v.project_id FROM social_posts sp "
+        "JOIN videos v ON v.id = sp.video_id WHERE sp.id = ?",
+        (post["id"],),
+    )
+    row = await cursor.fetchone()
+    project_id = int(row["project_id"]) if row is not None else 1
+    cursor = await db.execute(
+        "SELECT social_account_id FROM project_social_defaults "
+        "WHERE project_id = ? AND platform = ?",
+        (project_id, post["platform"]),
+    )
+    default_row = await cursor.fetchone()
+    if default_row is not None and default_row["social_account_id"] is not None:
+        return await get_credential_by_id(int(default_row["social_account_id"]))
+
+    return await get_first_active_credential(post["platform"])
+
+
 @router.post("/posts/{post_id}/send")
 async def send_post(post_id: int):
     """Send a single social post."""
@@ -220,6 +254,18 @@ async def send_post(post_id: int):
         raise HTTPException(404, "Post not found")
 
     post = dict(rows[0])
+
+    # Pre-check: if the credential we'll resolve to is already flagged
+    # as needing re-auth, fail fast instead of burning a round trip
+    # against the platform that we know will reject us again.
+    cred = await _credential_for_post(post)
+    if cred is not None and cred.get("needs_reauth"):
+        raise HTTPException(
+            401,
+            f"{post['platform']} credential needs re-authentication. "
+            "Reconnect from Settings before retrying.",
+        )
+
     try:
         poster = await _resolve_poster_for_post(post)
     except ValueError as exc:

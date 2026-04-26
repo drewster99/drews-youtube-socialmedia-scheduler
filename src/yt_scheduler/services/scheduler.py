@@ -144,6 +144,11 @@ async def publish_video_job(video_id: str) -> dict:
                 )
                 logger.info(f"Posted to {platform}: {post_result.get('url', '')}")
             except Exception as e:
+                from yt_scheduler.services.social import CredentialAuthError
+                from yt_scheduler.services.social_credentials import mark_needs_reauth
+
+                if isinstance(e, CredentialAuthError) and e.uuid:
+                    await mark_needs_reauth(e.uuid)
                 await db.execute(
                     "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
                     (str(e), post_id),
@@ -242,6 +247,11 @@ async def _send_scheduled_post(post_id: int) -> None:
             },
         )
     except Exception as exc:
+        from yt_scheduler.services.social import CredentialAuthError
+        from yt_scheduler.services.social_credentials import mark_needs_reauth
+
+        if isinstance(exc, CredentialAuthError) and exc.uuid:
+            await mark_needs_reauth(exc.uuid)
         logger.error("Failed to send scheduled post %s: %s", post_id, exc)
         await db.execute(
             "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",

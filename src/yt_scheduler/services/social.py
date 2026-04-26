@@ -634,14 +634,16 @@ class MastodonPoster(SocialPoster):
                 api_base_url=creds.get("instance_url", "https://mastodon.social"),
             )
 
-            media_ids = None
-            if media_path and Path(media_path).exists():
-                media = client.media_post(media_path)
-                media_ids = [media["id"]]
-
             try:
+                media_ids = None
+                if media_path and Path(media_path).exists():
+                    media = client.media_post(media_path)
+                    media_ids = [media["id"]]
+
                 status = client.status_post(text, media_ids=media_ids)
             except MastodonUnauthorizedError as exc:
+                # Either media_post or status_post can raise this if the
+                # access token has been revoked/expired.
                 raise CredentialAuthError(
                     creds.get("uuid"),
                     "Mastodon rejected the access token — re-OAuth.",

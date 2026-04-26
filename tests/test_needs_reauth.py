@@ -105,3 +105,52 @@ async def test_mark_on_unknown_uuid_is_silent(app_db) -> None:
     shouldn't blow up the response."""
     creds, _db = app_db
     await creds.mark_needs_reauth("does-not-exist")
+
+
+async def test_send_post_precheck_returns_401_for_flagged_credential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The route must short-circuit a post against a credential already
+    known to be broken — saves a 401 round-trip to the platform."""
+    monkeypatch.setenv("DYS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DYS_HOST", "127.0.0.1")
+    (tmp_path / "uploads").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "templates").mkdir(parents=True, exist_ok=True)
+    for mod in list(sys.modules.keys()):
+        if mod.startswith("yt_scheduler"):
+            sys.modules.pop(mod, None)
+
+    keychain = importlib.import_module("yt_scheduler.services.keychain")
+    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+
+    app_module = importlib.import_module("yt_scheduler.app")
+    creds_mod = importlib.import_module("yt_scheduler.services.social_credentials")
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(app_module.app) as c:
+        # Seed a credential, mark it needs_reauth, then try to send a
+        # post bound to it.
+        cred = await creds_mod.upsert_credential(
+            "twitter", "tw:1", "alice", {"bearer_token": "tok"}
+        )
+        await creds_mod.mark_needs_reauth(cred["uuid"])
+
+        # Insert a video + a post bound to that credential
+        from yt_scheduler.database import get_db
+        db = await get_db()
+        await db.execute(
+            "INSERT INTO videos (id, project_id, title, status) "
+            "VALUES ('vidA', 1, 'T', 'uploaded')"
+        )
+        cursor = await db.execute(
+            "INSERT INTO social_posts (video_id, platform, content, status, social_account_id) "
+            "VALUES ('vidA', 'twitter', 'hello', 'approved', ?)",
+            (cred["id"],),
+        )
+        post_id = int(cursor.lastrowid)
+        await db.commit()
+
+        resp = c.post(f"/api/social/posts/{post_id}/send")
+        assert resp.status_code == 401
+        assert "needs re-authentication" in resp.json()["detail"]
