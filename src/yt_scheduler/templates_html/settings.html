@@ -296,11 +296,17 @@ function renderPlatformCard(name, config, accounts) {
 
 function renderCredentialRow(cred) {
     const created = cred.created_at ? new Date(cred.created_at + 'Z').toLocaleDateString() : '';
+    const reauthBadge = cred.needs_reauth
+        ? ' <span class="badge badge-draft" style="margin-left:0.4rem;">Needs re-auth</span>'
+        : '';
+    const borderStyle = cred.needs_reauth
+        ? 'border:1px solid var(--danger)'
+        : 'border:1px solid var(--border)';
     return `
         <div class="credential-row" data-uuid="${escapeHtml(cred.uuid)}"
-             style="display:flex; justify-content:space-between; align-items:center; padding:0.5rem 0.75rem; border:1px solid var(--border); border-radius:6px; margin-bottom:0.5rem;">
+             style="display:flex; justify-content:space-between; align-items:center; padding:0.5rem 0.75rem; ${borderStyle}; border-radius:6px; margin-bottom:0.5rem;">
             <div>
-                <div style="font-weight:600;">${escapeHtml(cred.label)}</div>
+                <div style="font-weight:600;">${escapeHtml(cred.label)}${reauthBadge}</div>
                 <div style="font-size:0.8rem; color:var(--text-muted);">
                     ${cred.is_nickname ? '<em>nickname</em> · ' : ''}Connected ${escapeHtml(created)}
                 </div>
@@ -330,58 +336,6 @@ function renderAddAccountButton(name) {
     return '';
 }
 
-async function connectLinkedIn() {
-    const clientId = prompt('LinkedIn Client ID\n\n(developers.linkedin.com → your app → Auth tab → Application credentials)');
-    if (!clientId) return;
-    const clientSecret = prompt('LinkedIn Primary Client Secret');
-    if (!clientSecret) return;
-    try {
-        await openOAuthPopup('/api/oauth/linkedin/start', {
-            client_id: clientId.trim(),
-            client_secret: clientSecret.trim(),
-            origin: window.location.origin,
-        }, 'linkedin-oauth');
-    } catch (_) {}
-}
-
-async function connectTwitter() {
-    const clientId = prompt('X / Twitter OAuth 2.0 Client ID\n\n(developer.x.com → your app → Keys and tokens)');
-    if (!clientId) return;
-    const clientSecret = prompt('Client Secret\n\n(Optional — leave blank for a public app.)') || '';
-    try {
-        await openOAuthPopup('/api/oauth/twitter/start', {
-            client_id: clientId.trim(),
-            client_secret: clientSecret.trim(),
-            origin: window.location.origin,
-        }, 'twitter-oauth');
-    } catch (_) {}
-}
-
-async function connectMastodon() {
-    const instance = prompt('Mastodon instance URL\n\n(e.g. https://mastodon.social — the app will register itself there.)', 'https://mastodon.social');
-    if (!instance) return;
-    try {
-        await openOAuthPopup('/api/oauth/mastodon/start', {
-            instance_url: instance.trim(),
-            origin: window.location.origin,
-        }, 'mastodon-oauth');
-    } catch (_) {}
-}
-
-async function connectThreads() {
-    const clientId = prompt('Threads / Meta App Client ID\n\n(developers.facebook.com → your app → App settings → Basic)');
-    if (!clientId) return;
-    const clientSecret = prompt('Threads / Meta App Secret');
-    if (!clientSecret) return;
-    try {
-        await openOAuthPopup('/api/oauth/threads/start', {
-            client_id: clientId.trim(),
-            client_secret: clientSecret.trim(),
-            origin: window.location.origin,
-        }, 'threads-oauth');
-    } catch (_) {}
-}
-
 async function exchangeThreadsToken() {
     const appSecret = prompt('Threads App Secret\n\n(developers.facebook.com → your app → App settings → Basic → App Secret)');
     if (!appSecret) return;
@@ -401,18 +355,6 @@ async function exchangeThreadsToken() {
     }
 }
 
-async function connectBluesky() {
-    const handle = prompt('Your Bluesky handle (e.g. you.bsky.social — no @):');
-    if (!handle) return;
-    try {
-        await openOAuthPopup('/api/oauth/bluesky/start', {
-            origin: window.location.origin,
-            handle: handle.trim(),
-        });
-    } catch (err) {
-        // openOAuthPopup already showed a toast.
-    }
-}
 
 async function refreshCredentialUsername(uuid) {
     const resp = await fetch(`/api/social-credentials/${uuid}/refresh-username`, {method: 'POST'});

@@ -64,6 +64,11 @@ def _row_to_dict(row) -> dict:
         "credentials_ref": row["credentials_ref"],
         "created_at": row["created_at"],
         "deleted_at": row["deleted_at"],
+        # ``needs_reauth`` is a flag set by the poster when the platform
+        # rejects a request as unauthorised AND a refresh attempt also
+        # failed (or no refresh path exists). Cleared on next successful
+        # ``upsert_credential`` (i.e. after the user re-OAuths).
+        "needs_reauth": bool(row["needs_reauth"]) if "needs_reauth" in row.keys() else False,
         "label": format_account_label(row["platform"], row["username"]),
     }
 
@@ -170,10 +175,11 @@ async def upsert_credential(
     if row is not None:
         existing_id = int(row["id"])
         existing_uuid = row["uuid"]
+        # Clear needs_reauth: the user just successfully re-OAuthed.
         await db.execute(
             "UPDATE social_accounts "
             "SET username = ?, display_name = ?, is_nickname = ?, "
-            "    deleted_at = NULL "
+            "    deleted_at = NULL, needs_reauth = 0 "
             "WHERE id = ?",
             (username, display_name, 1 if is_nickname else 0, existing_id),
         )
@@ -199,6 +205,20 @@ async def upsert_credential(
         dict(bundle, provider_account_id=provider_account_id, username=username),
     )
     return await get_credential_by_id(new_id)  # type: ignore[return-value]
+
+
+async def mark_needs_reauth(uuid: str) -> None:
+    """Flag a credential as needing the user to re-OAuth.
+
+    Called by send paths after a terminal authentication failure. The
+    flag is cleared on the next successful :func:`upsert_credential`
+    (which runs as part of the OAuth callback).
+    """
+    db = await get_db()
+    await db.execute(
+        "UPDATE social_accounts SET needs_reauth = 1 WHERE uuid = ?", (uuid,)
+    )
+    await db.commit()
 
 
 async def soft_delete_credential(uuid: str) -> dict | None:

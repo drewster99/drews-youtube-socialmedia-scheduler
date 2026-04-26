@@ -318,18 +318,24 @@ async function loadSocialDefaults() {
         const credentials = credsByPlatform[key] || [];
         const currentId = defaults[key] ? defaults[key].social_account_id : null;
         const optionsHtml = ['<option value="">(none)</option>']
-            .concat(credentials.map(c =>
-                `<option value="${c.id}" ${c.id === currentId ? 'selected' : ''}>${c.label}</option>`
-            )).join('');
+            .concat(credentials.map(c => {
+                const reauth = c.needs_reauth ? ' (needs re-auth)' : '';
+                return `<option value="${c.id}" ${c.id === currentId ? 'selected' : ''}>${c.label}${reauth}</option>`;
+            })).join('');
         const isMissing = currentId && !credentials.some(c => c.id === currentId);
-        const missingNote = isMissing
-            ? '<span class="badge badge-draft" style="margin-left: 0.5rem;">Missing credential</span>'
-            : '';
+        const currentCred = credentials.find(c => c.id === currentId);
+        let badge = '';
+        if (isMissing) {
+            badge = '<span class="badge badge-draft" style="margin-left: 0.5rem;">Missing credential</span>';
+        } else if (currentCred && currentCred.needs_reauth) {
+            badge = '<span class="badge badge-draft" style="margin-left: 0.5rem;">Needs re-auth</span>';
+        }
         return `
             <div class="form-row" data-platform="${key}" style="align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
                 <label style="min-width: 8rem;">${label}</label>
                 <select data-platform="${key}" style="min-width: 18rem;">${optionsHtml}</select>
-                ${missingNote}
+                <button class="btn btn-sm btn-secondary" data-platform-add="${key}" title="Authenticate a new ${label} account and bind it as this project's default">+ New</button>
+                ${badge}
             </div>
         `;
     }).join('');
@@ -337,6 +343,28 @@ async function loadSocialDefaults() {
     root.querySelectorAll('select[data-platform]').forEach(select => {
         select.addEventListener('change', () => saveSocialDefault(select.dataset.platform, select.value));
     });
+    root.querySelectorAll('button[data-platform-add]').forEach(btn => {
+        btn.addEventListener('click', () => addCredentialForPlatform(btn.dataset.platformAdd));
+    });
+}
+
+function addCredentialForPlatform(platform) {
+    // Each connector function lives in /static/js/oauth-connectors.js and
+    // is shared with /settings. Passing ``slug`` flips the OAuth callback
+    // into "bind as this project's default for the platform" mode.
+    const connectors = {
+        twitter: connectTwitter,
+        bluesky: connectBluesky,
+        mastodon: connectMastodon,
+        linkedin: connectLinkedIn,
+        threads: connectThreads,
+    };
+    const fn = connectors[platform];
+    if (!fn) {
+        showToast(`No connector for ${platform}`, 'error');
+        return;
+    }
+    fn(slug);
 }
 
 async function saveSocialDefault(platform, rawValue) {

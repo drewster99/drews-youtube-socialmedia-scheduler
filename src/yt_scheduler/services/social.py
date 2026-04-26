@@ -216,6 +216,21 @@ async def _twitter_v2_upload(bearer_token: str, media_path: Path) -> str:
     return await _twitter_v2_simple_upload(bearer_token, media_path, mime or "image/jpeg")
 
 
+class CredentialAuthError(RuntimeError):
+    """Raised by a poster when the platform rejected our credentials and
+    no automatic recovery (e.g. token refresh) is possible.
+
+    The send-path catches this, marks the credential ``needs_reauth``,
+    and surfaces a clear message to the UI prompting the user to
+    reconnect. Carries the credential's UUID so the route handler
+    doesn't have to reach back into the bundle.
+    """
+
+    def __init__(self, uuid: str | None, message: str) -> None:
+        super().__init__(message)
+        self.uuid = uuid
+
+
 class SocialPoster:
     """Base class for social media platform posters.
 
@@ -275,27 +290,28 @@ class TwitterPoster(SocialPoster):
         creds = self._get_creds()
         bearer = creds.get("bearer_token")
         if not bearer:
-            raise RuntimeError(
-                "X is not configured. Click 'Connect with X (OAuth 2.0)' in Settings."
+            raise CredentialAuthError(
+                creds.get("uuid"),
+                "X is not configured. Click 'Connect with X (OAuth 2.0)' in Settings.",
             )
 
         has_media = bool(media_path) and Path(media_path).exists() if media_path else False
 
+        import tweepy
+
+        async def _upload_media(token: str) -> str | None:
+            try:
+                return await _twitter_v2_upload(token, Path(media_path))
+            except Exception as exc:
+                logger.warning(
+                    "Twitter v2 media upload failed (%s); posting text-only. "
+                    "Re-run Connect with X to refresh the media.write scope if "
+                    "this persists.",
+                    exc,
+                )
+                return None
+
         try:
-            import tweepy
-
-            async def _upload_media(token: str) -> str | None:
-                try:
-                    return await _twitter_v2_upload(token, Path(media_path))
-                except Exception as exc:
-                    logger.warning(
-                        "Twitter v2 media upload failed (%s); posting text-only. "
-                        "Re-run Connect with X to refresh the media.write scope if "
-                        "this persists.",
-                        exc,
-                    )
-                    return None
-
             media_ids = None
             if has_media:
                 media_id = await _upload_media(bearer)
@@ -305,11 +321,14 @@ class TwitterPoster(SocialPoster):
             try:
                 client = tweepy.Client(access_token=bearer)
                 response = client.create_tweet(text=text, media_ids=media_ids)
-            except tweepy.errors.Unauthorized:
+            except tweepy.errors.Unauthorized as exc:
                 # Bearer expired (~2h lifetime). Try once with refresh_token.
                 new_bearer = await _twitter_refresh_bearer(creds)
                 if not new_bearer:
-                    raise
+                    raise CredentialAuthError(
+                        creds.get("uuid"),
+                        "X bearer expired and refresh failed — re-OAuth.",
+                    ) from exc
                 logger.info("Twitter bearer refreshed; retrying tweet.")
                 # Re-upload media against the fresh token — the old media_id
                 # belongs to the original auth session and may not be valid.
@@ -317,10 +336,18 @@ class TwitterPoster(SocialPoster):
                     media_id = await _upload_media(new_bearer)
                     media_ids = [media_id] if media_id else None
                 client = tweepy.Client(access_token=new_bearer)
-                response = client.create_tweet(text=text, media_ids=media_ids)
+                try:
+                    response = client.create_tweet(text=text, media_ids=media_ids)
+                except tweepy.errors.Unauthorized as exc2:
+                    raise CredentialAuthError(
+                        creds.get("uuid"),
+                        "X rejected the refreshed bearer — re-OAuth.",
+                    ) from exc2
 
             tweet_id = response.data["id"]
             return {"url": f"https://x.com/i/status/{tweet_id}", "id": tweet_id}
+        except CredentialAuthError:
+            raise
         except Exception as e:
             raise RuntimeError(f"Twitter post failed: {e}") from e
 
@@ -351,13 +378,20 @@ class BlueskyPoster(SocialPoster):
 
         creds = self._get_creds()
         if creds.get("auth_method") != "oauth":
-            raise RuntimeError(
+            raise CredentialAuthError(
+                creds.get("uuid"),
                 "Bluesky credential is not OAuth-authenticated. "
-                "Click Connect with Bluesky in Settings to re-authenticate."
+                "Click Connect with Bluesky in Settings to re-authenticate.",
             )
 
         async with httpx.AsyncClient(follow_redirects=True) as client:
-            await self._ensure_fresh_token(creds, client, bluesky_oauth, save_bundle)
+            try:
+                await self._ensure_fresh_token(creds, client, bluesky_oauth, save_bundle)
+            except RuntimeError as exc:
+                # refresh_tokens raises RuntimeError on a non-200 from the
+                # AS — invalid_grant, expired_token, etc. all mean the
+                # user has to re-OAuth.
+                raise CredentialAuthError(creds.get("uuid"), str(exc)) from exc
 
             embed = None
             if media_path and Path(media_path).exists():
@@ -399,9 +433,21 @@ class BlueskyPoster(SocialPoster):
 
             resp = await _do()
             if resp.status_code in (400, 401):
-                if await self._handle_dpop_or_token_error(resp, creds, client, bluesky_oauth, save_bundle):
+                try:
+                    retried = await self._handle_dpop_or_token_error(
+                        resp, creds, client, bluesky_oauth, save_bundle,
+                    )
+                except RuntimeError as exc:
+                    raise CredentialAuthError(creds.get("uuid"), str(exc)) from exc
+                if retried:
                     resp = await _do()
 
+            if resp.status_code == 401:
+                # Still 401 after refresh+retry — the credential is dead.
+                raise CredentialAuthError(
+                    creds.get("uuid"),
+                    f"Bluesky rejected the credential after refresh: {resp.text}",
+                )
             if resp.status_code not in (200, 201):
                 raise RuntimeError(
                     f"Bluesky createRecord failed: HTTP {resp.status_code} {resp.text}"
@@ -539,9 +585,20 @@ class BlueskyPoster(SocialPoster):
 
         resp = await _do()
         if resp.status_code in (400, 401):
-            if await self._handle_dpop_or_token_error(resp, creds, client, bluesky_oauth, save_bundle):
+            try:
+                retried = await self._handle_dpop_or_token_error(
+                    resp, creds, client, bluesky_oauth, save_bundle,
+                )
+            except RuntimeError as exc:
+                raise CredentialAuthError(creds.get("uuid"), str(exc)) from exc
+            if retried:
                 resp = await _do()
 
+        if resp.status_code == 401:
+            raise CredentialAuthError(
+                creds.get("uuid"),
+                f"Bluesky uploadBlob rejected after refresh: {resp.text}",
+            )
         if resp.status_code not in (200, 201):
             raise RuntimeError(
                 f"Bluesky uploadBlob failed: HTTP {resp.status_code} {resp.text}"
@@ -570,6 +627,7 @@ class MastodonPoster(SocialPoster):
 
         try:
             from mastodon import Mastodon
+            from mastodon.errors import MastodonUnauthorizedError
 
             client = Mastodon(
                 access_token=creds["access_token"],
@@ -581,8 +639,16 @@ class MastodonPoster(SocialPoster):
                 media = client.media_post(media_path)
                 media_ids = [media["id"]]
 
-            status = client.status_post(text, media_ids=media_ids)
+            try:
+                status = client.status_post(text, media_ids=media_ids)
+            except MastodonUnauthorizedError as exc:
+                raise CredentialAuthError(
+                    creds.get("uuid"),
+                    "Mastodon rejected the access token — re-OAuth.",
+                ) from exc
             return {"url": status["url"], "id": str(status["id"])}
+        except CredentialAuthError:
+            raise
         except Exception as e:
             raise RuntimeError(f"Mastodon post failed: {e}") from e
 
@@ -619,9 +685,16 @@ class LinkedInPoster(SocialPoster):
                 resp = await client.post(
                     "https://api.linkedin.com/v2/ugcPosts", headers=headers, json=body
                 )
+                if resp.status_code == 401:
+                    raise CredentialAuthError(
+                        creds.get("uuid"),
+                        "LinkedIn rejected the access token — re-OAuth.",
+                    )
                 resp.raise_for_status()
                 post_id = resp.headers.get("x-restli-id", "")
                 return {"url": f"https://www.linkedin.com/feed/update/{post_id}", "id": post_id}
+        except CredentialAuthError:
+            raise
         except Exception as e:
             raise RuntimeError(f"LinkedIn post failed: {e}") from e
 
@@ -644,6 +717,11 @@ class ThreadsPoster(SocialPoster):
                     f"https://graph.threads.net/v1.0/{user_id}/threads",
                     params={"media_type": "TEXT", "text": text, "access_token": access_token},
                 )
+                if create_resp.status_code == 401:
+                    raise CredentialAuthError(
+                        creds.get("uuid"),
+                        "Threads rejected the access token — re-OAuth.",
+                    )
                 create_resp.raise_for_status()
                 container_id = create_resp.json()["id"]
 
@@ -651,11 +729,18 @@ class ThreadsPoster(SocialPoster):
                     f"https://graph.threads.net/v1.0/{user_id}/threads_publish",
                     params={"creation_id": container_id, "access_token": access_token},
                 )
+                if publish_resp.status_code == 401:
+                    raise CredentialAuthError(
+                        creds.get("uuid"),
+                        "Threads rejected the access token — re-OAuth.",
+                    )
                 publish_resp.raise_for_status()
                 post_id = publish_resp.json()["id"]
 
                 username = creds.get("username", "")
                 return {"url": f"https://threads.net/@{username}/post/{post_id}", "id": post_id}
+        except CredentialAuthError:
+            raise
         except Exception as e:
             raise RuntimeError(f"Threads post failed: {e}") from e
 

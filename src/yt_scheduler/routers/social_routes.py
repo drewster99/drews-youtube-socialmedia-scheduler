@@ -212,6 +212,8 @@ async def _resolve_poster_for_post(post: dict) -> social.SocialPoster:
 @router.post("/posts/{post_id}/send")
 async def send_post(post_id: int):
     """Send a single social post."""
+    from yt_scheduler.services.social_credentials import mark_needs_reauth
+
     db = await get_db()
     rows = await db.execute_fetchall("SELECT * FROM social_posts WHERE id = ?", (post_id,))
     if not rows:
@@ -238,6 +240,19 @@ async def send_post(post_id: int):
         )
         await db.commit()
         return {"status": "ok", "url": result.get("url", "")}
+    except social.CredentialAuthError as e:
+        if e.uuid:
+            await mark_needs_reauth(e.uuid)
+        await db.execute(
+            "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
+            (f"Credential needs re-auth: {e}", post_id),
+        )
+        await db.commit()
+        raise HTTPException(
+            401,
+            f"{post['platform']} credential needs re-authentication. "
+            "Reconnect from Settings.",
+        ) from e
     except Exception as e:
         await db.execute(
             "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
@@ -287,6 +302,8 @@ async def unschedule_post(post_id: int):
 @router.post("/posts/{video_id}/send-all")
 async def send_all_posts(video_id: str):
     """Send all approved posts for a video."""
+    from yt_scheduler.services.social_credentials import mark_needs_reauth
+
     db = await get_db()
     rows = await db.execute_fetchall(
         "SELECT * FROM social_posts WHERE video_id = ? AND status = 'approved'",
@@ -315,6 +332,17 @@ async def send_all_posts(video_id: str):
                 (result.get("url", ""), post["id"]),
             )
             results[post["platform"]] = {"status": "posted", "url": result.get("url", "")}
+        except social.CredentialAuthError as e:
+            if e.uuid:
+                await mark_needs_reauth(e.uuid)
+            await db.execute(
+                "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
+                (f"Credential needs re-auth: {e}", post["id"]),
+            )
+            results[post["platform"]] = {
+                "status": "needs_reauth",
+                "error": "Credential needs re-authentication. Reconnect from Settings.",
+            }
         except Exception as e:
             await db.execute(
                 "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
