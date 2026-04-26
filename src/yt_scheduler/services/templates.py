@@ -348,6 +348,182 @@ async def delete_template(name: str, project_id: int = 1) -> None:
     await db.commit()
 
 
+# --- Slot CRUD --------------------------------------------------------------
+
+
+_UNCHANGED = object()
+
+
+async def get_slot(slot_id: int) -> dict | None:
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT s.*, a.uuid AS account_uuid, a.username AS account_username, "
+        "       a.platform AS account_platform, a.deleted_at AS account_deleted_at "
+        "FROM template_slots s "
+        "LEFT JOIN social_accounts a ON a.id = s.social_account_id "
+        "WHERE s.id = ?",
+        (slot_id,),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    slot = _slot_to_dict(row)
+    if row["account_uuid"] is not None:
+        slot["resolved_account"] = {
+            "uuid": row["account_uuid"],
+            "username": row["account_username"],
+            "platform": row["account_platform"],
+            "deleted": row["account_deleted_at"] is not None,
+        }
+    else:
+        slot["resolved_account"] = None
+    return slot
+
+
+async def list_slots(template_id: int) -> list[dict]:
+    """Public wrapper around the internal _list_slots helper."""
+    return await _list_slots(template_id)
+
+
+async def add_slot(
+    template_id: int,
+    platform: str,
+    *,
+    body: str = "",
+    media: str = "thumbnail",
+    max_chars: int = 500,
+    social_account_id: int | None = None,
+    is_disabled: bool = False,
+    order_index: int | None = None,
+) -> dict:
+    """Add a non-builtin slot to an existing template.
+
+    Slots created here are always ``is_builtin = 0``; built-ins are
+    created exclusively by :func:`save_template` /
+    :func:`ensure_default_template` for the seeded templates.
+    """
+    if platform not in ALL_PLATFORMS:
+        raise ValueError(f"Unknown platform: {platform}")
+    if max_chars < 1:
+        raise ValueError("max_chars must be positive")
+
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT id FROM templates WHERE id = ?", (template_id,)
+    )
+    if await cursor.fetchone() is None:
+        raise ValueError(f"Template {template_id} not found")
+
+    if order_index is None:
+        cursor = await db.execute(
+            "SELECT COALESCE(MAX(order_index), -1) + 1 AS next "
+            "FROM template_slots WHERE template_id = ?",
+            (template_id,),
+        )
+        next_row = await cursor.fetchone()
+        order_index = int(next_row["next"]) if next_row else 0
+
+    cursor = await db.execute(
+        "INSERT INTO template_slots "
+        "(template_id, platform, social_account_id, is_builtin, is_disabled, "
+        " order_index, body, media, max_chars) "
+        "VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)",
+        (
+            template_id, platform, social_account_id,
+            1 if is_disabled else 0, int(order_index),
+            body, media, int(max_chars),
+        ),
+    )
+    await db.commit()
+    slot = await get_slot(int(cursor.lastrowid))
+    if slot is None:
+        raise RuntimeError("Saved slot disappeared between write and read")
+    return slot
+
+
+async def update_slot(
+    slot_id: int,
+    *,
+    body: object = _UNCHANGED,
+    media: object = _UNCHANGED,
+    max_chars: object = _UNCHANGED,
+    social_account_id: object = _UNCHANGED,
+    is_disabled: object = _UNCHANGED,
+    order_index: object = _UNCHANGED,
+) -> dict:
+    """Update one or more fields on an existing slot.
+
+    Pass the sentinel ``_UNCHANGED`` (or omit the kwarg) to leave a field
+    untouched. ``social_account_id`` can be set to ``None`` to clear the
+    binding without removing the slot.
+
+    The slot's ``platform`` and ``is_builtin`` flag are immutable.
+    """
+    existing = await get_slot(slot_id)
+    if existing is None:
+        raise ValueError(f"Slot {slot_id} not found")
+
+    updates: list[str] = []
+    params: list = []
+    if body is not _UNCHANGED:
+        updates.append("body = ?")
+        params.append(str(body))
+    if media is not _UNCHANGED:
+        updates.append("media = ?")
+        params.append(str(media))
+    if max_chars is not _UNCHANGED:
+        try:
+            n = int(max_chars)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_chars must be an integer") from exc
+        if n < 1:
+            raise ValueError("max_chars must be positive")
+        updates.append("max_chars = ?")
+        params.append(n)
+    if social_account_id is not _UNCHANGED:
+        updates.append("social_account_id = ?")
+        params.append(
+            int(social_account_id) if social_account_id is not None else None
+        )
+    if is_disabled is not _UNCHANGED:
+        updates.append("is_disabled = ?")
+        params.append(1 if is_disabled else 0)
+    if order_index is not _UNCHANGED:
+        updates.append("order_index = ?")
+        params.append(int(order_index))  # type: ignore[arg-type]
+
+    if not updates:
+        return existing
+
+    updates.append("updated_at = datetime('now')")
+    params.append(slot_id)
+
+    db = await get_db()
+    await db.execute(
+        f"UPDATE template_slots SET {', '.join(updates)} WHERE id = ?",
+        params,
+    )
+    await db.commit()
+
+    refreshed = await get_slot(slot_id)
+    if refreshed is None:
+        raise RuntimeError("Updated slot disappeared after write")
+    return refreshed
+
+
+async def delete_slot(slot_id: int) -> None:
+    """Delete a non-builtin slot. Built-in slots are protected — disable
+    them via :func:`update_slot` with ``is_disabled=True`` instead."""
+    existing = await get_slot(slot_id)
+    if existing is None:
+        raise ValueError(f"Slot {slot_id} not found")
+    if existing["is_builtin"]:
+        raise ValueError("Cannot delete a built-in slot — disable it instead")
+    db = await get_db()
+    await db.execute("DELETE FROM template_slots WHERE id = ?", (slot_id,))
+    await db.commit()
+
+
 async def ensure_default_template(project_id: int = 1) -> None:
     """Create the two built-in templates within a project if they don't
     already exist."""

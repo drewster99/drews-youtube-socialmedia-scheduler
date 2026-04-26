@@ -94,12 +94,15 @@ async def generate_posts(video_id: str, data: dict | None = None):
             (video_id,),
         )
 
-        generated = {}
-        for platform, config in template["platforms"].items():
+        generated: list[dict] = []
+        for slot in template.get("slots", []):
+            if slot.get("is_disabled"):
+                continue
+            platform = slot["platform"]
             if requested_platforms and platform not in requested_platforms:
                 continue
 
-            template_text = config.get("template", "")
+            template_text = slot.get("body", "") or ""
             if template_text:
                 try:
                     rendered = tmpl.render_template(template_text, variables)
@@ -108,20 +111,26 @@ async def generate_posts(video_id: str, data: dict | None = None):
             else:
                 rendered = ""
 
-            sa_id = defaults.get(platform)
+            # Routing precedence: slot binding → project default → none
+            sa_id = slot.get("social_account_id") or defaults.get(platform)
+            media = slot.get("media", "thumbnail")
+            max_chars = slot.get("max_chars", 500)
+
             await db.execute(
                 """INSERT INTO social_posts
                        (video_id, platform, content, media_type, status, social_account_id)
                 VALUES (?, ?, ?, ?, 'draft', ?)""",
-                (video_id, platform, rendered, config.get("media", "thumbnail"), sa_id),
+                (video_id, platform, rendered, media, sa_id),
             )
 
-            generated[platform] = {
+            generated.append({
+                "slot_id": slot.get("id"),
+                "platform": platform,
                 "content": rendered,
-                "media": config.get("media", "thumbnail"),
-                "max_chars": config.get("max_chars", 500),
+                "media": media,
+                "max_chars": max_chars,
                 "social_account_id": sa_id,
-            }
+            })
 
         await db.commit()
         return generated

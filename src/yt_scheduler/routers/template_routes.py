@@ -65,7 +65,103 @@ async def update_template(name: str, data: dict):
 @router.delete("/{name}")
 async def delete_template(name: str):
     """Delete a template."""
-    await tmpl.delete_template(name)
+    try:
+        await tmpl.delete_template(name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"status": "ok"}
+
+
+# --- Slot CRUD --------------------------------------------------------------
+
+
+async def _resolve_template_id(name: str) -> int:
+    template = await tmpl.get_template(name)
+    if not template:
+        raise HTTPException(404, f"Template '{name}' not found")
+    return int(template["id"])
+
+
+@router.get("/{name}/slots")
+async def list_template_slots(name: str):
+    template_id = await _resolve_template_id(name)
+    return await tmpl.list_slots(template_id)
+
+
+@router.post("/{name}/slots")
+async def add_template_slot(name: str, data: dict):
+    """Add a non-builtin slot. Body keys: ``platform`` (required), and
+    optionally ``body``, ``media``, ``max_chars``, ``social_account_id``,
+    ``is_disabled``, ``order_index``."""
+    template_id = await _resolve_template_id(name)
+    platform = (data.get("platform") or "").strip()
+    if not platform:
+        raise HTTPException(400, "platform is required")
+    sa_raw = data.get("social_account_id")
+    sa_id: int | None
+    if sa_raw is None or sa_raw == "":
+        sa_id = None
+    else:
+        try:
+            sa_id = int(sa_raw)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "social_account_id must be an integer or null") from exc
+    try:
+        return await tmpl.add_slot(
+            template_id,
+            platform,
+            body=str(data.get("body", "")),
+            media=str(data.get("media", "thumbnail")),
+            max_chars=int(data.get("max_chars", 500)),
+            social_account_id=sa_id,
+            is_disabled=bool(data.get("is_disabled", False)),
+            order_index=(
+                int(data["order_index"]) if "order_index" in data and data["order_index"] is not None else None
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.patch("/{name}/slots/{slot_id}")
+async def update_template_slot(name: str, slot_id: int, data: dict):
+    template_id = await _resolve_template_id(name)
+    existing = await tmpl.get_slot(slot_id)
+    if existing is None or existing["template_id"] != template_id:
+        raise HTTPException(404, f"Slot {slot_id} not found in template '{name}'")
+
+    kwargs: dict = {}
+    for field in ("body", "media", "is_disabled", "order_index"):
+        if field in data:
+            kwargs[field] = data[field]
+    if "max_chars" in data:
+        kwargs["max_chars"] = data["max_chars"]
+    if "social_account_id" in data:
+        raw = data["social_account_id"]
+        if raw is None or raw == "":
+            kwargs["social_account_id"] = None
+        else:
+            try:
+                kwargs["social_account_id"] = int(raw)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(400, "social_account_id must be an integer or null") from exc
+
+    try:
+        return await tmpl.update_slot(slot_id, **kwargs)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.delete("/{name}/slots/{slot_id}")
+async def delete_template_slot(name: str, slot_id: int):
+    template_id = await _resolve_template_id(name)
+    existing = await tmpl.get_slot(slot_id)
+    if existing is None or existing["template_id"] != template_id:
+        raise HTTPException(404, f"Slot {slot_id} not found in template '{name}'")
+    try:
+        await tmpl.delete_slot(slot_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     return {"status": "ok"}
 
 
