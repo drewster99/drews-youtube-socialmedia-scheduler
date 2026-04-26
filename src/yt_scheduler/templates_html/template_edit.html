@@ -5,8 +5,8 @@
 <div class="page-header">
     <h1>Template: <span id="template-name">{{ template_name }}</span></h1>
     <div class="header-actions">
-        <button class="btn btn-primary" onclick="saveTemplate()">Save Template</button>
-        <button class="btn btn-danger" onclick="deleteTemplate()">Delete</button>
+        <button class="btn btn-primary" onclick="saveTemplateMeta()">Save description &amp; applies-to</button>
+        <button class="btn btn-danger" id="delete-template-btn" onclick="deleteTemplate()">Delete template</button>
     </div>
 </div>
 
@@ -36,11 +36,27 @@
         {% endraw %}
     </div>
 
-    <div id="platform-editors">
-        <!-- Populated by JS -->
-    </div>
+    <h3 style="margin-top: 1.5rem;">Slots</h3>
+    <p class="form-hint">
+        Each slot produces one social post. Built-in slots are seeded with the template
+        and can be edited or disabled, but not deleted. Add extra slots to post a
+        platform more than once (e.g. two LinkedIn accounts) or to extend the template
+        to a new platform.
+    </p>
 
-    <button class="btn btn-secondary" onclick="addPlatform()">+ Add Platform</button>
+    <div id="slots-editor"><p class="loading">Loading…</p></div>
+
+    <div style="margin-top: 1rem;">
+        <select id="add-slot-platform">
+            <option value="">Pick platform…</option>
+            <option value="twitter">X (Twitter)</option>
+            <option value="bluesky">Bluesky</option>
+            <option value="mastodon">Mastodon</option>
+            <option value="linkedin">LinkedIn</option>
+            <option value="threads">Threads</option>
+        </select>
+        <button class="btn btn-secondary" onclick="addSlot()">+ Add slot</button>
+    </div>
 </div>
 
 <div class="card" style="margin-top: 1rem;">
@@ -67,7 +83,7 @@
         <label>Test user_message</label>
         <input type="text" id="preview-user-message" value="Just shipped this!" placeholder="Test user message">
     </div>
-    <button class="btn btn-secondary" onclick="previewAll()">Preview all platforms</button>
+    <button class="btn btn-secondary" onclick="previewAll()">Preview all slots</button>
     <div id="preview-results"></div>
 </div>
 {% endblock %}
@@ -77,67 +93,156 @@
 const projectSlug = "{{ current_project.slug }}";
 const templateName = '{{ template_name }}';
 const ALL_PLATFORMS = ['twitter', 'bluesky', 'mastodon', 'linkedin', 'threads'];
-let platforms = {};
 
-function renderPlatformEditors() {
-    const container = document.getElementById('platform-editors');
-    container.innerHTML = Object.entries(platforms).map(([name, config]) => `
-        <div class="platform-editor card" id="editor-${name}">
-            <div class="platform-editor-header">
-                <span class="platform-badge platform-${name}">${name}</span>
-                <button class="btn btn-sm btn-danger" onclick="removePlatform('${name}')">Remove</button>
+let template = null;       // last loaded /api/templates/{name} payload
+let slots = [];            // array of slot dicts
+let credentialsByPlatform = {};  // platform -> [credential rows]
+
+const PLATFORM_LABELS = {
+    twitter: 'X (Twitter)',
+    bluesky: 'Bluesky',
+    mastodon: 'Mastodon',
+    linkedin: 'LinkedIn',
+    threads: 'Threads',
+};
+
+function escapeHtml(s) {
+    return String(s ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+}
+
+function renderSlots() {
+    const container = document.getElementById('slots-editor');
+    if (!slots.length) {
+        container.innerHTML = '<p class="form-hint">No slots yet. Add one below.</p>';
+        return;
+    }
+    container.innerHTML = slots.map(slot => renderSlotCard(slot)).join('');
+    slots.forEach(slot => attachSlotHandlers(slot));
+}
+
+function renderSlotCard(slot) {
+    const credentials = credentialsByPlatform[slot.platform] || [];
+    const accountOptions = ['<option value="">(use project default)</option>']
+        .concat(credentials.map(c =>
+            `<option value="${c.id}" ${c.id === slot.social_account_id ? 'selected' : ''}>${escapeHtml(c.label)}</option>`
+        ));
+    const isMissingAccount = slot.social_account_id != null
+        && !credentials.some(c => c.id === slot.social_account_id);
+    const missingNote = isMissingAccount
+        ? '<span class="badge badge-draft" style="margin-left: 0.5rem;">Missing credential</span>'
+        : '';
+    const builtinBadge = slot.is_builtin
+        ? '<span class="badge badge-published" style="margin-left: 0.5rem;">Built-in</span>'
+        : '';
+    const deleteBtn = slot.is_builtin
+        ? `<span class="form-hint" style="margin-left: auto;">Built-in slots cannot be deleted — disable instead</span>`
+        : `<button class="btn btn-sm btn-danger" data-slot-delete="${slot.id}" style="margin-left: auto;">Delete slot</button>`;
+    const disabledTitle = slot.is_disabled ? ' (disabled)' : '';
+    return `
+        <div class="platform-editor card" data-slot-id="${slot.id}">
+            <div class="platform-editor-header" style="display: flex; align-items: center; gap: 0.5rem;">
+                <span class="platform-badge platform-${slot.platform}">${escapeHtml(PLATFORM_LABELS[slot.platform] || slot.platform)}${disabledTitle}</span>
+                ${builtinBadge}${missingNote}
+                <label style="margin-left: 1rem; font-size: 0.85rem;">
+                    <input type="checkbox" data-slot-disabled="${slot.id}" ${slot.is_disabled ? 'checked' : ''}>
+                    Disabled
+                </label>
+                ${deleteBtn}
             </div>
-            <div class="form-group">
-                <label>Template</label>
-                <textarea id="tmpl-${name}" rows="6" class="code-editor">${config.template || ''}</textarea>
+            <div class="form-group" style="margin-top: 0.5rem;">
+                <label>Template body</label>
+                <textarea data-slot-body="${slot.id}" rows="6" class="code-editor">${escapeHtml(slot.body)}</textarea>
             </div>
             <div class="form-row">
                 <div class="form-group">
                     <label>Media</label>
-                    <select id="media-${name}">
-                        <option value="thumbnail" ${config.media === 'thumbnail' ? 'selected' : ''}>Thumbnail</option>
-                        <option value="full_video" ${config.media === 'full_video' ? 'selected' : ''}>Full video (recommended for hooks)</option>
-                        <option value="clip" ${(config.media || '').startsWith('clip') ? 'selected' : ''}>Video clip</option>
-                        <option value="gif" ${(config.media || '').startsWith('gif') ? 'selected' : ''}>GIF</option>
-                        <option value="none" ${config.media === 'none' ? 'selected' : ''}>None</option>
+                    <select data-slot-media="${slot.id}">
+                        <option value="thumbnail" ${slot.media === 'thumbnail' ? 'selected' : ''}>Thumbnail</option>
+                        <option value="full_video" ${slot.media === 'full_video' ? 'selected' : ''}>Full video</option>
+                        <option value="clip" ${(slot.media || '').startsWith('clip') ? 'selected' : ''}>Clip</option>
+                        <option value="gif" ${(slot.media || '').startsWith('gif') ? 'selected' : ''}>GIF</option>
+                        <option value="none" ${slot.media === 'none' ? 'selected' : ''}>None</option>
                     </select>
                 </div>
                 <div class="form-group">
-                    <label>Max Characters</label>
-                    <input type="number" id="chars-${name}" value="${config.max_chars || 280}">
+                    <label>Max characters</label>
+                    <input type="number" data-slot-max="${slot.id}" value="${slot.max_chars}">
+                </div>
+                <div class="form-group">
+                    <label>Posts as</label>
+                    <select data-slot-account="${slot.id}">${accountOptions.join('')}</select>
                 </div>
             </div>
+            <div class="form-actions" style="margin-top: 0.5rem;">
+                <button class="btn btn-sm btn-primary" data-slot-save="${slot.id}">Save slot</button>
+            </div>
         </div>
-    `).join('');
+    `;
 }
 
-function addPlatform() {
-    const available = ALL_PLATFORMS.filter(p => !(p in platforms));
-    if (available.length === 0) {
-        showToast('All platforms added', 'info');
+function attachSlotHandlers(slot) {
+    const saveBtn = document.querySelector(`[data-slot-save="${slot.id}"]`);
+    if (saveBtn) saveBtn.addEventListener('click', () => saveSlot(slot.id));
+    const deleteBtn = document.querySelector(`[data-slot-delete="${slot.id}"]`);
+    if (deleteBtn) deleteBtn.addEventListener('click', () => deleteSlot(slot.id));
+    const disabledBox = document.querySelector(`[data-slot-disabled="${slot.id}"]`);
+    if (disabledBox) {
+        disabledBox.addEventListener('change', async () => {
+            await patchSlot(slot.id, { is_disabled: disabledBox.checked });
+        });
+    }
+}
+
+async function saveSlot(slotId) {
+    const body = document.querySelector(`[data-slot-body="${slotId}"]`).value;
+    const media = document.querySelector(`[data-slot-media="${slotId}"]`).value;
+    const max_chars = parseInt(document.querySelector(`[data-slot-max="${slotId}"]`).value || '500', 10);
+    const accountSel = document.querySelector(`[data-slot-account="${slotId}"]`);
+    const social_account_id = accountSel.value === '' ? null : Number(accountSel.value);
+    await patchSlot(slotId, { body, media, max_chars, social_account_id });
+}
+
+async function patchSlot(slotId, payload) {
+    const resp = await fetch(`/api/templates/${templateName}/slots/${slotId}`, {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload),
+    });
+    if (resp.ok) {
+        showToast('Slot saved', 'success');
+        await loadTemplate();
+    }
+}
+
+async function deleteSlot(slotId) {
+    if (!confirm('Delete this slot?')) return;
+    const resp = await fetch(`/api/templates/${templateName}/slots/${slotId}`, {method: 'DELETE'});
+    if (resp.ok) {
+        showToast('Slot deleted', 'success');
+        await loadTemplate();
+    }
+}
+
+async function addSlot() {
+    const platform = document.getElementById('add-slot-platform').value;
+    if (!platform) {
+        showToast('Pick a platform first', 'error');
         return;
     }
-    const name = prompt(`Add platform:\nAvailable: ${available.join(', ')}`);
-    if (!name || !ALL_PLATFORMS.includes(name)) return;
-    platforms[name] = {template: '', media: 'thumbnail', max_chars: 280};
-    renderPlatformEditors();
-}
-
-function removePlatform(name) {
-    delete platforms[name];
-    renderPlatformEditors();
-}
-
-function collectPlatformData() {
-    const result = {};
-    for (const name of Object.keys(platforms)) {
-        result[name] = {
-            template: document.getElementById(`tmpl-${name}`)?.value || '',
-            media: document.getElementById(`media-${name}`)?.value || 'thumbnail',
-            max_chars: parseInt(document.getElementById(`chars-${name}`)?.value || '280'),
-        };
+    const resp = await fetch(`/api/templates/${templateName}/slots`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({platform, body: '', media: 'thumbnail', max_chars: 280}),
+    });
+    if (resp.ok) {
+        document.getElementById('add-slot-platform').value = '';
+        await loadTemplate();
     }
-    return result;
 }
 
 function readAppliesTo() {
@@ -145,33 +250,27 @@ function readAppliesTo() {
         .map(box => box.value);
 }
 
-async function saveTemplate() {
+async function saveTemplateMeta() {
     const appliesTo = readAppliesTo();
     if (!appliesTo.length) {
         showToast('Pick at least one tier in "Applies to"', 'error');
         return;
     }
-    const data = {
-        name: templateName,
-        description: document.getElementById('template-desc').value,
-        platforms: collectPlatformData(),
-        applies_to: appliesTo,
-    };
-
-    const resp = await fetch('/api/templates', {
-        method: 'POST',
+    const resp = await fetch(`/api/templates/${templateName}`, {
+        method: 'PUT',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(data),
+        body: JSON.stringify({
+            description: document.getElementById('template-desc').value,
+            applies_to: appliesTo,
+        }),
     });
-
-    if (resp.ok) showToast('Template saved!', 'success');
-    else showToast('Failed to save', 'error');
+    if (resp.ok) showToast('Template saved', 'success');
 }
 
 async function deleteTemplate() {
     if (!confirm(`Delete template "${templateName}"?`)) return;
-    await fetch(`/api/templates/${templateName}`, {method: 'DELETE'});
-    window.location.href = '/templates';
+    const resp = await fetch(`/api/templates/${templateName}`, {method: 'DELETE'});
+    if (resp.ok) window.location.href = `/projects/${projectSlug}/templates`;
 }
 
 async function previewAll() {
@@ -191,55 +290,72 @@ async function previewAll() {
         tier: 'video',
     };
 
-    const platformData = collectPlatformData();
-    container.innerHTML = '<p class="loading">Generating previews (AI blocks may take a moment)...</p>';
+    container.innerHTML = '<p class="loading">Generating previews (AI blocks may take a moment)…</p>';
 
     const results = [];
-    for (const [name, config] of Object.entries(platformData)) {
+    for (const slot of slots) {
+        if (slot.is_disabled) continue;
+        const bodyEl = document.querySelector(`[data-slot-body="${slot.id}"]`);
+        const body = bodyEl ? bodyEl.value : slot.body;
         try {
             const resp = await fetch('/api/templates/preview', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({template: config.template, variables}),
+                body: JSON.stringify({template: body, variables}),
             });
             const result = await resp.json();
-            results.push({name, rendered: result.rendered || result.error || 'Error'});
+            results.push({slot, rendered: result.rendered || result.error || 'Error'});
         } catch (e) {
-            results.push({name, rendered: `Error: ${e.message}`});
+            results.push({slot, rendered: `Error: ${e.message}`});
         }
     }
 
     container.innerHTML = results.map(r => `
         <div class="preview-card">
-            <span class="platform-badge platform-${r.name}">${r.name}</span>
-            <pre>${r.rendered}</pre>
+            <span class="platform-badge platform-${r.slot.platform}">${escapeHtml(PLATFORM_LABELS[r.slot.platform] || r.slot.platform)}</span>
+            ${r.slot.is_builtin ? '<span class="badge badge-published" style="margin-left: 0.5rem;">Built-in</span>' : ''}
+            <pre>${escapeHtml(r.rendered)}</pre>
             <small>${r.rendered.length} characters</small>
         </div>
     `).join('');
 }
 
-// Load existing template
+async function loadCredentialsForVisiblePlatforms() {
+    const platformsInUse = [...new Set(slots.map(s => s.platform))];
+    const fetched = await Promise.all(platformsInUse.map(async (p) => {
+        const resp = await fetch(`/api/social-credentials?platform=${p}`, {_silent: true});
+        return [p, resp.ok ? await resp.json() : []];
+    }));
+    credentialsByPlatform = Object.fromEntries(fetched);
+}
+
 async function loadTemplate() {
     let appliesTo = ['hook', 'short', 'segment', 'video'];
     try {
         const resp = await fetch(`/api/templates/${templateName}`);
         if (resp.ok) {
-            const data = await resp.json();
-            document.getElementById('template-desc').value = data.description || '';
-            platforms = data.platforms || {};
-            if (Array.isArray(data.applies_to) && data.applies_to.length) {
-                appliesTo = data.applies_to;
+            template = await resp.json();
+            slots = template.slots || [];
+            document.getElementById('template-desc').value = template.description || '';
+            if (Array.isArray(template.applies_to) && template.applies_to.length) {
+                appliesTo = template.applies_to;
+            }
+            const deleteBtn = document.getElementById('delete-template-btn');
+            if (template.is_builtin) {
+                deleteBtn.disabled = true;
+                deleteBtn.title = 'Built-in templates cannot be deleted';
             }
         } else {
-            platforms = {};
+            slots = [];
         }
     } catch {
-        platforms = {};
+        slots = [];
     }
     document.querySelectorAll('input[name="applies_to"]').forEach(box => {
         box.checked = appliesTo.includes(box.value);
     });
-    renderPlatformEditors();
+    await loadCredentialsForVisiblePlatforms();
+    renderSlots();
 }
 
 loadTemplate();
