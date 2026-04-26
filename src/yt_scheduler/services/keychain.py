@@ -19,7 +19,6 @@ import os
 import platform
 import stat
 import subprocess
-from pathlib import Path
 
 from yt_scheduler.config import DATA_DIR
 

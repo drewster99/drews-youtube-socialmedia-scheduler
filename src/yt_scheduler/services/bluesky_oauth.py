@@ -360,7 +360,10 @@ class PendingAuth:
     private_key_pem: str
     project_slug: str | None = None
     pre_create: dict | None = None
-    dpop_nonce: str | None = None  # last-known AS nonce, replayed on token call
+    # Last-known DPoP nonce from the *authorization server* (PAR + token +
+    # refresh share an AS-side sequence). PDS-side nonces live on the
+    # credential bundle as ``dpop_nonce_pds`` once posting begins.
+    dpop_nonce_as: str | None = None
 
 
 def _is_dpop_nonce_error(resp: httpx.Response) -> bool:
@@ -411,7 +414,7 @@ async def push_authorization_request(
         nonce = resp.headers.get("DPoP-Nonce")
         if not nonce:
             raise RuntimeError("PAR demanded a DPoP nonce but did not provide one")
-        pending.dpop_nonce = nonce
+        pending.dpop_nonce_as = nonce
         resp = await _do(nonce)
 
     if resp.status_code not in (200, 201):
@@ -421,7 +424,7 @@ async def push_authorization_request(
 
     new_nonce = resp.headers.get("DPoP-Nonce")
     if new_nonce:
-        pending.dpop_nonce = new_nonce
+        pending.dpop_nonce_as = new_nonce
 
     body = resp.json() or {}
     request_uri = body.get("request_uri")
@@ -449,8 +452,8 @@ async def exchange_code_for_tokens(
     """Trade the auth code for ``{access_token, refresh_token, sub, ...}``.
 
     Replays ``DPoP-Nonce`` once on ``use_dpop_nonce``. Updates
-    ``pending.dpop_nonce`` from the response so the resource-server side
-    can pick up where we left off.
+    ``pending.dpop_nonce_as`` from the response so the next AS-side
+    call (refresh) picks up the latest nonce.
     """
     token_url = pending.auth_server.token_endpoint
     client_id = localhost_client_id(pending.redirect_uri)
@@ -470,12 +473,12 @@ async def exchange_code_for_tokens(
             token_url, data=form, headers={"DPoP": proof}, timeout=15
         )
 
-    resp = await _do(pending.dpop_nonce)
+    resp = await _do(pending.dpop_nonce_as)
     if _is_dpop_nonce_error(resp):
         nonce = resp.headers.get("DPoP-Nonce")
         if not nonce:
             raise RuntimeError("Token endpoint demanded DPoP nonce but did not provide one")
-        pending.dpop_nonce = nonce
+        pending.dpop_nonce_as = nonce
         resp = await _do(nonce)
 
     if resp.status_code != 200:
@@ -485,7 +488,7 @@ async def exchange_code_for_tokens(
 
     new_nonce = resp.headers.get("DPoP-Nonce")
     if new_nonce:
-        pending.dpop_nonce = new_nonce
+        pending.dpop_nonce_as = new_nonce
 
     body = resp.json() or {}
     if "access_token" not in body:
@@ -503,7 +506,11 @@ async def refresh_tokens(
     client: httpx.AsyncClient,
 ) -> dict:
     """Use a refresh_token to mint a new access_token (and a rotated
-    refresh_token). Returns the same shape as the initial token exchange."""
+    refresh_token). The ``nonce`` argument is the AS-side nonce (don't
+    reuse the PDS one — they're scoped to different servers). The
+    returned dict carries the AS's response payload plus
+    ``dpop_nonce_as`` so the caller can persist the next nonce in the
+    correct slot."""
     client_id = localhost_client_id(redirect_uri)
     form = {
         "grant_type": "refresh_token",
@@ -517,19 +524,21 @@ async def refresh_tokens(
             token_endpoint, data=form, headers={"DPoP": proof}, timeout=15
         )
 
-    resp = await _do(nonce)
+    used_nonce = nonce
+    resp = await _do(used_nonce)
     if _is_dpop_nonce_error(resp):
         new_nonce = resp.headers.get("DPoP-Nonce")
         if not new_nonce:
             raise RuntimeError("Refresh endpoint demanded DPoP nonce but did not provide one")
-        resp = await _do(new_nonce)
+        used_nonce = new_nonce
+        resp = await _do(used_nonce)
 
     if resp.status_code != 200:
         raise RuntimeError(
             f"Refresh failed: HTTP {resp.status_code} {resp.text}"
         )
     body = resp.json() or {}
-    body["dpop_nonce"] = resp.headers.get("DPoP-Nonce") or nonce
+    body["dpop_nonce_as"] = resp.headers.get("DPoP-Nonce") or used_nonce
     return body
 
 
@@ -548,12 +557,18 @@ def credentialed_bundle(
     access_token: str,
     refresh_token: str,
     expires_in: int,
-    dpop_nonce: str | None = None,
+    dpop_nonce_as: str | None = None,
 ) -> dict:
     """Shape the bundle written into Keychain after a successful OAuth.
 
     The poster reads this exact shape on every send. Field names are
     stable; new fields can be added but never renamed.
+
+    Two DPoP nonce slots are tracked separately because they are
+    server-scoped: ``dpop_nonce_as`` for the authorization server (PAR,
+    token, refresh) and ``dpop_nonce_pds`` for the PDS (uploadBlob,
+    createRecord). Reusing one server's nonce against the other forces
+    an extra round-trip per request.
     """
     return {
         "auth_method": "oauth",
@@ -567,7 +582,8 @@ def credentialed_bundle(
         "access_token": access_token,
         "refresh_token": refresh_token,
         "expires_at": int(time.time()) + int(expires_in or 7200),
-        "dpop_nonce": dpop_nonce,
+        "dpop_nonce_as": dpop_nonce_as,
+        "dpop_nonce_pds": None,
     }
 
 

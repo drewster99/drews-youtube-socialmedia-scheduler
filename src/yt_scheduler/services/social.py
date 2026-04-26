@@ -380,7 +380,7 @@ class BlueskyPoster(SocialPoster):
             async def _do() -> httpx.Response:
                 proof = bluesky_oauth.sign_dpop_proof(
                     creds["private_key_pem"], "POST", create_url,
-                    nonce=creds.get("dpop_nonce"),
+                    nonce=creds.get("dpop_nonce_pds"),
                     access_token=creds["access_token"],
                 )
                 return await client.post(
@@ -407,21 +407,43 @@ class BlueskyPoster(SocialPoster):
                     f"Bluesky createRecord failed: HTTP {resp.status_code} {resp.text}"
                 )
 
-            self._stash_nonce(creds, resp, save_bundle)
+            self._stash_pds_nonce(creds, resp, save_bundle)
 
         body = resp.json() or {}
         uri = body.get("uri", "")
-        rkey = uri.split("/")[-1] if uri else ""
+        # AT-URI shape: at://<did>/app.bsky.feed.post/<rkey>. A malformed
+        # URI here would silently produce an empty bsky.app/post/ path,
+        # so be strict.
+        rkey = self._rkey_from_at_uri(uri)
         return {
             "url": f"https://bsky.app/profile/{creds['handle']}/post/{rkey}",
             "id": uri,
         }
 
     @staticmethod
-    def _stash_nonce(creds: dict, resp: httpx.Response, save_bundle) -> None:
+    def _rkey_from_at_uri(uri: str) -> str:
+        """Pull the record key off an AT-URI, raising if the shape is wrong.
+
+        Expected: ``at://<did>/<collection>/<rkey>`` with a non-empty
+        rkey. Anything else is a bug (or a server returning an
+        unexpected response shape) — surface it loudly.
+        """
+        if not uri or not uri.startswith("at://"):
+            raise RuntimeError(
+                f"Bluesky createRecord returned no usable AT-URI: {uri!r}"
+            )
+        parts = uri[len("at://"):].split("/")
+        if len(parts) < 3 or not parts[-1]:
+            raise RuntimeError(
+                f"Bluesky createRecord returned malformed AT-URI: {uri!r}"
+            )
+        return parts[-1]
+
+    @staticmethod
+    def _stash_pds_nonce(creds: dict, resp: httpx.Response, save_bundle) -> None:
         new_nonce = resp.headers.get("DPoP-Nonce")
-        if new_nonce and new_nonce != creds.get("dpop_nonce"):
-            creds["dpop_nonce"] = new_nonce
+        if new_nonce and new_nonce != creds.get("dpop_nonce_pds"):
+            creds["dpop_nonce_pds"] = new_nonce
             save_bundle("bluesky", creds["uuid"], creds)
 
     async def _handle_dpop_or_token_error(
@@ -432,7 +454,12 @@ class BlueskyPoster(SocialPoster):
         bluesky_oauth,
         save_bundle,
     ) -> bool:
-        """Return True if the caller should retry the original request."""
+        """Return True if the caller should retry the original request.
+
+        The PDS issues nonces in its own sequence (separate from the AS),
+        so we update ``dpop_nonce_pds`` here. Token refresh writes back
+        to ``dpop_nonce_as``.
+        """
         try:
             body = resp.json() or {}
         except Exception:
@@ -441,7 +468,7 @@ class BlueskyPoster(SocialPoster):
         if err == "use_dpop_nonce":
             nonce = resp.headers.get("DPoP-Nonce")
             if nonce:
-                creds["dpop_nonce"] = nonce
+                creds["dpop_nonce_pds"] = nonce
                 save_bundle("bluesky", creds["uuid"], creds)
                 return True
         if resp.status_code == 401 or err in ("invalid_token", "expired_token"):
@@ -449,11 +476,18 @@ class BlueskyPoster(SocialPoster):
             return True
         return False
 
+    # Pre-emptively refresh when the access token has under this many
+    # seconds of lifetime left. Bluesky access tokens live ~2h, so a
+    # 15-minute window means a single posting batch never needs a
+    # mid-batch refresh, while a token revoked at the AS still gets
+    # caught lazily on a 401 from the PDS.
+    _PRE_REFRESH_WINDOW_SECS = 15 * 60
+
     async def _ensure_fresh_token(
         self, creds: dict, client: httpx.AsyncClient, bluesky_oauth, save_bundle,
     ) -> None:
         expires_at = int(creds.get("expires_at") or 0)
-        if expires_at and expires_at - 60 > int(time.time()):
+        if expires_at and expires_at - self._PRE_REFRESH_WINDOW_SECS > int(time.time()):
             return
         if not creds.get("refresh_token"):
             return
@@ -467,7 +501,7 @@ class BlueskyPoster(SocialPoster):
             private_key_pem=creds["private_key_pem"],
             token_endpoint=creds["token_endpoint"],
             redirect_uri=creds["redirect_uri"],
-            nonce=creds.get("dpop_nonce"),
+            nonce=creds.get("dpop_nonce_as"),
             client=client,
         )
         creds["access_token"] = result["access_token"]
@@ -475,8 +509,8 @@ class BlueskyPoster(SocialPoster):
             creds["refresh_token"] = result["refresh_token"]
         if result.get("expires_in"):
             creds["expires_at"] = int(time.time()) + int(result["expires_in"])
-        if result.get("dpop_nonce"):
-            creds["dpop_nonce"] = result["dpop_nonce"]
+        if result.get("dpop_nonce_as"):
+            creds["dpop_nonce_as"] = result["dpop_nonce_as"]
         save_bundle("bluesky", creds["uuid"], creds)
 
     async def _upload_blob(
@@ -490,7 +524,7 @@ class BlueskyPoster(SocialPoster):
         async def _do() -> httpx.Response:
             proof = bluesky_oauth.sign_dpop_proof(
                 creds["private_key_pem"], "POST", url,
-                nonce=creds.get("dpop_nonce"),
+                nonce=creds.get("dpop_nonce_pds"),
                 access_token=creds["access_token"],
             )
             return await client.post(
@@ -513,7 +547,7 @@ class BlueskyPoster(SocialPoster):
                 f"Bluesky uploadBlob failed: HTTP {resp.status_code} {resp.text}"
             )
 
-        self._stash_nonce(creds, resp, save_bundle)
+        self._stash_pds_nonce(creds, resp, save_bundle)
         body = resp.json() or {}
         blob = body.get("blob")
         if not isinstance(blob, dict):
@@ -648,16 +682,12 @@ PLATFORM_FIELDS: dict[str, list[dict]] = {
         {"key": "refresh_token", "label": "Refresh token", "type": "password", "secret": True},
         {"key": "username", "label": "Username", "type": "text", "secret": False},
     ],
-    "bluesky": [
-        # OAuth-only. Connect with Bluesky populates handle/did/pds and the
-        # tokens; the displayed values here are read-only and masked where
-        # they're sensitive (private_key_pem, tokens).
-        {"key": "handle", "label": "Handle", "type": "text", "secret": False},
-        {"key": "did", "label": "DID", "type": "text", "secret": False},
-        {"key": "pds", "label": "PDS endpoint", "type": "text", "secret": False},
-        {"key": "access_token", "label": "Access token", "type": "password", "secret": True},
-        {"key": "refresh_token", "label": "Refresh token", "type": "password", "secret": True},
-    ],
+    # Bluesky is OAuth-only — there is no paste form. The Settings UI
+    # renders the connected accounts list from /api/social-credentials,
+    # not from this fields/stored payload. Leaving this empty makes
+    # /api/settings/social return ``fields: []`` for bluesky so any
+    # callers that introspect it know there's nothing to render.
+    "bluesky": [],
     "mastodon": [
         {"key": "instance_url", "label": "Instance URL", "type": "text", "secret": False, "placeholder": "https://mastodon.social"},
         {"key": "access_token", "label": "Access Token", "type": "password", "secret": True},

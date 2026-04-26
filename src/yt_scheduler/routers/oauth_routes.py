@@ -1169,7 +1169,15 @@ async def bluesky_callback(
             platform="bluesky",
         )
 
-    if iss and iss.rstrip("/") != pending.auth_server.issuer.rstrip("/"):
+    if not iss:
+        return _result_page(
+            False,
+            "Callback is missing the required 'iss' parameter — refusing as a "
+            "defense against OAuth mix-up attacks. Click Connect with Bluesky "
+            "again.",
+            platform="bluesky",
+        )
+    if iss.rstrip("/") != pending.auth_server.issuer.rstrip("/"):
         return _result_page(
             False,
             f"Issuer mismatch: callback claimed {iss}, expected {pending.auth_server.issuer}.",
@@ -1202,7 +1210,7 @@ async def bluesky_callback(
         access_token=tokens["access_token"],
         refresh_token=tokens.get("refresh_token", ""),
         expires_in=int(tokens.get("expires_in") or 7200),
-        dpop_nonce=pending.dpop_nonce,
+        dpop_nonce_as=pending.dpop_nonce_as,
     )
     cred = await _persist_oauth_credential(
         platform="bluesky",

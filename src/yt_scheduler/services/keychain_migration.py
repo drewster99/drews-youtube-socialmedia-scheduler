@@ -112,17 +112,15 @@ async def _resolve_threads(creds: dict[str, str]) -> tuple[str | None, str | Non
     return creds.get("user_id"), creds.get("username")
 
 
-async def _resolve_bluesky(creds: dict[str, str]) -> tuple[str | None, str | None]:
-    handle = creds.get("handle")
-    return handle, handle
-
-
 _RESOLVERS = {
     "twitter": _resolve_twitter,
     "mastodon": _resolve_mastodon,
     "linkedin": _resolve_linkedin,
     "threads": _resolve_threads,
-    "bluesky": _resolve_bluesky,
+    # No bluesky resolver: Phase F's v9 wipe pass deletes any
+    # app-password-era bundle the v8 migration would otherwise have
+    # constructed for it. Bluesky credentials are recreated through the
+    # OAuth flow, never reconstructed from legacy paste-form keys.
 }
 
 

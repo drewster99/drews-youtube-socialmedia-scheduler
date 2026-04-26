@@ -239,3 +239,49 @@ def test_credentialed_bundle_has_required_keys() -> None:
         assert key in bundle
     assert bundle["auth_method"] == "oauth"
     assert bundle["expires_at"] > 0
+    # Phase F hardening: nonces are tracked separately per server so a
+    # PDS-issued nonce is never replayed against the AS (or vice versa).
+    assert bundle["dpop_nonce_as"] is None
+    assert bundle["dpop_nonce_pds"] is None
+
+
+# --- AT-URI parsing in the poster ------------------------------------------
+
+
+def test_rkey_extraction_from_valid_at_uri() -> None:
+    from yt_scheduler.services.social import BlueskyPoster
+    rkey = BlueskyPoster._rkey_from_at_uri(
+        "at://did:plc:abc/app.bsky.feed.post/3kxyz"
+    )
+    assert rkey == "3kxyz"
+
+
+def test_rkey_extraction_rejects_empty() -> None:
+    from yt_scheduler.services.social import BlueskyPoster
+    with pytest.raises(RuntimeError, match="no usable AT-URI"):
+        BlueskyPoster._rkey_from_at_uri("")
+
+
+def test_rkey_extraction_rejects_non_at_uri() -> None:
+    from yt_scheduler.services.social import BlueskyPoster
+    with pytest.raises(RuntimeError, match="no usable AT-URI"):
+        BlueskyPoster._rkey_from_at_uri("https://example.test/x")
+
+
+def test_rkey_extraction_rejects_truncated_uri() -> None:
+    from yt_scheduler.services.social import BlueskyPoster
+    with pytest.raises(RuntimeError, match="malformed"):
+        BlueskyPoster._rkey_from_at_uri("at://did:plc:abc/app.bsky.feed.post/")
+    with pytest.raises(RuntimeError, match="malformed"):
+        BlueskyPoster._rkey_from_at_uri("at://did:plc:abc")
+
+
+# --- Refresh window --------------------------------------------------------
+
+
+def test_pre_refresh_window_is_fifteen_minutes() -> None:
+    """Bundles within 15 minutes of expiry must refresh before the next
+    request, so a single batch of posts never gets caught mid-batch by
+    a token expiring."""
+    from yt_scheduler.services.social import BlueskyPoster
+    assert BlueskyPoster._PRE_REFRESH_WINDOW_SECS == 15 * 60

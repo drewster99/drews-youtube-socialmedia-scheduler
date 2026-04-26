@@ -6,7 +6,7 @@ working unchanged."""
 from __future__ import annotations
 
 import re
-from typing import Iterable, Literal
+from typing import Literal
 
 from yt_scheduler.database import get_db
 

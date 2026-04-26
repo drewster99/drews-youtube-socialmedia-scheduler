@@ -212,3 +212,25 @@ def test_callback_oauth_error_returns_html_error(client) -> None:
     )
     assert resp.status_code == 200
     assert "denied authorization" in resp.text
+
+
+def test_callback_missing_iss_is_rejected(client) -> None:
+    """Phase F hardening: a callback without ``iss`` is refused outright
+    as a defense against OAuth mix-up attacks. The state check stays the
+    primary CSRF gate; this is belt-and-braces."""
+    c, monkeypatch = client
+    _stub_resolution_and_par(monkeypatch)
+    resp = c.post(
+        "/api/oauth/bluesky/start",
+        json={"origin": "http://127.0.0.1:8008", "handle": "alice.bsky.social"},
+    )
+    assert resp.status_code == 200
+    routes = importlib.import_module("yt_scheduler.routers.oauth_routes")
+    state = next(iter(routes._bluesky_pending))
+
+    bad = c.get(
+        "/api/oauth/bluesky/callback",
+        params={"code": "abc", "state": state},
+    )
+    assert bad.status_code == 200
+    assert "missing the required 'iss'" in bad.text

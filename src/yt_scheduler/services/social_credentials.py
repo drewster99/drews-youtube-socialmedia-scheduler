@@ -201,25 +201,6 @@ async def upsert_credential(
     return await get_credential_by_id(new_id)  # type: ignore[return-value]
 
 
-async def update_active_bundle_keys(
-    platform: str, partial_update: dict
-) -> bool:
-    """Merge ``partial_update`` into the first active credential's bundle.
-
-    Used by legacy paste-form paths (Bluesky app-password input) that don't
-    know about UUIDs. Returns ``True`` when an update happened, ``False``
-    when there is no active credential for this platform — caller should
-    create one via ``upsert_credential`` instead.
-    """
-    cred = await get_first_active_credential(platform)
-    if cred is None:
-        return False
-    bundle = load_bundle(platform, cred["uuid"]) or {}
-    bundle.update(partial_update)
-    save_bundle(platform, cred["uuid"], bundle)
-    return True
-
-
 async def soft_delete_credential(uuid: str) -> dict | None:
     """Soft-delete a credential: mark deleted_at, remove Keychain bundle.
 

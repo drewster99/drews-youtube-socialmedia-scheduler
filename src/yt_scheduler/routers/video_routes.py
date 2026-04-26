@@ -8,7 +8,6 @@ import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, Form, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
 
 from yt_scheduler.config import UPLOAD_DIR
 from yt_scheduler.database import get_db

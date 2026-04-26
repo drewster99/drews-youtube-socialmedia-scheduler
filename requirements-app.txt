@@ -12,10 +12,10 @@ apscheduler>=3.10
 httpx>=0.28
 aiosqlite>=0.20
 python-dotenv>=1.0
+cryptography>=42
 
 # Social media
 tweepy>=4.14
-atproto>=0.0.55
 Mastodon.py>=1.8
 
 # Transcription (faster-whisper works on both Intel and Apple Silicon)

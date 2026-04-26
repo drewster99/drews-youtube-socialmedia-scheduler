@@ -606,21 +606,18 @@ def transcribe(
 
 def list_available_backends() -> list[dict]:
     """List which transcription backends are available."""
+    import importlib.util
+
     available = []
 
-    # MLX Whisper
-    try:
-        import mlx_whisper
+    if importlib.util.find_spec("mlx_whisper") is not None:
         available.append({"name": "mlx-whisper", "status": "available", "note": "Apple Silicon GPU acceleration"})
-    except ImportError:
-        if platform.machine() == "arm64" and platform.system() == "Darwin":
-            available.append({"name": "mlx-whisper", "status": "installable", "note": "pip install mlx-whisper"})
+    elif platform.machine() == "arm64" and platform.system() == "Darwin":
+        available.append({"name": "mlx-whisper", "status": "installable", "note": "pip install mlx-whisper"})
 
-    # faster-whisper
-    try:
-        import faster_whisper
+    if importlib.util.find_spec("faster_whisper") is not None:
         available.append({"name": "faster-whisper", "status": "available", "note": "CTranslate2 backend"})
-    except ImportError:
+    else:
         available.append({"name": "faster-whisper", "status": "installable", "note": "pip install faster-whisper"})
 
     # whisper.cpp
