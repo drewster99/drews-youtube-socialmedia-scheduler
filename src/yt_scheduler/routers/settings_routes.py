@@ -13,7 +13,7 @@ from yt_scheduler.config import (
 )
 from yt_scheduler.database import get_db
 from yt_scheduler.services import moderation
-from yt_scheduler.services import oauth_clients
+from yt_scheduler.services import ngrok, oauth_clients
 from yt_scheduler.services.keychain import (
     delete_secret,
     get_storage_type,
@@ -127,18 +127,40 @@ OAUTH_CLIENT_DISPLAY = {
 }
 
 OAUTH_CLIENT_HELP = {
-    "twitter": (
-        "Register an app at developer.x.com → your app → Keys and tokens. "
-        "OAuth 2.0 PKCE; the secret is optional (leave blank for a public app)."
-    ),
-    "linkedin": (
-        "Register an app at developers.linkedin.com → your app → Auth tab. "
-        "Both Client ID and Primary Client Secret are required."
-    ),
-    "threads": (
-        "Register an app at developers.facebook.com → your app → App settings → "
-        "Basic. Both App ID (client_id) and App Secret are required."
-    ),
+    "twitter": {
+        "console_url": "https://developer.x.com",
+        "console_label": "developer.x.com",
+        "id_label": "Client ID",
+        "secret_label": "Client Secret",
+        "instructions": (
+            "Register an app, then open your app → Keys and tokens. "
+            "OAuth 2.0 with PKCE; the secret is optional (leave blank if you "
+            "registered the app as a public client)."
+        ),
+    },
+    "linkedin": {
+        "console_url": "https://developer.linkedin.com",
+        "console_label": "developer.linkedin.com",
+        "id_label": "Client ID",
+        "secret_label": "Primary Client Secret",
+        "instructions": (
+            "Register an app, then open your app → Auth tab → Application "
+            "credentials. Both Client ID and Primary Client Secret are required."
+        ),
+    },
+    "threads": {
+        "console_url": "https://developers.facebook.com",
+        "console_label": "developers.facebook.com",
+        "id_label": "Client ID",
+        "secret_label": "Client Secret",
+        "instructions": (
+            "Register a Threads app, then open your app → Use cases → "
+            "Threads API → Settings. Both Client ID and Client Secret are "
+            "required. Threads OAuth requires HTTPS, so connect the account "
+            "with the app open via the ngrok tunnel URL (see the HTTPS "
+            "tunnel card)."
+        ),
+    },
 }
 
 
@@ -159,13 +181,18 @@ async def list_oauth_clients():
     out = {}
     for platform in oauth_clients.SUPPORTED_PLATFORMS:
         cid, csec = oauth_clients.get_oauth_client(platform)
+        help_blob = OAUTH_CLIENT_HELP.get(platform, {})
         out[platform] = {
             "configured": bool(cid),
             "client_id": cid,
             "client_secret_set": bool(csec),
             "secret_required": platform != "twitter",
             "display": OAUTH_CLIENT_DISPLAY.get(platform, platform.capitalize()),
-            "help": OAUTH_CLIENT_HELP.get(platform, ""),
+            "console_url": help_blob.get("console_url", ""),
+            "console_label": help_blob.get("console_label", ""),
+            "id_label": help_blob.get("id_label", "Client ID"),
+            "secret_label": help_blob.get("secret_label", "Client Secret"),
+            "instructions": help_blob.get("instructions", ""),
             "masked_secret": _mask(csec),
         }
     return {"storage": get_storage_type(), "platforms": out}
@@ -200,6 +227,27 @@ async def delete_oauth_client(platform: str):
         raise HTTPException(400, f"Unsupported platform: {platform}")
     oauth_clients.clear_oauth_client(platform)
     return {"status": "ok"}
+
+
+# --- ngrok HTTPS tunnel detection (for OAuth flows that require HTTPS) ---
+
+
+@router.get("/ngrok")
+async def get_ngrok_status():
+    """Report whether an ngrok tunnel is forwarding to our local port.
+
+    Used by the Settings UI to surface the ``https://...ngrok-free.app``
+    URL the user should open the app at when running an OAuth flow that
+    Meta / others reject from plain ``http://`` origins.
+    """
+    from yt_scheduler.config import PORT
+
+    public_url = await ngrok.detect_https_tunnel(PORT)
+    return {
+        "detected": public_url is not None,
+        "public_url": public_url or "",
+        "local_port": PORT,
+    }
 
 
 # --- Social Media Credentials ---

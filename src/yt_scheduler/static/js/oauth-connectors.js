@@ -49,6 +49,31 @@ async function connectMastodon(projectSlug = null) {
 }
 
 async function connectThreads(projectSlug = null) {
+    // Meta refuses to issue tokens to OAuth flows that originated on a
+    // plain http:// page. If we're on http://, try to detect an ngrok
+    // tunnel and tell the user to reload the app via the HTTPS URL —
+    // we can't initiate the flow ourselves because Meta validates the
+    // *referrer*, which means the user's browser must be on https when
+    // they click + New.
+    if (window.location.protocol !== 'https:') {
+        let publicUrl = '';
+        try {
+            const r = await fetch('/api/settings/ngrok', {_silent: true});
+            if (r.ok) publicUrl = (await r.json()).public_url || '';
+        } catch (_) {}
+        const target = publicUrl
+            ? publicUrl.replace(/\/$/, '') + window.location.pathname + window.location.search
+            : null;
+        const msg = publicUrl
+            ? `Threads OAuth needs HTTPS. Opening the app via the ngrok tunnel — click + New again on the new tab once it loads:\n\n${target}`
+            : 'Threads OAuth needs HTTPS. Start an ngrok tunnel (see Settings → HTTPS tunnel) and reload the app at the resulting https:// URL before connecting Threads.';
+        if (publicUrl && confirm(msg)) {
+            window.open(target, '_blank');
+        } else if (!publicUrl) {
+            showToast(msg, 'error');
+        }
+        return;
+    }
     try {
         await openOAuthPopup('/api/oauth/threads/start', {
             origin: window.location.origin,

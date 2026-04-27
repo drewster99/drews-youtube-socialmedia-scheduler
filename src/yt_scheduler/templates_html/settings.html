@@ -59,6 +59,22 @@
     </div>
 </div>
 
+<!-- HTTPS tunnel (ngrok) — needed for OAuth flows like Meta/Threads that
+     reject http:// origins -->
+<div class="card">
+    <h2>HTTPS tunnel (ngrok)</h2>
+    <p class="form-hint">
+        Meta / Threads OAuth refuses to issue tokens from <code>http://</code>
+        pages — so to connect a Threads account, the app needs to be loaded
+        over HTTPS. The simplest path is to run
+        <code>ngrok http <span id="ngrok-port-hint">8008</span></code>
+        in a terminal; this card auto-detects the resulting tunnel.
+    </p>
+    <div id="ngrok-status">
+        <p class="loading">Checking…</p>
+    </div>
+</div>
+
 <!-- OAuth Client Credentials (per platform) -->
 <div class="card">
     <h2>OAuth client credentials</h2>
@@ -259,6 +275,45 @@ async function removeAnthropicKey() {
     }
 }
 
+// --- ngrok HTTPS tunnel ---
+
+async function loadNgrokStatus() {
+    const root = document.getElementById('ngrok-status');
+    const resp = await fetch('/api/settings/ngrok', {_silent: true});
+    if (!resp.ok) {
+        root.innerHTML = '<p class="form-hint">Could not check tunnel status.</p>';
+        return;
+    }
+    const data = await resp.json();
+    document.getElementById('ngrok-port-hint').textContent = data.local_port;
+    if (data.detected) {
+        const onTunnel = window.location.origin === data.public_url.replace(/\/$/, '');
+        const onTunnelBadge = onTunnel
+            ? '<span class="badge badge-published" style="margin-left: 0.5rem;">App loaded via tunnel</span>'
+            : '<button class="btn btn-sm btn-primary" style="margin-left: 0.5rem;" onclick="window.open(this.dataset.url + window.location.pathname, \'_blank\')" data-url="' + escapeHtml(data.public_url) + '">Open this app via the tunnel</button>';
+        root.innerHTML = `
+            <div style="display:flex; align-items:center; gap:0.5rem; flex-wrap:wrap;">
+                <span class="badge badge-published">Tunnel detected</span>
+                <code style="background: var(--bg-input); padding: 0.2rem 0.5rem; border-radius: 4px;">${escapeHtml(data.public_url)}</code>
+                ${onTunnelBadge}
+            </div>
+            <p class="form-hint" style="margin-top: 0.5rem;">
+                For Threads OAuth: register
+                <code>${escapeHtml(data.public_url)}/api/oauth/threads/callback</code>
+                as a Valid OAuth Redirect URI in your Meta app settings, then load the
+                app via the tunnel URL above and click + New on Threads.
+            </p>`;
+    } else {
+        root.innerHTML = `
+            <p class="form-hint">
+                <span class="badge badge-draft">No tunnel detected</span>
+                Start one with <code>ngrok http ${data.local_port}</code> (install
+                ngrok from <a href="https://ngrok.com/download" target="_blank" rel="noopener">ngrok.com/download</a>),
+                then refresh this page.
+            </p>`;
+    }
+}
+
 // --- OAuth Client Credentials (Twitter / LinkedIn / Threads) ---
 
 async function loadOAuthClients() {
@@ -277,15 +332,16 @@ async function loadOAuthClients() {
         const status = p.configured
             ? `<span class="badge badge-published">Configured</span>`
             : `<span class="badge badge-draft">Not configured</span>`;
+        const secretLabel = escapeHtml(p.secret_label || 'Client Secret');
         const secretRow = p.secret_required || p.client_secret_set
             ? `<div class="form-group">
-                   <label>Client Secret${p.secret_required ? '' : ' <small style="color:var(--text-muted);">(optional)</small>'}</label>
+                   <label>${secretLabel}${p.secret_required ? '' : ' <small style="color:var(--text-muted);">(optional)</small>'}</label>
                    <input type="password" data-oauth-secret="${key}"
                           placeholder="${p.client_secret_set ? 'Stored — paste a new value to replace' : 'Paste secret here'}"
                           autocomplete="off">
                </div>`
             : `<div class="form-group">
-                   <label>Client Secret <small style="color:var(--text-muted);">(optional for ${escapeHtml(p.display)})</small></label>
+                   <label>${secretLabel} <small style="color:var(--text-muted);">(optional for ${escapeHtml(p.display)})</small></label>
                    <input type="password" data-oauth-secret="${key}" placeholder="Leave blank for a public app" autocomplete="off">
                </div>`;
         return `
@@ -299,10 +355,14 @@ async function loadOAuthClients() {
                         ? `<button class="btn btn-sm btn-danger" data-oauth-remove="${key}">Remove</button>`
                         : ''}
                 </div>
-                <p class="form-hint" style="margin:0 0 0.5rem 0;">${escapeHtml(p.help)}</p>
+                <p class="form-hint" style="margin:0 0 0.5rem 0;">
+                    ${p.console_url
+                        ? `<a href="${escapeHtml(p.console_url)}" target="_blank" rel="noopener">${escapeHtml(p.console_label || p.console_url)}</a> — `
+                        : ''}${escapeHtml(p.instructions || '')}
+                </p>
                 <div class="form-group">
-                    <label>Client ID</label>
-                    <input type="text" data-oauth-id="${key}" value="${escapeHtml(p.client_id)}" placeholder="Paste Client ID" autocomplete="off">
+                    <label>${escapeHtml(p.id_label || 'Client ID')}</label>
+                    <input type="text" data-oauth-id="${key}" value="${escapeHtml(p.client_id)}" placeholder="Paste ${escapeHtml(p.id_label || 'Client ID')}" autocomplete="off">
                 </div>
                 ${secretRow}
                 <div class="form-actions">
@@ -587,6 +647,7 @@ async function loadSettings() {
 // Load everything
 loadAuthStatus();
 loadAnthropicStatus();
+loadNgrokStatus();
 loadOAuthClients();
 loadSocialPlatforms();
 loadSettings();

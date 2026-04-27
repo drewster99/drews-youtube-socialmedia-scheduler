@@ -13,12 +13,12 @@
             <label for="project-name">Display name</label>
             <input type="text" id="project-name" value="{{ current_project.name }}" maxlength="80">
         </div>
-        <p class="form-hint">
+        <p class="form-hint" style="margin-bottom: 1rem;">
             This project lives at <code>/projects/{{ current_project.slug }}/</code> in the URL bar.
             That path component (the &ldquo;slug&rdquo;) is fixed for the lifetime of the project &mdash;
             renaming below changes only the display name, not the URL.
         </p>
-        <button class="btn btn-primary" id="rename-btn">Save</button>
+        <button class="btn btn-primary" id="rename-btn" disabled>Save</button>
     </div>
 </section>
 
@@ -30,7 +30,7 @@
             <thead><tr><th></th><th>Uploads</th><th>Imports</th></tr></thead>
             <tbody id="auto-actions-body"></tbody>
         </table>
-        <button class="btn btn-primary" id="save-auto-actions" style="margin-top: 1rem;">Save auto-actions</button>
+        <button class="btn btn-primary" id="save-auto-actions" style="margin-top: 1rem;" disabled>Save auto-actions</button>
     </div>
 </section>
 
@@ -47,7 +47,7 @@
             <label>Minutes after video posting before socials fire<input type="number" id="post-delay" min="0" value="15"></label>
             <label>Minutes between social postings<input type="number" id="post-spacing" min="0" value="5"></label>
         </div>
-        <button class="btn btn-primary" id="save-posting" style="margin-top: 1rem;">Save posting settings</button>
+        <button class="btn btn-primary" id="save-posting" style="margin-top: 1rem;" disabled>Save posting settings</button>
     </div>
 </section>
 
@@ -106,6 +106,17 @@ const SOCIAL_PLATFORMS = ['twitter', 'bluesky', 'mastodon', 'linkedin', 'threads
 
 let autoActions = null;
 let postingSettings = null;
+const ORIGINAL_PROJECT_NAME = "{{ current_project.name }}";
+
+// JSON-stable comparison so the auto-actions matrix and the posting-settings
+// form can each detect whether the user has actually changed anything since
+// the last successful load. Sorts keys deterministically so {a:1,b:2} and
+// {b:2,a:1} hash equal.
+function jsonStable(value) {
+    if (value === null || typeof value !== 'object') return JSON.stringify(value);
+    if (Array.isArray(value)) return '[' + value.map(jsonStable).join(',') + ']';
+    return '{' + Object.keys(value).sort().map(k => JSON.stringify(k) + ':' + jsonStable(value[k])).join(',') + '}';
+}
 
 function renderMatrix() {
     const body = document.getElementById('auto-actions-body');
@@ -150,23 +161,19 @@ async function loadAutoActions() {
     if (resp.ok) {
         autoActions = await resp.json();
         renderMatrix();
+        // Re-snapshot on every successful load so the dirty check compares
+        // against what's currently on the server, not the page's first load.
+        autoActionsBaseline = jsonStable(buildAutoActionsPayload());
+        updateAutoActionsButtonState();
     }
 }
 
-async function loadPostingSettings() {
-    const resp = await fetch(`/api/projects/${slug}/posting-settings`);
-    if (resp.ok) {
-        postingSettings = await resp.json();
-        document.getElementById('dt-video').value = postingSettings.default_template_video || 'announce_video';
-        document.getElementById('dt-segment').value = postingSettings.default_template_segment || 'announce_video';
-        document.getElementById('dt-short').value = postingSettings.default_template_short || 'announce_video';
-        document.getElementById('dt-hook').value = postingSettings.default_template_hook || 'announce_video';
-        document.getElementById('post-delay').value = postingSettings.post_video_delay_minutes ?? 15;
-        document.getElementById('post-spacing').value = postingSettings.inter_post_spacing_minutes ?? 5;
-    }
-}
+let autoActionsBaseline = null;
 
-document.getElementById('save-auto-actions').addEventListener('click', async () => {
+// Build the payload exactly the way the Save handler does, so the dirty
+// check stays in sync with what we'd actually PUT.
+function buildAutoActionsPayload() {
+    if (!autoActions) return {};
     const inputs = document.querySelectorAll('#auto-actions-body [data-col]');
     const next = { upload: { ...autoActions.upload }, import: { ...autoActions.import } };
     for (const col of ['upload', 'import']) {
@@ -183,6 +190,57 @@ document.getElementById('save-auto-actions').addEventListener('click', async () 
             next[col][key] = value;
         }
     });
+    return next;
+}
+
+function updateAutoActionsButtonState() {
+    const btn = document.getElementById('save-auto-actions');
+    if (autoActionsBaseline === null) { btn.disabled = true; return; }
+    btn.disabled = jsonStable(buildAutoActionsPayload()) === autoActionsBaseline;
+}
+
+document.getElementById('auto-actions-body').addEventListener('change', updateAutoActionsButtonState);
+
+let postingBaseline = null;
+
+function buildPostingPayload() {
+    return {
+        default_template_video: document.getElementById('dt-video').value || 'announce_video',
+        default_template_segment: document.getElementById('dt-segment').value || 'announce_video',
+        default_template_short: document.getElementById('dt-short').value || 'announce_video',
+        default_template_hook: document.getElementById('dt-hook').value || 'announce_video',
+        post_video_delay_minutes: Number(document.getElementById('post-delay').value) || 15,
+        inter_post_spacing_minutes: Number(document.getElementById('post-spacing').value) || 5,
+    };
+}
+
+function updatePostingButtonState() {
+    const btn = document.getElementById('save-posting');
+    if (postingBaseline === null) { btn.disabled = true; return; }
+    btn.disabled = jsonStable(buildPostingPayload()) === postingBaseline;
+}
+
+async function loadPostingSettings() {
+    const resp = await fetch(`/api/projects/${slug}/posting-settings`);
+    if (resp.ok) {
+        postingSettings = await resp.json();
+        document.getElementById('dt-video').value = postingSettings.default_template_video || 'announce_video';
+        document.getElementById('dt-segment').value = postingSettings.default_template_segment || 'announce_video';
+        document.getElementById('dt-short').value = postingSettings.default_template_short || 'announce_video';
+        document.getElementById('dt-hook').value = postingSettings.default_template_hook || 'announce_video';
+        document.getElementById('post-delay').value = postingSettings.post_video_delay_minutes ?? 15;
+        document.getElementById('post-spacing').value = postingSettings.inter_post_spacing_minutes ?? 5;
+        postingBaseline = jsonStable(buildPostingPayload());
+        updatePostingButtonState();
+    }
+}
+
+['dt-video', 'dt-segment', 'dt-short', 'dt-hook', 'post-delay', 'post-spacing'].forEach(id => {
+    document.getElementById(id).addEventListener('input', updatePostingButtonState);
+});
+
+document.getElementById('save-auto-actions').addEventListener('click', async () => {
+    const next = buildAutoActionsPayload();
     const resp = await fetch(`/api/projects/${slug}/auto-actions`, {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
@@ -192,18 +250,13 @@ document.getElementById('save-auto-actions').addEventListener('click', async () 
         autoActions = await resp.json();
         showToast('Auto-actions saved', 'success');
         renderMatrix();
+        autoActionsBaseline = jsonStable(buildAutoActionsPayload());
+        updateAutoActionsButtonState();
     }
 });
 
 document.getElementById('save-posting').addEventListener('click', async () => {
-    const next = {
-        default_template_video: document.getElementById('dt-video').value || 'announce_video',
-        default_template_segment: document.getElementById('dt-segment').value || 'announce_video',
-        default_template_short: document.getElementById('dt-short').value || 'announce_video',
-        default_template_hook: document.getElementById('dt-hook').value || 'announce_video',
-        post_video_delay_minutes: Number(document.getElementById('post-delay').value) || 15,
-        inter_post_spacing_minutes: Number(document.getElementById('post-spacing').value) || 5,
-    };
+    const next = buildPostingPayload();
     const resp = await fetch(`/api/projects/${slug}/posting-settings`, {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
@@ -212,11 +265,24 @@ document.getElementById('save-posting').addEventListener('click', async () => {
     if (resp.ok) {
         postingSettings = await resp.json();
         showToast('Posting settings saved', 'success');
+        postingBaseline = jsonStable(buildPostingPayload());
+        updatePostingButtonState();
     }
 });
 
-document.getElementById('rename-btn').addEventListener('click', async () => {
-    const name = document.getElementById('project-name').value.trim();
+// Save (rename) is only enabled when the typed name is non-empty AND
+// different from the project's current display name.
+const projectNameInput = document.getElementById('project-name');
+const renameBtn = document.getElementById('rename-btn');
+function updateRenameButtonState() {
+    const next = projectNameInput.value.trim();
+    renameBtn.disabled = !next || next === ORIGINAL_PROJECT_NAME.trim();
+}
+projectNameInput.addEventListener('input', updateRenameButtonState);
+updateRenameButtonState();
+
+renameBtn.addEventListener('click', async () => {
+    const name = projectNameInput.value.trim();
     if (!name) return;
     const resp = await fetch(`/api/projects/${slug}`, {
         method: 'PATCH',
