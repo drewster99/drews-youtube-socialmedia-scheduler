@@ -29,7 +29,7 @@ from yt_scheduler.services.auth import (
     has_client_secret,
     store_credentials,
 )
-from yt_scheduler.services import bluesky_oauth
+from yt_scheduler.services import bluesky_oauth, oauth_clients
 from yt_scheduler.services.projects import slugify
 from yt_scheduler.services.social_credentials import (
     display_name_for,
@@ -82,8 +82,18 @@ async def linkedin_start(data: dict):
     client_secret = (data.get("client_secret") or "").strip()
     origin = (data.get("origin") or "").rstrip("/")
     project_slug = (data.get("project_slug") or "").strip() or None
-    if not client_id or not client_secret or not origin:
-        raise HTTPException(400, "client_id, client_secret, and origin are required")
+    if not client_id or not client_secret:
+        stored_id, stored_secret = oauth_clients.get_oauth_client("linkedin")
+        client_id = client_id or stored_id
+        client_secret = client_secret or stored_secret
+    if not client_id or not client_secret:
+        raise HTTPException(
+            400,
+            "LinkedIn OAuth client is not configured. Open Settings → "
+            "OAuth client credentials and add a Client ID and Client Secret.",
+        )
+    if not origin:
+        raise HTTPException(400, "origin is required")
 
     _gc_pending()
     state = secrets.token_urlsafe(24)
@@ -196,8 +206,18 @@ async def threads_start(data: dict):
     client_secret = (data.get("client_secret") or "").strip()
     origin = (data.get("origin") or "").rstrip("/")
     project_slug = (data.get("project_slug") or "").strip() or None
-    if not client_id or not client_secret or not origin:
-        raise HTTPException(400, "client_id, client_secret, and origin are required")
+    if not client_id or not client_secret:
+        stored_id, stored_secret = oauth_clients.get_oauth_client("threads")
+        client_id = client_id or stored_id
+        client_secret = client_secret or stored_secret
+    if not client_id or not client_secret:
+        raise HTTPException(
+            400,
+            "Threads OAuth client is not configured. Open Settings → "
+            "OAuth client credentials and add a Client ID and Client Secret.",
+        )
+    if not origin:
+        raise HTTPException(400, "origin is required")
 
     _gc_pending()
     state = secrets.token_urlsafe(24)
@@ -335,8 +355,17 @@ async def threads_exchange(data: dict):
     """
     app_secret = (data.get("app_secret") or "").strip()
     short_token = (data.get("short_lived_token") or "").strip()
-    if not app_secret or not short_token:
-        raise HTTPException(400, "app_secret and short_lived_token are required")
+    if not app_secret:
+        _, stored_secret = oauth_clients.get_oauth_client("threads")
+        app_secret = stored_secret
+    if not short_token:
+        raise HTTPException(400, "short_lived_token is required")
+    if not app_secret:
+        raise HTTPException(
+            400,
+            "Threads App Secret is not configured. Open Settings → "
+            "OAuth client credentials and save the Threads Client ID and Secret first.",
+        )
 
     try:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -426,8 +455,19 @@ async def twitter_start(data: dict):
     client_secret = (data.get("client_secret") or "").strip()
     origin = (data.get("origin") or "").rstrip("/")
     project_slug = (data.get("project_slug") or "").strip() or None
-    if not client_id or not origin:
-        raise HTTPException(400, "client_id and origin are required")
+    if not client_id:
+        stored_id, stored_secret = oauth_clients.get_oauth_client("twitter")
+        client_id = stored_id
+        if not client_secret:
+            client_secret = stored_secret
+    if not client_id:
+        raise HTTPException(
+            400,
+            "X / Twitter OAuth client is not configured. Open Settings → "
+            "OAuth client credentials and add a Client ID.",
+        )
+    if not origin:
+        raise HTTPException(400, "origin is required")
 
     _gc_pending()
     state = secrets.token_urlsafe(24)

@@ -59,6 +59,19 @@
     </div>
 </div>
 
+<!-- OAuth Client Credentials (per platform) -->
+<div class="card">
+    <h2>OAuth client credentials</h2>
+    <p class="form-hint">
+        These are the developer-app credentials for each social platform. Set them
+        once and connecting an account on Settings or a project's Settings page just
+        opens the OAuth popup — no per-connection prompts.
+    </p>
+    <div id="oauth-clients-list">
+        <p class="loading">Loading…</p>
+    </div>
+</div>
+
 <!-- Social Media Accounts -->
 <div class="card">
     <h2>Social media accounts</h2>
@@ -246,6 +259,94 @@ async function removeAnthropicKey() {
     }
 }
 
+// --- OAuth Client Credentials (Twitter / LinkedIn / Threads) ---
+
+async function loadOAuthClients() {
+    const root = document.getElementById('oauth-clients-list');
+    const resp = await fetch('/api/settings/oauth-clients');
+    if (!resp.ok) {
+        root.innerHTML = '<p class="form-hint">Could not load OAuth clients.</p>';
+        return;
+    }
+    const data = await resp.json();
+    const platforms = data.platforms || {};
+    const order = ['twitter', 'linkedin', 'threads'];
+    root.innerHTML = order.map(key => {
+        const p = platforms[key];
+        if (!p) return '';
+        const status = p.configured
+            ? `<span class="badge badge-published">Configured</span>`
+            : `<span class="badge badge-draft">Not configured</span>`;
+        const secretRow = p.secret_required || p.client_secret_set
+            ? `<div class="form-group">
+                   <label>Client Secret${p.secret_required ? '' : ' <small style="color:var(--text-muted);">(optional)</small>'}</label>
+                   <input type="password" data-oauth-secret="${key}"
+                          placeholder="${p.client_secret_set ? 'Stored — paste a new value to replace' : 'Paste secret here'}"
+                          autocomplete="off">
+               </div>`
+            : `<div class="form-group">
+                   <label>Client Secret <small style="color:var(--text-muted);">(optional for ${escapeHtml(p.display)})</small></label>
+                   <input type="password" data-oauth-secret="${key}" placeholder="Leave blank for a public app" autocomplete="off">
+               </div>`;
+        return `
+            <div class="oauth-client-row" data-platform="${key}" style="border:1px solid var(--border); border-radius:6px; padding:0.75rem 1rem; margin-bottom:0.75rem;">
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:0.75rem; margin-bottom:0.5rem;">
+                    <div>
+                        <strong>${escapeHtml(p.display)}</strong>
+                        <span style="margin-left:0.5rem;">${status}</span>
+                    </div>
+                    ${p.configured
+                        ? `<button class="btn btn-sm btn-danger" data-oauth-remove="${key}">Remove</button>`
+                        : ''}
+                </div>
+                <p class="form-hint" style="margin:0 0 0.5rem 0;">${escapeHtml(p.help)}</p>
+                <div class="form-group">
+                    <label>Client ID</label>
+                    <input type="text" data-oauth-id="${key}" value="${escapeHtml(p.client_id)}" placeholder="Paste Client ID" autocomplete="off">
+                </div>
+                ${secretRow}
+                <div class="form-actions">
+                    <button class="btn btn-primary btn-sm" data-oauth-save="${key}">Save</button>
+                </div>
+            </div>`;
+    }).join('');
+    root.querySelectorAll('button[data-oauth-save]').forEach(btn => {
+        btn.addEventListener('click', () => saveOAuthClient(btn.dataset.oauthSave));
+    });
+    root.querySelectorAll('button[data-oauth-remove]').forEach(btn => {
+        btn.addEventListener('click', () => removeOAuthClient(btn.dataset.oauthRemove));
+    });
+}
+
+async function saveOAuthClient(platform) {
+    const idInput = document.querySelector(`input[data-oauth-id="${platform}"]`);
+    const secretInput = document.querySelector(`input[data-oauth-secret="${platform}"]`);
+    const clientId = (idInput.value || '').trim();
+    const clientSecret = (secretInput.value || '').trim();
+    if (!clientId) {
+        showToast('Client ID is required', 'error');
+        return;
+    }
+    const resp = await fetch(`/api/settings/oauth-clients/${platform}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({client_id: clientId, client_secret: clientSecret}),
+    });
+    if (resp.ok) {
+        showToast(`${platform} OAuth client saved`, 'success');
+        loadOAuthClients();
+    }
+}
+
+async function removeOAuthClient(platform) {
+    if (!confirm(`Remove the stored OAuth client for ${platform}? Connecting new accounts will fail until you re-add it.`)) return;
+    const resp = await fetch(`/api/settings/oauth-clients/${platform}`, {method: 'DELETE'});
+    if (resp.ok) {
+        showToast(`${platform} OAuth client removed`, 'success');
+        loadOAuthClients();
+    }
+}
+
 // --- Social Media Accounts (multi-credential) ---
 
 const PLATFORM_ORDER = ['twitter', 'bluesky', 'mastodon', 'linkedin', 'threads'];
@@ -363,15 +464,13 @@ function renderAddAccountButton(name) {
 }
 
 async function exchangeThreadsToken() {
-    const appSecret = prompt('Threads App Secret\n\n(developers.facebook.com → your app → App settings → Basic → App Secret)');
-    if (!appSecret) return;
-    const shortToken = prompt('Short-lived Access Token\n\nGet it from https://developers.facebook.com/tools/explorer/');
+    const shortToken = prompt('Short-lived Access Token\n\nGet it from https://developers.facebook.com/tools/explorer/\n\n(The App Secret comes from Settings → OAuth client credentials.)');
     if (!shortToken) return;
     showToast('Exchanging for long-lived token…', 'info');
     const resp = await fetch('/api/oauth/threads/exchange', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({app_secret: appSecret.trim(), short_lived_token: shortToken.trim()}),
+        body: JSON.stringify({short_lived_token: shortToken.trim()}),
     });
     if (resp.ok) {
         const result = await resp.json();
@@ -488,6 +587,7 @@ async function loadSettings() {
 // Load everything
 loadAuthStatus();
 loadAnthropicStatus();
+loadOAuthClients();
 loadSocialPlatforms();
 loadSettings();
 </script>

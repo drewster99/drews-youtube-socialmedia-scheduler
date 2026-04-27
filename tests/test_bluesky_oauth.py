@@ -43,6 +43,23 @@ def test_normalise_handle_accepts_custom_domain() -> None:
     assert bo.normalise_handle("blog.example.com") == "blog.example.com"
 
 
+def test_normalise_handle_extracts_from_bsky_app_profile_url() -> None:
+    assert bo.normalise_handle(
+        "https://bsky.app/profile/alice.bsky.social"
+    ) == "alice.bsky.social"
+    assert bo.normalise_handle(
+        "bsky.app/profile/alice.bsky.social"
+    ) == "alice.bsky.social"
+    assert bo.normalise_handle(
+        "https://bsky.app/profile/alice.bsky.social/post/abc123"
+    ) == "alice.bsky.social"
+
+
+def test_normalise_handle_strips_scheme_from_personal_domain() -> None:
+    assert bo.normalise_handle("https://blog.example.com") == "blog.example.com"
+    assert bo.normalise_handle("http://alice.bsky.social/") == "alice.bsky.social"
+
+
 # --- ES256 keypair + JWK ---------------------------------------------------
 
 

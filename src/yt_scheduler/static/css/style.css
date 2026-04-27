@@ -772,14 +772,15 @@ body {
 .section { margin-bottom: 2rem; }
 .section h2 { margin-bottom: 0.75rem; }
 
-/* Home page */
+/* Home page — stack Upcoming, Recent, and Projects so each gets full width.
+   The previous side-by-side Upcoming/Recent split squeezed Recent's
+   timestamp + title + project-badge row onto two cramped lines. */
 .home-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 1fr;
     gap: 1.25rem;
     align-items: start;
 }
-.home-grid .home-projects { grid-column: 1 / -1; }
 .home-grid .card-header {
     display: flex;
     justify-content: space-between;

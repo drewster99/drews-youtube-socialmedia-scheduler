@@ -77,7 +77,17 @@ function showToast(message, type = 'info') {
                 if (body) {
                     try {
                         const j = JSON.parse(body);
-                        detail = j.detail || j.message || body.slice(0, 200);
+                        const raw = j.detail ?? j.message ?? body.slice(0, 200);
+                        // FastAPI's HTTPException(detail=<dict>) yields a
+                        // structured detail (e.g. {private_video: true,
+                        // message: "..."}). Stringifying those naively
+                        // produced "[object Object]" toasts; pull the
+                        // message field if present, JSON-encode otherwise.
+                        if (raw && typeof raw === 'object') {
+                            detail = raw.message || JSON.stringify(raw);
+                        } else {
+                            detail = String(raw ?? '');
+                        }
                     } catch {
                         detail = body.slice(0, 200);
                     }

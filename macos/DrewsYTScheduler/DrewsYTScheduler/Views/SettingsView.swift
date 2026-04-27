@@ -87,6 +87,11 @@ struct SettingsView: View {
                 .controlSize(.large)
                 .buttonStyle(.borderedProminent)
                 .tint(.blue)
+                // Only enabled when the server actually answers AND its
+                // build_id matches this .app shell — otherwise opening
+                // the browser sends the user to "can't connect" or to a
+                // stale build that doesn't match what the app expects.
+                .disabled(!state.serverMatchesBundle)
             }
             .padding(.top, 4)
 

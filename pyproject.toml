@@ -25,11 +25,13 @@ social = [
     "tweepy>=4.14,<5",
     "Mastodon.py>=1.8,<2",
 ]
-# yt-dlp lets us download a video file on demand when the user asks to
-# transcribe an imported (= no-local-file) YouTube video locally with mlx /
-# Apple Speech / faster-whisper / whisper.cpp.
+# pytubefix lets us pull a video file off YouTube on demand — no cookies,
+# no browser-keychain prompts. Used when the user asks to transcribe or
+# describe-from-frames an imported (= no-local-file) video. Private videos
+# require the user to flip them to unlisted first; the route asks for
+# confirmation before doing that.
 youtube-download = [
-    "yt-dlp>=2024.12,<2026",
+    "pytubefix>=10,<11",
 ]
 transcription-mlx = [
     "mlx-whisper>=0.4,<1",

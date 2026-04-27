@@ -13,6 +13,7 @@ from yt_scheduler.config import (
 )
 from yt_scheduler.database import get_db
 from yt_scheduler.services import moderation
+from yt_scheduler.services import oauth_clients
 from yt_scheduler.services.keychain import (
     delete_secret,
     get_storage_type,
@@ -114,6 +115,90 @@ async def update_anthropic_key(data: dict):
 async def delete_anthropic_key():
     """Remove Anthropic API key from Keychain/secrets."""
     delete_secret(ANTHROPIC_NAMESPACE, ANTHROPIC_API_KEY_FIELD)
+    return {"status": "ok"}
+
+
+# --- OAuth client credentials (Twitter / LinkedIn / Threads) ---
+
+OAUTH_CLIENT_DISPLAY = {
+    "twitter": "X / Twitter",
+    "linkedin": "LinkedIn",
+    "threads": "Threads / Meta",
+}
+
+OAUTH_CLIENT_HELP = {
+    "twitter": (
+        "Register an app at developer.x.com → your app → Keys and tokens. "
+        "OAuth 2.0 PKCE; the secret is optional (leave blank for a public app)."
+    ),
+    "linkedin": (
+        "Register an app at developers.linkedin.com → your app → Auth tab. "
+        "Both Client ID and Primary Client Secret are required."
+    ),
+    "threads": (
+        "Register an app at developers.facebook.com → your app → App settings → "
+        "Basic. Both App ID (client_id) and App Secret are required."
+    ),
+}
+
+
+def _mask(secret: str) -> str:
+    if not secret:
+        return ""
+    return secret[:4] + "..." if len(secret) > 4 else "***"
+
+
+@router.get("/oauth-clients")
+async def list_oauth_clients():
+    """Return the configured OAuth clients for every platform that needs one.
+
+    Shape per platform: ``{configured: bool, client_id, client_secret_set,
+    secret_required: bool, display, help}``. ``client_id`` is returned in
+    full (not a secret); ``client_secret`` is never returned, just a flag.
+    """
+    out = {}
+    for platform in oauth_clients.SUPPORTED_PLATFORMS:
+        cid, csec = oauth_clients.get_oauth_client(platform)
+        out[platform] = {
+            "configured": bool(cid),
+            "client_id": cid,
+            "client_secret_set": bool(csec),
+            "secret_required": platform != "twitter",
+            "display": OAUTH_CLIENT_DISPLAY.get(platform, platform.capitalize()),
+            "help": OAUTH_CLIENT_HELP.get(platform, ""),
+            "masked_secret": _mask(csec),
+        }
+    return {"storage": get_storage_type(), "platforms": out}
+
+
+@router.put("/oauth-clients/{platform}")
+async def update_oauth_client(platform: str, data: dict):
+    """Save or replace the OAuth client credentials for a platform.
+
+    Body: ``{"client_id": "...", "client_secret": "..."}``. ``client_secret``
+    may be omitted or empty for X/Twitter (public client). For LinkedIn /
+    Threads it is required.
+    """
+    if platform not in oauth_clients.SUPPORTED_PLATFORMS:
+        raise HTTPException(400, f"Unsupported platform: {platform}")
+    client_id = (data.get("client_id") or "").strip()
+    client_secret = (data.get("client_secret") or "").strip()
+    if not client_id:
+        raise HTTPException(400, "client_id is required")
+    if platform != "twitter" and not client_secret:
+        raise HTTPException(
+            400, f"{OAUTH_CLIENT_DISPLAY.get(platform, platform)} requires a client_secret"
+        )
+    oauth_clients.store_oauth_client(platform, client_id, client_secret)
+    return {"status": "ok", "storage": get_storage_type()}
+
+
+@router.delete("/oauth-clients/{platform}")
+async def delete_oauth_client(platform: str):
+    """Remove the stored OAuth client credentials for a platform."""
+    if platform not in oauth_clients.SUPPORTED_PLATFORMS:
+        raise HTTPException(400, f"Unsupported platform: {platform}")
+    oauth_clients.clear_oauth_client(platform)
     return {"status": "ok"}
 
 

@@ -186,8 +186,26 @@ HANDLE_REGEX_HOST_CHAR = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01
 
 
 def normalise_handle(raw: str) -> str:
-    """Trim leading ``@`` and lowercase. Returns empty string when invalid."""
-    handle = (raw or "").strip().lstrip("@").lower()
+    """Accept handle, ``@handle``, or any of the URL forms users tend to paste.
+
+    Recognised inputs all map to the bare handle (e.g. ``alice.bsky.social``):
+
+    - ``alice.bsky.social`` / ``@alice.bsky.social``
+    - ``https://bsky.app/profile/alice.bsky.social`` (also without scheme,
+      with trailing slash, or with a deeper path like ``/post/abc``)
+    - ``https://alice.bsky.social`` (personal-domain handles, where the
+      domain itself *is* the handle)
+
+    Returns empty string when the result isn't a valid handle.
+    """
+    handle = (raw or "").strip()
+    if not handle:
+        return ""
+    handle = handle.removeprefix("https://").removeprefix("http://")
+    if handle.startswith("bsky.app/profile/"):
+        handle = handle[len("bsky.app/profile/"):]
+    handle = handle.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    handle = handle.lstrip("@").lower()
     if not handle or "." not in handle:
         return ""
     if any(ch not in HANDLE_REGEX_HOST_CHAR for ch in handle):

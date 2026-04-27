@@ -7,7 +7,7 @@ import json
 import shutil
 from pathlib import Path
 
-from fastapi import APIRouter, Form, UploadFile, File, HTTPException
+from fastapi import APIRouter, Form, UploadFile, File, HTTPException, Query
 
 from yt_scheduler.config import UPLOAD_DIR
 from yt_scheduler.database import get_db
@@ -288,13 +288,23 @@ async def update_video(video_id: str, data: dict):
 
 
 @router.post("/{video_id}/transcribe")
-async def transcribe_video(video_id: str, data: dict | None = None):
+async def transcribe_video(
+    video_id: str,
+    data: dict | None = None,
+    confirm_unlist: bool = Query(default=False),
+):
     """Transcribe a video locally using on-device speech recognition.
 
     Optional body params:
         model: Whisper model size (tiny, base, small, medium, large-v3). Default: large-v3
         language: Language code (e.g., "en"). Default: auto-detect
         backend: Force specific backend (mlx-whisper, faster-whisper, whisper.cpp, macos-speech)
+
+    Imported videos that aren't on disk yet are pulled via pytubefix.
+    Private videos can't be downloaded anonymously, so the route returns
+    HTTP 409 ``{"private_video": True}`` and the caller should re-issue
+    the request with ``?confirm_unlist=true`` after asking the user
+    whether to flip the video to unlisted.
     """
     from yt_scheduler.services import transcription
 
@@ -306,33 +316,58 @@ async def transcribe_video(video_id: str, data: dict | None = None):
     video = dict(rows[0])
     video_file = video.get("video_file_path")
     if not video_file or not Path(video_file).exists():
-        # For imported videos we don't keep a local copy by default. Pull it
-        # on demand via yt-dlp so Apple Speech / Whisper has a file to read.
-        if video.get("imported_from_youtube"):
-            try:
-                downloaded = await asyncio.to_thread(
-                    youtube.download_video_file, video_id, UPLOAD_DIR
-                )
-            except Exception as exc:
-                raise HTTPException(
-                    400,
-                    "Could not download video for re-transcription "
-                    f"({exc}). Install yt-dlp with: "
-                    "pip install -e \".[youtube-download]\""
-                ) from exc
-            video_file = str(downloaded)
-            await db.execute(
-                "UPDATE videos SET video_file_path = ?, updated_at = datetime('now') "
-                "WHERE id = ?",
-                (video_file, video_id),
-            )
-            await db.commit()
-        else:
+        if not video.get("imported_from_youtube"):
             raise HTTPException(
                 400,
                 "Video file not found locally. Re-upload the video to "
                 "enable on-device transcription.",
             )
+
+        if confirm_unlist:
+            try:
+                await asyncio.to_thread(
+                    youtube.set_video_privacy, video_id, "unlisted"
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    400, f"Could not flip {video_id} to unlisted: {exc}"
+                ) from exc
+            await db.execute(
+                "UPDATE videos SET privacy_status = 'unlisted', updated_at = datetime('now') "
+                "WHERE id = ?",
+                (video_id,),
+            )
+            await db.commit()
+
+        try:
+            downloaded = await asyncio.to_thread(
+                youtube.download_video_file, video_id, UPLOAD_DIR
+            )
+        except youtube.PrivateVideoError as exc:
+            raise HTTPException(
+                409,
+                {
+                    "private_video": True,
+                    "video_id": video_id,
+                    "message": (
+                        "This video is private on YouTube. To download it for "
+                        "transcription, it needs to be flipped to unlisted "
+                        "first. It will stay unlisted afterwards."
+                    ),
+                },
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                400, f"Could not download video for re-transcription ({exc})."
+            ) from exc
+
+        video_file = str(downloaded)
+        await db.execute(
+            "UPDATE videos SET video_file_path = ?, updated_at = datetime('now') "
+            "WHERE id = ?",
+            (video_file, video_id),
+        )
+        await db.commit()
 
     opts = data or {}
     try:

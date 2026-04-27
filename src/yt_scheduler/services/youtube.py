@@ -2,11 +2,31 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from googleapiclient.http import MediaFileUpload
 
 from yt_scheduler.services.auth import get_youtube_service
+
+logger = logging.getLogger(__name__)
+
+
+class PrivateVideoError(Exception):
+    """Raised by ``download_video_file`` when the target video is private.
+
+    pytubefix can fetch unlisted/public videos anonymously, but private
+    ones require either browser cookies (which we deliberately don't
+    use — see the cookie-prompt UX problems we hit with yt-dlp) or a
+    privacy flip. The route layer catches this and asks the user to
+    confirm flipping the video to unlisted before retrying.
+    """
+
+    def __init__(self, video_id: str):
+        super().__init__(
+            f"Video {video_id} is private; flip to unlisted to download."
+        )
+        self.video_id = video_id
 
 
 def upload_video(
@@ -240,60 +260,75 @@ def upload_caption(
 
 
 def download_video_file(video_id: str, target_dir: "Path | str") -> "Path":
-    """Pull the video file off YouTube via yt-dlp.
+    """Pull the video file off YouTube via pytubefix.
 
-    Used when the user wants to transcribe an imported video locally —
-    Apple Speech / Whisper backends need a local file path. Picks the
-    smallest reasonable mp4 (audio is what the transcribers use; we don't
-    need 4K) to minimise download time + disk usage.
+    Used when the user wants to transcribe (or describe-from-frames) an
+    imported video locally — Apple Speech / Whisper / ffmpeg need a file
+    on disk. Anonymous pytubefix happily fetches public and unlisted
+    videos; for private videos it raises ``VideoPrivate``, which we
+    re-raise as :class:`PrivateVideoError` so the route can ask the user
+    to flip the video to unlisted before retrying.
 
-    Returns the absolute path to the downloaded file. Raises RuntimeError
-    if yt-dlp isn't installed or the download fails.
+    Picks the highest-resolution progressive mp4 stream (audio + video
+    in one file). The transcribers only need audio, but pytubefix's
+    ``get_highest_resolution`` is the cleanest one-liner and the file
+    sizes for a typical YouTube video are still modest at 720p.
+
+    Returns the absolute path to the downloaded file. Raises
+    :class:`PrivateVideoError` for private videos and ``RuntimeError``
+    for any other failure (network, age-gated, members-only, removed).
     """
-    from pathlib import Path
-
     try:
-        import yt_dlp
+        from pytubefix import YouTube
+        from pytubefix.exceptions import LoginRequired, VideoPrivate
     except ImportError as exc:  # pragma: no cover — dependency probe
         raise RuntimeError(
-            "yt-dlp is not installed. Install with: "
+            "pytubefix is not installed. Install with: "
             "pip install -e \".[youtube-download]\""
         ) from exc
 
     target_dir = Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
-    out_template = str(target_dir / f"{video_id}.%(ext)s")
-
-    options = {
-        "format": "best[height<=720][ext=mp4]/best[ext=mp4]/best",
-        "outtmpl": out_template,
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        # Don't write metadata or thumbnail sidecars — we already have those.
-        "writethumbnail": False,
-        "writeinfojson": False,
-        "writedescription": False,
-        "writesubtitles": False,
-    }
 
     url = f"https://www.youtube.com/watch?v={video_id}"
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
-        downloaded_path = ydl.prepare_filename(info)
-
-    path = Path(downloaded_path)
-    if not path.exists():
-        # yt-dlp sometimes finalises with a different extension than the
-        # template suggests; pick the latest matching file in the dir.
-        candidates = sorted(
-            target_dir.glob(f"{video_id}.*"),
-            key=lambda p: p.stat().st_mtime,
+    try:
+        yt = YouTube(url)
+        stream = yt.streams.get_highest_resolution()
+        if stream is None:
+            raise RuntimeError(
+                f"pytubefix returned no usable progressive streams for {video_id}"
+            )
+        downloaded = stream.download(
+            output_path=str(target_dir),
+            filename=f"{video_id}.{stream.subtype or 'mp4'}",
         )
-        if not candidates:
-            raise RuntimeError(f"yt-dlp finished but no file found for {video_id}")
-        path = candidates[-1]
-    return path.resolve()
+    except (VideoPrivate, LoginRequired) as exc:
+        # pytubefix surfaces private videos as either ``VideoPrivate`` (when
+        # the playability response says ``LOGIN_REQUIRED`` with the
+        # PRIVATE_VIDEO subreason) or the broader ``LoginRequired`` (anything
+        # else that requires a login — for our use case, also a private
+        # video the caller doesn't have cookies for).
+        raise PrivateVideoError(video_id) from exc
+    except Exception as exc:
+        # Last-ditch heuristic: some YouTube responses still surface as a
+        # plain Exception with "Please sign in" / "requires login" text.
+        # Treat those as private too so the route can offer the unlist flow.
+        text = str(exc).lower()
+        if "sign in" in text or "login" in text or "private" in text:
+            raise PrivateVideoError(video_id) from exc
+        raise RuntimeError(f"pytubefix could not download {video_id}: {exc}") from exc
+
+    return Path(downloaded).resolve()
+
+
+def set_video_privacy(video_id: str, privacy_status: str) -> dict:
+    """Flip a video's privacy status (private / unlisted / public).
+
+    Thin wrapper over :func:`update_video_metadata` so the route layer
+    can express its intent ("flip to unlisted before download") without
+    importing the broader metadata-update helper.
+    """
+    return update_video_metadata(video_id, privacy_status=privacy_status)
 
 
 # --- Comments ---

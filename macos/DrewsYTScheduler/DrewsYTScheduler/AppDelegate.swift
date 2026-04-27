@@ -287,6 +287,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(AppPaths.serverWebURL)
     }
 
+    /// Cocoa calls this for any menu item whose ``target`` is the
+    /// AppDelegate before it's drawn. Used here to grey out the File
+    /// menu's "Open UI" command whenever the server isn't reachable
+    /// or its build doesn't match this .app shell — same gate as the
+    /// SwiftUI Open UI buttons in Welcome and Settings, and the menu
+    /// bar's Open UI entry.
+    @objc func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(openWebUI) {
+            return state.serverMatchesBundle
+        }
+        return true
+    }
+
     @objc private func viewLogsAction() {
         NSWorkspace.shared.activateFileViewerSelecting([AppPaths.serverLogFile])
     }
@@ -335,6 +348,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let openWebUI = NSMenuItem(title: "Open UI", action: #selector(openWebUI), keyEquivalent: "")
         openWebUI.target = self
+        // Same gate as the Welcome / Settings buttons: refuse to open the
+        // browser unless the server is actually answering AND its build_id
+        // matches this .app shell. Avoids "can't connect" pages and stale
+        // builds running against a newer .app.
+        openWebUI.isEnabled = state.serverMatchesBundle
         menu.addItem(openWebUI)
 
         let restart = NSMenuItem(title: "Restart Server", action: #selector(restartServerAction), keyEquivalent: "")

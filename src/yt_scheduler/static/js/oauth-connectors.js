@@ -1,27 +1,26 @@
 /* Per-platform OAuth connector helpers, shared between Settings and
  * project Settings.
  *
- * Each connector prompts for whatever the user must supply (LinkedIn /
- * Twitter / Threads need client_id+client_secret; Mastodon needs an
- * instance URL; Bluesky needs the user's handle), then opens an OAuth
- * popup against the platform's `/api/oauth/<platform>/start` endpoint.
+ * The OAuth client (Client ID / Secret) for Twitter, LinkedIn, and
+ * Threads is configured *once* in Settings → OAuth client credentials
+ * and stored in Keychain. Each connector below just opens the popup;
+ * the server reads the stored credentials. If none are stored, the
+ * server returns a 400 whose ``detail`` text directs the user to
+ * Settings — `openOAuthPopup` already surfaces that as a toast.
+ *
+ * Mastodon registers itself dynamically per instance, and Bluesky uses
+ * AT-proto OAuth with the install acting as its own client, so neither
+ * needs a stored client_id — only the instance URL / handle the user
+ * is connecting.
  *
  * When called with a non-null ``projectSlug``, the start endpoint
  * receives ``project_slug`` so the OAuth callback binds the resulting
- * credential as the project's default for that platform. When called
- * with ``null`` (or no argument), the credential is created without a
- * project binding — the existing General Settings flow.
+ * credential as the project's default for that platform.
  */
 
 async function connectLinkedIn(projectSlug = null) {
-    const clientId = prompt('LinkedIn Client ID\n\n(developers.linkedin.com → your app → Auth tab → Application credentials)');
-    if (!clientId) return;
-    const clientSecret = prompt('LinkedIn Primary Client Secret');
-    if (!clientSecret) return;
     try {
         await openOAuthPopup('/api/oauth/linkedin/start', {
-            client_id: clientId.trim(),
-            client_secret: clientSecret.trim(),
             origin: window.location.origin,
             project_slug: projectSlug,
         }, 'linkedin-oauth');
@@ -29,13 +28,8 @@ async function connectLinkedIn(projectSlug = null) {
 }
 
 async function connectTwitter(projectSlug = null) {
-    const clientId = prompt('X / Twitter OAuth 2.0 Client ID\n\n(developer.x.com → your app → Keys and tokens)');
-    if (!clientId) return;
-    const clientSecret = prompt('Client Secret\n\n(Optional — leave blank for a public app.)') || '';
     try {
         await openOAuthPopup('/api/oauth/twitter/start', {
-            client_id: clientId.trim(),
-            client_secret: clientSecret.trim(),
             origin: window.location.origin,
             project_slug: projectSlug,
         }, 'twitter-oauth');
@@ -55,14 +49,8 @@ async function connectMastodon(projectSlug = null) {
 }
 
 async function connectThreads(projectSlug = null) {
-    const clientId = prompt('Threads / Meta App Client ID\n\n(developers.facebook.com → your app → App settings → Basic)');
-    if (!clientId) return;
-    const clientSecret = prompt('Threads / Meta App Secret');
-    if (!clientSecret) return;
     try {
         await openOAuthPopup('/api/oauth/threads/start', {
-            client_id: clientId.trim(),
-            client_secret: clientSecret.trim(),
             origin: window.location.origin,
             project_slug: projectSlug,
         }, 'threads-oauth');

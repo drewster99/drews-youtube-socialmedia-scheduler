@@ -1301,25 +1301,75 @@ async function transcribeLocally() {
     try {
         const body = {model};
         if (backend) body.backend = backend;
-        const resp = await fetch(`/api/videos/${videoId}/transcribe`, {
+        let resp = await fetch(`/api/videos/${videoId}/transcribe`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(body),
+            // The 409 + private-video flow shows its own confirm() and
+            // retries — the global error toast would race the dialog.
+            _silent: true,
         });
+
+        // Private-video gate: server can't pull a private video without
+        // cookies, so it asks us to confirm a flip to unlisted and retry.
+        if (resp.status === 409) {
+            let detail;
+            try { detail = (await resp.json()).detail; } catch { detail = null; }
+            if (detail && detail.private_video) {
+                const ok = confirm(
+                    detail.message ||
+                    'This video is private on YouTube. Flip it to unlisted so it can be downloaded for transcription? It will stay unlisted afterwards.'
+                );
+                if (!ok) {
+                    area.innerHTML = `<p class="empty-state">Cancelled — video is still private.</p>`;
+                    return;
+                }
+                area.innerHTML = `
+                    <div class="transcription-progress" style="text-align: center; padding: 2rem;">
+                        <div class="spinner" style="display: inline-block; width: 24px; height: 24px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite;"></div>
+                        <p style="margin-top: 0.5rem; color: var(--text-muted);">Flipping to unlisted and downloading…</p>
+                    </div>`;
+                resp = await fetch(`/api/videos/${videoId}/transcribe?confirm_unlist=true`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(body),
+                    _silent: true,
+                });
+            }
+        }
+
         if (resp.ok) {
             const result = await resp.json();
             window._lastTranscriptBackend = `${result.backend} · model: ${result.model || model}`;
             showToast(`Transcribed! ${result.segments} segments, ${result.word_count} words via ${result.backend}`, 'success');
-            loadVideo();
             loadTranscriptionBackends();
         } else {
-            area.innerHTML = `<p class="empty-state" style="color: var(--danger);">Transcription failed (HTTP ${resp.status})</p>`;
+            // Pull the server's actual error message instead of the bare
+            // status code. Server always returns FastAPI shape
+            // {"detail": <string|object>}; if detail is an object, prefer
+            // its .message field.
+            let msg = `HTTP ${resp.status}`;
+            try {
+                const j = await resp.json();
+                const d = j && j.detail;
+                if (d && typeof d === 'object') {
+                    msg = d.message || JSON.stringify(d);
+                } else if (d) {
+                    msg = String(d);
+                }
+            } catch { /* body not JSON — keep the status code */ }
+            area.innerHTML = `<p class="empty-state" style="color: var(--danger);">Transcription failed: ${escapeHtml(msg)}</p>`;
+            showToast(msg, 'error');
         }
     } catch (_) {
         area.innerHTML = `<p class="empty-state" style="color: var(--danger);">Transcription failed — see toast.</p>`;
     } finally {
         btn.disabled = false;
         btn.textContent = 'Transcribe';
+        // Always refresh video state — the lazy-download branch may have
+        // populated video_file_path even on transcribe failure, which
+        // unblocks "Generate from video" / frame-based description.
+        loadVideo();
     }
 }
 

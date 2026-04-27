@@ -390,6 +390,15 @@ window.addEventListener('message', (event) => {
     }
 });
 
+// Safari sometimes drops `window.opener` across the cross-origin navigation
+// the OAuth flow performs, so the popup's postMessage never reaches us.
+// Re-pull defaults whenever the tab regains focus — covers closing the popup
+// after a successful auth even when the message was lost.
+window.addEventListener('focus', () => {
+    loadSocialDefaults();
+    loadYouTube();
+});
+
 loadAutoActions();
 loadPostingSettings();
 loadYouTube();

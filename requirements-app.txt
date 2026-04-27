@@ -22,5 +22,7 @@ Mastodon.py>=1.8
 faster-whisper>=1.0
 
 # YouTube video download — needed when the user re-transcribes an imported
-# (no-local-file) video locally with Apple Speech / Whisper.
-yt-dlp>=2024.12
+# (no-local-file) video locally with Apple Speech / Whisper. pytubefix needs
+# no cookies; for private videos the route flips them to unlisted on
+# user confirmation before downloading.
+pytubefix>=10,<11
