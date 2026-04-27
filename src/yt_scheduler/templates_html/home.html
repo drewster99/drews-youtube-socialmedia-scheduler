@@ -303,7 +303,8 @@ function resetWizard() {
     wizard.channel_title = '';
     wizard.finishing = false;
     document.getElementById('new-project-name').value = '';
-    document.getElementById('wizard-step2-status').textContent = '';
+    // Channel-first wizard moved the OAuth status display to step 1.
+    document.getElementById('wizard-step1-status').textContent = '';
     document.getElementById('wizard-social-defaults').innerHTML = '';
     setWizardStep(1);
 }
