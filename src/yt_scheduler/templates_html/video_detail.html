@@ -587,6 +587,15 @@ function renderEvent(ev) {
                     : escapeHtml(platform)
             }]</span>`;
         }
+        case 'social_post_skipped_duplicate': {
+            const platform = ev.payload?.platform || 'social';
+            const prevUrl = ev.payload?.previous_post_url;
+            const prevId = ev.payload?.previous_post_id;
+            const prev = prevUrl
+                ? `<a href="${escapeHtml(prevUrl)}" target="_blank" rel="noopener">previous post</a>`
+                : (prevId ? `previous post #${prevId}` : 'a previous post');
+            return `${ts} <span>Social post skipped — duplicate of ${prev} [${escapeHtml(platform)}]</span>`;
+        }
         default:
             return `${ts} <span>${escapeHtml(ev.type)}</span>`;
     }
@@ -1080,7 +1089,15 @@ async function sendPost(postId) {
             return;
         }
 
-        const resp = await fetch(`/api/social/posts/${postId}/send`, { method: 'POST' });
+        let resp = await fetch(`/api/social/posts/${postId}/send`, { method: 'POST', _silent: true });
+        if (resp.status === 409) {
+            const dup = (await resp.json()).detail || {};
+            if (!confirmDuplicate(dup)) {
+                showToast('Send cancelled — duplicate detected', 'info');
+                return;
+            }
+            resp = await fetch(`/api/social/posts/${postId}/send?confirm_dup=true`, { method: 'POST' });
+        }
         const result = await resp.json();
         if (resp.ok) {
             showToast(`Posted! ${result.url || ''}`, 'success');
@@ -1091,6 +1108,34 @@ async function sendPost(postId) {
     } finally {
         setPostCardBusy(postId, false);
     }
+}
+
+function confirmDuplicate(dup) {
+    /* Build a confirm() body from a 409 duplicate payload. The shape is
+     * documented by social_routes._duplicate_payload — single-post sends
+     * use ``previous`` (one match); send-all uses ``duplicates`` (an
+     * array, one match per offending post). */
+    const lines = [];
+    lines.push('This looks like a repost.');
+    lines.push('');
+    if (dup.previous) {
+        lines.push(`Already sent to ${dup.platform || 'this platform'}:`);
+        if (dup.previous.posted_at) lines.push(`  at ${dup.previous.posted_at}`);
+        if (dup.previous.post_url) lines.push(`  ${dup.previous.post_url}`);
+        if (dup.previous.content_preview) {
+            lines.push('');
+            lines.push(`  "${dup.previous.content_preview}"`);
+        }
+    } else if (Array.isArray(dup.duplicates)) {
+        lines.push(`${dup.duplicates.length} post(s) match recent sends:`);
+        for (const d of dup.duplicates) {
+            const when = d.previous?.posted_at || '?';
+            lines.push(`  • ${d.platform} sent at ${when}`);
+        }
+    }
+    lines.push('');
+    lines.push('Post anyway?');
+    return confirm(lines.join('\n'));
 }
 
 async function sendAllPosts() {

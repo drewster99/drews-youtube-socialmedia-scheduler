@@ -152,6 +152,41 @@ async def publish_video_job(video_id: str) -> dict:
                 )
                 continue
 
+            # Duplicate guard: even after the user approved this post, if
+            # an identical content was sent to the same platform+account
+            # in the last 30 days we refuse to post it twice. The user
+            # can override by manually re-sending with confirm_dup=true.
+            from yt_scheduler.services.social import find_recent_duplicate_post
+
+            dup = await find_recent_duplicate_post(
+                platform=post["platform"],
+                social_account_id=post.get("social_account_id"),
+                content=post.get("content") or "",
+                exclude_post_id=post_id,
+            )
+            if dup is not None:
+                await _release_post_to_approved(post_id)
+                results["social_results"][platform].append({
+                    "post_id": post_id,
+                    "status": "skipped",
+                    "reason": f"duplicate of post {dup['id']} ({dup.get('posted_at') or ''})",
+                })
+                logger.warning(
+                    "publish_video_job: skipped post %s — duplicate of #%s",
+                    post_id, dup.get("id"),
+                )
+                await events.record_event(
+                    video_id,
+                    "social_post_skipped_duplicate",
+                    {
+                        "platform": platform,
+                        "social_account_id": post.get("social_account_id"),
+                        "previous_post_id": dup.get("id"),
+                        "previous_post_url": dup.get("post_url"),
+                    },
+                )
+                continue
+
             try:
                 poster = await _resolve_poster(post, project_id)
             except ValueError as exc:
@@ -244,6 +279,36 @@ async def _send_scheduled_post(post_id: int) -> None:
     if not await _claim_post_for_send(post_id):
         # Either it wasn't 'approved' (e.g. user already manually sent
         # or unscheduled it) or another worker beat us to the claim.
+        return
+
+    # Duplicate guard. Same rule as publish_video_job: an unattended
+    # scheduler must never post identical content twice. Releasing the
+    # claim leaves the post in 'approved' so the user can override
+    # manually via the route's confirm_dup=true.
+    from yt_scheduler.services.social import find_recent_duplicate_post
+
+    dup = await find_recent_duplicate_post(
+        platform=post["platform"],
+        social_account_id=post.get("social_account_id"),
+        content=post.get("content") or "",
+        exclude_post_id=post_id,
+    )
+    if dup is not None:
+        await _release_post_to_approved(post_id)
+        logger.warning(
+            "_send_scheduled_post: skipped post %s — duplicate of #%s",
+            post_id, dup.get("id"),
+        )
+        await events.record_event(
+            post["video_id"],
+            "social_post_skipped_duplicate",
+            {
+                "platform": post["platform"],
+                "social_account_id": post.get("social_account_id"),
+                "previous_post_id": dup.get("id"),
+                "previous_post_url": dup.get("post_url"),
+            },
+        )
         return
 
     try:

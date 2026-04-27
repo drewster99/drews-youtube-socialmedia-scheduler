@@ -277,20 +277,59 @@ document.getElementById('btn-schedule-confirm').addEventListener('click', async 
         .map(cb => Number(cb.dataset.id));
 
     let i = 0;
+    let dupCancelled = 0;
     for (const postId of includedIds) {
         const at = new Date(when.getTime() + i * spacingMs);
-        await fetch(`/api/social/posts/${postId}/schedule`, {
+        const body = JSON.stringify({scheduled_at: at.toISOString()});
+        let resp = await fetch(`/api/social/posts/${postId}/schedule`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({scheduled_at: at.toISOString()}),
+            body,
+            _silent: true,
         });
+        if (resp.status === 409) {
+            const dup = (await resp.json()).detail || {};
+            if (!confirmDuplicateInline(dup)) {
+                dupCancelled++;
+                i++;
+                continue;
+            }
+            resp = await fetch(`/api/social/posts/${postId}/schedule?confirm_dup=true`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body,
+            });
+        } else if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            showToast(`Schedule failed for post ${postId}: ${err.detail || resp.status}`, 'error');
+        }
         i++;
     }
     document.getElementById('schedule-dialog').close();
-    showToast(`Scheduled ${includedIds.length} posts`, 'success');
+    const scheduled = includedIds.length - dupCancelled;
+    if (dupCancelled) {
+        showToast(`Scheduled ${scheduled}; skipped ${dupCancelled} as duplicates`, 'info');
+    } else {
+        showToast(`Scheduled ${scheduled} posts`, 'success');
+    }
     await refresh();
     maybeShowDone();
 });
+
+function confirmDuplicateInline(dup) {
+    const lines = ['This looks like a repost.', ''];
+    if (dup.previous) {
+        lines.push(`Already sent to ${dup.platform || 'this platform'}:`);
+        if (dup.previous.posted_at) lines.push(`  at ${dup.previous.posted_at}`);
+        if (dup.previous.post_url) lines.push(`  ${dup.previous.post_url}`);
+        if (dup.previous.content_preview) {
+            lines.push('');
+            lines.push(`  "${dup.previous.content_preview}"`);
+        }
+    }
+    lines.push('', 'Schedule anyway?');
+    return confirm(lines.join('\n'));
+}
 
 async function refresh() {
     const postsResp = await fetch(`/api/social/posts/${videoId}`);

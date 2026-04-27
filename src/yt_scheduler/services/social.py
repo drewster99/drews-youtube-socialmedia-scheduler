@@ -857,6 +857,69 @@ def get_poster(platform: str) -> SocialPoster:
     return cls()
 
 
+async def find_recent_duplicate_post(
+    *,
+    platform: str,
+    social_account_id: int | None,
+    content: str,
+    exclude_post_id: int | None = None,
+    lookback_days: int = 30,
+) -> dict | None:
+    """Look for a previously-sent post with the same content going to the
+    same target. Returns the matching row (with id, posted_at, post_url,
+    content, social_account_id) or ``None`` if there is no recent dup.
+
+    Match criteria:
+
+    * same ``platform``,
+    * same ``social_account_id`` (when both sides have one — null/null is
+      compared by content alone, which is the conservative call),
+    * exact ``content`` match (after stripping whitespace),
+    * status is ``posted`` or ``sending``,
+    * occurred within the last ``lookback_days`` days.
+
+    The bulk-send path uses this as a pre-flight check; if the user
+    confirms despite the dup, the route re-runs with ``confirm=true``
+    and skips the check. The scheduler-fired paths
+    (``publish_video_job``, ``_send_scheduled_post``) call this as a
+    hard gate and skip-with-log on a hit, so an old auto-schedule that
+    happens to produce identical content can't double-post even when
+    nobody's at the keyboard.
+    """
+    from yt_scheduler.database import get_db
+
+    normalised = (content or "").strip()
+    if not normalised:
+        return None  # empty post can't be a dup of anything meaningful
+
+    db = await get_db()
+    sql_parts = [
+        "SELECT id, video_id, platform, content, social_account_id, "
+        "       posted_at, post_url, status, "
+        "       COALESCE(posted_at, created_at) AS event_at "
+        "FROM social_posts "
+        "WHERE platform = ? AND TRIM(content) = ? "
+        "AND status IN ('posted', 'sending') "
+        "AND COALESCE(posted_at, created_at) >= datetime('now', '-' || ? || ' days')"
+    ]
+    params: list = [platform, normalised, lookback_days]
+    if social_account_id is not None:
+        sql_parts.append(
+            "AND (social_account_id = ? OR social_account_id IS NULL)"
+        )
+        params.append(int(social_account_id))
+    if exclude_post_id is not None:
+        sql_parts.append("AND id != ?")
+        params.append(int(exclude_post_id))
+    sql_parts.append("ORDER BY event_at DESC LIMIT 1")
+
+    cursor = await db.execute(" ".join(sql_parts), tuple(params))
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
 async def get_poster_for_account(social_account_id: int) -> SocialPoster:
     """Build a poster bound to a specific ``social_accounts`` row."""
     from yt_scheduler.services.social_credentials import (

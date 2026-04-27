@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from yt_scheduler.database import get_db
 from yt_scheduler.services import social, templates as tmpl, youtube
@@ -243,9 +243,33 @@ async def _credential_for_post(post: dict) -> dict | None:
     return await get_first_active_credential(post["platform"])
 
 
+def _duplicate_payload(prev: dict, platform: str) -> dict:
+    """Shape the 409 body the UI uses to render a 'post anyway?' dialog."""
+    snippet = (prev.get("content") or "")
+    if len(snippet) > 200:
+        snippet = snippet[:200] + "…"
+    return {
+        "duplicate": True,
+        "platform": platform,
+        "previous": {
+            "id": prev.get("id"),
+            "video_id": prev.get("video_id"),
+            "posted_at": prev.get("posted_at"),
+            "post_url": prev.get("post_url"),
+            "content_preview": snippet,
+        },
+        "needs_confirm": True,
+    }
+
+
 @router.post("/posts/{post_id}/send")
-async def send_post(post_id: int):
-    """Send a single social post."""
+async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
+    """Send a single social post.
+
+    Returns 409 with a duplicate payload if the same (platform, account,
+    content) was sent within the last 30 days. Pass ``?confirm_dup=true``
+    to override after the user confirms.
+    """
     from yt_scheduler.services.social_credentials import mark_needs_reauth
 
     db = await get_db()
@@ -265,6 +289,16 @@ async def send_post(post_id: int):
             f"{post['platform']} credential needs re-authentication. "
             "Reconnect from Settings before retrying.",
         )
+
+    if not confirm_dup:
+        dup = await social.find_recent_duplicate_post(
+            platform=post["platform"],
+            social_account_id=cred["id"] if cred else post.get("social_account_id"),
+            content=post.get("content") or "",
+            exclude_post_id=post_id,
+        )
+        if dup is not None:
+            raise HTTPException(409, _duplicate_payload(dup, post["platform"]))
 
     try:
         poster = await _resolve_poster_for_post(post)
@@ -309,10 +343,15 @@ async def send_post(post_id: int):
 
 
 @router.post("/posts/{post_id}/schedule")
-async def schedule_post(post_id: int, data: dict):
+async def schedule_post(
+    post_id: int, data: dict, confirm_dup: bool = Query(default=False)
+):
     """Schedule an individual social post via APScheduler DateTrigger.
 
     Body: ``{"scheduled_at": "2026-04-25T14:00:00-07:00"}``
+
+    Returns 409 with a duplicate payload if an identical post was sent
+    in the last 30 days. ``?confirm_dup=true`` overrides.
     """
     from datetime import datetime as dt, timezone
     from yt_scheduler.services.scheduler import schedule_social_post
@@ -328,6 +367,23 @@ async def schedule_post(post_id: int, data: dict):
         when = when.replace(tzinfo=timezone.utc)
     if when <= dt.now(timezone.utc):
         raise HTTPException(400, "scheduled_at must be in the future")
+
+    if not confirm_dup:
+        db = await get_db()
+        rows = await db.execute_fetchall(
+            "SELECT * FROM social_posts WHERE id = ?", (post_id,)
+        )
+        if rows:
+            post = dict(rows[0])
+            cred = await _credential_for_post(post)
+            dup = await social.find_recent_duplicate_post(
+                platform=post["platform"],
+                social_account_id=cred["id"] if cred else post.get("social_account_id"),
+                content=post.get("content") or "",
+                exclude_post_id=post_id,
+            )
+            if dup is not None:
+                raise HTTPException(409, _duplicate_payload(dup, post["platform"]))
 
     try:
         job_id = await schedule_social_post(post_id, when)
@@ -346,8 +402,17 @@ async def unschedule_post(post_id: int):
 
 
 @router.post("/posts/{video_id}/send-all")
-async def send_all_posts(video_id: str):
-    """Send all approved posts for a video."""
+async def send_all_posts(
+    video_id: str, confirm_dup: bool = Query(default=False)
+):
+    """Send all approved posts for a video.
+
+    Pre-flights every approved post against the duplicate check. If any
+    are duplicates of recent successful sends, returns 409 with a
+    ``duplicates`` array — one entry per offending post — so the UI can
+    show 'these N posts look like resends, post anyway?'. Pass
+    ``?confirm_dup=true`` to skip the check after the user confirms.
+    """
     from yt_scheduler.services.social_credentials import mark_needs_reauth
 
     db = await get_db()
@@ -355,6 +420,29 @@ async def send_all_posts(video_id: str):
         "SELECT * FROM social_posts WHERE video_id = ? AND status = 'approved'",
         (video_id,),
     )
+
+    if not confirm_dup:
+        duplicates: list[dict] = []
+        for row in rows:
+            post = dict(row)
+            cred = await _credential_for_post(post)
+            dup = await social.find_recent_duplicate_post(
+                platform=post["platform"],
+                social_account_id=cred["id"] if cred else post.get("social_account_id"),
+                content=post.get("content") or "",
+                exclude_post_id=int(post["id"]),
+            )
+            if dup is not None:
+                duplicates.append({
+                    "post_id": int(post["id"]),
+                    **_duplicate_payload(dup, post["platform"]),
+                })
+        if duplicates:
+            raise HTTPException(409, {
+                "duplicate": True,
+                "duplicates": duplicates,
+                "needs_confirm": True,
+            })
 
     results = {}
     for row in rows:
