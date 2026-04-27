@@ -47,7 +47,11 @@ function fmtScheduledWhen(iso) {
 async function loadVideos() {
     const container = document.getElementById('video-list');
     try {
-        const resp = await fetch('/api/videos');
+        // Always scope the listing to the current project — the route's
+        // unfiltered shape (no query) returns videos across all projects
+        // and would render @TheDrewBenson's videos under
+        // DrewBensonCodes' Dashboard, etc.
+        const resp = await fetch(`/api/videos?project_slug=${encodeURIComponent(projectSlug)}`);
         const videos = await resp.json();
 
         if (videos.length === 0) {
