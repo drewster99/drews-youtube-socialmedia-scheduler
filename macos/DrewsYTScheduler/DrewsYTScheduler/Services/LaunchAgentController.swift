@@ -97,31 +97,161 @@ final class LaunchAgentController {
         ActivityLog.shared.log(.info, .agent, "unregister() returned — post-status=\(service.status.displayName)")
     }
 
-    /// Restart by unregister + kill running process + register, so launchd
-    /// reads the (possibly newer) plist from disk and the new spawn isn't
-    /// blocked by the old one still holding the port.
+    /// Restart by unregister + force-unload from launchd + kill listener +
+    /// register, so launchd reads the new plist from disk and the new spawn
+    /// isn't blocked by the old one still holding the port.
     ///
-    /// Empirically ``SMAppService.unregister()`` only tells launchd to stop
-    /// scheduling new launches — a process that's already alive (via
-    /// ``RunAtLoad`` / ``KeepAlive`` semantics or simply because launchd
-    /// hasn't gotten around to reaping it) will keep its TCP listener open.
-    /// If we then ``register()`` and launchd tries to spawn a fresh
-    /// instance, the new process can't bind and either crashes or never
-    /// comes up. So we explicitly TERM (then KILL) anything still on the
-    /// port before re-registering.
+    /// Why not just SMAppService.unregister + register?
+    ///
+    /// The agent plist sets ``KeepAlive = { SuccessfulExit: false }``,
+    /// which means launchd respawns the process every time it exits non-
+    /// zero. When we SIGTERM or SIGKILL the running server, that's a
+    /// non-zero exit, and launchd dutifully spawns it RIGHT BACK from the
+    /// OLD on-disk binary path that BTM still has cached. SMAppService's
+    /// ``unregister()`` is supposed to detach the job before that happens,
+    /// but in practice BTM sometimes leaves the job in a "pending
+    /// unregister" state — launchd keeps managing it, our kill triggers a
+    /// respawn, and we lose the race.
+    ///
+    /// The reliable sequence is:
+    ///
+    ///  1. ``SMAppService.unregister()`` — best-effort, tells BTM to drop
+    ///     the record.
+    ///  2. ``launchctl bootout gui/<uid>/<label>`` — forcibly unload the
+    ///     job from launchd. After this, SIGTERM/SIGKILL is a final death,
+    ///     not a "please respawn me" signal.
+    ///  3. SIGTERM / SIGKILL anything still listening on the port (in case
+    ///     the launchd-issued TERM didn't catch it).
+    ///  4. ``SMAppService.register()`` — re-bootstrap from the new plist.
     func restartAgent() async throws {
         let service = agentService
         ActivityLog.shared.log(.info, .agent, "restart: pre-status=\(service.status.displayName)")
+
+        // Step 1: SMAppService.unregister(). Best-effort — keep going even
+        // if it throws. The bootout below is what actually has to succeed
+        // for the kill step to take.
         if service.status != .notRegistered {
-            try await service.unregister()
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-            ActivityLog.shared.log(.info, .agent, "restart: after unregister, status=\(service.status.displayName)")
+            do {
+                try await service.unregister()
+                ActivityLog.shared.log(.info, .agent,
+                    "restart: SMAppService.unregister() returned, status=\(service.status.displayName)")
+            } catch {
+                ActivityLog.shared.log(.warn, .agent,
+                    "restart: SMAppService.unregister() threw (continuing): \(error.localizedDescription)")
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
         }
 
+        // Step 2: force-unload from launchd. This is the step that breaks
+        // the KeepAlive respawn loop.
+        let label = Self.agentLabel
+        await Self.launchctlBootout(label: label)
+
+        // Step 3: belt-and-suspenders — kill anything still on the port.
+        // After bootout, launchd has already TERMed the process; this only
+        // catches the rare straggler.
         await Self.killProcessOnPort(AppPaths.serverPort)
 
+        // Step 4: bring the new version up.
         try service.register()
         ActivityLog.shared.log(.info, .agent, "restart: after register, status=\(service.status.displayName)")
+    }
+
+    /// The label launchd knows the agent by — same as the bundle id, used
+    /// in both the embedded plist's ``Label`` key and ``launchctl`` calls.
+    static let agentLabel = "com.nuclearcyborg.drews-socialmedia-scheduler"
+
+    /// `launchctl bootout gui/<uid>/<label>` — force-unload the job so
+    /// launchd stops respawning it. Logs PID-level detail before/after so
+    /// the user can see what changed in the Activity Log.
+    static func launchctlBootout(label: String) async {
+        let domain = "gui/\(getuid())"
+        let target = "\(domain)/\(label)"
+
+        // Inspect launchd's view BEFORE we touch anything — this gets us
+        // the PID launchd thinks is running the job, plus its loaded/
+        // pending state, so we can see whether bootout actually changed
+        // anything.
+        let preState = launchctlPrintSummary(target: target)
+        ActivityLog.shared.log(.info, .agent,
+            "restart: launchd pre-bootout for \(target): \(preState)")
+
+        guard preState != "not loaded" else {
+            ActivityLog.shared.log(.info, .agent,
+                "restart: launchd already shows \(target) as not loaded — skipping bootout")
+            return
+        }
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        proc.arguments = ["bootout", target]
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = errPipe
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            let stderr = String(
+                data: errPipe.fileHandleForReading.readDataToEndOfFile(),
+                encoding: .utf8) ?? ""
+            ActivityLog.shared.log(
+                proc.terminationStatus == 0 ? .info : .warn,
+                .agent,
+                "restart: launchctl bootout \(target) exited \(proc.terminationStatus)" +
+                    (stderr.isEmpty ? "" : "; stderr=\(stderr.trimmingCharacters(in: .whitespacesAndNewlines))"))
+        } catch {
+            ActivityLog.shared.log(.warn, .agent,
+                "restart: launchctl bootout threw: \(error.localizedDescription)")
+            return
+        }
+
+        // Wait up to ~3s for launchd to fully release the job.
+        for _ in 0..<6 {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            if launchctlPrintSummary(target: target) == "not loaded" {
+                ActivityLog.shared.log(.info, .agent,
+                    "restart: launchd released \(target)")
+                return
+            }
+        }
+        ActivityLog.shared.log(.warn, .agent,
+            "restart: launchd still reports \(target) loaded after bootout " +
+            "— register() may fail. Post-state: \(launchctlPrintSummary(target: target))")
+    }
+
+    /// Run ``launchctl print <target>`` and reduce to a one-word summary:
+    /// "not loaded" when the target doesn't exist, "loaded pid=N" when it
+    /// does, or "loaded" when it's loaded but no PID was reported.
+    private static func launchctlPrintSummary(target: String) -> String {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        proc.arguments = ["print", target]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            return "unknown"
+        }
+        if proc.terminationStatus != 0 {
+            // Non-zero typically means "Could not find service" — i.e.
+            // the job isn't loaded. Treat that as the success state.
+            return "not loaded"
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let text = String(data: data, encoding: .utf8) else {
+            return "loaded"
+        }
+        for line in text.split(whereSeparator: \.isNewline) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("pid = ") {
+                return "loaded \(trimmed)"
+            }
+        }
+        return "loaded"
     }
 
     /// SIGTERM (and if it doesn't die, SIGKILL) any process holding a
