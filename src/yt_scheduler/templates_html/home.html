@@ -38,37 +38,45 @@
 
 <dialog id="add-project-dialog" class="modal modal-wide">
     <div data-step="1">
-        <h3>New project — step 1 of 3: name</h3>
-        <label>
-            Project name
-            <input type="text" id="new-project-name" maxlength="80" autofocus>
-        </label>
-        <p class="form-hint">
-            The project's URL slug is derived from the name and stays fixed for
-            its lifetime. You can rename it later.
+        <h3>New project — step 1 of 3: connect YouTube</h3>
+        <p>
+            Sign in with the Google account that owns the YouTube channel
+            you'll post to from this project. The channel id you
+            authenticate as becomes the project's permanent posting target.
         </p>
+        <p class="form-hint">
+            The project row isn't created until OAuth completes successfully —
+            you can cancel safely at any time during this step. After
+            OAuth, the next step lets you name the project (default is
+            your channel's display name).
+        </p>
+        <div id="wizard-step1-status" class="form-hint" style="margin-top: 0.5rem;"></div>
         <div class="modal-actions">
             <button class="btn" data-wizard-cancel>Cancel</button>
-            <button class="btn btn-primary" id="wizard-step1-next">Next: connect YouTube</button>
+            <button class="btn btn-primary" id="wizard-step1-connect">Connect with YouTube</button>
         </div>
     </div>
 
     <div data-step="2" hidden>
-        <h3>New project — step 2 of 3: connect YouTube</h3>
+        <h3>New project — step 2 of 3: name</h3>
         <p>
-            Sign in with the Google account that owns the YouTube channel for
-            <strong id="wizard-name-echo">this project</strong>. The channel id
-            you authenticate as becomes this project's permanent posting target.
+            Connected to <strong id="wizard-channel-echo">your channel</strong>.
+            Pick a name for this project. We've defaulted to the channel's
+            display name; you can change it now or rename later from
+            Project Settings.
         </p>
+        <label>
+            Project name
+            <input type="text" id="new-project-name" maxlength="80">
+        </label>
         <p class="form-hint">
-            The project row isn't created until OAuth completes successfully —
-            you can cancel safely at any time during this step.
+            The project's URL slug is derived from this name on first save
+            and stays fixed for the project's lifetime; renames only change
+            the display name.
         </p>
-        <div id="wizard-step2-status" class="form-hint" style="margin-top: 0.5rem;"></div>
         <div class="modal-actions">
-            <button class="btn" data-wizard-cancel>Cancel</button>
-            <button class="btn" id="wizard-step1-back">Back</button>
-            <button class="btn btn-primary" id="wizard-step2-connect">Connect with YouTube</button>
+            <button class="btn" data-wizard-cancel>Cancel — open project</button>
+            <button class="btn btn-primary" id="wizard-step2-next">Next: social defaults</button>
         </div>
     </div>
 
@@ -318,53 +326,20 @@ dialog.querySelectorAll('[data-wizard-cancel]').forEach(btn => {
     });
 });
 
-document.getElementById('wizard-step1-next').addEventListener('click', async () => {
-    const name = document.getElementById('new-project-name').value.trim();
-    if (!name) {
-        showToast('Project name is required', 'error');
-        return;
-    }
-
-    /* Pre-flight: the wizard's step 2 calls /api/oauth/youtube/start which
-     * requires client_secret.json to be in Keychain. If it's not, the
-     * user will hit a 400 and the OAuth popup error toast just says 'No
-     * OAuth client configured' with no obvious next step. Fail loudly
-     * here instead, link to Settings, and don't advance. */
-    try {
-        const resp = await fetch('/auth/status', {_silent: true});
-        if (resp.ok) {
-            const status = await resp.json();
-            if (!status.client_secret_uploaded) {
-                showToast(
-                    "Upload client_secret.json in General Settings → YouTube authentication first. " +
-                    "It's the OAuth client credential the new project will sign in against.",
-                    'error',
-                );
-                return;
-            }
-        }
-    } catch (_) {
-        // Network failure here just means /auth/status couldn't be reached;
-        // step 2's Connect call will surface its own error.
-    }
-
-    wizard.name = name;
-    document.getElementById('wizard-name-echo').textContent = name;
-    document.getElementById('wizard-name-echo-3').textContent = name;
-    setWizardStep(2);
-});
-
-document.getElementById('wizard-step1-back').addEventListener('click', () => {
-    setWizardStep(1);
-});
-
-document.getElementById('wizard-step2-connect').addEventListener('click', async () => {
-    const status = document.getElementById('wizard-step2-status');
+/* Step 1: open the OAuth popup. Calling ``openOAuthPopup`` synchronously
+ * inside the click handler is what keeps the popup from being blocked —
+ * see static/js/app.js for the gesture-token explanation. The
+ * client_secret pre-flight is left to the start endpoint; it returns 400
+ * fast enough that the popup just closes with a toast. */
+document.getElementById('wizard-step1-connect').addEventListener('click', async () => {
+    const status = document.getElementById('wizard-step1-status');
     status.textContent = 'Opening Google OAuth…';
     try {
         await openOAuthPopup('/api/oauth/youtube/start', {
             origin: window.location.origin,
-            pre_create: { name: wizard.name },
+            // Empty name signals 'channel-first' mode — server uses the
+            // resolved channel title as the default project name.
+            pre_create: {},
         });
         status.textContent = 'Waiting for the popup to complete the flow…';
     } catch (err) {
@@ -379,18 +354,58 @@ window.addEventListener('message', async (event) => {
     if (data.platform !== 'youtube') return;
     if (!dialog.open) return;
     if (!data.ok) {
-        document.getElementById('wizard-step2-status').textContent =
+        document.getElementById('wizard-step1-status').textContent =
             'OAuth failed. Try Connect again.';
         return;
     }
     if (data.mode === 'pre_create') {
         wizard.slug = data.slug;
         wizard.project_id = data.project_id;
+        wizard.name = data.name || '';
         wizard.channel_title = data.channel_title || '';
-        document.getElementById('wizard-step2-status').textContent = '';
-        await renderWizardSocialDefaults();
-        setWizardStep(3);
+        document.getElementById('wizard-step1-status').textContent = '';
+
+        // Step 2: confirm/edit the project name. Default is whatever the
+        // server picked from the resolved channel (channel title → handle
+        // → channel id). The project row already exists, so this just
+        // PATCHes the display name when the user changes it.
+        const echoLabel = wizard.channel_title || data.channel_handle || data.channel_id || 'your channel';
+        document.getElementById('wizard-channel-echo').textContent = echoLabel;
+        document.getElementById('wizard-name-echo-3').textContent = wizard.name || echoLabel;
+        const nameInput = document.getElementById('new-project-name');
+        nameInput.value = wizard.name || '';
+        setWizardStep(2);
+        // Focus + select-all so the user can immediately overwrite.
+        setTimeout(() => { nameInput.focus(); nameInput.select(); }, 50);
     }
+});
+
+document.getElementById('wizard-step2-next').addEventListener('click', async () => {
+    const desiredName = document.getElementById('new-project-name').value.trim();
+    if (!desiredName) {
+        showToast('Project name is required', 'error');
+        return;
+    }
+    if (desiredName !== wizard.name) {
+        // Rename via PATCH. Slug is immutable, so this only changes the
+        // display name — no risk of breaking the URL the OAuth callback
+        // already redirected to.
+        const resp = await fetch(`/api/projects/${wizard.slug}`, {
+            method: 'PATCH',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ name: desiredName }),
+            _silent: true,
+        });
+        if (resp.ok) {
+            const updated = await resp.json();
+            wizard.name = updated.name;
+            document.getElementById('wizard-name-echo-3').textContent = wizard.name;
+        } else {
+            showToast('Rename failed; keeping the channel-derived name.', 'error');
+        }
+    }
+    await renderWizardSocialDefaults();
+    setWizardStep(3);
 });
 
 async function renderWizardSocialDefaults() {

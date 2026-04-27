@@ -748,10 +748,14 @@ async def youtube_start(data: dict):
         )
 
     mode_re_auth = (data.get("project_slug") or "").strip() or None
-    pre_create_blob = data.get("pre_create") or None
-    if mode_re_auth and pre_create_blob:
+    # Channel-first wizard sends ``pre_create: {}`` (empty dict) before
+    # the channel is known. ``data.get("pre_create") or None`` would
+    # collapse that to None and 400; check for key PRESENCE instead.
+    pre_create_present = "pre_create" in data and data.get("pre_create") is not None
+    pre_create_blob = data.get("pre_create") if pre_create_present else None
+    if mode_re_auth and pre_create_present:
         raise HTTPException(400, "Provide project_slug OR pre_create, not both")
-    if not mode_re_auth and not pre_create_blob:
+    if not mode_re_auth and not pre_create_present:
         raise HTTPException(400, "Provide project_slug or pre_create")
 
     db = await get_db()
@@ -765,19 +769,24 @@ async def youtube_start(data: dict):
             raise HTTPException(404, f"Project '{mode_re_auth}' not found")
     else:
         name = (pre_create_blob.get("name") or "").strip()
-        if not name:
-            raise HTTPException(400, "pre_create.name is required")
-        candidate_slug = slugify(name)
-        cursor = await db.execute(
-            "SELECT id FROM projects WHERE slug = ?", (candidate_slug,)
-        )
-        if await cursor.fetchone() is not None:
-            raise HTTPException(
-                400,
-                f"A project with slug '{candidate_slug}' already exists. "
-                "Pick a different name.",
+        if name:
+            candidate_slug = slugify(name)
+            cursor = await db.execute(
+                "SELECT id FROM projects WHERE slug = ?", (candidate_slug,)
             )
-        pre_create = {"name": name, "slug": candidate_slug}
+            if await cursor.fetchone() is not None:
+                raise HTTPException(
+                    400,
+                    f"A project with slug '{candidate_slug}' already exists. "
+                    "Pick a different name.",
+                )
+            pre_create = {"name": name, "slug": candidate_slug}
+        else:
+            # Channel-first wizard mode: caller doesn't know the project
+            # name yet — they'll OAuth first, then we use the resolved
+            # YouTube channel title as the default. The callback fills
+            # in name + slug once it has the channel.
+            pre_create = {"name": None, "slug": None}
 
     redirect_uri = f"{origin}{YOUTUBE_REDIRECT_PATH}"
     config = get_client_secret_dict()
@@ -793,6 +802,16 @@ async def youtube_start(data: dict):
     except Exception as exc:
         raise HTTPException(400, f"Invalid client_secret config: {exc}") from exc
 
+    # PKCE: generate the code_verifier here so we can persist it across
+    # the start→callback boundary. ``flow.authorization_url`` would
+    # otherwise auto-generate one and stash it on the Flow object, which
+    # we throw away when this request returns — making token exchange in
+    # the callback fail with "(invalid_grant) Missing code verifier".
+    # 64 random url-safe bytes → ~86 chars, well within the RFC 7636
+    # 43–128 char range.
+    code_verifier = secrets.token_urlsafe(64)
+    flow.code_verifier = code_verifier
+
     state = secrets.token_urlsafe(24)
     auth_url, _ = flow.authorization_url(
         prompt="consent",
@@ -807,6 +826,7 @@ async def youtube_start(data: dict):
         "project_slug": mode_re_auth,
         "pre_create": pre_create,
         "redirect_uri": redirect_uri,
+        "code_verifier": code_verifier,
         "ts": time.time(),
     }
     return {"auth_url": auth_url}
@@ -850,6 +870,13 @@ async def youtube_callback(
         flow = Flow.from_client_config(
             config, scopes=YOUTUBE_SCOPES, redirect_uri=pending["redirect_uri"],
         )
+        # Replay the PKCE code_verifier we generated at start time —
+        # without this, Google rejects the exchange with
+        # "(invalid_grant) Missing code verifier" because the auth_url
+        # was issued with a code_challenge.
+        verifier = pending.get("code_verifier")
+        if verifier:
+            flow.code_verifier = verifier
         flow.fetch_token(code=code)
         creds = flow.credentials
     except Exception as exc:
@@ -882,23 +909,41 @@ async def youtube_callback(
                 platform="youtube",
             )
 
-        cursor = await db.execute(
-            "SELECT id FROM projects WHERE slug = ?", (pre["slug"],)
-        )
-        if await cursor.fetchone() is not None:
-            return _result_page(
-                False,
-                f"Project slug '{pre['slug']}' was claimed before this OAuth completed.",
-                platform="youtube",
+        # Channel-first wizard: pre_create.name was None at start time;
+        # derive the default name from the resolved channel title now.
+        name = pre.get("name")
+        slug = pre.get("slug")
+        if not name:
+            name = (channel_title or channel_handle or channel_id or "Project").strip()
+            base_slug = slugify(name) or "project"
+            slug = base_slug
+            counter = 2
+            while True:
+                cursor = await db.execute(
+                    "SELECT id FROM projects WHERE slug = ?", (slug,)
+                )
+                if await cursor.fetchone() is None:
+                    break
+                slug = f"{base_slug}-{counter}"
+                counter += 1
+        else:
+            cursor = await db.execute(
+                "SELECT id FROM projects WHERE slug = ?", (slug,)
             )
+            if await cursor.fetchone() is not None:
+                return _result_page(
+                    False,
+                    f"Project slug '{slug}' was claimed before this OAuth completed.",
+                    platform="youtube",
+                )
 
         cursor = await db.execute(
             "INSERT INTO projects (name, slug, youtube_channel_id) VALUES (?, ?, ?)",
-            (pre["name"], pre["slug"], channel_id),
+            (name, slug, channel_id),
         )
         await db.commit()
         project_id = int(cursor.lastrowid)
-        store_credentials(pre["slug"], creds)
+        store_credentials(slug, creds)
 
         from yt_scheduler.services.templates import ensure_default_template
 
@@ -906,12 +951,12 @@ async def youtube_callback(
 
         return _result_page(
             True,
-            f"Project '{pre['name']}' created and connected to {channel_title or channel_id}.",
+            f"Project '{name}' created and connected to {channel_title or channel_id}.",
             platform="youtube",
             payload={
                 "mode": "pre_create",
-                "slug": pre["slug"],
-                "name": pre["name"],
+                "slug": slug,
+                "name": name,
                 "channel_id": channel_id,
                 "channel_title": channel_title,
                 "channel_handle": channel_handle,
