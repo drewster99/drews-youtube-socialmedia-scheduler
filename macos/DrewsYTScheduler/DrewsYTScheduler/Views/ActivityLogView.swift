@@ -53,9 +53,15 @@ struct ActivityLogView: View {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss.SSS"
         return HStack(alignment: .top, spacing: 8) {
+            // Width sized for the full ``HH:mm:ss.SSS`` (12 chars) in
+            // the monospaced body font. The previous 96pt left the last
+            // millisecond digit wrapping to a second line on macOS where
+            // the system body font measures slightly wider per glyph.
             Text(formatter.string(from: entry.timestamp))
                 .foregroundStyle(.secondary)
-                .frame(width: 96, alignment: .leading)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(width: 116, alignment: .leading)
             Text(entry.source.rawValue)
                 .foregroundStyle(.secondary)
                 .frame(width: 80, alignment: .leading)
