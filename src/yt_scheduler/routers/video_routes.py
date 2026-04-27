@@ -49,12 +49,30 @@ def _decode_tags(raw: str | None) -> list[str]:
 
 
 @router.get("")
-async def list_videos():
-    """List all tracked videos."""
+async def list_videos(project_slug: str | None = None):
+    """List tracked videos.
+
+    Filters to a single project when ``?project_slug=`` is supplied. Per-
+    project dashboards always pass it; the legacy unfiltered call (no
+    query string) returns everything across every project so the import
+    pages and admin views still work.
+    """
     db = await get_db()
-    rows = await db.execute_fetchall(
-        "SELECT * FROM videos ORDER BY created_at DESC"
-    )
+    if project_slug:
+        cursor = await db.execute(
+            "SELECT id FROM projects WHERE slug = ?", (project_slug,)
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise HTTPException(404, f"Project '{project_slug}' not found")
+        rows = await db.execute_fetchall(
+            "SELECT * FROM videos WHERE project_id = ? ORDER BY created_at DESC",
+            (int(row["id"]),),
+        )
+    else:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM videos ORDER BY created_at DESC"
+        )
     return [dict(r) for r in rows]
 
 

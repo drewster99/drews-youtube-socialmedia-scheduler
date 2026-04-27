@@ -25,6 +25,12 @@ def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     for mod in list(sys.modules.keys()):
         if mod.startswith("yt_scheduler"):
             sys.modules.pop(mod, None)
+    # Force the file-backed keychain so this test reads from tmp_path's
+    # secrets.json, not the real macOS Keychain (which on the dev box
+    # actually has a client_secret stored from manual testing — that
+    # would make ``test_no_client_secret_returns_400`` falsely 200).
+    keychain = importlib.import_module("yt_scheduler.services.keychain")
+    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
     app_module = importlib.import_module("yt_scheduler.app")
     with TestClient(app_module.app) as c:
         yield c, monkeypatch
@@ -100,15 +106,26 @@ def test_both_modes_returns_400(client) -> None:
     assert "not both" in resp.json()["detail"]
 
 
-def test_pre_create_empty_name_returns_400(client) -> None:
+def test_pre_create_empty_name_is_accepted_for_channel_first_mode(client) -> None:
+    """Channel-first wizard: caller posts ``pre_create: {}`` (or with an
+    empty name) before the channel is known, and the callback derives
+    name + slug from the resolved YouTube channel title."""
     c, monkeypatch = client
     _stub_client_secret(monkeypatch)
     resp = c.post(
         "/api/oauth/youtube/start",
         json={"origin": "http://127.0.0.1:8008", "pre_create": {"name": "  "}},
     )
-    assert resp.status_code == 400
-    assert "name" in resp.json()["detail"].lower()
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "auth_url" in body
+
+    # ``pre_create: {}`` (no name key at all) is also accepted — same path.
+    resp2 = c.post(
+        "/api/oauth/youtube/start",
+        json={"origin": "http://127.0.0.1:8008", "pre_create": {}},
+    )
+    assert resp2.status_code == 200
 
 
 def test_pre_create_slug_collision_returns_400(client) -> None:

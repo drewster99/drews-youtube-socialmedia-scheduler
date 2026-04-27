@@ -19,8 +19,13 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     StatusLightsView(state: state)
                     HStack {
+                        // Restart is also allowed when status is .notFound —
+                        // see MonitorView for why. restartAgent() handles
+                        // the orphan case end-to-end.
                         Button("Restart server") { state.restartAgent() }
-                            .disabled(state.agentStatus != .enabled || state.busy)
+                            .disabled(state.busy ||
+                                      !(state.agentStatus == .enabled ||
+                                        state.agentStatus == .notFound))
                         Button("Reinstall…") { state.registerAgent() }
                             .disabled(state.busy)
                         Button("Activity log…") {
@@ -65,12 +70,25 @@ struct SettingsView: View {
                 .padding(8)
             }
 
+            Divider()
+                .padding(.vertical, 8)
+
             HStack {
                 Spacer()
-                Button("Open in browser") {
+                Button(action: {
                     NSWorkspace.shared.open(AppPaths.serverWebURL)
+                }) {
+                    Text("Open UI")
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                        .frame(minWidth: 160)
+                        .padding(.vertical, 4)
                 }
+                .controlSize(.large)
+                .buttonStyle(.borderedProminent)
+                .tint(.blue)
             }
+            .padding(.top, 4)
 
             Spacer()
         }
@@ -91,14 +109,26 @@ struct SettingsView: View {
         }
     }
 
-    /// Poll every 2s while Settings is open so the 3 lights stay live as the
-    /// agent registers/restarts/spawns Python in the background.
+    /// Poll while Settings is open so the 3 lights stay live as the agent
+    /// registers/restarts/spawns Python in the background.
+    ///
+    /// Cadence: 2s for the first ~10s after the window opens (so a fresh
+    /// install / restart sees status flip in near-real-time), then back
+    /// off to every 30s indefinitely. The aggressive cadence at start
+    /// catches state changes the user just triggered; the long cadence
+    /// keeps the build-mismatch detector live without burning a /api/build
+    /// every 2 seconds for the lifetime of the app.
     private func startProbing() {
         probeTask?.cancel()
         probeTask = Task { @MainActor in
+            var fastTicks = 5  // 5 × 2s = 10s of fast polling on entry
             while !Task.isCancelled {
                 state.refresh()
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                let interval: UInt64 = fastTicks > 0
+                    ? 2_000_000_000
+                    : 30_000_000_000
+                if fastTicks > 0 { fastTicks -= 1 }
+                try? await Task.sleep(nanoseconds: interval)
             }
         }
     }

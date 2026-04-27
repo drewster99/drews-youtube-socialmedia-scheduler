@@ -26,10 +26,32 @@
 <script>
 const projectSlug = "{{ current_project.slug }}";
 
+function fmtScheduledWhen(iso) {
+    /* Same shape as the Home page's fmtWhen — Mon 4/27 2:30pm — so the
+     * dashboard scheduled-time line reads consistently with the Upcoming
+     * panel users may have come from. */
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    const dow = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()];
+    const sameYear = d.getFullYear() === new Date().getFullYear();
+    const datePart = sameYear
+        ? `${d.getMonth() + 1}/${d.getDate()}`
+        : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    let h = d.getHours();
+    const m = String(d.getMinutes()).padStart(2, '0');
+    const ampm = h >= 12 ? 'pm' : 'am';
+    h = h % 12 || 12;
+    return `${dow} ${datePart} ${h}:${m}${ampm}`;
+}
+
 async function loadVideos() {
     const container = document.getElementById('video-list');
     try {
-        const resp = await fetch('/api/videos');
+        // Always scope the listing to the current project — the route's
+        // unfiltered shape (no query) returns videos across all projects
+        // and would render @TheDrewBenson's videos under
+        // DrewBensonCodes' Dashboard, etc.
+        const resp = await fetch(`/api/videos?project_slug=${encodeURIComponent(projectSlug)}`);
         const videos = await resp.json();
 
         if (videos.length === 0) {
@@ -37,23 +59,38 @@ async function loadVideos() {
             return;
         }
 
-        container.innerHTML = videos.map(v => `
-            <a href="/projects/${projectSlug}/videos/${v.id}" class="video-card">
-                <div class="video-thumb">
-                    ${v.thumbnail_path
-                        ? `<img src="/uploads/${v.thumbnail_path.split('/').pop()}" alt="${v.title}">`
-                        : '<div class="thumb-placeholder">No thumbnail</div>'}
-                </div>
-                <div class="video-info">
-                    <h3>${v.title}</h3>
-                    <div class="video-meta">
-                        <span class="badge badge-${v.status}">${v.status}</span>
-                        <span class="badge badge-${v.privacy_status}">${v.privacy_status}</span>
+        const now = Date.now();
+        container.innerHTML = videos.map(v => {
+            // Future-scheduled tasks get a 'When' line at the top of the
+            // card so users can see at a glance when each one will fire.
+            // We treat a video as 'scheduled-future' when it has a
+            // publish_at that's still in the future, regardless of
+            // whether status is exactly 'scheduled' (covers the brief
+            // window where the scheduler has the job pending but the
+            // status hasn't been flipped yet).
+            const scheduledFuture = v.publish_at && new Date(v.publish_at).getTime() > now;
+            const scheduleLine = scheduledFuture
+                ? `<div class="video-schedule">⏰ Scheduled: <strong>${fmtScheduledWhen(v.publish_at)}</strong></div>`
+                : '';
+            return `
+                <a href="/projects/${projectSlug}/videos/${v.id}" class="video-card">
+                    <div class="video-thumb">
+                        ${v.thumbnail_path
+                            ? `<img src="/uploads/${v.thumbnail_path.split('/').pop()}" alt="${v.title}">`
+                            : '<div class="thumb-placeholder">No thumbnail</div>'}
                     </div>
-                    <time>${new Date(v.created_at).toLocaleDateString()}</time>
-                </div>
-            </a>
-        `).join('');
+                    <div class="video-info">
+                        <h3>${v.title}</h3>
+                        ${scheduleLine}
+                        <div class="video-meta">
+                            <span class="badge badge-${v.status}">${v.status}</span>
+                            <span class="badge badge-${v.privacy_status}">${v.privacy_status}</span>
+                        </div>
+                        <time>${new Date(v.created_at).toLocaleDateString()}</time>
+                    </div>
+                </a>
+            `;
+        }).join('');
     } catch (e) {
         container.innerHTML = '<p class="error">Failed to load videos.</p>';
     }

@@ -408,6 +408,16 @@ body {
     color: var(--text-muted);
 }
 
+/* "Scheduled: <when>" line on dashboard cards for future-scheduled
+ * videos. Sits above the status/privacy badges so the time is the
+ * first thing the user sees when scanning the list. */
+.video-schedule {
+    font-size: 0.8rem;
+    color: var(--accent, #3ea6ff);
+    margin-bottom: 0.3rem;
+}
+.video-schedule strong { color: var(--text-primary); }
+
 /* Detail grid (two-column layout). The right column hosts Log + Status +
  * Social posts; widened from 380px to 494px (~30%) so multi-line log
  * entries don't wrap on the platform tag. */
