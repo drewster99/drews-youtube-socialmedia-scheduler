@@ -202,6 +202,46 @@ function eventVerb(type) {
     }[type] || type;
 }
 
+/* Per-event-type details rendered inline in the Recent feed.
+ *
+ * The default (for video-lifecycle events like ``created``,
+ * ``imported``, ``uploaded``, ``metadata_updated``, ``published``)
+ * is empty — the verb itself is enough.
+ *
+ * Social-post events get a ``[platform]`` tag, with the platform's
+ * name linkified to the post URL when one is known.
+ *
+ * Schedule events get the scheduled time so the user doesn't have to
+ * click through to find out when the publish will fire.
+ */
+function eventDetails(item) {
+    const p = item.payload || {};
+    switch (item.type) {
+        case 'social_post_published':
+            return p.platform
+                ? ` [${p.post_url
+                    ? `<a href="${escapeHtml(p.post_url)}" target="_blank" rel="noopener">${escapeHtml(p.platform)}</a>`
+                    : escapeHtml(p.platform)}]`
+                : '';
+        case 'social_post_scheduled': {
+            const at = p.scheduled_at ? ` &lt;${fmtWhen(p.scheduled_at)}&gt;` : '';
+            const platform = p.platform ? ` [${escapeHtml(p.platform)}]` : '';
+            return `${at}${platform}`;
+        }
+        case 'social_post_skipped_duplicate':
+            return p.platform ? ` [${escapeHtml(p.platform)}]` : '';
+        case 'publish_scheduled':
+            return p.publish_at
+                ? ` &lt;${fmtWhen(p.publish_at)}&gt; [${escapeHtml(p.platform || 'youtube')}]`
+                : ` [${escapeHtml(p.platform || 'youtube')}]`;
+        case 'published':
+        case 'uploaded':
+            return ` [${escapeHtml(p.platform || 'youtube')}]`;
+        default:
+            return '';
+    }
+}
+
 async function loadRecent() {
     const container = document.getElementById('recent-list');
     try {
@@ -214,9 +254,9 @@ async function loadRecent() {
         container.innerHTML = items.map(i => `
             <div class="event-row">
                 <span class="event-when">${fmtWhen(i.created_at)}</span>
-                <span>${eventVerb(i.type)}</span>
-                <a href="/projects/${i.project_slug}/videos/${i.video_id}">${i.video_title}</a>
-                <span class="event-project">${i.project_name}</span>
+                <span>${eventVerb(i.type)}${eventDetails(i)}</span>
+                <a href="/projects/${i.project_slug}/videos/${i.video_id}">${escapeHtml(i.video_title)}</a>
+                <span class="event-project">${escapeHtml(i.project_name)}</span>
             </div>
         `).join('');
     } catch (e) {
