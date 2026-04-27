@@ -63,15 +63,30 @@ struct WelcomeView: View {
                 .padding(8)
             }
 
+            // Visual separation — Open UI is the welcome flow's only exit;
+            // it deserves its own row, well clear of the install controls
+            // above so the user doesn't accidentally hit it before they're
+            // ready.
+            Divider()
+                .padding(.vertical, 4)
+
             HStack {
                 Spacer()
-                Button("Open in browser") {
+                Button(action: {
                     NSWorkspace.shared.open(AppPaths.serverWebURL)
                     onFinish()
+                }) {
+                    Text("Open UI")
+                        .font(.headline)
+                        .frame(minWidth: 160)
+                        .padding(.vertical, 4)
                 }
+                .controlSize(.large)
+                .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
                 .disabled(!canOpenBrowser)
             }
+            .padding(.top, 8)
         }
         .padding(24)
         .frame(width: 650)

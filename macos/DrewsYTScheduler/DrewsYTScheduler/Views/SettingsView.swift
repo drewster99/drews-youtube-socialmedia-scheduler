@@ -65,12 +65,23 @@ struct SettingsView: View {
                 .padding(8)
             }
 
+            Divider()
+                .padding(.vertical, 8)
+
             HStack {
                 Spacer()
-                Button("Open in browser") {
+                Button(action: {
                     NSWorkspace.shared.open(AppPaths.serverWebURL)
+                }) {
+                    Text("Open UI")
+                        .font(.headline)
+                        .frame(minWidth: 160)
+                        .padding(.vertical, 4)
                 }
+                .controlSize(.large)
+                .buttonStyle(.borderedProminent)
             }
+            .padding(.top, 4)
 
             Spacer()
         }

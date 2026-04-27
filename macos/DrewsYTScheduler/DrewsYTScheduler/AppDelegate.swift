@@ -103,7 +103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let fileItem = NSMenuItem()
         fileItem.title = "File"
         let fileMenu = NSMenu(title: "File")
-        let openWebUI = NSMenuItem(title: "Open Web UI", action: #selector(openWebUI), keyEquivalent: "o")
+        let openWebUI = NSMenuItem(title: "Open UI", action: #selector(openWebUI), keyEquivalent: "o")
         openWebUI.target = self
         fileMenu.addItem(openWebUI)
         fileMenu.addItem(.separator())
@@ -333,7 +333,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        let openWebUI = NSMenuItem(title: "Open Web UI", action: #selector(openWebUI), keyEquivalent: "")
+        let openWebUI = NSMenuItem(title: "Open UI", action: #selector(openWebUI), keyEquivalent: "")
         openWebUI.target = self
         menu.addItem(openWebUI)
 
