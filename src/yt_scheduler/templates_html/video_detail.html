@@ -41,8 +41,17 @@
                 <div class="form-group" data-field="description">
                     <label>Description</label>
                     <textarea id="meta-description" name="description" rows="8"></textarea>
-                    <div class="description-actions">
-                        <button type="button" class="btn btn-sm" id="btn-regenerate-desc" onclick="regenerateDescription()" style="display:none;">Regenerate</button>
+                    <div class="description-actions" style="display: flex; gap: 0.5rem; margin-top: 0.5rem;">
+                        <button type="button" class="btn btn-sm" id="btn-regen-desc-frames"
+                                onclick="regenerateDescription('frames')" style="display:none;"
+                                title="Sample keyframes from the video file and have Claude describe what's visible.">
+                            Generate from video
+                        </button>
+                        <button type="button" class="btn btn-sm" id="btn-regen-desc-transcript"
+                                onclick="regenerateDescription('transcript')" style="display:none;"
+                                title="Generate from the transcript text. Disabled until a transcript exists.">
+                            Generate from transcript
+                        </button>
                     </div>
                 </div>
                 <div class="form-group" data-field="tags">
@@ -895,27 +904,50 @@ document.getElementById('metadata-form').addEventListener('submit', async (event
 // --- Regenerate description -----------------------------------------------
 
 function updateRegenerateVisibility() {
-    const btn = document.getElementById('btn-regenerate-desc');
-    if (!btn || !videoData) return;
+    const fromVideo = document.getElementById('btn-regen-desc-frames');
+    const fromTranscript = document.getElementById('btn-regen-desc-transcript');
+    if (!fromVideo || !fromTranscript || !videoData) return;
+
+    /* Show the row whenever it's likely useful: an imported video, OR a
+     * transcript that's newer than the last generated description. The
+     * frames button is gated on having a local file to extract from;
+     * the transcript button is gated on having a transcript at all. */
     const imported = !!videoData.imported_from_youtube;
+    const hasLocalFile = !!videoData.video_file_path;
+    const hasTranscript = !!(videoData.transcript && videoData.transcript.trim());
     const transcriptUpdated = videoData.transcript_updated_at;
     const descriptionGenAt = videoData.description_generated_at;
     const transcriptNewer = transcriptUpdated && descriptionGenAt
         ? new Date(transcriptUpdated) > new Date(descriptionGenAt)
         : (transcriptUpdated && !descriptionGenAt);
-    btn.style.display = (imported || transcriptNewer) ? 'inline-flex' : 'none';
+    const showRow = imported || transcriptNewer || (!hasTranscript && hasLocalFile);
+
+    fromVideo.style.display = showRow ? 'inline-flex' : 'none';
+    fromTranscript.style.display = showRow ? 'inline-flex' : 'none';
+
+    fromVideo.disabled = !hasLocalFile;
+    fromVideo.title = hasLocalFile
+        ? "Sample keyframes from the video file and have Claude describe what's visible."
+        : "No local video file. Re-import the video or upload a copy to use this.";
+
+    fromTranscript.disabled = !hasTranscript;
+    fromTranscript.title = hasTranscript
+        ? "Generate from the transcript text."
+        : "No transcript yet. Wait for captions, transcribe locally, or upload one.";
 }
 
-async function regenerateDescription() {
-    const btn = document.getElementById('btn-regenerate-desc');
+async function regenerateDescription(mode) {
+    const btnId = mode === 'frames' ? 'btn-regen-desc-frames' : 'btn-regen-desc-transcript';
+    const btn = document.getElementById(btnId);
+    if (!btn || btn.disabled) return;
     btn.disabled = true;
     const oldText = btn.textContent;
-    btn.textContent = 'Generating...';
+    btn.textContent = mode === 'frames' ? 'Watching video…' : 'Reading transcript…';
     try {
         const resp = await fetch(`/api/videos/${videoId}/generate-description`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({}),
+            body: JSON.stringify({ mode }),
         });
         if (resp.ok) {
             const result = await resp.json();
@@ -923,11 +955,18 @@ async function regenerateDescription() {
             // saves with "Update to YouTube" or rolls back with Revert.
             document.getElementById('meta-description').value = result.description;
             refreshDirtyState();
-            showToast('Description regenerated — review and save', 'info');
+            showToast(
+                mode === 'frames'
+                    ? 'Description generated from video frames — review and save'
+                    : 'Description generated from transcript — review and save',
+                'info',
+            );
         }
     } finally {
         btn.disabled = false;
         btn.textContent = oldText;
+        // Re-evaluate disabled state in case transcript appeared during the call.
+        updateRegenerateVisibility();
     }
 }
 

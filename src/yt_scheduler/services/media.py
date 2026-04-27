@@ -110,6 +110,62 @@ def get_video_duration(video_path: str | Path) -> float:
     return float(result.stdout.strip())
 
 
+def extract_keyframes(
+    video_path: str | Path,
+    count: int = 6,
+    *,
+    max_width: int = 1024,
+) -> list[bytes]:
+    """Sample ``count`` JPEG keyframes evenly across the video.
+
+    Returns a list of JPEG bytes — already encoded, ready to attach to a
+    Claude vision message. The frames are scaled to ``max_width`` to
+    keep request payloads small (and the per-image cost down).
+
+    Used by the AI description path when a video has no spoken
+    transcript: we send these frames to Claude instead so it can
+    describe what's visible.
+    """
+    video_path = Path(video_path)
+    if count < 1:
+        return []
+
+    duration = get_video_duration(video_path)
+    if duration <= 0:
+        return []
+
+    # Avoid the absolute ends of the file (often leader/trailer frames).
+    pad = min(0.5, duration * 0.05)
+    if count == 1:
+        timestamps = [duration / 2]
+    else:
+        span = max(duration - 2 * pad, 0.1)
+        step = span / (count - 1)
+        timestamps = [pad + i * step for i in range(count)]
+
+    frames: list[bytes] = []
+    for ts in timestamps:
+        # Use -ss before -i for fast seek, then a single frame to stdout.
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-ss", f"{ts:.3f}",
+                "-i", str(video_path),
+                "-frames:v", "1",
+                "-vf", f"scale='min({max_width},iw)':-2",
+                "-q:v", "3",
+                "-f", "image2pipe",
+                "-vcodec", "mjpeg",
+                "-",
+            ],
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode == 0 and result.stdout:
+            frames.append(result.stdout)
+    return frames
+
+
 def generate_thumbnail(
     video_path: str | Path,
     timestamp: str = "0:05",

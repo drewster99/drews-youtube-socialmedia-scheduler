@@ -392,7 +392,21 @@ async def transcribe_video(video_id: str, data: dict | None = None):
 
 @router.post("/{video_id}/generate-description")
 async def generate_description(video_id: str, data: dict | None = None):
-    """Generate an SEO description from the video's transcript."""
+    """Generate an SEO description from the video's transcript, or from
+    keyframes when no transcript exists.
+
+    Optional body keys:
+      * ``extra_instructions``: appended to the prompt verbatim.
+      * ``mode``: ``"transcript"`` (default), ``"frames"``, or ``"auto"``.
+        ``auto`` uses transcript when present, falls back to frames when
+        the video has a local file. ``frames`` forces frame-based even
+        if a transcript exists (useful when the transcript is wrong or
+        the visuals are the actual content).
+    """
+    from pathlib import Path as _P
+
+    from yt_scheduler.services import media as media_service
+
     db = await get_db()
     rows = await db.execute_fetchall("SELECT * FROM videos WHERE id = ?", (video_id,))
     if not rows:
@@ -400,16 +414,55 @@ async def generate_description(video_id: str, data: dict | None = None):
 
     video = dict(rows[0])
     transcript = video.get("transcript", "")
-    if not transcript:
-        raise HTTPException(400, "No transcript available yet. Wait for captions or upload one.")
-
     extra = (data or {}).get("extra_instructions", "")
-    try:
-        description = await ai.generate_seo_description(
-            title=video["title"],
-            transcript=transcript,
-            extra_instructions=extra,
+    mode = ((data or {}).get("mode") or "auto").strip()
+
+    use_frames: bool
+    if mode == "transcript":
+        if not transcript:
+            raise HTTPException(
+                400,
+                "No transcript available yet. Wait for captions or upload one — "
+                "or pass mode='frames' to describe from keyframes instead.",
+            )
+        use_frames = False
+    elif mode == "frames":
+        use_frames = True
+    else:  # auto
+        use_frames = not transcript
+
+    video_file = video.get("video_file_path") or ""
+    if use_frames and not (video_file and _P(video_file).exists()):
+        raise HTTPException(
+            400,
+            "No transcript available, and no local video file to extract "
+            "keyframes from. Re-import the video or upload a copy.",
         )
+
+    try:
+        if use_frames:
+            frames = await asyncio.to_thread(
+                media_service.extract_keyframes, video_file, 6,
+            )
+            if not frames:
+                raise HTTPException(
+                    502,
+                    "ffmpeg returned no usable keyframes — the video file may "
+                    "be corrupted or in an unsupported format.",
+                )
+            description = await ai.generate_seo_description_from_frames(
+                title=video["title"],
+                frames=frames,
+                extra_instructions=extra,
+            )
+        else:
+            description = await ai.generate_seo_description(
+                title=video["title"],
+                transcript=transcript,
+                extra_instructions=extra,
+            )
+    except HTTPException:
+        raise
     except Exception as e:
         # Surface Anthropic auth / rate-limit / transport failures as a clean 502
         # instead of bubbling up as an uncaught 500 (which breaks the JSON client).

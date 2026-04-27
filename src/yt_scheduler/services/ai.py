@@ -129,6 +129,108 @@ async def generate_seo_description(
     return message.content[0].text.strip()
 
 
+async def generate_seo_description_from_frames(
+    title: str,
+    frames: list[bytes],
+    *,
+    channel_name: str = "",
+    extra_instructions: str = "",
+) -> str:
+    """Generate an SEO description from a list of JPEG keyframes.
+
+    The transcript-based prompt template doesn't apply here — we send the
+    frames directly with a built-in vision prompt. Used as the fallback
+    when ``services/media.extract_keyframes`` yields frames and the
+    video has no usable transcript (silent screen recordings, b-roll
+    montages, etc.).
+    """
+    import base64
+
+    if not frames:
+        raise ValueError("generate_seo_description_from_frames called with no frames")
+
+    channel_block = f"Channel: {channel_name}\n" if channel_name else ""
+    extra_block = f"\nAdditional instructions:\n{extra_instructions}\n" if extra_instructions else ""
+
+    instructions = (
+        f"{channel_block}"
+        f"Title: {title}\n\n"
+        "Below are keyframes sampled in order from a short YouTube video.\n"
+        "Write a YouTube SEO description (3-5 short paragraphs) that "
+        "describes what happens in the video and would help viewers find "
+        "it via search. Open with a strong hook in the first sentence — "
+        "that's the only line shown in YouTube's collapsed description. "
+        "Do not invent dialogue or audio; describe only what's visible. "
+        "Do not output any preamble, tags list, or markdown headings — "
+        "just the description text."
+        f"{extra_block}"
+    )
+
+    content: list[dict] = [{"type": "text", "text": instructions}]
+    for frame in frames:
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": base64.b64encode(frame).decode("ascii"),
+            },
+        })
+
+    client = get_client()
+    message = await asyncio.to_thread(
+        client.messages.create,
+        model=await _resolve_model(),
+        max_tokens=1024,
+        messages=[{"role": "user", "content": content}],
+    )
+    return message.content[0].text.strip()
+
+
+async def generate_tags_from_frames(
+    title: str,
+    description: str,
+    frames: list[bytes],
+) -> list[str]:
+    """Generate YouTube tags using the title + (optionally generated)
+    description + the keyframes, when there's no transcript to feed
+    ``generate_tags_from_metadata``."""
+    import base64
+
+    if not frames:
+        raise ValueError("generate_tags_from_frames called with no frames")
+
+    instructions = (
+        f"Title: {title}\n"
+        f"Description: {description or '(none yet)'}\n\n"
+        "Below are keyframes from the video. Generate 8-12 YouTube search "
+        "tags as a comma-separated list. Each tag 1-3 words, lowercase, "
+        "no quotes, no '#'. Return ONLY the comma-separated tags."
+    )
+
+    content: list[dict] = [{"type": "text", "text": instructions}]
+    for frame in frames:
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": base64.b64encode(frame).decode("ascii"),
+            },
+        })
+
+    client = get_client()
+    message = await asyncio.to_thread(
+        client.messages.create,
+        model=await _resolve_model(),
+        max_tokens=256,
+        messages=[{"role": "user", "content": content}],
+        system="You return ONLY a comma-separated list of tags, no preamble.",
+    )
+    raw = message.content[0].text.strip()
+    return [t.strip().strip('"\'').lower() for t in raw.split(",") if t.strip()]
+
+
 async def generate_tags_from_metadata(
     title: str,
     description: str,
