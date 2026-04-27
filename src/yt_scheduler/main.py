@@ -42,12 +42,58 @@ def main():
     args = sys.argv[1:]
 
     if not args or args[0] == "serve" or args[0] == "--reload":
-        # Default: run the web server
+        # Default: run the web server.
+        #
+        # uvicorn's default access log line is ``INFO:    127.0.0.1:NNNN -
+        # "GET /api/build HTTP/1.1" 200 OK`` with no timestamp. When the
+        # log rolls into the .app's Server Monitor or the user opens
+        # ~/Library/Logs/<bundle>/server.log directly, every line is
+        # functionally indistinguishable in time. Inject a log_config
+        # that prefixes every record with ``YYYY-MM-DDTHH:MM:SS,sss``
+        # and the level — same format for app, error, and access loggers
+        # — so logs are usable without a tail timestamp tool.
+        log_config = {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "formatters": {
+                "default": {
+                    "format": "%(asctime)s.%(msecs)03d %(levelname)s %(name)s — %(message)s",
+                    "datefmt": "%Y-%m-%dT%H:%M:%S",
+                },
+                "access": {
+                    "format": "%(asctime)s.%(msecs)03d %(levelname)s %(client_addr)s — \"%(request_line)s\" %(status_code)s",
+                    "datefmt": "%Y-%m-%dT%H:%M:%S",
+                    "class": "uvicorn.logging.AccessFormatter",
+                },
+            },
+            "handlers": {
+                "default": {
+                    "formatter": "default",
+                    "class": "logging.StreamHandler",
+                    "stream": "ext://sys.stdout",
+                },
+                "access": {
+                    "formatter": "access",
+                    "class": "logging.StreamHandler",
+                    "stream": "ext://sys.stdout",
+                },
+            },
+            "loggers": {
+                # uvicorn's main logger (startup / shutdown / config)
+                "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
+                "uvicorn.error": {"level": "INFO"},
+                "uvicorn.access": {"handlers": ["access"], "level": "INFO", "propagate": False},
+                # Our own app logger so /api routes' info/warn/error
+                # lines also get timestamped consistently.
+                "yt_scheduler": {"handlers": ["default"], "level": "INFO", "propagate": False},
+            },
+        }
         uvicorn.run(
             "yt_scheduler.app:app",
             host=HOST,
             port=PORT,
             reload="--reload" in args,
+            log_config=log_config,
         )
 
     elif args[0] == "install":

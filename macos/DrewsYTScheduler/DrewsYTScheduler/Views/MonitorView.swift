@@ -31,24 +31,16 @@ struct MonitorView: View {
 
             Divider()
 
-            ScrollViewReader { proxy in
-                ScrollView {
-                    Text(currentContent.isEmpty ? "(empty)" : currentContent)
-                        .font(.system(.body, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(10)
-                        .id("logBottom")
-                }
-                .background(Color(NSColor.textBackgroundColor))
-                .onChange(of: currentContent) { _, _ in
-                    if autoScroll {
-                        proxy.scrollTo("logBottom", anchor: .bottom)
-                    }
-                }
-                .onChange(of: showingBootLog) { _, _ in
-                    proxy.scrollTo("logBottom", anchor: .bottom)
-                }
-            }
+            // SwiftUI's ``Text`` rendering N kilobytes of monospaced log
+            // text inside a ``ScrollView`` is genuinely slow on macOS —
+            // every layout pass measures the whole string, beachballing
+            // on scroll. ``NSTextView`` virtualizes its glyph layout, so
+            // even multi-MiB logs scroll smoothly.
+            LogTextView(
+                text: currentContent.isEmpty ? "(empty)" : currentContent,
+                autoScroll: autoScroll,
+            )
+            .background(Color(NSColor.textBackgroundColor))
 
             HStack {
                 Toggle("Follow tail", isOn: $autoScroll)
@@ -78,6 +70,50 @@ struct MonitorView: View {
 
     private var currentContent: String {
         showingBootLog ? bootTail.content : tail.content
+    }
+
+    /// Read-only ``NSTextView`` wrapped for SwiftUI. Auto-scrolls to the
+    /// bottom on each text update when ``autoScroll`` is true. Glyph
+    /// layout is virtualized by AppKit so multi-MiB logs scroll without
+    /// the SwiftUI ``Text`` beachball.
+    private struct LogTextView: NSViewRepresentable {
+        let text: String
+        let autoScroll: Bool
+
+        func makeNSView(context: Context) -> NSScrollView {
+            let scroll = NSTextView.scrollableTextView()
+            scroll.hasVerticalScroller = true
+            scroll.hasHorizontalScroller = false
+            scroll.autohidesScrollers = false
+            guard let textView = scroll.documentView as? NSTextView else { return scroll }
+            textView.isEditable = false
+            textView.isSelectable = true
+            textView.isRichText = false
+            textView.font = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+            textView.textContainerInset = NSSize(width: 8, height: 6)
+            textView.drawsBackground = false
+            textView.isHorizontallyResizable = false
+            textView.isVerticallyResizable = true
+            textView.textContainer?.widthTracksTextView = true
+            return scroll
+        }
+
+        func updateNSView(_ scroll: NSScrollView, context: Context) {
+            guard let textView = scroll.documentView as? NSTextView else { return }
+            if textView.string != text {
+                let attributed = NSAttributedString(
+                    string: text,
+                    attributes: [
+                        .font: NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular),
+                        .foregroundColor: NSColor.textColor,
+                    ],
+                )
+                textView.textStorage?.setAttributedString(attributed)
+                if autoScroll {
+                    textView.scrollToEndOfDocument(nil)
+                }
+            }
+        }
     }
 
     private var statusBlock: some View {

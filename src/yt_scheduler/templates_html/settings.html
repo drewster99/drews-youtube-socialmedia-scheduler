@@ -115,17 +115,40 @@ async function loadAuthStatus() {
     const data = await resp.json();
     const el = document.getElementById('auth-info');
     const storage = data.storage === 'keychain' ? 'macOS Keychain' : 'encrypted secrets file';
-    if (data.authenticated) {
-        el.innerHTML = `<span class="badge badge-published">Authenticated</span>
-            <span style="color: var(--text-muted); font-size: 0.8rem; margin-left: 0.5rem;">
-                Stored in ${storage}
-            </span>`;
-    } else {
-        el.innerHTML = `<span class="badge badge-draft">Not authenticated</span>
-            <span style="color: var(--text-muted); font-size: 0.8rem; margin-left: 0.5rem;">
-                Will use ${storage}
-            </span>`;
-    }
+
+    /* Two independent states:
+     *   1) client_secret.json (the app's OAuth credential): required to
+     *      START any new auth flow (e.g. "Add project").
+     *   2) Per-project OAuth tokens (default project): required to call
+     *      YouTube on behalf of that project.
+     *
+     * The previous UI conflated them — showed a single 'Authenticated'
+     * badge based on (2), so users with valid tokens but no uploaded
+     * client_secret saw 'Authenticated' and were confused when the new
+     * project wizard's Connect button returned 'No OAuth client
+     * configured'. Each is now displayed separately with its own
+     * coloured badge. */
+    const clientSecretBadge = data.client_secret_uploaded
+        ? `<span class="badge badge-published">Uploaded</span>`
+        : `<span class="badge badge-draft" style="background:#d29922; color:#0d1117;">Not uploaded — required for new projects</span>`;
+
+    const tokenBadge = data.authenticated
+        ? `<span class="badge badge-published">Tokens stored</span>`
+        : `<span class="badge badge-draft">No tokens yet</span>`;
+
+    el.innerHTML = `
+        <div style="display: grid; grid-template-columns: max-content 1fr; gap: 0.4rem 0.75rem; align-items: center;">
+            <div style="font-size: 0.85rem; color: var(--text-secondary);">Client secret (client_secret.json):</div>
+            <div>${clientSecretBadge}</div>
+            <div style="font-size: 0.85rem; color: var(--text-secondary);">Default project tokens:</div>
+            <div>${tokenBadge}</div>
+        </div>
+        <div style="color: var(--text-muted); font-size: 0.8rem; margin-top: 0.5rem;">
+            Stored in ${storage}.
+            ${data.client_secret_uploaded
+                ? ''
+                : '<strong style="color:#d29922;">⚠ Upload client_secret.json before adding new projects.</strong>'}
+        </div>`;
 }
 
 document.getElementById('client-secret-file').addEventListener('change', async (e) => {
@@ -134,7 +157,10 @@ document.getElementById('client-secret-file').addEventListener('change', async (
     const formData = new FormData();
     formData.append('file', file);
     const resp = await fetch('/auth/upload-client-secret', {method: 'POST', body: formData});
-    if (resp.ok) showToast('Client secret saved', 'success');
+    if (resp.ok) {
+        showToast('Client secret saved', 'success');
+        loadAuthStatus();
+    }
 });
 
 async function doLogout() {

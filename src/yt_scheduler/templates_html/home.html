@@ -318,12 +318,36 @@ dialog.querySelectorAll('[data-wizard-cancel]').forEach(btn => {
     });
 });
 
-document.getElementById('wizard-step1-next').addEventListener('click', () => {
+document.getElementById('wizard-step1-next').addEventListener('click', async () => {
     const name = document.getElementById('new-project-name').value.trim();
     if (!name) {
         showToast('Project name is required', 'error');
         return;
     }
+
+    /* Pre-flight: the wizard's step 2 calls /api/oauth/youtube/start which
+     * requires client_secret.json to be in Keychain. If it's not, the
+     * user will hit a 400 and the OAuth popup error toast just says 'No
+     * OAuth client configured' with no obvious next step. Fail loudly
+     * here instead, link to Settings, and don't advance. */
+    try {
+        const resp = await fetch('/auth/status', {_silent: true});
+        if (resp.ok) {
+            const status = await resp.json();
+            if (!status.client_secret_uploaded) {
+                showToast(
+                    "Upload client_secret.json in General Settings → YouTube authentication first. " +
+                    "It's the OAuth client credential the new project will sign in against.",
+                    'error',
+                );
+                return;
+            }
+        }
+    } catch (_) {
+        // Network failure here just means /auth/status couldn't be reached;
+        // step 2's Connect call will surface its own error.
+    }
+
     wizard.name = name;
     document.getElementById('wizard-name-echo').textContent = name;
     document.getElementById('wizard-name-echo-3').textContent = name;
