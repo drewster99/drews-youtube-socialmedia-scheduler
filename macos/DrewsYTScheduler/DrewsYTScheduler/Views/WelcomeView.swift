@@ -78,11 +78,18 @@ struct WelcomeView: View {
                 }) {
                     Text("Open UI")
                         .font(.headline)
+                        .foregroundStyle(.white)
                         .frame(minWidth: 160)
                         .padding(.vertical, 4)
                 }
                 .controlSize(.large)
                 .buttonStyle(.borderedProminent)
+                // Explicit blue tint instead of relying on the system
+                // accent — on machines where the accent is set to
+                // 'multicolor' or a subdued shade, .borderedProminent
+                // renders too close to the background and the button
+                // doesn't read as the primary action.
+                .tint(.blue)
                 .keyboardShortcut(.defaultAction)
                 .disabled(!canOpenBrowser)
             }

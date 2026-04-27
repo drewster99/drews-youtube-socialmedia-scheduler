@@ -49,10 +49,16 @@ struct MonitorView: View {
                     let url = showingBootLog ? AppPaths.bootLogFile : AppPaths.serverLogFile
                     NSWorkspace.shared.activateFileViewerSelecting([url])
                 }
+                // Restart is also allowed when status is .notFound — that's
+                // the 'orphaned launchd job, no BTM record for this bundle'
+                // case (typically a rebuilt .app whose old registration is
+                // dangling). restartAgent() handles it: skip the no-op
+                // SMAppService.unregister, force-unload via launchctl
+                // bootout, kill the orphaned port-holder, register fresh.
                 Button("Restart server") {
                     state.restartAgent()
                 }
-                .disabled(state.agentStatus != .enabled)
+                .disabled(!(state.agentStatus == .enabled || state.agentStatus == .notFound))
             }
             .padding(12)
         }

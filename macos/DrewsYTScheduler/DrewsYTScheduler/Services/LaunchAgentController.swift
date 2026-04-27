@@ -127,10 +127,15 @@ final class LaunchAgentController {
         let service = agentService
         ActivityLog.shared.log(.info, .agent, "restart: pre-status=\(service.status.displayName)")
 
-        // Step 1: SMAppService.unregister(). Best-effort — keep going even
-        // if it throws. The bootout below is what actually has to succeed
-        // for the kill step to take.
-        if service.status != .notRegistered {
+        // Step 1: SMAppService.unregister(). Only call this when BTM
+        // actually has a record we can drop — ``.enabled`` (live) or
+        // ``.requiresApproval`` (live but unapproved). For ``.notFound``
+        // (orphaned launchd job, no BTM record for this bundle) and
+        // ``.notRegistered``, unregister() is guaranteed to throw, so
+        // skip it and rely on bootout + register to recover.
+        let canUnregister = (service.status == .enabled ||
+                             service.status == .requiresApproval)
+        if canUnregister {
             do {
                 try await service.unregister()
                 ActivityLog.shared.log(.info, .agent,
@@ -140,6 +145,9 @@ final class LaunchAgentController {
                     "restart: SMAppService.unregister() threw (continuing): \(error.localizedDescription)")
             }
             try? await Task.sleep(nanoseconds: 500_000_000)
+        } else {
+            ActivityLog.shared.log(.info, .agent,
+                "restart: skipping SMAppService.unregister() (status=\(service.status.displayName) — no BTM record to drop)")
         }
 
         // Step 2: force-unload from launchd. This is the step that breaks

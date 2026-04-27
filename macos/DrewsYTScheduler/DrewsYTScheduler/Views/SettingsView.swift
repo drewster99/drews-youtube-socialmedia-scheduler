@@ -19,8 +19,13 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     StatusLightsView(state: state)
                     HStack {
+                        // Restart is also allowed when status is .notFound —
+                        // see MonitorView for why. restartAgent() handles
+                        // the orphan case end-to-end.
                         Button("Restart server") { state.restartAgent() }
-                            .disabled(state.agentStatus != .enabled || state.busy)
+                            .disabled(state.busy ||
+                                      !(state.agentStatus == .enabled ||
+                                        state.agentStatus == .notFound))
                         Button("Reinstall…") { state.registerAgent() }
                             .disabled(state.busy)
                         Button("Activity log…") {
@@ -75,11 +80,13 @@ struct SettingsView: View {
                 }) {
                     Text("Open UI")
                         .font(.headline)
+                        .foregroundStyle(.white)
                         .frame(minWidth: 160)
                         .padding(.vertical, 4)
                 }
                 .controlSize(.large)
                 .buttonStyle(.borderedProminent)
+                .tint(.blue)
             }
             .padding(.top, 4)
 
