@@ -162,6 +162,7 @@ async def publish_video_job(video_id: str) -> dict:
                 platform=post["platform"],
                 social_account_id=post.get("social_account_id"),
                 content=post.get("content") or "",
+                media_path=post.get("media_path"),
                 exclude_post_id=post_id,
             )
             if dup is not None:
@@ -291,6 +292,7 @@ async def _send_scheduled_post(post_id: int) -> None:
         platform=post["platform"],
         social_account_id=post.get("social_account_id"),
         content=post.get("content") or "",
+        media_path=post.get("media_path"),
         exclude_post_id=post_id,
     )
     if dup is not None:

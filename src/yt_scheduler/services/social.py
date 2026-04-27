@@ -287,6 +287,7 @@ class TwitterPoster(SocialPoster):
     required_keys: list[str] = ["bearer_token"]
 
     async def post(self, text: str, media_path: str | None = None) -> dict:
+        text = (text or "").strip()
         creds = self._get_creds()
         bearer = creds.get("bearer_token")
         if not bearer:
@@ -375,6 +376,8 @@ class BlueskyPoster(SocialPoster):
 
         from yt_scheduler.services import bluesky_oauth
         from yt_scheduler.services.social_credentials import save_bundle
+
+        text = (text or "").strip()
 
         creds = self._get_creds()
         if creds.get("auth_method") != "oauth":
@@ -623,6 +626,7 @@ class MastodonPoster(SocialPoster):
     required_keys = ["access_token", "instance_url"]
 
     async def post(self, text: str, media_path: str | None = None) -> dict:
+        text = (text or "").strip()
         creds = self._get_creds()
 
         try:
@@ -660,6 +664,7 @@ class LinkedInPoster(SocialPoster):
     required_keys = ["access_token", "person_urn"]
 
     async def post(self, text: str, media_path: str | None = None) -> dict:
+        text = (text or "").strip()
         creds = self._get_creds()
 
         try:
@@ -706,6 +711,7 @@ class ThreadsPoster(SocialPoster):
     required_keys = ["access_token", "user_id"]
 
     async def post(self, text: str, media_path: str | None = None) -> dict:
+        text = (text or "").strip()
         creds = self._get_creds()
 
         try:
@@ -862,19 +868,28 @@ async def find_recent_duplicate_post(
     platform: str,
     social_account_id: int | None,
     content: str,
+    media_path: str | None = None,
     exclude_post_id: int | None = None,
     lookback_days: int = 30,
 ) -> dict | None:
-    """Look for a previously-sent post with the same content going to the
-    same target. Returns the matching row (with id, posted_at, post_url,
-    content, social_account_id) or ``None`` if there is no recent dup.
+    """Look for a previously-sent post with the same content AND same
+    media going to the same target. Returns the matching row (with id,
+    posted_at, post_url, content, media_path, social_account_id) or
+    ``None`` if there is no recent dup.
 
     Match criteria:
 
     * same ``platform``,
     * same ``social_account_id`` (when both sides have one — null/null is
       compared by content alone, which is the conservative call),
-    * exact ``content`` match (after stripping whitespace),
+    * identical ``content`` after stripping leading/trailing whitespace
+      (internal newlines and indentation are preserved — only the edges
+      are normalised, since AI blocks frequently emit a stray leading
+      space or trailing newline),
+    * identical ``media_path`` — same text with different attached media
+      is NOT a duplicate. NULL/empty-string media is treated as a single
+      "no media" bucket; switching from no-media to media (or vice
+      versa) is also not a duplicate.
     * status is ``posted`` or ``sending``,
     * occurred within the last ``lookback_days`` days.
 
@@ -892,17 +907,23 @@ async def find_recent_duplicate_post(
     if not normalised:
         return None  # empty post can't be a dup of anything meaningful
 
+    # Normalise media to "" for the no-media bucket so NULL and "" both
+    # compare equal. SQLite NULL semantics would otherwise make
+    # ``media_path = ?`` always false when one side is NULL.
+    media_key = (media_path or "").strip()
+
     db = await get_db()
     sql_parts = [
-        "SELECT id, video_id, platform, content, social_account_id, "
+        "SELECT id, video_id, platform, content, media_path, social_account_id, "
         "       posted_at, post_url, status, "
         "       COALESCE(posted_at, created_at) AS event_at "
         "FROM social_posts "
         "WHERE platform = ? AND TRIM(content) = ? "
+        "AND COALESCE(TRIM(media_path), '') = ? "
         "AND status IN ('posted', 'sending') "
         "AND COALESCE(posted_at, created_at) >= datetime('now', '-' || ? || ' days')"
     ]
-    params: list = [platform, normalised, lookback_days]
+    params: list = [platform, normalised, media_key, lookback_days]
     if social_account_id is not None:
         sql_parts.append(
             "AND (social_account_id = ? OR social_account_id IS NULL)"

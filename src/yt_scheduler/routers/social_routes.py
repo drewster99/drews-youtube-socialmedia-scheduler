@@ -111,6 +111,13 @@ async def generate_posts(video_id: str, data: dict | None = None):
             else:
                 rendered = ""
 
+            # Trim leading/trailing whitespace at the boundary — AI blocks
+            # frequently emit a stray leading space or trailing newline,
+            # which would render as whitespace on the destination
+            # platform and would also cause near-identical content to
+            # bypass the dedup check by accident.
+            rendered = rendered.strip()
+
             # Routing precedence: slot binding → project default → none
             sa_id = slot.get("social_account_id") or defaults.get(platform)
             media = slot.get("media", "thumbnail")
@@ -155,8 +162,12 @@ async def update_post(post_id: int, data: dict):
     params = []
 
     if "content" in data:
+        # Same trim-at-write rule as generate_posts: leading/trailing
+        # whitespace would render as visible whitespace on the
+        # destination platform and would silently bypass the dedup
+        # matcher on near-identical content.
         updates.append("content = ?")
-        params.append(data["content"])
+        params.append((data["content"] or "").strip())
     if "status" in data:
         updates.append("status = ?")
         params.append(data["status"])
@@ -295,6 +306,7 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
             platform=post["platform"],
             social_account_id=cred["id"] if cred else post.get("social_account_id"),
             content=post.get("content") or "",
+            media_path=post.get("media_path"),
             exclude_post_id=post_id,
         )
         if dup is not None:
@@ -430,6 +442,7 @@ async def send_all_posts(
                 platform=post["platform"],
                 social_account_id=cred["id"] if cred else post.get("social_account_id"),
                 content=post.get("content") or "",
+                media_path=post.get("media_path"),
                 exclude_post_id=int(post["id"]),
             )
             if dup is not None:

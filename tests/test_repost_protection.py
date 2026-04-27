@@ -51,13 +51,15 @@ async def app_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     await database.close_db()
 
 
-async def _seed_posted(db, *, platform, account_id, content, posted_at=None):
+async def _seed_posted(
+    db, *, platform, account_id, content, posted_at=None, media_path=None,
+):
     """Insert a row in social_posts with status='posted'."""
     cursor = await db.execute(
         "INSERT INTO social_posts (video_id, platform, content, status, "
-        "social_account_id, posted_at, post_url) "
-        "VALUES ('vidD', ?, ?, 'posted', ?, ?, 'https://x.test/1')",
-        (platform, content, account_id, posted_at),
+        "social_account_id, posted_at, post_url, media_path) "
+        "VALUES ('vidD', ?, ?, 'posted', ?, ?, 'https://x.test/1', ?)",
+        (platform, content, account_id, posted_at, media_path),
     )
     await db.commit()
     return int(cursor.lastrowid)
@@ -162,6 +164,123 @@ async def test_empty_content_never_matches(app_db) -> None:
         platform="mastodon", social_account_id=1, content="",
     )
     assert result is None
+
+
+async def test_same_text_different_media_is_not_duplicate(app_db) -> None:
+    """Same caption with a different image is a legitimate post (e.g.
+    posting two distinct frames from the same video)."""
+    social, db = app_db
+    await _seed_posted(
+        db, platform="mastodon", account_id=1, content="hello",
+        posted_at="2026-04-26 12:00:00",
+        media_path="/uploads/vidA/thumb1.jpg",
+    )
+    result = await social.find_recent_duplicate_post(
+        platform="mastodon", social_account_id=1, content="hello",
+        media_path="/uploads/vidA/thumb2.jpg",
+    )
+    assert result is None
+
+
+async def test_same_text_same_media_is_duplicate(app_db) -> None:
+    social, db = app_db
+    pid = await _seed_posted(
+        db, platform="mastodon", account_id=1, content="hello",
+        posted_at="2026-04-26 12:00:00",
+        media_path="/uploads/vidA/thumb1.jpg",
+    )
+    result = await social.find_recent_duplicate_post(
+        platform="mastodon", social_account_id=1, content="hello",
+        media_path="/uploads/vidA/thumb1.jpg",
+    )
+    assert result is not None
+    assert result["id"] == pid
+
+
+async def test_text_only_vs_text_with_media_is_not_duplicate(app_db) -> None:
+    """Switching from text-only to text+media (or vice versa) is a
+    different post."""
+    social, db = app_db
+    # Previously sent: text only (no media)
+    await _seed_posted(
+        db, platform="mastodon", account_id=1, content="hello",
+        posted_at="2026-04-26 12:00:00",
+        media_path=None,
+    )
+    # New attempt: same text but with a thumbnail attached
+    result = await social.find_recent_duplicate_post(
+        platform="mastodon", social_account_id=1, content="hello",
+        media_path="/uploads/vidA/thumb1.jpg",
+    )
+    assert result is None
+
+
+async def test_null_and_empty_media_treated_as_same_no_media(app_db) -> None:
+    """``NULL`` and ``""`` media_path both mean 'no media' — they must
+    compare equal so a duplicate text-only post is still flagged."""
+    social, db = app_db
+    pid = await _seed_posted(
+        db, platform="mastodon", account_id=1, content="hello",
+        posted_at="2026-04-26 12:00:00",
+        media_path=None,  # stored as NULL
+    )
+    # Caller passes empty string as the no-media sentinel
+    result = await social.find_recent_duplicate_post(
+        platform="mastodon", social_account_id=1, content="hello",
+        media_path="",
+    )
+    assert result is not None
+    assert result["id"] == pid
+
+
+async def test_update_post_trims_content_on_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """PUT /api/social/posts/{id} must store the trimmed content so the
+    dedup matcher and the platform API see the same canonical form."""
+    monkeypatch.setenv("DYS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DYS_HOST", "127.0.0.1")
+    (tmp_path / "uploads").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "templates").mkdir(parents=True, exist_ok=True)
+    for mod in list(sys.modules.keys()):
+        if mod.startswith("yt_scheduler"):
+            sys.modules.pop(mod, None)
+
+    keychain = importlib.import_module("yt_scheduler.services.keychain")
+    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+
+    app_module = importlib.import_module("yt_scheduler.app")
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(app_module.app) as c:
+        from yt_scheduler.database import get_db
+        db = await get_db()
+        await db.execute(
+            "INSERT INTO videos (id, project_id, title, status) "
+            "VALUES ('vidT', 1, 'T', 'uploaded')"
+        )
+        cursor = await db.execute(
+            "INSERT INTO social_posts (video_id, platform, content, status) "
+            "VALUES ('vidT', 'mastodon', 'old', 'draft')"
+        )
+        post_id = int(cursor.lastrowid)
+        await db.commit()
+
+        resp = c.put(
+            f"/api/social/posts/{post_id}",
+            json={"content": "  hello world  \n\n"},
+        )
+        assert resp.status_code == 200
+
+        cursor = await db.execute(
+            "SELECT content FROM social_posts WHERE id = ?", (post_id,)
+        )
+        row = await cursor.fetchone()
+        assert row["content"] == "hello world"
+
+    from yt_scheduler.database import close_db
+    await close_db()
 
 
 async def test_send_post_returns_409_on_duplicate(
