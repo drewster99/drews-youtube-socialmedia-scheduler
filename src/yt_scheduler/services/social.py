@@ -783,11 +783,13 @@ PLATFORM_FIELDS: dict[str, list[dict]] = {
         {"key": "access_token", "label": "Access Token", "type": "password", "secret": True},
         {"key": "person_urn", "label": "Person URN", "type": "text", "secret": False, "placeholder": "urn:li:person:xxxxxxxx"},
     ],
-    "threads": [
-        {"key": "access_token", "label": "Access Token", "type": "password", "secret": True},
-        {"key": "user_id", "label": "User ID", "type": "text", "secret": False},
-        {"key": "username", "label": "Username", "type": "text", "secret": False},
-    ],
+    # Threads is OAuth-only at the network layer; fields stay empty so the
+    # Settings UI doesn't paint a paste form. The "+ Add account" button
+    # uses the popup flow on HTTPS origins and the short-lived token
+    # exchange on HTTP origins (both go through Meta's OAuth endpoints —
+    # the exchange is a redirect-less variant Meta provides specifically
+    # for native/CLI clients that can't host an HTTPS callback).
+    "threads": [],
 }
 
 PLATFORM_DESCRIPTIONS: dict[str, str] = {

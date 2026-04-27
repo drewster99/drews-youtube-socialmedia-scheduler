@@ -27,6 +27,43 @@ def get_publish_lock(video_id: str) -> asyncio.Lock:
     return _publish_locks[video_id]
 
 
+async def _claim_post_for_send(post_id: int) -> bool:
+    """Atomically transition a post from ``approved`` → ``sending``.
+
+    Returns True if THIS caller won the claim and should now send;
+    False if someone else already did. Stops a race where
+    ``publish_video_job`` and ``_send_scheduled_post`` both fire at the
+    same instant for the same post — both used to read ``status='approved'``,
+    both posted to the platform, both wrote ``status='posted'`` (1 DB row,
+    2 actual social posts).
+    """
+    db = await get_db()
+    cursor = await db.execute(
+        "UPDATE social_posts SET status = 'sending' "
+        "WHERE id = ? AND status = 'approved'",
+        (post_id,),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def _release_post_to_approved(post_id: int) -> None:
+    """Roll a claimed post back to 'approved' so the user can retry.
+
+    Used when the send fails for a reason that's not the credential
+    being broken — network blip, transient platform error, etc.
+    Credential auth errors keep the 'failed' status because retrying
+    won't help until the user re-OAuths.
+    """
+    db = await get_db()
+    await db.execute(
+        "UPDATE social_posts SET status = 'approved' "
+        "WHERE id = ? AND status = 'sending'",
+        (post_id,),
+    )
+    await db.commit()
+
+
 async def publish_video_job(video_id: str) -> dict:
     """Publish a video and fire all approved social posts.
 
@@ -105,15 +142,27 @@ async def publish_video_job(video_id: str) -> dict:
             if platform not in results["social_results"]:
                 results["social_results"][platform] = []
 
+            # Atomic claim: another worker (e.g. _send_scheduled_post for
+            # the same post_id) might fire concurrently. Whoever wins the
+            # status transition sends; the loser sees rowcount=0 and
+            # skips, so we never hit the platform twice.
+            if not await _claim_post_for_send(post_id):
+                results["social_results"][platform].append(
+                    {"post_id": post_id, "status": "skipped", "reason": "already claimed by another worker"}
+                )
+                continue
+
             try:
                 poster = await _resolve_poster(post, project_id)
             except ValueError as exc:
+                await _release_post_to_approved(post_id)
                 results["social_results"][platform].append(
                     {"post_id": post_id, "status": "skipped", "reason": str(exc)}
                 )
                 continue
 
             if not await poster.is_configured():
+                await _release_post_to_approved(post_id)
                 results["social_results"][platform].append(
                     {"post_id": post_id, "status": "skipped", "reason": "not configured"}
                 )
@@ -188,8 +237,14 @@ async def _send_scheduled_post(post_id: int) -> None:
         logger.warning("Scheduled post %s vanished before firing", post_id)
         return
     post = dict(rows[0])
-    if post.get("status") == "posted":
-        return  # Idempotent — already sent
+    if post.get("status") in ("posted", "sending"):
+        # Already sent or another worker is sending right now — abort.
+        return
+
+    if not await _claim_post_for_send(post_id):
+        # Either it wasn't 'approved' (e.g. user already manually sent
+        # or unscheduled it) or another worker beat us to the claim.
+        return
 
     try:
         sa_id = post.get("social_account_id")
@@ -512,6 +567,31 @@ async def moderate_comments_job() -> None:
                 "Moderation tick: checked %s, matched %s",
                 results.get("checked", 0),
                 results.get("matched", 0),
+            )
+        # Surface auth-shaped errors loudly so they don't drown in the
+        # generic per-video error list. Project Settings → YouTube card
+        # also re-renders 'Needs re-auth' on next load (its needs_reauth
+        # flag is computed live from a channels().list() probe), but
+        # that requires the user to look. Logging gives ops a signal too.
+        errors = results.get("errors") or []
+        auth_failures = [
+            err for err in errors
+            if any(needle in (err.get("error") or "").lower() for needle in (
+                "not authenticated", "invalid_grant", "unauthorized",
+                "401", "credentials", "refresh",
+            ))
+        ]
+        if auth_failures:
+            logger.error(
+                "Moderation: YouTube auth failures on %d video(s); "
+                "the project's YouTube credential likely needs re-auth. "
+                "First error: %s",
+                len(auth_failures), auth_failures[0]["error"],
+            )
+        elif errors:
+            logger.warning(
+                "Moderation: %d video(s) errored (non-auth); first: %s",
+                len(errors), errors[0]["error"],
             )
     except Exception as e:
         logger.warning(f"Comment moderation job failed: {e}")

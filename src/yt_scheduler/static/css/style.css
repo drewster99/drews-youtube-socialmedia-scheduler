@@ -408,10 +408,12 @@ body {
     color: var(--text-muted);
 }
 
-/* Detail grid (two-column layout) */
+/* Detail grid (two-column layout). The right column hosts Log + Status +
+ * Social posts; widened from 380px to 494px (~30%) so multi-line log
+ * entries don't wrap on the platform tag. */
 .detail-grid {
     display: grid;
-    grid-template-columns: 1fr 380px;
+    grid-template-columns: 1fr 494px;
     gap: 1rem;
     align-items: start;
 }
