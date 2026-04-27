@@ -97,9 +97,18 @@ final class LaunchAgentController {
         ActivityLog.shared.log(.info, .agent, "unregister() returned — post-status=\(service.status.displayName)")
     }
 
-    /// Restart by unregister+register so launchd reads the (possibly newer)
-    /// plist from disk. After-the-first-time-approved, this round-trip does
-    /// not re-prompt.
+    /// Restart by unregister + kill running process + register, so launchd
+    /// reads the (possibly newer) plist from disk and the new spawn isn't
+    /// blocked by the old one still holding the port.
+    ///
+    /// Empirically ``SMAppService.unregister()`` only tells launchd to stop
+    /// scheduling new launches — a process that's already alive (via
+    /// ``RunAtLoad`` / ``KeepAlive`` semantics or simply because launchd
+    /// hasn't gotten around to reaping it) will keep its TCP listener open.
+    /// If we then ``register()`` and launchd tries to spawn a fresh
+    /// instance, the new process can't bind and either crashes or never
+    /// comes up. So we explicitly TERM (then KILL) anything still on the
+    /// port before re-registering.
     func restartAgent() async throws {
         let service = agentService
         ActivityLog.shared.log(.info, .agent, "restart: pre-status=\(service.status.displayName)")
@@ -108,8 +117,97 @@ final class LaunchAgentController {
             try? await Task.sleep(nanoseconds: 1_000_000_000)
             ActivityLog.shared.log(.info, .agent, "restart: after unregister, status=\(service.status.displayName)")
         }
+
+        await Self.killProcessOnPort(AppPaths.serverPort)
+
         try service.register()
         ActivityLog.shared.log(.info, .agent, "restart: after register, status=\(service.status.displayName)")
+    }
+
+    /// SIGTERM (and if it doesn't die, SIGKILL) any process holding a
+    /// TCP listener on ``port``. Logs every PID it finds and the result
+    /// of each kill. No-op when nothing is listening.
+    static func killProcessOnPort(_ port: Int) async {
+        let pids = listeningPIDs(onPort: port)
+        guard !pids.isEmpty else {
+            ActivityLog.shared.log(.info, .agent,
+                "restart: nothing listening on port \(port) — nothing to kill")
+            return
+        }
+
+        ActivityLog.shared.log(.info, .agent,
+            "restart: killing \(pids.count) PID(s) on port \(port): \(pids.map(String.init).joined(separator: ", "))")
+
+        // First pass — polite SIGTERM. Most well-behaved processes (the
+        // Python server included) flush state and exit on this.
+        for pid in pids {
+            sendSignal(pid: pid, signal: "TERM")
+        }
+
+        // Wait up to ~5s for the port to free.
+        for _ in 0..<10 {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            if listeningPIDs(onPort: port).isEmpty {
+                ActivityLog.shared.log(.info, .agent,
+                    "restart: port \(port) freed after SIGTERM")
+                return
+            }
+        }
+
+        // Still holding the port — escalate to SIGKILL.
+        let stragglers = listeningPIDs(onPort: port)
+        ActivityLog.shared.log(.warn, .agent,
+            "restart: \(stragglers.count) PID(s) still holding port \(port) after SIGTERM — sending SIGKILL")
+        for pid in stragglers {
+            sendSignal(pid: pid, signal: "KILL")
+        }
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        if !listeningPIDs(onPort: port).isEmpty {
+            ActivityLog.shared.log(.error, .agent,
+                "restart: port \(port) STILL not free after SIGKILL — register() will likely fail to bind")
+        }
+    }
+
+    /// Return PIDs listening on ``port`` (parsed from ``lsof -ti``).
+    /// Returns ``[]`` on tool error or no listener; never throws.
+    private static func listeningPIDs(onPort port: Int) -> [pid_t] {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        proc.arguments = ["-ti", "tcp:\(port)", "-sTCP:LISTEN"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            return []
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let text = String(data: data, encoding: .utf8) else { return [] }
+        return text
+            .split(whereSeparator: \.isNewline)
+            .compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
+    }
+
+    /// Run ``/bin/kill -<signal> <pid>``. Logs failure but doesn't throw.
+    private static func sendSignal(pid: pid_t, signal: String) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/kill")
+        proc.arguments = ["-\(signal)", String(pid)]
+        proc.standardOutput = Pipe()
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            if proc.terminationStatus != 0 {
+                ActivityLog.shared.log(.warn, .agent,
+                    "kill -\(signal) \(pid) exited \(proc.terminationStatus)")
+            }
+        } catch {
+            ActivityLog.shared.log(.warn, .agent,
+                "kill -\(signal) \(pid) threw: \(error.localizedDescription)")
+        }
     }
 
     // --- "launch at login" main app -----------------------------------------
