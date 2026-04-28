@@ -457,6 +457,35 @@ async def get_moderation_log(limit: int = 50):
     return await moderation.get_moderation_log(limit)
 
 
+@router.get("/moderation-status")
+async def get_moderation_status():
+    """Return next/last run timestamps for the comment-moderation job.
+
+    APScheduler tracks ``next_run_time`` directly. The job uses a fixed
+    interval, so ``last_run = next_run - interval`` gives us "when did
+    it last fire" without needing to persist any state. Returns ISO 8601
+    UTC strings; the UI formats them via the standard _ensureUtc shim.
+    """
+    from datetime import datetime, timezone
+    from yt_scheduler.config import COMMENT_CHECK_INTERVAL_MINUTES
+    from yt_scheduler.services.scheduler import scheduler as _scheduler
+
+    job = _scheduler.get_job("moderate_comments")
+    if job is None or job.next_run_time is None:
+        return {"next_run": None, "last_run": None, "interval_minutes": COMMENT_CHECK_INTERVAL_MINUTES}
+    next_run = job.next_run_time
+    if next_run.tzinfo is None:
+        next_run = next_run.replace(tzinfo=timezone.utc)
+    interval_min = COMMENT_CHECK_INTERVAL_MINUTES
+    last_run = next_run.timestamp() - interval_min * 60
+    last_run_dt = datetime.fromtimestamp(last_run, tz=timezone.utc)
+    return {
+        "next_run": next_run.isoformat(),
+        "last_run": last_run_dt.isoformat(),
+        "interval_minutes": interval_min,
+    }
+
+
 @router.post("/moderation/run")
 async def run_moderation_now():
     """Run comment moderation against the default project's videos right now.

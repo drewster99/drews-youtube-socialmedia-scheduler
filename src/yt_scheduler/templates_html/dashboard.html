@@ -62,7 +62,7 @@ async function loadVideos() {
         // unfiltered shape (no query) returns videos across all projects
         // and would render @TheDrewBenson's videos under
         // DrewBensonCodes' Dashboard, etc.
-        const resp = await fetch(`/api/videos?project_slug=${encodeURIComponent(projectSlug)}`);
+        const resp = await fetch(`/api/videos?project_slug=${encodeURIComponent(projectSlug)}`, {_silent: true});
         const videos = await resp.json();
 
         if (videos.length === 0) {
@@ -166,5 +166,18 @@ async function loadAvailableImports() {
 
 loadVideos();
 loadAvailableImports();
+
+// Background-driven state changes (a scheduled video flipping public,
+// a status update arriving from YouTube) won't show until the user
+// refreshes. Poll every 30s while the tab is visible.
+let _dashPollTimer = null;
+function _dashPollTick() {
+    if (document.visibilityState !== 'visible') return;
+    loadVideos();
+}
+_dashPollTimer = setInterval(_dashPollTick, 30_000);
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') _dashPollTick();
+});
 </script>
 {% endblock %}

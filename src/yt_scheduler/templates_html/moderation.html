@@ -4,7 +4,10 @@
 {% block content %}
 <div class="page-header">
     <h1>{{ current_project.name }} / Moderation</h1>
-    <button class="btn btn-primary" onclick="runNow()">Run check now</button>
+    <div style="display: flex; align-items: center; gap: 1rem;">
+        <span id="moderation-status" style="color: var(--text-muted); font-size: 0.9rem;"></span>
+        <button class="btn btn-primary" onclick="runNow()">Run check now</button>
+    </div>
 </div>
 
 <div class="detail-grid">
@@ -52,7 +55,7 @@ function _ensureUtc(iso) {
 }
 
 async function loadBlocklist() {
-    const resp = await fetch('/api/settings/blocklist');
+    const resp = await fetch('/api/settings/blocklist', {_silent: true});
     const items = await resp.json();
     const area = document.getElementById('blocklist-area');
     if (items.length === 0) {
@@ -86,8 +89,35 @@ async function removeKeyword(id) {
     loadBlocklist();
 }
 
+function fmtRelative(iso) {
+    const d = new Date(_ensureUtc(iso));
+    if (Number.isNaN(d.getTime())) return '?';
+    const diffMs = d.getTime() - Date.now();
+    const absMin = Math.round(Math.abs(diffMs) / 60_000);
+    const future = diffMs > 0;
+    if (absMin < 1) return future ? 'in <1 min' : 'just now';
+    if (absMin < 60) return future ? `in ${absMin} min` : `${absMin} min ago`;
+    const hours = Math.round(absMin / 60);
+    if (hours < 24) return future ? `in ${hours}h` : `${hours}h ago`;
+    return d.toLocaleString();
+}
+
+async function loadModerationStatus() {
+    try {
+        const resp = await fetch('/api/settings/moderation-status', {_silent: true});
+        if (!resp.ok) return;
+        const s = await resp.json();
+        const el = document.getElementById('moderation-status');
+        if (!s.last_run || !s.next_run) {
+            el.textContent = 'Background check: not scheduled';
+            return;
+        }
+        el.textContent = `Last checked ${fmtRelative(s.last_run)} • next ${fmtRelative(s.next_run)} (every ${s.interval_minutes}m)`;
+    } catch {}
+}
+
 async function loadLog() {
-    const resp = await fetch('/api/settings/moderation-log');
+    const resp = await fetch('/api/settings/moderation-log', {_silent: true});
     const items = await resp.json();
     const area = document.getElementById('log-area');
     if (items.length === 0) {
@@ -130,5 +160,21 @@ async function runNow() {
 
 loadBlocklist();
 loadLog();
+loadModerationStatus();
+
+// Refresh log + status periodically so background check ticks become
+// visible without the user reloading. Status changes every minute (the
+// "X min ago" line), so 60s feels right; pause when tab is hidden.
+let _modPollTimer = setInterval(() => {
+    if (document.visibilityState !== 'visible') return;
+    loadLog();
+    loadModerationStatus();
+}, 60_000);
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+        loadLog();
+        loadModerationStatus();
+    }
+});
 </script>
 {% endblock %}
