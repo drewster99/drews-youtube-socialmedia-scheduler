@@ -41,6 +41,16 @@
 <script>
 const projectSlug = "{{ current_project.slug }}";
 
+// SQLite's datetime('now') returns naive UTC. Safari parses those as
+// local time; coerce to ISO-with-Z so they parse as UTC.
+function _ensureUtc(iso) {
+    if (typeof iso !== 'string') return iso;
+    if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(iso) && !/(?:Z|[+-]\d\d:?\d\d)$/.test(iso)) {
+        return iso.replace(' ', 'T') + 'Z';
+    }
+    return iso;
+}
+
 async function loadBlocklist() {
     const resp = await fetch('/api/settings/blocklist');
     const items = await resp.json();
@@ -88,7 +98,7 @@ async function loadLog() {
         <thead><tr><th>Date</th><th>Video</th><th>Author</th><th>Comment</th><th>Matched</th><th>Action</th></tr></thead>
         <tbody>${items.map(i => `
             <tr>
-                <td>${new Date(i.created_at).toLocaleString()}</td>
+                <td>${new Date(_ensureUtc(i.created_at)).toLocaleString()}</td>
                 <td><a href="/projects/${projectSlug}/videos/${i.video_id}">${i.video_id}</a></td>
                 <td>${i.author || '—'}</td>
                 <td class="comment-preview">${(i.comment_text || '').slice(0, 80)}...</td>

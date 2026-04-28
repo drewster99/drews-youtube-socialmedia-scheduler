@@ -7,7 +7,7 @@ import json
 from fastapi import APIRouter, HTTPException, Query
 
 from yt_scheduler.database import get_db
-from yt_scheduler.services import social, templates as tmpl, youtube
+from yt_scheduler.services import events, social, templates as tmpl, youtube
 from yt_scheduler.services.scheduler import get_publish_lock
 from yt_scheduler.services.transcripts import srt_to_plain_text
 
@@ -88,9 +88,14 @@ async def generate_posts(video_id: str, data: dict | None = None):
     # This ensures we don't delete/recreate posts while the scheduler is sending them.
     lock = get_publish_lock(video_id)
     async with lock:
-        # Remove existing drafts for this video so regeneration replaces them
+        # Replace unsent posts on regenerate. Posts that already went out
+        # ('posted') stay for the audit trail; in-flight scheduled posts
+        # ('sending') stay because the per-post scheduler holds its own
+        # per-post lock — not the per-video publish lock — so deleting a
+        # 'sending' row here would race with an active send.
         await db.execute(
-            "DELETE FROM social_posts WHERE video_id = ? AND status = 'draft'",
+            "DELETE FROM social_posts "
+            "WHERE video_id = ? AND status NOT IN ('posted', 'sending')",
             (video_id,),
         )
 
@@ -331,6 +336,17 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
             (result.get("url", ""), post_id),
         )
         await db.commit()
+        from datetime import datetime as _dt, timezone as _tz
+        await events.record_event(
+            post["video_id"],
+            "social_post_published",
+            {
+                "platform": post["platform"],
+                "social_account_id": post.get("social_account_id"),
+                "post_url": result.get("url", ""),
+                "posted_at": _dt.now(_tz.utc).isoformat(),
+            },
+        )
         return {"status": "ok", "url": result.get("url", "")}
     except social.CredentialAuthError as e:
         if e.uuid:
@@ -479,6 +495,17 @@ async def send_all_posts(
                 (result.get("url", ""), post["id"]),
             )
             results[post["platform"]] = {"status": "posted", "url": result.get("url", "")}
+            from datetime import datetime as _dt, timezone as _tz
+            await events.record_event(
+                video_id,
+                "social_post_published",
+                {
+                    "platform": post["platform"],
+                    "social_account_id": post.get("social_account_id"),
+                    "post_url": result.get("url", ""),
+                    "posted_at": _dt.now(_tz.utc).isoformat(),
+                },
+            )
         except social.CredentialAuthError as e:
             if e.uuid:
                 await mark_needs_reauth(e.uuid)

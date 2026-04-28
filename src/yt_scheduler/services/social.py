@@ -320,8 +320,18 @@ class TwitterPoster(SocialPoster):
                     media_ids = [media_id]
 
             try:
-                client = tweepy.Client(access_token=bearer)
-                response = client.create_tweet(text=text, media_ids=media_ids)
+                # Two stacked tweepy gotchas with OAuth 2.0 user-context:
+                # 1. ``tweepy.Client(access_token=...)`` makes tweepy try
+                #    to build an OAuth1Session — must use ``bearer_token=``.
+                # 2. ``create_tweet`` defaults ``user_auth=True``, which
+                #    again routes through OAuth1 even when constructed
+                #    with bearer_token only — must pass ``user_auth=False``
+                #    so tweepy uses our bearer. Skipping either one yields
+                #    "Consumer key must be string or bytes, not NoneType".
+                client = tweepy.Client(bearer_token=bearer)
+                response = client.create_tweet(
+                    text=text, media_ids=media_ids, user_auth=False,
+                )
             except tweepy.errors.Unauthorized as exc:
                 # Bearer expired (~2h lifetime). Try once with refresh_token.
                 new_bearer = await _twitter_refresh_bearer(creds)
@@ -336,9 +346,11 @@ class TwitterPoster(SocialPoster):
                 if has_media:
                     media_id = await _upload_media(new_bearer)
                     media_ids = [media_id] if media_id else None
-                client = tweepy.Client(access_token=new_bearer)
+                client = tweepy.Client(bearer_token=new_bearer)
                 try:
-                    response = client.create_tweet(text=text, media_ids=media_ids)
+                    response = client.create_tweet(
+                        text=text, media_ids=media_ids, user_auth=False,
+                    )
                 except tweepy.errors.Unauthorized as exc2:
                     raise CredentialAuthError(
                         creds.get("uuid"),

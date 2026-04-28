@@ -69,6 +69,16 @@
 <script>
 const params = new URLSearchParams(window.location.search);
 const videoId = params.get('video_id');
+
+// SQLite's datetime('now') returns naive UTC. Safari parses those as
+// local time; coerce to ISO-with-Z so they parse as UTC.
+function _ensureUtc(iso) {
+    if (typeof iso !== 'string') return iso;
+    if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(iso) && !/(?:Z|[+-]\d\d:?\d\d)$/.test(iso)) {
+        return iso.replace(' ', 'T') + 'Z';
+    }
+    return iso;
+}
 if (!videoId) {
     document.querySelector('.page-header h1').textContent = 'Socials from template — missing video_id';
 }
@@ -143,6 +153,14 @@ async function generatePreviews() {
     const templateName = document.getElementById('template-picker').value;
     const userMessage = document.getElementById('user-message').value;
 
+    // send_message is the only built-in whose body is literally
+    // {{user_message}}. With nothing typed, every generated post is
+    // empty — easy to mistake for "the template was ignored".
+    if (templateName === 'send_message' && !userMessage.trim()) {
+        showToast('send_message needs text in "User message" — every post will be empty otherwise.', 'error');
+        return;
+    }
+
     document.getElementById('btn-generate').disabled = true;
     const resp = await fetch(`/api/social/generate-posts/${videoId}`, {
         method: 'POST',
@@ -185,7 +203,7 @@ function renderPreviews() {
                     <span class="platform-badge platform-${p.platform}">${p.platform}</span>
                 </label>
                 <span class="compose-status">${
-                    isPosted ? 'Posted ' + new Date(p.posted_at).toLocaleString() :
+                    isPosted ? 'Posted ' + new Date(_ensureUtc(p.posted_at)).toLocaleString() :
                     isFailed ? 'Error: ' + (p.error || 'unknown') : ''
                 }</span>
             </div>

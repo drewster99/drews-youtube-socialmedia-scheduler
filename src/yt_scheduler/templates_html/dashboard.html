@@ -26,11 +26,22 @@
 <script>
 const projectSlug = "{{ current_project.slug }}";
 
+// SQLite's datetime('now') returns naive UTC strings ("2026-04-27 20:00:00").
+// Safari parses those as local time, shifting timestamps by the viewer's
+// UTC offset. Coerce to ISO-with-Z so they parse as UTC.
+function _ensureUtc(iso) {
+    if (typeof iso !== 'string') return iso;
+    if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(iso) && !/(?:Z|[+-]\d\d:?\d\d)$/.test(iso)) {
+        return iso.replace(' ', 'T') + 'Z';
+    }
+    return iso;
+}
+
 function fmtScheduledWhen(iso) {
     /* Same shape as the Home page's fmtWhen — Mon 4/27 2:30pm — so the
      * dashboard scheduled-time line reads consistently with the Upcoming
      * panel users may have come from. */
-    const d = new Date(iso);
+    const d = new Date(_ensureUtc(iso));
     if (Number.isNaN(d.getTime())) return iso;
     const dow = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()];
     const sameYear = d.getFullYear() === new Date().getFullYear();
@@ -68,7 +79,7 @@ async function loadVideos() {
             // whether status is exactly 'scheduled' (covers the brief
             // window where the scheduler has the job pending but the
             // status hasn't been flipped yet).
-            const scheduledFuture = v.publish_at && new Date(v.publish_at).getTime() > now;
+            const scheduledFuture = v.publish_at && new Date(_ensureUtc(v.publish_at)).getTime() > now;
             const scheduleLine = scheduledFuture
                 ? `<div class="video-schedule">⏰ Scheduled: <strong>${fmtScheduledWhen(v.publish_at)}</strong></div>`
                 : '';
@@ -86,7 +97,7 @@ async function loadVideos() {
                             <span class="badge badge-${v.status}">${v.status}</span>
                             <span class="badge badge-${v.privacy_status}">${v.privacy_status}</span>
                         </div>
-                        <time>${new Date(v.created_at).toLocaleDateString()}</time>
+                        <time>${new Date(_ensureUtc(v.created_at)).toLocaleDateString()}</time>
                     </div>
                 </a>
             `;
