@@ -135,7 +135,7 @@ async function loadAvailableImports() {
                         <h3>${v.title}</h3>
                         <div class="video-meta">
                             <span class="badge badge-${v.privacy_status || 'unlisted'}">${v.privacy_status || 'unknown'}</span>
-                            <time>${v.published_at ? new Date(v.published_at).toLocaleDateString() : ''}</time>
+                            <time>${v.published_at ? new Date(_ensureUtc(v.published_at)).toLocaleDateString() : ''}</time>
                         </div>
                         <button class="btn btn-sm btn-primary" data-import-id="${v.video_id}">+ Import</button>
                     </div>

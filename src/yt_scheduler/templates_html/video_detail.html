@@ -831,7 +831,7 @@ let platformConfigs = {};
 
 async function loadPlatformConfigs() {
     try {
-        const resp = await fetch('/api/settings/social');
+        const resp = await fetch('/api/settings/social', {_silent: true});
         platformConfigs = await resp.json();
     } catch (e) {
         platformConfigs = {};
