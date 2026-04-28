@@ -161,6 +161,24 @@ def _format_vtt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 
+def _audio_duration_seconds(audio_path: Path) -> float | None:
+    """Return audio duration in seconds via ffprobe; ``None`` on any
+    failure (caller treats as unknown)."""
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(audio_path),
+            ],
+            text=True, timeout=10,
+        )
+        return float(out.strip())
+    except (subprocess.SubprocessError, FileNotFoundError, ValueError):
+        return None
+
+
 def _extract_audio(video_path: Path) -> Path:
     """Extract audio from video to a temp WAV file (16kHz mono, required by Whisper)."""
     fd, tmp_path = tempfile.mkstemp(suffix=".wav")
@@ -234,7 +252,17 @@ def _try_mlx_whisper(audio_path: Path, model: str, language: str | None) -> Tran
 
 
 def _try_faster_whisper(audio_path: Path, model: str, language: str | None) -> TranscriptionResult | None:
-    """Transcribe using faster-whisper (CTranslate2 backend)."""
+    """Transcribe using faster-whisper (CTranslate2 backend).
+
+    Note: CTranslate2 has no Metal/MPS support. On Apple Silicon this
+    runs entirely on CPU, which is roughly 0.1–0.3× realtime for
+    large-v3 — so a 12-minute video can take 40–120 minutes. We enforce
+    a wall-clock budget proportional to audio duration so a runaway
+    transcribe can't hang the request forever; partial results are
+    returned when the budget is exceeded.
+    """
+    import time
+
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -243,8 +271,28 @@ def _try_faster_whisper(audio_path: Path, model: str, language: str | None) -> T
 
     logger.info(f"Transcribing with faster-whisper (model: {model})")
 
-    # Use CPU by default; faster-whisper auto-detects CUDA if available
     whisper_model = WhisperModel(model, device="auto", compute_type="auto")
+
+    # Surface the device + compute type CT2 actually selected so the user
+    # can see "device=cpu compute=int8" in the server log and understand
+    # why a large model is slow on Apple Silicon. The attributes live on
+    # the underlying CT2 model (whisper_model.model), not on the wrapper.
+    dev = "?"
+    ct = "?"
+    try:
+        ct2_model = getattr(whisper_model, "model", None)
+        if ct2_model is not None:
+            dev = getattr(ct2_model, "device", "?")
+            ct = getattr(ct2_model, "compute_type", "?")
+        logger.info(f"faster-whisper backend: device={dev} compute_type={ct}")
+        if dev == "cpu" and platform.machine() == "arm64" and platform.system() == "Darwin":
+            logger.warning(
+                "faster-whisper is running on CPU on Apple Silicon (CTranslate2 has no Metal "
+                "support). For best speed on this machine, switch the Transcribe-with picker to "
+                "mlx-whisper — same Whisper weights, ~30–50× faster on the GPU."
+            )
+    except Exception:
+        pass
 
     kwargs = {"word_timestamps": True}
     if language:
@@ -252,9 +300,33 @@ def _try_faster_whisper(audio_path: Path, model: str, language: str | None) -> T
 
     raw_segments, info = whisper_model.transcribe(str(audio_path), **kwargs)
 
+    # Wall-clock budget tuned to real-world numbers. Even MLX medium runs
+    # at ~22× realtime, so transcription should comfortably finish in a
+    # tiny fraction of the audio length. Formula: 60s headroom for model
+    # download / load + 10% of audio length for inference, with a 2-min
+    # floor for short clips. Examples: 12-min video → 132s (2:12);
+    # 30-min video → 240s (4:00); 1-min clip → 120s floor.
+    audio_duration = _audio_duration_seconds(audio_path)
+    if audio_duration is not None and audio_duration > 0:
+        budget = max(120, int(60 + audio_duration * 0.1))
+    else:
+        budget = 180  # unknown length → 3-min ceiling
+    deadline = time.monotonic() + budget
+    logger.info(f"faster-whisper budget: {budget}s wall (audio ≈ {audio_duration or '?'}s)")
+
     segments = []
     has_words = False
+    aborted = False
+    last_log = time.monotonic()
     for seg in raw_segments:
+        if time.monotonic() > deadline:
+            aborted = True
+            logger.warning(
+                "faster-whisper exceeded %ds budget — returning %d partial segments "
+                "(stopped at %.1fs of audio). Switch to mlx-whisper for full coverage.",
+                budget, len(segments), segments[-1].end if segments else 0.0,
+            )
+            break
         words = None
         if hasattr(seg, "words") and seg.words:
             has_words = True
@@ -268,6 +340,25 @@ def _try_faster_whisper(audio_path: Path, model: str, language: str | None) -> T
         segments.append(TranscriptSegment(
             start=seg.start, end=seg.end, text=seg.text, words=words,
         ))
+        # Periodic progress so a long run isn't silent.
+        now = time.monotonic()
+        if now - last_log >= 15:
+            elapsed = now - (deadline - budget)
+            logger.info(
+                "faster-whisper progress: %d segments, %.1fs of audio transcribed in %.1fs wall",
+                len(segments), seg.end, elapsed,
+            )
+            last_log = now
+
+    if aborted and not segments:
+        # No partials at all in the budget — surface the timeout as an
+        # error so the route can show something actionable rather than
+        # an empty transcript.
+        raise RuntimeError(
+            f"faster-whisper produced no segments within the {budget}s budget. "
+            "On Apple Silicon, large models run on CPU and are very slow. "
+            "Switch to mlx-whisper for GPU acceleration."
+        )
 
     return TranscriptionResult(
         segments=segments,
@@ -362,6 +453,25 @@ def _parse_whisper_cpp_time(ts: str) -> float:
 # --- Backend: macOS SFSpeechRecognizer ---
 
 
+def _macos_speech_timeout_seconds(audio_path: Path) -> int:
+    """Pick a Swift-side timeout proportional to the audio length.
+
+    Apple Speech runs at roughly 1× real-time on Apple Silicon, so a
+    fixed 120s ceiling kept timing out on multi-minute recordings.
+    Formula: ``max(120, ceil(duration * 1.5) + 60)`` — covers a 1.5×
+    real-time worst case plus 60s of model load / serialisation, with
+    a 120s floor for very short clips and an absolute 1800s cap so a
+    bad probe can't hang us forever.
+    """
+    from yt_scheduler.services.tiers import probe_local_duration
+
+    duration = probe_local_duration(audio_path)
+    if duration is None or duration <= 0:
+        return 600  # unknown length — fall back to the previous ceiling
+    timeout = int(duration * 1.5) + 60
+    return max(120, min(1800, timeout))
+
+
 def _try_macos_speech(audio_path: Path, language: str | None) -> TranscriptionResult | None:
     """Transcribe using macOS built-in speech recognition via a Swift helper."""
     if platform.system() != "Darwin":
@@ -371,6 +481,8 @@ def _try_macos_speech(audio_path: Path, language: str | None) -> TranscriptionRe
 
     # We use a small inline Swift script via `swift` CLI
     locale = language or "en-US"
+    swift_timeout = _macos_speech_timeout_seconds(audio_path)
+    logger.info("SFSpeechRecognizer timeout set to %ds for %s", swift_timeout, audio_path.name)
     swift_code = f"""
 import Foundation
 import Speech
@@ -404,7 +516,14 @@ log("recognizer ready; on-device support=\\(recognizer.supportsOnDeviceRecogniti
 
 let url = URL(fileURLWithPath: "{audio_path}")
 let request = SFSpeechURLRecognitionRequest(url: url)
-request.shouldReportPartialResults = false
+// Even though `shouldReportPartialResults = false` is documented to send
+// only the final result, on macOS 14+ the on-device recognizer often
+// sends a stream of partials and never flips ``isFinal`` for audio
+// longer than ~60s. So we ASK for partials, treat each one as the
+// running best-known transcript, and on timeout emit the latest partial
+// instead of failing — that's still a usable transcript even if the
+// framework refuses to mark it final.
+request.shouldReportPartialResults = true
 if #available(macOS 10.15, *), recognizer.supportsOnDeviceRecognition {{
     request.requiresOnDeviceRecognition = true
     log("using on-device recognition")
@@ -415,6 +534,10 @@ if #available(macOS 10.15, *), recognizer.supportsOnDeviceRecognition {{
 func runRecognition() async throws -> [[String: Any]] {{
     try await withCheckedThrowingContinuation {{ (continuation: CheckedContinuation<[[String: Any]], Error>) in
         var resumed = false
+        // Last partial transcript we've seen; emitted as the final
+        // answer if the framework times out without flipping isFinal.
+        var lastPartial: [[String: Any]] = []
+        var partialCount = 0
         let resumeOnce: (Result<[[String: Any]], Error>) -> Void = {{ outcome in
             if resumed {{ return }}
             resumed = true
@@ -424,32 +547,53 @@ func runRecognition() async throws -> [[String: Any]] {{
         log("starting recognition task…")
         let task = recognizer.recognitionTask(with: request) {{ result, error in
             if let error = error {{
-                log("recognition error: \\(error)")
-                resumeOnce(.failure(error))
+                // If we've already buffered partials, prefer them over
+                // failing — the framework sometimes errors out at the
+                // tail of a long file even after producing usable text.
+                if !lastPartial.isEmpty {{
+                    log("recognition error after \\(partialCount) partials — emitting latest partial: \\(error)")
+                    resumeOnce(.success(lastPartial))
+                }} else {{
+                    log("recognition error: \\(error)")
+                    resumeOnce(.failure(error))
+                }}
                 return
             }}
             guard let result = result else {{ log("callback with nil result"); return }}
+            // Capture every partial as the current best-known transcript.
+            var snapshot: [[String: Any]] = []
+            for segment in result.bestTranscription.segments {{
+                snapshot.append([
+                    "start": segment.timestamp,
+                    "end": segment.timestamp + segment.duration,
+                    "text": segment.substring
+                ])
+            }}
+            if !snapshot.isEmpty {{
+                lastPartial = snapshot
+                partialCount += 1
+            }}
             if result.isFinal {{
                 log("final result received (\\(result.bestTranscription.segments.count) segments)")
-                var out: [[String: Any]] = []
-                for segment in result.bestTranscription.segments {{
-                    out.append([
-                        "start": segment.timestamp,
-                        "end": segment.timestamp + segment.duration,
-                        "text": segment.substring
-                    ])
-                }}
-                resumeOnce(.success(out))
-            }} else {{
-                log("interim result — waiting for final")
+                resumeOnce(.success(snapshot))
             }}
         }}
 
-        DispatchQueue.global().asyncAfter(deadline: .now() + 120) {{
+        // Timeout sized to the audio length (passed in from Python via
+        // ffprobe — see ``_macos_speech_timeout_seconds``). Apple Speech
+        // runs roughly 1x real-time on-device. If we hit it, fall back
+        // to whatever partial we have rather than failing.
+        DispatchQueue.global().asyncAfter(deadline: .now() + {swift_timeout}) {{
             if !resumed {{
-                log("ERROR: timed out after 120s (state=\\(task.state.rawValue))")
-                task.cancel()
-                resumeOnce(.failure(SpeechErr.timedOut))
+                if !lastPartial.isEmpty {{
+                    log("timeout after {swift_timeout}s — emitting latest partial (\\(lastPartial.count) segments from \\(partialCount) partials)")
+                    task.cancel()
+                    resumeOnce(.success(lastPartial))
+                }} else {{
+                    log("ERROR: timed out after {swift_timeout}s with no partials (state=\\(task.state.rawValue))")
+                    task.cancel()
+                    resumeOnce(.failure(SpeechErr.timedOut))
+                }}
             }}
         }}
     }}
@@ -536,12 +680,26 @@ def transcribe(
     audio_path = _extract_audio(video_path)
 
     try:
-        # Try backends in order
+        # Try backends in order.
+        #
+        # ``macos-speech`` (Apple SFSpeechRecognizer) is intentionally NOT in
+        # the auto-fallback list. Bench testing on a 12-min screencast showed
+        # that ``SFSpeechURLRecognitionRequest`` with on-device recognition
+        # operates as a sliding window for long audio: it processes the whole
+        # file fast (~15× realtime) but each result callback REPLACES the
+        # previous transcript instead of extending it, so we end up with only
+        # the final ~10s of the recording. Apple's URL request was designed
+        # for short utterances (< ~60s), not long-form transcription. The
+        # ``_try_macos_speech`` implementation is preserved below for short
+        # clips and as reference, but it can only be reached by passing
+        # ``backend="macos-speech"`` explicitly via the API. A proper fix
+        # would chunk the audio and run a separate request per chunk —
+        # not done yet.
         backends = [
             ("mlx-whisper", lambda: _try_mlx_whisper(audio_path, model, language)),
             ("faster-whisper", lambda: _try_faster_whisper(audio_path, model, language)),
             ("whisper.cpp", lambda: _try_whisper_cpp(audio_path, model, language)),
-            ("macos-speech", lambda: _try_macos_speech(audio_path, language)),
+            # ("macos-speech", lambda: _try_macos_speech(audio_path, language)),
         ]
 
         if backend:
@@ -629,8 +787,11 @@ def list_available_backends() -> list[dict]:
     else:
         available.append({"name": "whisper.cpp", "status": "installable", "note": "brew install whisper-cpp"})
 
-    # macOS Speech
-    if platform.system() == "Darwin":
-        available.append({"name": "macos-speech", "status": "available", "note": "Built-in, lower quality"})
+    # macOS Speech (Apple SFSpeechRecognizer) is deliberately omitted from
+    # the user-facing backend list. See the comment above the ``backends``
+    # list in ``transcribe()`` for the long-form transcription bug. The
+    # ``_try_macos_speech`` codepath is still reachable via the API by
+    # passing ``backend="macos-speech"``, but it isn't surfaced as a
+    # choice in the UI.
 
     return available

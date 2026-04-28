@@ -18,7 +18,12 @@ cryptography>=42
 tweepy>=4.14
 Mastodon.py>=1.8
 
-# Transcription (faster-whisper works on both Intel and Apple Silicon)
+# Transcription. mlx-whisper runs on Apple Silicon GPU (Metal via MLX) and is
+# 30–50× faster than faster-whisper, which on Apple Silicon is forced onto the
+# CPU because CTranslate2 has no Metal backend. Install both: mlx-whisper as
+# the fast default for Apple Silicon, faster-whisper as the universal
+# fallback for Intel Macs.
+mlx-whisper>=0.4,<1; platform_machine=="arm64" and sys_platform=="darwin"
 faster-whisper>=1.0
 
 # YouTube video download — needed when the user re-transcribes an imported

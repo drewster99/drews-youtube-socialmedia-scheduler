@@ -81,11 +81,16 @@
                 <span id="transcribe-model-chooser">
                     using model
                     <select id="transcribe-model" class="btn btn-sm" style="background: var(--bg-input); padding: 0.3rem 0.5rem;">
-                        <option value="large-v3">large-v3 — best (~3.0 GB)</option>
-                        <option value="medium">medium — faster (~1.5 GB)</option>
-                        <option value="small">small — fast (~460 MB)</option>
-                        <option value="base">base — fastest (~140 MB)</option>
-                        <option value="tiny">tiny — lowest quality (~75 MB)</option>
+                        <!-- Models intentionally limited to small/medium/large.
+                             Bench testing on real screencast audio showed that
+                             "tiny" and "base" mangled the very first sentence
+                             ("Hi everyone" → "I have a one") and dropped
+                             technical words mid-sentence — too poor to ship as
+                             a user-selectable option. The backend code still
+                             accepts those names if forced via the API. -->
+                        <option value="large-v3">Best (large-v3, ~3.0 GB)</option>
+                        <option value="medium" selected>Better (medium, ~1.5 GB)</option>
+                        <option value="small">Good (small, ~460 MB)</option>
                     </select>
                 </span>
                 <button class="btn btn-sm btn-success" id="btn-transcribe" onclick="transcribeLocally()" style="margin-left: auto;">
@@ -129,14 +134,16 @@
                     <label>Publish Date & Time</label>
                     <input type="datetime-local" id="schedule-datetime">
                 </div>
+                <div id="schedule-post-preview" style="margin-bottom: 0.5rem;"></div>
                 <div class="form-actions">
-                    <button class="btn btn-sm btn-primary" onclick="schedulePublish()">Schedule</button>
+                    <button class="btn btn-sm btn-primary" id="btn-schedule" onclick="schedulePublish()">Schedule</button>
                     <button class="btn btn-sm btn-secondary" onclick="scheduleCollapse()">Cancel</button>
                     <button class="btn btn-sm btn-danger" id="btn-cancel-schedule" onclick="cancelSchedule()" style="display:none;">Cancel Schedule</button>
                 </div>
             </div>
             <small style="color: var(--text-muted); display: block; margin-top: 0.5rem;">
-                At the scheduled time: video goes public + all approved social posts fire simultaneously.
+                Each approved social post gets its own scheduled job at the chosen time.
+                Re-time individual posts in the Socials section to stagger.
             </small>
         </div>
 
@@ -275,10 +282,74 @@ function scheduleReveal() {
     if (!input.value) input.value = defaultScheduleValue();
     document.getElementById('schedule-collapsed').style.display = 'none';
     document.getElementById('schedule-expanded').style.display = 'block';
+    renderSchedulePostPreview();
 }
 function scheduleCollapse() {
     document.getElementById('schedule-expanded').style.display = 'none';
     document.getElementById('schedule-collapsed').style.display = 'block';
+}
+
+const PLATFORM_SHORT = {
+    twitter: 'X', bluesky: 'Bluesky', mastodon: 'Mastodon',
+    linkedin: 'LinkedIn', threads: 'Threads',
+};
+
+function renderSchedulePostPreview() {
+    const preview = document.getElementById('schedule-post-preview');
+    const btn = document.getElementById('btn-schedule');
+    if (!preview || !btn) return;
+
+    const dtStr = document.getElementById('schedule-datetime').value;
+    const videoTime = dtStr ? new Date(dtStr) : null;
+
+    const approved = socialPostsCache.filter(p => p.status === 'approved');
+    const draft = socialPostsCache.filter(p => p.status === 'draft');
+
+    btn.textContent = approved.length
+        ? `Schedule video + ${approved.length} post${approved.length === 1 ? '' : 's'}`
+        : 'Schedule video';
+
+    if (!approved.length && !draft.length) {
+        preview.innerHTML = '';
+        return;
+    }
+
+    const rows = [];
+    for (const p of approved) {
+        const platform = PLATFORM_SHORT[p.platform] || p.platform;
+        const snippet = (p.content || '').replace(/\s+/g, ' ').slice(0, 60);
+        // Per-post scheduled_at takes priority over the video's time.
+        // Only show a per-post time when the user has hand-retimed it
+        // (different from what the video schedule would assign).
+        let timeLabel = '';
+        if (p.scheduled_at) {
+            const pTime = new Date(_ensureUtc(p.scheduled_at));
+            if (!videoTime || Math.abs(pTime.getTime() - videoTime.getTime()) > 60_000) {
+                timeLabel = `<span style="color: var(--accent); margin-left: auto;">${pTime.toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'})}</span>`;
+            }
+        }
+        rows.push(`
+            <div style="display: flex; align-items: center; gap: 0.5rem; padding: 0.25rem 0; font-size: 0.85rem;">
+                <span class="platform-badge platform-${p.platform}" style="font-size: 0.7rem;">${platform}</span>
+                <span style="color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;">${escapeHtml(snippet)}${snippet.length >= 60 ? '…' : ''}</span>
+                ${timeLabel}
+            </div>
+        `);
+    }
+    for (const p of draft) {
+        const platform = PLATFORM_SHORT[p.platform] || p.platform;
+        rows.push(`
+            <div style="display: flex; align-items: center; gap: 0.5rem; padding: 0.25rem 0; font-size: 0.85rem; opacity: 0.55;">
+                <span class="platform-badge platform-${p.platform}" style="font-size: 0.7rem;">${platform}</span>
+                <span style="color: var(--text-muted);">draft — won't send</span>
+            </div>
+        `);
+    }
+    preview.innerHTML = `
+        <div style="border: 1px solid var(--border); border-radius: 4px; padding: 0.4rem 0.6rem; background: var(--bg-input);">
+            ${rows.join('')}
+        </div>
+    `;
 }
 
 async function loadVideo() {
@@ -349,11 +420,16 @@ async function loadVideo() {
     // Schedule info
     const scheduleInfo = document.getElementById('schedule-info');
     const cancelBtn = document.getElementById('btn-cancel-schedule');
-    document.getElementById('schedule-datetime').min = toLocalInputValue(new Date());
+    const scheduleInput = document.getElementById('schedule-datetime');
+    scheduleInput.min = toLocalInputValue(new Date());
+    if (!scheduleInput.dataset.previewBound) {
+        scheduleInput.addEventListener('input', renderSchedulePostPreview);
+        scheduleInput.dataset.previewBound = '1';
+    }
     const ytPrivacy = video.youtube_data?.status?.privacyStatus;
     const ytIsPublic = ytPrivacy === 'public';
     if (video.status === 'scheduled' && video.publish_at && !ytIsPublic) {
-        const pubDate = new Date(video.publish_at);
+        const pubDate = new Date(_ensureUtc(video.publish_at));
         scheduleInfo.innerHTML = `<span class="badge badge-scheduled">Scheduled</span>
             <span style="margin-left: 0.5rem;">${pubDate.toLocaleString()}</span>`;
         cancelBtn.style.display = 'inline-flex';
@@ -363,7 +439,7 @@ async function loadVideo() {
         const ytPublishedAt = video.youtube_data?.status?.publishAt
                            || video.youtube_data?.snippet?.publishedAt
                            || video.publish_at;
-        const when = ytPublishedAt ? new Date(ytPublishedAt).toLocaleString() : '';
+        const when = ytPublishedAt ? new Date(_ensureUtc(ytPublishedAt)).toLocaleString() : '';
         scheduleInfo.innerHTML = `<span class="badge badge-published">Published</span>`
                                + (when ? ` <span style="margin-left: 0.5rem;">${when}</span>` : '');
         cancelBtn.style.display = 'none';
@@ -532,8 +608,20 @@ async function saveTranscriptSelection() {
 
 // --- Per-video log ---------------------------------------------------------
 
+// SQLite's datetime('now') returns naive UTC strings like
+// "2026-04-27 20:00:00" with no timezone marker. Safari parses those as
+// local time, which shifts every timestamp by the viewer's UTC offset.
+// Coerce to ISO-with-Z so the Date constructor treats it as UTC.
+function _ensureUtc(iso) {
+    if (typeof iso !== 'string') return iso;
+    if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(iso) && !/(?:Z|[+-]\d\d:?\d\d)$/.test(iso)) {
+        return iso.replace(' ', 'T') + 'Z';
+    }
+    return iso;
+}
+
 function fmtEventDate(iso) {
-    const date = new Date(iso);
+    const date = new Date(_ensureUtc(iso));
     if (Number.isNaN(date.getTime())) return iso;
     const dow = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][date.getDay()];
     const now = new Date();
@@ -729,6 +817,18 @@ async function loadPlatformConfigs() {
     }
 }
 
+// Map from social_post.id → error message, refreshed on every load.
+// Powers the click-the-failed-badge popover so the user can recover the
+// error text after the toast fades.
+const postErrorsById = new Map();
+
+function showPostError(postId) {
+    const msg = postErrorsById.get(postId);
+    if (msg) showToast(msg, 'error');
+}
+
+let socialPostsCache = [];
+
 async function loadSocialPosts() {
     const area = document.getElementById('social-posts-area');
     const picker = document.getElementById('social-platform-picker');
@@ -738,6 +838,9 @@ async function loadSocialPosts() {
     try {
         const resp = await fetch(`/api/social/posts/${videoId}`);
         const posts = await resp.json();
+        socialPostsCache = posts;
+        renderSchedulePostPreview();
+        postErrorsById.clear();
 
         const existingPlatforms = new Set(posts.map(p => p.platform));
         const allPlatforms = ['twitter', 'bluesky', 'mastodon', 'linkedin', 'threads'];
@@ -778,6 +881,12 @@ async function loadSocialPosts() {
             if (!isConfigured && !isPosted) {
                 statusBadge = `<span class="badge badge-draft" style="background: #6e4000; color: #ffa940;">not configured</span>`;
             }
+            // Click the "failed" badge to re-display the persisted error.
+            // Easy to miss the toast first time around — this surfaces it on
+            // demand so the user can copy/screenshot the failure.
+            if (isFailed && p.error) {
+                statusBadge = `<button class="badge badge-failed" onclick="showPostError(${p.id})" title="Click to show the error" style="border:0; cursor:pointer;">failed</button>`;
+            }
 
             let actions = '';
             if (isPosted) {
@@ -785,17 +894,21 @@ async function loadSocialPosts() {
                     actions = `<a href="${p.post_url}" target="_blank" class="btn btn-sm" style="margin-left: auto;">View</a>`;
                 }
             } else {
-                const isApproved = p.status === 'approved';
+                // A post in 'failed' status was previously approved — its
+                // status was overwritten by the failed send. Treat it as
+                // already-approved so the user can just hit Send to retry
+                // instead of having to re-Approve every time.
+                const wasApproved = p.status === 'approved' || p.status === 'failed';
                 actions = `
                     <button class="btn btn-sm" onclick="saveSocialPost(${p.id})">Save</button>
-                    ${!isApproved ? `<button class="btn btn-sm btn-primary" onclick="approvePost(${p.id})">Approve</button>` : ''}
+                    ${!wasApproved ? `<button class="btn btn-sm btn-primary" onclick="approvePost(${p.id})">Approve</button>` : ''}
                     <button class="btn btn-sm btn-success" onclick="sendPost(${p.id})"
                         ${!isConfigured ? 'disabled title="Configure this platform in Settings first"' : ''}>
                         Send
                     </button>`;
             }
             if (isFailed && p.error) {
-                actions += `<span style="color: var(--danger); font-size: 0.8rem; margin-left: 0.5rem;" title="${p.error}">Failed</span>`;
+                postErrorsById.set(p.id, p.error);
             }
 
             return `
@@ -918,7 +1031,7 @@ function updateRegenerateVisibility() {
     const transcriptUpdated = videoData.transcript_updated_at;
     const descriptionGenAt = videoData.description_generated_at;
     const transcriptNewer = transcriptUpdated && descriptionGenAt
-        ? new Date(transcriptUpdated) > new Date(descriptionGenAt)
+        ? new Date(_ensureUtc(transcriptUpdated)) > new Date(_ensureUtc(descriptionGenAt))
         : (transcriptUpdated && !descriptionGenAt);
     const showRow = imported || transcriptNewer || (!hasTranscript && hasLocalFile);
 
@@ -1028,8 +1141,23 @@ async function regeneratePosts() {
 
 async function doGeneratePosts(platforms) {
     const btn = document.getElementById('btn-generate-posts');
+    const area = document.getElementById('social-posts-area');
+    const picker = document.getElementById('social-platform-picker');
     btn.disabled = true;
-    btn.textContent = 'Generating...';
+    btn.textContent = 'Generating…';
+    // AI rendering can take 5–30s per platform; replace the area with an
+    // explicit spinner so the user can see something is happening, and
+    // hide the picker so they don't double-click.
+    if (picker) picker.style.display = 'none';
+    const platformsLabel = (platforms && platforms.length)
+        ? platforms.join(', ')
+        : 'all platforms';
+    area.innerHTML = `
+        <div style="text-align: center; padding: 2rem;">
+            <div class="spinner" style="display:inline-block; width:24px; height:24px; border:3px solid var(--border); border-top-color: var(--accent); border-radius:50%; animation: spin 1s linear infinite;"></div>
+            <p style="margin-top: 0.5rem; color: var(--text-muted);">Generating posts for ${escapeHtml(platformsLabel)}…</p>
+            <style>@keyframes spin { to { transform: rotate(360deg); } }</style>
+        </div>`;
     try {
         const body = {};
         if (platforms) body.platforms = platforms;
@@ -1037,13 +1165,23 @@ async function doGeneratePosts(platforms) {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(body),
+            _silent: true,
         });
         if (resp.ok) {
-            showToast('Social posts generated!', 'success');
-            loadSocialPosts();
+            const generated = await resp.json();
+            const count = Array.isArray(generated) ? generated.length : 0;
+            showToast(
+                count
+                    ? `Generated ${count} post${count === 1 ? '' : 's'} for ${platformsLabel}.`
+                    : `No posts generated — the template has no slots for ${platformsLabel}.`,
+                count ? 'success' : 'error',
+            );
+            await loadSocialPosts();
         } else {
-            const err = await resp.json();
-            showToast(err.detail || 'Failed to generate posts', 'error');
+            let detail = 'Failed to generate posts';
+            try { detail = (await resp.json()).detail || detail; } catch {}
+            showToast(detail, 'error');
+            await loadSocialPosts();
         }
     } finally {
         btn.disabled = false;
@@ -1259,8 +1397,17 @@ async function schedulePublish() {
     });
     const result = await resp.json();
     if (resp.ok) {
-        showToast(`Scheduled! Video + social posts will fire at ${new Date(result.publish_at).toLocaleString()}`, 'success');
+        const approved = socialPostsCache.filter(p => p.status === 'approved').length;
+        const when = new Date(_ensureUtc(result.publish_at)).toLocaleString();
+        showToast(
+            approved
+                ? `Scheduled video + ${approved} post${approved === 1 ? '' : 's'} for ${when}`
+                : `Scheduled video for ${when}`,
+            'success',
+        );
         loadVideo();
+        loadSocialPosts();
+        loadEventLog();
     } else {
         showToast(result.detail || 'Failed to schedule', 'error');
     }
