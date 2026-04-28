@@ -480,23 +480,22 @@ async def restore_scheduled_posts() -> None:
 
 
 async def schedule_publish(video_id: str, publish_at: datetime) -> str:
-    """Schedule a video and all its approved, unscheduled social posts.
+    """Schedule a video and all its approved social posts.
 
-    For each approved social post on the video that doesn't already have its
-    own ``scheduled_at``, register a per-post APScheduler job at the same
-    instant the video flips public. This way the Log card shows one entry
-    per post (via the existing ``social_post_scheduled`` event), and the
-    user can later re-time any individual post without affecting the rest.
+    For each approved social post on the video, register a per-post
+    APScheduler job staggered using the project's posting settings:
+    ``post_video_delay_minutes`` for the offset of the first post,
+    ``inter_post_spacing_minutes`` between subsequent posts. Same math
+    the Socials Compose page uses.
 
-    Posts with their own custom ``scheduled_at`` (set by the user via the
-    Socials tab) are deliberate and left alone, except for the special
-    case where a previous call to this function auto-attached them at the
-    prior ``video.publish_at`` — those get re-targeted to the new time so
-    re-scheduling the video moves all auto-attached posts together.
+    The video's schedule owns its per-post jobs — re-scheduling or
+    cancelling the video re-baselines all of them. A user who wants a
+    custom time for one post should re-time it AFTER scheduling the
+    video, and accept that another video re-schedule will overwrite it.
 
-    ``publish_video_job`` still walks any remaining ``approved`` posts at
-    fire time as a safety net (e.g. user approved a new post after
-    scheduling), and the atomic claim prevents double-sends when both
+    ``publish_video_job`` still walks any remaining ``approved`` posts
+    at fire time as a safety net (e.g. user approved a new post after
+    scheduling). The atomic claim prevents double-sends when both
     paths target the same post.
     """
     if publish_at.tzinfo is None:
@@ -504,21 +503,26 @@ async def schedule_publish(video_id: str, publish_at: datetime) -> str:
 
     db = await get_db()
 
-    cursor = await db.execute("SELECT publish_at FROM videos WHERE id = ?", (video_id,))
+    cursor = await db.execute(
+        "SELECT project_id FROM videos WHERE id = ?", (video_id,)
+    )
     row = await cursor.fetchone()
-    prior_publish_at = row["publish_at"] if row else None
+    project_id = int(row["project_id"]) if row and row["project_id"] is not None else 1
 
-    # Posts auto-attached to the prior schedule are identified by
-    # scheduled_at == prior video.publish_at. Detach them now; we'll
-    # re-attach to the new time below alongside any newly approved posts.
-    if prior_publish_at:
-        prior_attached = await db.execute_fetchall(
-            "SELECT id FROM social_posts "
-            "WHERE video_id = ? AND scheduled_at = ? AND scheduler_job_id IS NOT NULL",
-            (video_id, prior_publish_at),
-        )
-        for r in prior_attached:
-            await cancel_scheduled_post(int(r["id"]))
+    # The video's schedule owns all of its currently-pending per-post
+    # jobs. Detach them all so we can re-attach with the new time and
+    # current stagger settings. Hand-retimed posts the user set via the
+    # per-post API after the prior schedule_publish are intentionally
+    # re-baselined — re-scheduling the video is the explicit "reset
+    # everything" action. Already-posted posts have scheduler_job_id
+    # NULL'd by _send_scheduled_post on success, so they're skipped.
+    pending = await db.execute_fetchall(
+        "SELECT id FROM social_posts "
+        "WHERE video_id = ? AND scheduler_job_id IS NOT NULL",
+        (video_id,),
+    )
+    for r in pending:
+        await cancel_scheduled_post(int(r["id"]))
 
     job_id = f"publish_{video_id}"
     existing = scheduler.get_job(job_id)
@@ -540,15 +544,29 @@ async def schedule_publish(video_id: str, publish_at: datetime) -> str:
     )
     await db.commit()
 
+    # Stagger using the project's posting settings. Same math the
+    # Socials Compose page uses, so the two scheduling paths produce
+    # identical timing for the same posts.
+    from datetime import timedelta
+    from yt_scheduler.services import project_settings as _ps
+    posting = await _ps.get_posting_settings(project_id)
+    delay_min = int(posting.get("post_video_delay_minutes", 15) or 0)
+    spacing_min = int(posting.get("inter_post_spacing_minutes", 5) or 0)
+
+    # All approved posts get a per-post job. After the cancel above,
+    # any scheduled_at values from the prior schedule are nulled, so
+    # the WHERE filter on status alone selects the full set.
     approved = await db.execute_fetchall(
         "SELECT id FROM social_posts "
-        "WHERE video_id = ? AND status = 'approved' AND scheduled_at IS NULL",
+        "WHERE video_id = ? AND status = 'approved' "
+        "ORDER BY id",
         (video_id,),
     )
     attached_count = 0
-    for r in approved:
+    for i, r in enumerate(approved):
+        when = publish_at + timedelta(minutes=delay_min + i * spacing_min)
         try:
-            await schedule_social_post(int(r["id"]), publish_at)
+            await schedule_social_post(int(r["id"]), when)
             attached_count += 1
         except Exception as exc:
             logger.error(
@@ -557,18 +575,14 @@ async def schedule_publish(video_id: str, publish_at: datetime) -> str:
             )
 
     logger.info(
-        "Scheduled video %s + %d posts for %s",
-        video_id, attached_count, publish_at.isoformat(),
+        "Scheduled video %s for %s + %d posts (delay=%dm, spacing=%dm)",
+        video_id, publish_at.isoformat(), attached_count, delay_min, spacing_min,
     )
     return job_id
 
 
 async def cancel_scheduled_publish(video_id: str) -> bool:
-    """Cancel the video's publish job and any posts auto-attached to it.
-
-    Posts the user re-timed independently (``scheduled_at`` differs from
-    ``video.publish_at``) keep their own per-post jobs.
-    """
+    """Cancel the video's publish job and all of its pending per-post jobs."""
     job_id = f"publish_{video_id}"
     db = await get_db()
 
@@ -576,14 +590,16 @@ async def cancel_scheduled_publish(video_id: str) -> bool:
     row = await cursor.fetchone()
     publish_at = row["publish_at"] if row else None
 
-    if publish_at:
-        attached = await db.execute_fetchall(
-            "SELECT id FROM social_posts "
-            "WHERE video_id = ? AND scheduled_at = ? AND scheduler_job_id IS NOT NULL",
-            (video_id, publish_at),
-        )
-        for r in attached:
-            await cancel_scheduled_post(int(r["id"]))
+    # The video schedule owns its per-post jobs; cancelling the video
+    # cancels them all. Already-posted posts have scheduler_job_id=NULL
+    # so they're skipped automatically.
+    pending = await db.execute_fetchall(
+        "SELECT id FROM social_posts "
+        "WHERE video_id = ? AND scheduler_job_id IS NOT NULL",
+        (video_id,),
+    )
+    for r in pending:
+        await cancel_scheduled_post(int(r["id"]))
 
     existing = scheduler.get_job(job_id)
     if not existing and not publish_at:

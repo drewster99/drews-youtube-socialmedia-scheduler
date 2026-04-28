@@ -142,8 +142,8 @@
                 </div>
             </div>
             <small style="color: var(--text-muted); display: block; margin-top: 0.5rem;">
-                Each approved social post gets its own scheduled job at the chosen time.
-                Re-time individual posts in the Socials section to stagger.
+                Posts stagger using the project's posting settings (delay + spacing).
+                Adjust those in Project Settings to change the cadence.
             </small>
         </div>
 
@@ -314,19 +314,20 @@ function renderSchedulePostPreview() {
         return;
     }
 
+    // Predict each post's time using the project's stagger settings —
+    // matches what the server will compute when Schedule fires.
+    const delayMin = Number(postingSettingsCache?.post_video_delay_minutes ?? 15);
+    const spacingMin = Number(postingSettingsCache?.inter_post_spacing_minutes ?? 5);
+
     const rows = [];
-    for (const p of approved) {
+    approved.forEach((p, i) => {
         const platform = PLATFORM_SHORT[p.platform] || p.platform;
         const snippet = (p.content || '').replace(/\s+/g, ' ').slice(0, 60);
-        // Per-post scheduled_at takes priority over the video's time.
-        // Only show a per-post time when the user has hand-retimed it
-        // (different from what the video schedule would assign).
         let timeLabel = '';
-        if (p.scheduled_at) {
-            const pTime = new Date(_ensureUtc(p.scheduled_at));
-            if (!videoTime || Math.abs(pTime.getTime() - videoTime.getTime()) > 60_000) {
-                timeLabel = `<span style="color: var(--accent); margin-left: auto;">${pTime.toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'})}</span>`;
-            }
+        if (videoTime) {
+            const offsetMs = (delayMin + i * spacingMin) * 60_000;
+            const pTime = new Date(videoTime.getTime() + offsetMs);
+            timeLabel = `<span style="color: var(--accent); margin-left: auto; font-variant-numeric: tabular-nums;">${pTime.toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'})}</span>`;
         }
         rows.push(`
             <div style="display: flex; align-items: center; gap: 0.5rem; padding: 0.25rem 0; font-size: 0.85rem;">
@@ -335,7 +336,7 @@ function renderSchedulePostPreview() {
                 ${timeLabel}
             </div>
         `);
-    }
+    });
     for (const p of draft) {
         const platform = PLATFORM_SHORT[p.platform] || p.platform;
         rows.push(`
@@ -828,12 +829,26 @@ function showPostError(postId) {
 }
 
 let socialPostsCache = [];
+let postingSettingsCache = null;
+
+async function loadPostingSettings() {
+    if (postingSettingsCache) return postingSettingsCache;
+    try {
+        const resp = await fetch(`/api/projects/${projectSlug}/posting-settings`, {_silent: true});
+        if (resp.ok) postingSettingsCache = await resp.json();
+    } catch {}
+    if (!postingSettingsCache) {
+        postingSettingsCache = {post_video_delay_minutes: 15, inter_post_spacing_minutes: 5};
+    }
+    return postingSettingsCache;
+}
 
 async function loadSocialPosts() {
     const area = document.getElementById('social-posts-area');
     const picker = document.getElementById('social-platform-picker');
 
     await loadPlatformConfigs();
+    await loadPostingSettings();
 
     try {
         const resp = await fetch(`/api/social/posts/${videoId}`);
