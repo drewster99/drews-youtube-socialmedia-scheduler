@@ -474,6 +474,7 @@ async function loadVideo() {
     loadSocialPosts();
     loadComments();
     loadEventLog();
+    startLogPolling();
 }
 
 async function copyVideoURL() {
@@ -704,7 +705,7 @@ let eventCache = [];
 async function loadEventLog() {
     const area = document.getElementById('log-area');
     try {
-        const resp = await fetch(`/api/videos/${videoId}/events`);
+        const resp = await fetch(`/api/videos/${videoId}/events`, {_silent: true});
         if (!resp.ok) {
             area.innerHTML = '<p class="empty-state">Could not load log.</p>';
             return;
@@ -720,6 +721,25 @@ async function loadEventLog() {
         area.innerHTML = '<p class="empty-state">Could not load log.</p>';
     }
 }
+
+// Poll the Log + social posts every 15s while the tab is visible.
+// Background scheduler events (publish, social_post_scheduled,
+// social_post_published) fire server-side without any user action, so
+// without polling the user has to hit refresh to see them. Pause when
+// the tab is hidden so we're not burning quota for nothing.
+let _logPollTimer = null;
+function _logPollTick() {
+    if (document.visibilityState !== 'visible') return;
+    loadEventLog();
+    loadSocialPosts();
+}
+function startLogPolling() {
+    if (_logPollTimer) return;
+    _logPollTimer = setInterval(_logPollTick, 15_000);
+}
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') _logPollTick();
+});
 
 document.addEventListener('click', (event) => {
     const fieldLink = event.target.closest?.('.event-field-link');
