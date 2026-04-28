@@ -125,6 +125,24 @@ async def publish_video_job(video_id: str) -> dict:
         except Exception as e:
             logger.error(f"Failed to publish video {video_id}: {e}")
             results["publish_error"] = str(e)
+            # Auth-shaped failures need user action. Surface them in
+            # the Log so the user sees "Credential for YouTube is
+            # invalid — Update" instead of having to find the warning
+            # in the server logs.
+            err_text = str(e).lower()
+            if any(needle in err_text for needle in (
+                "invalid_grant", "unauthorized", "401",
+                "credentials", "refresh", "not authenticated",
+            )):
+                await events.record_event(
+                    video_id,
+                    "credential_invalid",
+                    {
+                        "scope": "youtube",
+                        "account_label": "YouTube channel",
+                        "error": str(e),
+                    },
+                )
             # Don't fire social posts if video didn't go public
             return results
 
@@ -412,10 +430,33 @@ async def _send_scheduled_post(post_id: int) -> None:
         )
     except Exception as exc:
         from yt_scheduler.services.social import CredentialAuthError
-        from yt_scheduler.services.social_credentials import mark_needs_reauth
+        from yt_scheduler.services.social_credentials import (
+            format_account_label, get_credential_by_uuid, mark_needs_reauth,
+        )
 
         if isinstance(exc, CredentialAuthError) and exc.uuid:
             await mark_needs_reauth(exc.uuid)
+            cred = await get_credential_by_uuid(exc.uuid)
+            label = format_account_label(
+                post["platform"],
+                (cred or {}).get("username"),
+            )
+            # Record a user-visible event so the Log card surfaces this
+            # with an "Update" link instead of just the credentialed
+            # service silently dropping posts. Same payload shape used
+            # for YouTube auth failures elsewhere — frontend renders a
+            # single credential_invalid type for both.
+            await events.record_event(
+                post["video_id"],
+                "credential_invalid",
+                {
+                    "scope": "social",
+                    "platform": post["platform"],
+                    "account_label": label,
+                    "uuid": exc.uuid,
+                    "error": str(exc),
+                },
+            )
         logger.error("Failed to send scheduled post %s: %s", post_id, exc)
         await db.execute(
             "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",

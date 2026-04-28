@@ -700,6 +700,15 @@ function renderEvent(ev) {
             const priv = ev.payload?.video_privacy || '?';
             return `${ts} <span style="color: var(--danger);">Social post failed — YouTube video is ${escapeHtml(priv)}, not public [${escapeHtml(platform)}] — use Send below to retry</span>`;
         }
+        case 'credential_invalid': {
+            const scope = ev.payload?.scope || 'account';
+            const label = ev.payload?.account_label || (scope === 'youtube' ? 'YouTube' : 'social');
+            const settingsUrl = `/projects/${projectSlug}/settings`;
+            const subject = scope === 'youtube'
+                ? `YouTube account '${escapeHtml(label)}'`
+                : `social account '${escapeHtml(label)}'`;
+            return `${ts} <span style="color: var(--danger);">Credential for ${subject} is invalid. <a href="${settingsUrl}" class="btn btn-sm btn-primary" style="margin-left: 0.5rem; padding: 0.1rem 0.5rem;">Update</a></span>`;
+        }
         default:
             return `${ts} <span>${escapeHtml(ev.type)}</span>`;
     }

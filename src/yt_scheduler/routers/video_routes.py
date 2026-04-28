@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, Form, UploadFile, File, HTTPException, Query
+
+logger = logging.getLogger(__name__)
 
 from yt_scheduler.config import UPLOAD_DIR
 from yt_scheduler.database import get_db
@@ -234,7 +237,11 @@ async def update_video(video_id: str, data: dict):
     before = dict(rows[0])
     before["tags"] = _decode_tags(before.get("tags"))
 
-    # Update on YouTube
+    # Update on YouTube, then read back from YouTube to confirm. The
+    # API can silently coerce values (privacy clamped on managed
+    # channels, publish_at adjusted to comply with channel rules,
+    # tags trimmed past length limits) so writing what-we-sent to the
+    # DB drifts from reality. Always trust YouTube's response.
     try:
         youtube.update_video_metadata(
             video_id=video_id,
@@ -247,13 +254,35 @@ async def update_video(video_id: str, data: dict):
     except Exception as e:
         raise HTTPException(500, f"YouTube update failed: {e}")
 
-    # Update local record
+    confirmed = None
+    try:
+        fresh = youtube.get_video(video_id)
+        if fresh:
+            snippet = fresh.get("snippet") or {}
+            status = fresh.get("status") or {}
+            confirmed = {
+                "title": snippet.get("title"),
+                "description": snippet.get("description"),
+                "tags": snippet.get("tags") or [],
+                "privacy_status": status.get("privacyStatus"),
+                "publish_at": status.get("publishAt"),
+            }
+    except Exception as e:
+        logger.warning("YouTube readback after metadata update failed: %s", e)
+
+    # Update local record. Prefer YouTube's confirmed values for fields
+    # that were touched in this request — that way a privacy clamp or
+    # silent tag-trim shows up in the DB and event diff. Fall back to
+    # the user-supplied values if readback failed.
     updates = []
     params = []
     for field in ["title", "description", "tags", "privacy_status", "publish_at", "pinned_links", "status"]:
         if field in data:
             updates.append(f"{field} = ?")
-            val = data[field]
+            if confirmed is not None and field in confirmed and confirmed[field] is not None:
+                val = confirmed[field]
+            else:
+                val = data[field]
             if field == "tags" and isinstance(val, list):
                 val = json.dumps(val)
             params.append(val)
