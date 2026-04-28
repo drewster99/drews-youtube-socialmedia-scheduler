@@ -178,6 +178,68 @@ async def test_cancel_clears_all_attached_posts(app_db) -> None:
     assert vrow["status"] == "ready"
 
 
+async def test_send_scheduled_post_blocks_when_video_not_public(app_db) -> None:
+    """Per-post jobs fire independently of publish_video_job. If YouTube
+    publish failed (auth expired, quota exhausted), the per-post job
+    must NOT cheerfully post a link to a still-unlisted video. The
+    fired post should land in 'failed' with an actionable error and a
+    log event so the user sees it and can retry from the UI.
+    """
+    scheduler_mod, db, _ = app_db
+    video_id, pids = await _seed(db, [("twitter", "approved")])
+    # Video sits in the post-upload state — never went public.
+    # _send_scheduled_post should refuse to fire the post.
+
+    await scheduler_mod._send_scheduled_post(pids[0])
+
+    cursor = await db.execute(
+        "SELECT status, error, scheduler_job_id FROM social_posts WHERE id = ?",
+        (pids[0],),
+    )
+    row = await cursor.fetchone()
+    assert row["status"] == "failed"
+    assert "still" in (row["error"] or "").lower()
+    assert row["scheduler_job_id"] is None
+
+    rows = await db.execute_fetchall(
+        "SELECT type FROM video_events "
+        "WHERE video_id = ? AND type = 'social_post_failed_video_not_public'",
+        (video_id,),
+    )
+    assert len(rows) == 1
+
+
+async def test_send_scheduled_post_proceeds_when_video_public(app_db) -> None:
+    scheduler_mod, db, _ = app_db
+    video_id, pids = await _seed(db, [("twitter", "approved")])
+    await db.execute(
+        "UPDATE videos SET privacy_status = 'public', status = 'published' WHERE id = ?",
+        (video_id,),
+    )
+    await db.commit()
+
+    # The video is public so the gate doesn't block; the post will
+    # progress to the claim+poster path. We can't mock the network here,
+    # so it'll fail at "not configured" — but the key invariant is that
+    # status moved past 'approved', proving the gate was passed.
+    await scheduler_mod._send_scheduled_post(pids[0])
+
+    cursor = await db.execute(
+        "SELECT status FROM social_posts WHERE id = ?", (pids[0],)
+    )
+    row = await cursor.fetchone()
+    assert row["status"] in ("failed", "posted"), (
+        f"gate must not have blocked; got status={row['status']}"
+    )
+    # The error, if present, must NOT be the video-not-public error.
+    cursor = await db.execute(
+        "SELECT error FROM social_posts WHERE id = ?", (pids[0],)
+    )
+    row = await cursor.fetchone()
+    if row["error"]:
+        assert "non-public" not in row["error"]
+
+
 async def test_schedule_records_one_event_per_post(app_db) -> None:
     """The user-visible promise: every auto-attached post produces a Log row."""
     scheduler_mod, db, _ = app_db

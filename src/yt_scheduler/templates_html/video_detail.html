@@ -695,6 +695,11 @@ function renderEvent(ev) {
                 : (prevId ? `previous post #${prevId}` : 'a previous post');
             return `${ts} <span>Social post skipped — duplicate of ${prev} [${escapeHtml(platform)}]</span>`;
         }
+        case 'social_post_failed_video_not_public': {
+            const platform = ev.payload?.platform || 'social';
+            const priv = ev.payload?.video_privacy || '?';
+            return `${ts} <span style="color: var(--danger);">Social post failed — YouTube video is ${escapeHtml(priv)}, not public [${escapeHtml(platform)}] — use Send below to retry</span>`;
+        }
         default:
             return `${ts} <span>${escapeHtml(ev.type)}</span>`;
     }

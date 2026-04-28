@@ -277,6 +277,48 @@ async def _send_scheduled_post(post_id: int) -> None:
         # Already sent or another worker is sending right now — abort.
         return
 
+    # Pre-flight: never post a YouTube link to a non-public video. With
+    # the unified video+post scheduling, post jobs fire independently
+    # of publish_video_job — so if YouTube publish failed at fire time
+    # (auth expired, quota exhausted), the per-post jobs would still
+    # cheerfully announce a video that's actually still unlisted. The
+    # social_posts.video_id column is the dependency link; we re-read
+    # the video's privacy state right before claiming and bail with an
+    # actionable error if YouTube isn't actually public yet.
+    video_id = post.get("video_id")
+    if video_id:
+        cursor = await db.execute(
+            "SELECT privacy_status, status FROM videos WHERE id = ?", (video_id,)
+        )
+        vrow = await cursor.fetchone()
+        if vrow and (vrow["privacy_status"] != "public" or vrow["status"] != "published"):
+            err = (
+                f"YouTube video is still {vrow['privacy_status']!r} (status "
+                f"{vrow['status']!r}); refusing to post a link to a non-public "
+                "video. Re-publish the video and use Send to retry."
+            )
+            await db.execute(
+                "UPDATE social_posts SET status = 'failed', error = ?, "
+                "scheduler_job_id = NULL WHERE id = ?",
+                (err, post_id),
+            )
+            await db.commit()
+            await events.record_event(
+                video_id,
+                "social_post_failed_video_not_public",
+                {
+                    "platform": post["platform"],
+                    "social_account_id": post.get("social_account_id"),
+                    "video_privacy": vrow["privacy_status"],
+                    "video_status": vrow["status"],
+                },
+            )
+            logger.warning(
+                "_send_scheduled_post: post %s blocked — video %s is %s/%s",
+                post_id, video_id, vrow["privacy_status"], vrow["status"],
+            )
+            return
+
     if not await _claim_post_for_send(post_id):
         # Either it wasn't 'approved' (e.g. user already manually sent
         # or unscheduled it) or another worker beat us to the claim.
