@@ -61,6 +61,8 @@ Each router owns a domain of API endpoints under `/api/`:
 - **`settings_routes`** — Credential management, blocklist, YouTube auth status
 - **`auth_routes`** — OAuth status endpoint
 
+When you add, remove, or change the shape of any HTTP endpoint, update `API.md` in the same change.
+
 ### Services (`services/`)
 
 Business logic layer, each service wraps one concern:
