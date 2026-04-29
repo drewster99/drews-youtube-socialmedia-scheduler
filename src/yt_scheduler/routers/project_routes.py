@@ -207,6 +207,7 @@ async def list_project_prompts(slug: str) -> list[dict]:
                 "body": row["body"],
                 "is_default": False,
                 "default_body": seed.body,
+                "variables": list(seed.variables),
             })
         else:
             merged.append({
@@ -215,6 +216,7 @@ async def list_project_prompts(slug: str) -> list[dict]:
                 "body": seed.body,
                 "is_default": True,
                 "default_body": seed.body,
+                "variables": list(seed.variables),
             })
     return merged
 

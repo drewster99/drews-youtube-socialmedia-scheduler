@@ -20,6 +20,12 @@ class SeedPrompt:
     key: str
     name: str
     body: str
+    # Variables the AI service substitutes into this prompt at render time.
+    # Surfaced in the prompt-editor UI so users editing the template know
+    # what placeholders they have available — referencing any name not
+    # listed here will render literally (the bare ``{{name}}`` form falls
+    # through; only the ``{{name!}}`` required form raises).
+    variables: tuple[str, ...] = ()
 
 
 # Fallback bodies if a row is missing — kept in code so existing installs that
@@ -43,6 +49,10 @@ SEED_DESCRIPTION_FROM_TRANSCRIPT = SeedPrompt(
         "{{extra_instructions}}\n\n"
         "Return ONLY the description text, no preamble."
     ),
+    variables=(
+        "title", "channel_name", "channel_name_block",
+        "transcript", "transcript_truncated", "extra_instructions",
+    ),
 )
 
 SEED_TAGS_FROM_METADATA = SeedPrompt(
@@ -60,6 +70,7 @@ SEED_TAGS_FROM_METADATA = SeedPrompt(
         "- Avoid duplicates and near-duplicates.\n\n"
         "Return ONLY the comma-separated list."
     ),
+    variables=("title", "description", "transcript", "transcript_truncated"),
 )
 
 SEED_DESCRIPTION_FROM_FRAMES = SeedPrompt(
@@ -78,6 +89,10 @@ SEED_DESCRIPTION_FROM_FRAMES = SeedPrompt(
         "just the description text."
         "{{extra_instructions_block}}"
     ),
+    variables=(
+        "title", "channel_name", "channel_name_block",
+        "extra_instructions", "extra_instructions_block",
+    ),
 )
 
 SEED_TAGS_FROM_FRAMES = SeedPrompt(
@@ -90,6 +105,7 @@ SEED_TAGS_FROM_FRAMES = SeedPrompt(
         "tags as a comma-separated list. Each tag 1-3 words, lowercase, "
         "no quotes, no '#'. Return ONLY the comma-separated tags."
     ),
+    variables=("title", "description", "description_or_none"),
 )
 
 _SEEDS_BY_KEY: dict[str, SeedPrompt] = {

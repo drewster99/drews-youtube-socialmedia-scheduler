@@ -585,19 +585,29 @@ async function loadPromptTemplates() {
         return;
     }
     promptDirty.clear();
-    container.innerHTML = prompts.map(p => `
+    container.innerHTML = prompts.map(p => {
+        const vars = (p.variables || []);
+        const varsBlock = vars.length
+            ? `<p class="form-hint" style="margin: 0.25rem 0;">
+                Available variables — referencing any other name renders literally:
+                ${vars.map(v => `<code style="margin-right: 0.25rem;">{{${v}}}</code>`).join('')}
+              </p>`
+            : '';
+        return `
         <div class="prompt-row" data-key="${p.key}" style="margin-bottom: 1.25rem;">
             <h3 style="margin: 0 0 0.25rem; font-size: 1rem;">${p.name}
                 <span class="form-hint" style="font-weight: normal;">(<code>${p.key}</code>)</span>
                 ${p.is_default ? '<span class="badge badge-draft" style="margin-left: 0.5rem;">Default</span>' : ''}
             </h3>
+            ${varsBlock}
             <textarea class="prompt-body" rows="10" style="width: 100%; font-family: var(--font-mono, monospace); font-size: 0.85rem;">${escapeHtml(p.body)}</textarea>
             <div class="modal-actions" style="justify-content: flex-end; margin-top: 0.25rem;">
                 <button type="button" class="btn btn-sm" data-action="reset" data-default="${escapeHtml(p.default_body)}">Reset to default</button>
                 <button type="button" class="btn btn-sm btn-primary" data-action="save" disabled>Save</button>
             </div>
         </div>
-    `).join('');
+        `;
+    }).join('');
     container.querySelectorAll('.prompt-row').forEach(row => {
         const key = row.dataset.key;
         const ta = row.querySelector('.prompt-body');

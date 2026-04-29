@@ -237,9 +237,18 @@ def get_youtube_service(project_slug: str | None = None):
     """Build an authenticated YouTube API service for a project.
 
     Resolution order: explicit ``project_slug`` arg → ``set_active_project``
-    binding → ``DEFAULT_PROJECT_SLUG``.
+    binding. Raises if neither is set — the silent fallback to the default
+    project was a footgun: a caller that forgot to bind would unwittingly
+    use the default project's credentials and post to the wrong channel.
     """
-    slug = project_slug or _active_project_slug.get() or DEFAULT_PROJECT_SLUG
+    slug = project_slug or _active_project_slug.get()
+    if slug is None:
+        raise RuntimeError(
+            "get_youtube_service requires an active project. Either pass "
+            "project_slug=... explicitly or call set_active_project(slug) "
+            "earlier in the request / job. The default-project fallback "
+            "was removed to prevent silent wrong-channel posts."
+        )
     creds = get_credentials(slug)
     if not creds:
         raise RuntimeError(
