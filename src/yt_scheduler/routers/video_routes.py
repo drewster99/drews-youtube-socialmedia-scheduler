@@ -105,6 +105,18 @@ async def list_transcription_backends():
     return transcription.list_available_backends()
 
 
+@router.get("/transcription-model-cached")
+async def is_transcription_model_cached(backend: str, model: str) -> dict:
+    """Report whether a transcription model is locally cached so the UI can
+    warn the user about a multi-minute first-run download (~1.5 GB for
+    medium, ~3 GB for large-v3) before kicking off an MLX transcribe.
+    Currently only meaningful for the mlx-whisper backend; other backends
+    return ``{"cached": null}`` (we don't know)."""
+    from yt_scheduler.services import transcription
+    cached = transcription.is_model_cached(backend=backend, model=model)
+    return {"backend": backend, "model": model, "cached": cached}
+
+
 @router.get("/scheduled")
 async def list_scheduled():
     """List all videos with scheduled publishes."""
@@ -581,7 +593,15 @@ async def transcribe_video(
 
     opts = data or {}
     try:
-        result = transcription.transcribe(
+        # transcribe() is fully synchronous — runs ffmpeg, downloads HF
+        # weights on first use of a model (~1.5 GB for medium), and runs
+        # the actual inference. Without to_thread the FastAPI event loop
+        # would freeze for the entire duration, dropping TCP keep-alives
+        # and stalling concurrent requests; that was the source of the
+        # "Network error: Load failed" the client saw on a long
+        # first-run download.
+        result = await asyncio.to_thread(
+            transcription.transcribe,
             video_path=video_file,
             model=opts.get("model", "large-v3"),
             language=opts.get("language"),

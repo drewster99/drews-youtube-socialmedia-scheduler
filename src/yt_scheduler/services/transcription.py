@@ -620,6 +620,50 @@ def transcribe(
         audio_path.unlink(missing_ok=True)
 
 
+def is_model_cached(*, backend: str | None, model: str | None) -> bool | None:
+    """Return True if the given (backend, model) is already on disk so a
+    transcribe call won't trigger a multi-minute download. Returns False
+    when we can confirm it's missing, or None when we don't know how to
+    check (non-mlx backends).
+
+    For ``mlx-whisper`` we look for the HuggingFace cache directory
+    ``models--mlx-community--whisper-{model}-mlx`` under the standard HF
+    cache root (HF_HOME / HUGGINGFACE_HUB_CACHE / default ~/.cache/huggingface/hub).
+    """
+    if not backend or not model:
+        return None
+    if backend not in ("mlx-whisper", "mlx_whisper"):
+        # whisper.cpp keeps its own ggml-*.bin under ~/.cache/whisper/;
+        # macos-speech doesn't download anything; we don't probe these
+        # because the UI only surfaces the model picker for MLX today.
+        return None
+
+    # HuggingFace caches under one of these env-honored roots, in order.
+    import os
+    candidates = []
+    hf_home = os.environ.get("HF_HOME")
+    hf_cache = os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if hf_cache:
+        candidates.append(Path(hf_cache))
+    if hf_home:
+        candidates.append(Path(hf_home) / "hub")
+    candidates.append(Path.home() / ".cache" / "huggingface" / "hub")
+
+    repo_dir = f"models--mlx-community--whisper-{model}-mlx"
+    for root in candidates:
+        target = root / repo_dir
+        if target.is_dir():
+            # The directory exists once the snapshot has been pulled — we
+            # don't verify per-file presence (HF marks completion via the
+            # snapshots/<rev>/ symlink farm; checking that subdir gives a
+            # better signal).
+            snapshots = target / "snapshots"
+            if snapshots.is_dir() and any(snapshots.iterdir()):
+                return True
+            return False
+    return False
+
+
 def list_available_backends() -> list[dict]:
     """List which transcription backends are available."""
     import importlib.util
