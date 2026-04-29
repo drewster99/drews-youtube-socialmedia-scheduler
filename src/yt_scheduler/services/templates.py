@@ -435,7 +435,7 @@ def _platforms_view_from_slots(slots: list[dict]) -> dict:
 # --- Public API ------------------------------------------------------------
 
 
-async def get_template(name: str, project_id: int = 1) -> dict | None:
+async def get_template(name: str, *, project_id: int) -> dict | None:
     """Get a template by name within a project."""
     db = await get_db()
     cursor = await db.execute(
@@ -460,7 +460,7 @@ async def get_template(name: str, project_id: int = 1) -> dict | None:
     }
 
 
-async def list_templates(project_id: int = 1) -> list[dict]:
+async def list_templates(project_id: int) -> list[dict]:
     """List all templates within a project."""
     db = await get_db()
     cursor = await db.execute(
@@ -520,7 +520,8 @@ async def save_template(
     name: str,
     description: str,
     platforms: dict,
-    project_id: int = 1,
+    *,
+    project_id: int,
     applies_to: list[str] | None = None,
 ) -> dict:
     """Create or update a template within a project (compatibility-shape API).
@@ -577,7 +578,7 @@ async def save_template(
     return saved
 
 
-async def delete_template(name: str, project_id: int = 1) -> None:
+async def delete_template(name: str, *, project_id: int) -> None:
     """Delete a template within a project. Refuses to delete built-in
     templates by name."""
     if name in BUILTIN_TEMPLATE_NAMES:
@@ -767,6 +768,9 @@ async def delete_slot(slot_id: int) -> None:
 
 
 async def ensure_default_template(project_id: int = 1) -> None:
+    # NOTE: project_id retains a default of 1 because this is invoked at
+    # app startup before any project context exists; the bootstrap path
+    # always seeds the default project.
     """Create the two built-in templates within a project if they don't
     already exist."""
     for tpl in (DEFAULT_TEMPLATE, DEFAULT_NEW_MESSAGE_TEMPLATE):

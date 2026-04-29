@@ -62,9 +62,41 @@ SEED_TAGS_FROM_METADATA = SeedPrompt(
     ),
 )
 
+SEED_DESCRIPTION_FROM_FRAMES = SeedPrompt(
+    key="description_from_frames",
+    name="Description from keyframes (vision)",
+    body=(
+        "{{channel_name_block}}"
+        "Title: {{title}}\n\n"
+        "Below are keyframes sampled in order from a short YouTube video.\n"
+        "Write a YouTube SEO description (3-5 short paragraphs) that "
+        "describes what happens in the video and would help viewers find "
+        "it via search. Open with a strong hook in the first sentence — "
+        "that's the only line shown in YouTube's collapsed description. "
+        "Do not invent dialogue or audio; describe only what's visible. "
+        "Do not output any preamble, tags list, or markdown headings — "
+        "just the description text."
+        "{{extra_instructions_block}}"
+    ),
+)
+
+SEED_TAGS_FROM_FRAMES = SeedPrompt(
+    key="tags_from_frames",
+    name="Tags from keyframes (vision)",
+    body=(
+        "Title: {{title}}\n"
+        "Description: {{description_or_none}}\n\n"
+        "Below are keyframes from the video. Generate 8-12 YouTube search "
+        "tags as a comma-separated list. Each tag 1-3 words, lowercase, "
+        "no quotes, no '#'. Return ONLY the comma-separated tags."
+    ),
+)
+
 _SEEDS_BY_KEY: dict[str, SeedPrompt] = {
     SEED_DESCRIPTION_FROM_TRANSCRIPT.key: SEED_DESCRIPTION_FROM_TRANSCRIPT,
     SEED_TAGS_FROM_METADATA.key: SEED_TAGS_FROM_METADATA,
+    SEED_DESCRIPTION_FROM_FRAMES.key: SEED_DESCRIPTION_FROM_FRAMES,
+    SEED_TAGS_FROM_FRAMES.key: SEED_TAGS_FROM_FRAMES,
 }
 
 
@@ -81,7 +113,7 @@ def _row_to_dict(row) -> dict:
     return data
 
 
-async def list_prompt_templates(project_id: int = 1) -> list[dict]:
+async def list_prompt_templates(project_id: int) -> list[dict]:
     db = await get_db()
     rows = await db.execute_fetchall(
         "SELECT id, project_id, key, name, body, applies_to, updated_at "
@@ -91,7 +123,7 @@ async def list_prompt_templates(project_id: int = 1) -> list[dict]:
     return [_row_to_dict(r) for r in rows]
 
 
-async def get_prompt_template(key: str, project_id: int = 1) -> dict | None:
+async def get_prompt_template(key: str, *, project_id: int) -> dict | None:
     db = await get_db()
     rows = await db.execute_fetchall(
         "SELECT id, project_id, key, name, body, applies_to, updated_at "
@@ -101,7 +133,7 @@ async def get_prompt_template(key: str, project_id: int = 1) -> dict | None:
     return _row_to_dict(rows[0]) if rows else None
 
 
-async def get_prompt_body_with_fallback(key: str, project_id: int = 1) -> str:
+async def get_prompt_body_with_fallback(key: str, *, project_id: int) -> str:
     """Return the prompt body for ``key`` from the DB, falling back to the seed.
 
     Routes call this so a missing row doesn't break generation in existing
@@ -121,8 +153,8 @@ async def upsert_prompt_template(
     key: str,
     name: str,
     body: str,
+    project_id: int,
     applies_to: Iterable[str] = ("hook", "short", "segment", "video"),
-    project_id: int = 1,
 ) -> int:
     db = await get_db()
     cursor = await db.execute(

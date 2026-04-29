@@ -95,7 +95,7 @@ const projectSlug = projectSlugFromBody();
 
 async function loadInitial() {
     const [tplResp, socResp, postingResp] = await Promise.all([
-        fetch('/api/templates'),
+        fetch(`/api/templates?project_slug=${encodeURIComponent(projectSlug)}`),
         fetch('/api/settings/social'),
         fetch(`/api/projects/${projectSlug}/posting-settings`),
     ]);

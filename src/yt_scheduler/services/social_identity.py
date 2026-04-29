@@ -119,7 +119,7 @@ async def resolve_username(platform: str) -> str | None:
     return await resolver()
 
 
-async def upsert_social_account(platform: str, project_id: int = 1) -> int | None:
+async def upsert_social_account(platform: str, *, project_id: int) -> int | None:
     """Reflect the currently-configured platform credentials into a row in
     ``social_accounts`` (and link it to the given project) so the per-project
     UX can list real accounts. Returns the social_account id, or None if the

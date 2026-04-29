@@ -27,14 +27,14 @@ async def prompts_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 
 async def test_seeded_description_from_transcript_present(prompts_env) -> None:
     prompts, _db = prompts_env
-    record = await prompts.get_prompt_template("description_from_transcript")
+    record = await prompts.get_prompt_template("description_from_transcript", project_id=1)
     assert record is not None
     assert "{{transcript_truncated}}" in record["body"]
 
 
 async def test_seeded_tags_from_metadata_present(prompts_env) -> None:
     prompts, _db = prompts_env
-    record = await prompts.get_prompt_template("tags_from_metadata")
+    record = await prompts.get_prompt_template("tags_from_metadata", project_id=1)
     assert record is not None
     assert "comma-separated" in record["body"]
 
@@ -44,14 +44,14 @@ async def test_fallback_when_row_missing(prompts_env, monkeypatch) -> None:
     # Wipe the row to simulate a fresh install pre-migration.
     await db.execute("DELETE FROM prompt_templates WHERE key = 'description_from_transcript'")
     await db.commit()
-    body = await prompts.get_prompt_body_with_fallback("description_from_transcript")
+    body = await prompts.get_prompt_body_with_fallback("description_from_transcript", project_id=1)
     assert "Generate an SEO-friendly YouTube video description" in body
 
 
 async def test_unknown_key_raises(prompts_env) -> None:
     prompts, _db = prompts_env
     with pytest.raises(KeyError):
-        await prompts.get_prompt_body_with_fallback("not_a_real_key")
+        await prompts.get_prompt_body_with_fallback("not_a_real_key", project_id=1)
 
 
 async def test_upsert_round_trip(prompts_env) -> None:
@@ -61,8 +61,9 @@ async def test_upsert_round_trip(prompts_env) -> None:
         name="Custom thing",
         body="Hello {{title}}",
         applies_to=["hook", "short"],
+        project_id=1,
     )
-    record = await prompts.get_prompt_template("custom_thing")
+    record = await prompts.get_prompt_template("custom_thing", project_id=1)
     assert record is not None
     assert record["body"] == "Hello {{title}}"
     assert record["applies_to"] == ["hook", "short"]
@@ -74,7 +75,8 @@ async def test_upsert_replaces_existing(prompts_env) -> None:
         key="description_from_transcript",
         name="My override",
         body="Custom body {{title}}",
+        project_id=1,
     )
-    record = await prompts.get_prompt_template("description_from_transcript")
+    record = await prompts.get_prompt_template("description_from_transcript", project_id=1)
     assert record["name"] == "My override"
     assert record["body"] == "Custom body {{title}}"

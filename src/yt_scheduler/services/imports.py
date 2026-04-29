@@ -20,7 +20,7 @@ from yt_scheduler.services.projects import get_project_by_id
 logger = logging.getLogger(__name__)
 
 
-async def list_available_imports(project_id: int = 1, max_results: int = 50) -> list[dict]:
+async def list_available_imports(project_id: int, max_results: int = 50) -> list[dict]:
     """Return YouTube videos on the authenticated channel that aren't already
     in our DB. Each entry includes enough metadata for the user to pick (id,
     title, thumbnail URL, published date, privacy status, embeddable hint)."""
@@ -57,7 +57,7 @@ async def list_available_imports(project_id: int = 1, max_results: int = 50) -> 
     return out
 
 
-async def import_video(video_id: str, project_id: int = 1) -> dict:
+async def import_video(video_id: str, *, project_id: int) -> dict:
     """Pull metadata + thumbnail + transcript from YouTube into our DB.
 
     Returns the inserted/updated row.

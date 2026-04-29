@@ -45,7 +45,7 @@ async def app_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 
 async def test_ensure_default_template_creates_builtin_slots(app_db) -> None:
     templates, _creds, _db = app_db
-    announce = await templates.get_template("announce_video")
+    announce = await templates.get_template("announce_video", project_id=1)
     assert announce is not None
     assert announce["is_builtin"] is True
     assert len(announce["slots"]) == 5
@@ -58,7 +58,7 @@ async def test_ensure_default_template_creates_builtin_slots(app_db) -> None:
 
 async def test_add_slot_creates_non_builtin(app_db) -> None:
     templates, _creds, _db = app_db
-    announce = await templates.get_template("announce_video")
+    announce = await templates.get_template("announce_video", project_id=1)
     new_slot = await templates.add_slot(
         announce["id"], "twitter", body="Second X variant", max_chars=200,
     )
@@ -67,14 +67,14 @@ async def test_add_slot_creates_non_builtin(app_db) -> None:
     assert new_slot["body"] == "Second X variant"
     assert new_slot["max_chars"] == 200
 
-    refreshed = await templates.get_template("announce_video")
+    refreshed = await templates.get_template("announce_video", project_id=1)
     twitter_slots = [s for s in refreshed["slots"] if s["platform"] == "twitter"]
     assert len(twitter_slots) == 2
 
 
 async def test_add_slot_rejects_unknown_platform(app_db) -> None:
     templates, _creds, _db = app_db
-    announce = await templates.get_template("announce_video")
+    announce = await templates.get_template("announce_video", project_id=1)
     with pytest.raises(ValueError, match="Unknown platform"):
         await templates.add_slot(announce["id"], "myspace")
 
@@ -87,7 +87,7 @@ async def test_add_slot_rejects_missing_template(app_db) -> None:
 
 async def test_update_slot_changes_fields(app_db) -> None:
     templates, _creds, _db = app_db
-    announce = await templates.get_template("announce_video")
+    announce = await templates.get_template("announce_video", project_id=1)
     twitter_builtin = next(s for s in announce["slots"] if s["platform"] == "twitter")
 
     updated = await templates.update_slot(
@@ -102,7 +102,7 @@ async def test_update_slot_changes_fields(app_db) -> None:
 
 async def test_update_slot_rejects_invalid_max_chars(app_db) -> None:
     templates, _creds, _db = app_db
-    announce = await templates.get_template("announce_video")
+    announce = await templates.get_template("announce_video", project_id=1)
     twitter = next(s for s in announce["slots"] if s["platform"] == "twitter")
     with pytest.raises(ValueError, match="max_chars must be positive"):
         await templates.update_slot(twitter["id"], max_chars=0)
@@ -110,7 +110,7 @@ async def test_update_slot_rejects_invalid_max_chars(app_db) -> None:
 
 async def test_update_slot_can_disable_builtin(app_db) -> None:
     templates, _creds, _db = app_db
-    announce = await templates.get_template("announce_video")
+    announce = await templates.get_template("announce_video", project_id=1)
     threads = next(s for s in announce["slots"] if s["platform"] == "threads")
     updated = await templates.update_slot(threads["id"], is_disabled=True)
     assert updated["is_disabled"] is True
@@ -121,7 +121,7 @@ async def test_update_slot_can_set_and_clear_account(app_db) -> None:
     cred = await creds.upsert_credential(
         "twitter", "tw:abc", "tester", {"bearer_token": "tok"}
     )
-    announce = await templates.get_template("announce_video")
+    announce = await templates.get_template("announce_video", project_id=1)
     twitter = next(s for s in announce["slots"] if s["platform"] == "twitter")
 
     bound = await templates.update_slot(twitter["id"], social_account_id=cred["id"])
@@ -135,7 +135,7 @@ async def test_update_slot_can_set_and_clear_account(app_db) -> None:
 
 async def test_delete_slot_refuses_builtin(app_db) -> None:
     templates, _creds, _db = app_db
-    announce = await templates.get_template("announce_video")
+    announce = await templates.get_template("announce_video", project_id=1)
     twitter = next(s for s in announce["slots"] if s["platform"] == "twitter")
     with pytest.raises(ValueError, match="built-in"):
         await templates.delete_slot(twitter["id"])
@@ -143,7 +143,7 @@ async def test_delete_slot_refuses_builtin(app_db) -> None:
 
 async def test_delete_slot_works_for_non_builtin(app_db) -> None:
     templates, _creds, _db = app_db
-    announce = await templates.get_template("announce_video")
+    announce = await templates.get_template("announce_video", project_id=1)
     new_slot = await templates.add_slot(announce["id"], "linkedin", body="extra")
     await templates.delete_slot(new_slot["id"])
     assert await templates.get_slot(new_slot["id"]) is None
@@ -151,7 +151,7 @@ async def test_delete_slot_works_for_non_builtin(app_db) -> None:
 
 async def test_add_slot_default_order_index_appends(app_db) -> None:
     templates, _creds, _db = app_db
-    announce = await templates.get_template("announce_video")
+    announce = await templates.get_template("announce_video", project_id=1)
     initial_max = max(s["order_index"] for s in announce["slots"])
     new_slot = await templates.add_slot(announce["id"], "twitter")
     assert new_slot["order_index"] == initial_max + 1
@@ -162,17 +162,17 @@ async def test_get_template_returns_resolved_account_for_slot(app_db) -> None:
     cred = await creds.upsert_credential(
         "linkedin", "li:1", "Pro User", {"access_token": "tok"}
     )
-    announce = await templates.get_template("announce_video")
+    announce = await templates.get_template("announce_video", project_id=1)
     li = next(s for s in announce["slots"] if s["platform"] == "linkedin")
     await templates.update_slot(li["id"], social_account_id=cred["id"])
 
-    refreshed = await templates.get_template("announce_video")
+    refreshed = await templates.get_template("announce_video", project_id=1)
     li_after = next(s for s in refreshed["slots"] if s["platform"] == "linkedin")
     assert li_after["resolved_account"]["uuid"] == cred["uuid"]
     assert li_after["resolved_account"]["deleted"] is False
 
     await creds.soft_delete_credential(cred["uuid"])
-    refreshed2 = await templates.get_template("announce_video")
+    refreshed2 = await templates.get_template("announce_video", project_id=1)
     li_after2 = next(s for s in refreshed2["slots"] if s["platform"] == "linkedin")
     assert li_after2["resolved_account"]["deleted"] is True
 
@@ -180,16 +180,17 @@ async def test_get_template_returns_resolved_account_for_slot(app_db) -> None:
 async def test_save_template_only_touches_builtin_slots(app_db) -> None:
     """Re-saving a template via save_template must not clobber non-builtin slots."""
     templates, _creds, _db = app_db
-    announce = await templates.get_template("announce_video")
+    announce = await templates.get_template("announce_video", project_id=1)
     extra = await templates.add_slot(announce["id"], "twitter", body="extra variant")
 
     await templates.save_template(
         "announce_video",
         description="updated description",
         platforms={"twitter": {"template": "new built-in", "media": "thumbnail", "max_chars": 280}},
+        project_id=1,
     )
 
-    refreshed = await templates.get_template("announce_video")
+    refreshed = await templates.get_template("announce_video", project_id=1)
     assert refreshed["description"] == "updated description"
     builtin_twitter = next(
         s for s in refreshed["slots"]

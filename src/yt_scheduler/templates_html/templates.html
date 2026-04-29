@@ -18,7 +18,7 @@ const projectSlug = "{{ current_project.slug }}";
 
 async function loadTemplates() {
     const container = document.getElementById('template-list');
-    const resp = await fetch('/api/templates');
+    const resp = await fetch(`/api/templates?project_slug=${encodeURIComponent(projectSlug)}`);
     const templates = await resp.json();
 
     if (templates.length === 0) {

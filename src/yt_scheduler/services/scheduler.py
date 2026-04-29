@@ -789,6 +789,46 @@ async def restore_scheduled_jobs() -> None:
             logger.error(f"Failed to restore schedule for {row['id']}: {e}")
 
     await restore_scheduled_posts()
+    await restore_pending_auto_actions()
+
+
+async def restore_pending_auto_actions() -> None:
+    """Re-fire ``_run_chain`` for videos whose auto-action chain may not have
+    completed before the last shutdown.
+
+    The chain itself has idempotency gates (skip transcribe if transcript
+    exists, skip description if one exists, skip socials if they exist), so
+    re-firing on every applicable video is cheap when there's no work to do
+    and recovers in-flight work when there is. We pick candidates by the
+    presence of a ``video_file_path`` plus the ABSENCE of either a transcript
+    or a generated description — the two longest-running steps. Imported
+    videos and videos in any project status are eligible since the chain
+    decides per-step whether the auto-action settings ask for the work.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id, project_id, transcript, description_generated_at, "
+        "imported_from_youtube FROM videos "
+        "WHERE (transcript IS NULL OR transcript = '' "
+        "       OR description_generated_at IS NULL)"
+    )
+    if not rows:
+        return
+
+    from yt_scheduler.services.auto_actions import run_post_create_actions
+    restored = 0
+    for row in rows:
+        try:
+            project_id = int(row["project_id"]) if row["project_id"] is not None else 1
+            source = "import" if row["imported_from_youtube"] else "upload"
+            await run_post_create_actions(row["id"], project_id, source)
+            restored += 1
+        except Exception as exc:
+            logger.warning(
+                "Could not restore auto-actions for %s: %s", row["id"], exc
+            )
+    if restored:
+        logger.info("Restored %d pending auto-action chain(s)", restored)
 
 
 async def _iter_project_slugs() -> list[tuple[int, str]]:

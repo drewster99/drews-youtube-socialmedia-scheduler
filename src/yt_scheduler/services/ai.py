@@ -86,9 +86,10 @@ def _render_template_body(body: str, variables: dict[str, str]) -> str:
 async def generate_seo_description(
     title: str,
     transcript: str,
+    *,
+    project_id: int,
     channel_name: str = "",
     extra_instructions: str = "",
-    project_id: int = 1,
 ) -> str:
     """Generate an SEO-friendly video description from a transcript.
 
@@ -132,37 +133,38 @@ async def generate_seo_description_from_frames(
     title: str,
     frames: list[bytes],
     *,
+    project_id: int,
     channel_name: str = "",
     extra_instructions: str = "",
 ) -> str:
     """Generate an SEO description from a list of JPEG keyframes.
 
-    The transcript-based prompt template doesn't apply here — we send the
-    frames directly with a built-in vision prompt. Used as the fallback
-    when ``services/media.extract_keyframes`` yields frames and the
-    video has no usable transcript (silent screen recordings, b-roll
-    montages, etc.).
+    Prompt body comes from the ``description_from_frames`` row in
+    ``prompt_templates``; the seed default kicks in when the row is missing.
+    Frames are attached after the rendered prompt text in the same user turn.
     """
     import base64
+    from yt_scheduler.services import prompts as prompt_service
 
     if not frames:
         raise ValueError("generate_seo_description_from_frames called with no frames")
 
-    channel_block = f"Channel: {channel_name}\n" if channel_name else ""
-    extra_block = f"\nAdditional instructions:\n{extra_instructions}\n" if extra_instructions else ""
-
-    instructions = (
-        f"{channel_block}"
-        f"Title: {title}\n\n"
-        "Below are keyframes sampled in order from a short YouTube video.\n"
-        "Write a YouTube SEO description (3-5 short paragraphs) that "
-        "describes what happens in the video and would help viewers find "
-        "it via search. Open with a strong hook in the first sentence — "
-        "that's the only line shown in YouTube's collapsed description. "
-        "Do not invent dialogue or audio; describe only what's visible. "
-        "Do not output any preamble, tags list, or markdown headings — "
-        "just the description text."
-        f"{extra_block}"
+    body = await prompt_service.get_prompt_body_with_fallback(
+        "description_from_frames", project_id=project_id
+    )
+    extra_block = (
+        f"\n\nAdditional instructions:\n{extra_instructions}\n"
+        if extra_instructions else ""
+    )
+    instructions = _render_template_body(
+        body,
+        {
+            "title": title,
+            "channel_name": channel_name,
+            "channel_name_block": f"Channel: {channel_name}\n" if channel_name else "",
+            "extra_instructions": extra_instructions,
+            "extra_instructions_block": extra_block,
+        },
     )
 
     content: list[dict] = [{"type": "text", "text": instructions}]
@@ -190,21 +192,32 @@ async def generate_tags_from_frames(
     title: str,
     description: str,
     frames: list[bytes],
+    *,
+    project_id: int,
 ) -> list[str]:
     """Generate YouTube tags using the title + (optionally generated)
     description + the keyframes, when there's no transcript to feed
-    ``generate_tags_from_metadata``."""
+    ``generate_tags_from_metadata``.
+
+    Prompt body comes from the ``tags_from_frames`` row in
+    ``prompt_templates``; the seed default kicks in when the row is missing.
+    """
     import base64
+    from yt_scheduler.services import prompts as prompt_service
 
     if not frames:
         raise ValueError("generate_tags_from_frames called with no frames")
 
-    instructions = (
-        f"Title: {title}\n"
-        f"Description: {description or '(none yet)'}\n\n"
-        "Below are keyframes from the video. Generate 8-12 YouTube search "
-        "tags as a comma-separated list. Each tag 1-3 words, lowercase, "
-        "no quotes, no '#'. Return ONLY the comma-separated tags."
+    body = await prompt_service.get_prompt_body_with_fallback(
+        "tags_from_frames", project_id=project_id
+    )
+    instructions = _render_template_body(
+        body,
+        {
+            "title": title,
+            "description": description,
+            "description_or_none": description or "(none yet)",
+        },
     )
 
     content: list[dict] = [{"type": "text", "text": instructions}]
@@ -234,7 +247,8 @@ async def generate_tags_from_metadata(
     title: str,
     description: str,
     transcript: str = "",
-    project_id: int = 1,
+    *,
+    project_id: int,
 ) -> list[str]:
     """Generate YouTube tags based on title/description/transcript using the
     user-editable prompt template."""

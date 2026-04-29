@@ -718,6 +718,7 @@ async def generate_description(video_id: str, data: dict | None = None):
                 title=video["title"],
                 frames=frames,
                 extra_instructions=extra,
+                project_id=project_id,
             )
         else:
             description = await ai.generate_seo_description(

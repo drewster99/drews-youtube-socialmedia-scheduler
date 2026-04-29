@@ -248,7 +248,7 @@ async function saveSlot(slotId) {
 }
 
 async function patchSlot(slotId, payload) {
-    const resp = await fetch(`/api/templates/${templateName}/slots/${slotId}`, {
+    const resp = await fetch(`/api/templates/${templateName}/slots/${slotId}?project_slug=${encodeURIComponent(projectSlug)}`, {
         method: 'PATCH',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(payload),
@@ -261,7 +261,7 @@ async function patchSlot(slotId, payload) {
 
 async function deleteSlot(slotId) {
     if (!confirm('Delete this slot?')) return;
-    const resp = await fetch(`/api/templates/${templateName}/slots/${slotId}`, {method: 'DELETE'});
+    const resp = await fetch(`/api/templates/${templateName}/slots/${slotId}?project_slug=${encodeURIComponent(projectSlug)}`, {method: 'DELETE'});
     if (resp.ok) {
         showToast('Slot deleted', 'success');
         await loadTemplate();
@@ -274,7 +274,7 @@ async function addSlot() {
         showToast('Pick a platform first', 'error');
         return;
     }
-    const resp = await fetch(`/api/templates/${templateName}/slots`, {
+    const resp = await fetch(`/api/templates/${templateName}/slots?project_slug=${encodeURIComponent(projectSlug)}`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({platform, body: '', media: 'thumbnail', max_chars: 280}),
@@ -296,7 +296,7 @@ async function saveTemplateMeta() {
         showToast('Pick at least one tier in "Applies to"', 'error');
         return;
     }
-    const resp = await fetch(`/api/templates/${templateName}`, {
+    const resp = await fetch(`/api/templates/${templateName}?project_slug=${encodeURIComponent(projectSlug)}`, {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -309,7 +309,7 @@ async function saveTemplateMeta() {
 
 async function deleteTemplate() {
     if (!confirm(`Delete template "${templateName}"?`)) return;
-    const resp = await fetch(`/api/templates/${templateName}`, {method: 'DELETE'});
+    const resp = await fetch(`/api/templates/${templateName}?project_slug=${encodeURIComponent(projectSlug)}`, {method: 'DELETE'});
     if (resp.ok) window.location.href = `/projects/${projectSlug}/templates`;
 }
 
@@ -372,7 +372,7 @@ async function loadCredentialsForVisiblePlatforms() {
 async function loadTemplate() {
     let appliesTo = ['hook', 'short', 'segment', 'video'];
     try {
-        const resp = await fetch(`/api/templates/${templateName}`);
+        const resp = await fetch(`/api/templates/${templateName}?project_slug=${encodeURIComponent(projectSlug)}`);
         if (resp.ok) {
             template = await resp.json();
             slots = template.slots || [];

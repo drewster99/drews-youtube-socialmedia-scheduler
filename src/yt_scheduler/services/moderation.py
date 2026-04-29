@@ -12,7 +12,7 @@ from yt_scheduler.services import youtube
 logger = logging.getLogger(__name__)
 
 
-async def get_blocklist(project_id: int = 1) -> list[dict]:
+async def get_blocklist(project_id: int) -> list[dict]:
     """Get all blocked keywords for a project."""
     db = await get_db()
     rows = await db.execute_fetchall(
@@ -22,7 +22,7 @@ async def get_blocklist(project_id: int = 1) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-async def add_keyword(keyword: str, is_regex: bool = False, project_id: int = 1) -> None:
+async def add_keyword(keyword: str, *, is_regex: bool = False, project_id: int) -> None:
     """Add a keyword to a project's blocklist."""
     db = await get_db()
     await db.execute(
@@ -33,7 +33,7 @@ async def add_keyword(keyword: str, is_regex: bool = False, project_id: int = 1)
     await db.commit()
 
 
-async def remove_keyword(keyword_id: int, project_id: int = 1) -> None:
+async def remove_keyword(keyword_id: int, project_id: int) -> None:
     """Remove a keyword from a project's blocklist."""
     db = await get_db()
     await db.execute(
@@ -68,7 +68,7 @@ async def _list_comment_threads_async(video_id: str, max_results: int = 200) -> 
     )
 
 
-async def check_video_comments(video_id: str, *, project_id: int = 1, blocklist: list[dict] | None = None) -> list[dict]:
+async def check_video_comments(video_id: str, *, project_id: int, blocklist: list[dict] | None = None) -> list[dict]:
     """Check all comments on a video against the blocklist.
 
     Returns the list of actions taken. Errors fetching comments propagate as
@@ -159,7 +159,7 @@ async def _process_one(
     }]
 
 
-async def check_all_videos(project_id: int = 1) -> dict:
+async def check_all_videos(project_id: int) -> dict:
     """Run moderation against every uploaded/published video for a project.
 
     Returns a structured summary the UI can render directly.
@@ -193,7 +193,7 @@ async def check_all_videos(project_id: int = 1) -> dict:
     return results
 
 
-async def get_moderation_log(limit: int = 50, project_id: int = 1) -> list[dict]:
+async def get_moderation_log(limit: int = 50, *, project_id: int) -> list[dict]:
     """Get recent moderation actions for a project."""
     db = await get_db()
     rows = await db.execute_fetchall(

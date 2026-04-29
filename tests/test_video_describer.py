@@ -39,7 +39,7 @@ async def app_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 # --- ai.generate_seo_description_from_frames -------------------------------
 
 
-async def test_frames_prompt_shape() -> None:
+async def test_frames_prompt_shape(app_db) -> None:
     """The Claude request must include the title in text + every frame as
     a base64 image part, in order."""
     from yt_scheduler.services import ai
@@ -65,6 +65,7 @@ async def test_frames_prompt_shape() -> None:
                 frames=frames,
                 channel_name="Test Channel",
                 extra_instructions="No emoji.",
+                project_id=1,
             )
 
     assert out == "A description."
@@ -90,10 +91,10 @@ async def test_frames_empty_raises() -> None:
     from yt_scheduler.services import ai
 
     with pytest.raises(ValueError, match="no frames"):
-        await ai.generate_seo_description_from_frames(title="x", frames=[])
+        await ai.generate_seo_description_from_frames(title="x", frames=[], project_id=1)
 
 
-async def test_tags_from_frames_returns_lowercase_list() -> None:
+async def test_tags_from_frames_returns_lowercase_list(app_db) -> None:
     from yt_scheduler.services import ai
 
     frames = [b"FAKE_FRAME"]
@@ -109,7 +110,7 @@ async def test_tags_from_frames_returns_lowercase_list() -> None:
     with patch.object(ai, "get_client", return_value=fake_client):
         with patch.object(ai, "_resolve_model", new=_async_return("claude-fake")):
             tags = await ai.generate_tags_from_frames(
-                title="t", description="d", frames=frames,
+                title="t", description="d", frames=frames, project_id=1,
             )
 
     assert tags == ["foo", "bar baz", "qux", "tag-five"]
@@ -142,7 +143,7 @@ async def test_generate_description_falls_back_to_frames(
 
     monkeypatch.setattr(media, "extract_keyframes", lambda path, count, **kw: [b"F1", b"F2"])
 
-    async def _fake_from_frames(*, title, frames, channel_name="", extra_instructions=""):
+    async def _fake_from_frames(*, title, frames, channel_name="", extra_instructions="", project_id=1):
         # Verify the route handed us the mocked frames, not a transcript.
         assert frames == [b"F1", b"F2"]
         return "Visually-described summary."
