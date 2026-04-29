@@ -1172,6 +1172,25 @@ def get_poster(platform: str) -> SocialPoster:
     return cls()
 
 
+def decode_media_paths(post_row: dict) -> list[str]:
+    """Pull a media-paths list out of a social_posts row.
+
+    Prefers the new JSON-array column (``media_paths``); falls back to the
+    legacy single-string column (``media_path``) for any row written before
+    migration 010 or by an older code path. Empty / NULL ⇒ ``[]``.
+    """
+    raw = post_row.get("media_paths")
+    if raw:
+        try:
+            decoded = json.loads(raw)
+            if isinstance(decoded, list):
+                return [str(p) for p in decoded if p]
+        except (TypeError, ValueError):
+            pass
+    legacy = post_row.get("media_path")
+    return [str(legacy)] if legacy else []
+
+
 async def find_recent_duplicate_post(
     *,
     platform: str,

@@ -179,16 +179,20 @@ async def set_active_transcript(
             video_id,
         ),
     )
+    await db.commit()
     # When the active transcript text was edited away from any source, also
     # persist that edit as a user_edited transcript row so it survives a
-    # subsequent re-selection of a different source.
+    # subsequent re-selection of a different source. The source row may not
+    # itself be a user_edited row, so look up (or create) the per-video
+    # user_edited row separately rather than trying to UPDATE by transcript_id.
     if is_edited:
+        await ensure_user_edited_row(video_id, text)
         await db.execute(
             "UPDATE transcripts SET text = ?, created_at = datetime('now') "
-            "WHERE id = ? AND source = 'user_edited'",
-            (text, transcript_id),
+            "WHERE video_id = ? AND source = 'user_edited'",
+            (text, video_id),
         )
-    await db.commit()
+        await db.commit()
 
     rows = await db.execute_fetchall(
         "SELECT transcript_id, transcript_source, transcript_created_at, "

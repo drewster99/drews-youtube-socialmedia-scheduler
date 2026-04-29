@@ -103,6 +103,21 @@
 </section>
 
 <section class="card">
+    <div class="card-header"><h2>LLM prompt templates</h2></div>
+    <div class="card-body">
+        <p class="form-hint">Edit the prompts the app sends to Claude. Template
+            variables like <code>{{title}}</code>, <code>{{description}}</code>,
+            <code>{{transcript_truncated}}</code>, <code>{{channel_name_block}}</code>,
+            and <code>{{extra_instructions}}</code> are filled in at generation
+            time. Leave blank or hit Reset to default to fall back to the
+            built-in seed.</p>
+        <div id="prompt-templates-list">
+            <p class="loading">Loading…</p>
+        </div>
+    </div>
+</section>
+
+<section class="card">
     <div class="card-header"><h2>YouTube channel</h2></div>
     <div class="card-body">
         <div id="yt-info">
@@ -179,6 +194,28 @@ function renderMatrix() {
         </tr>
     `).join('');
 
+    const backendOpts = ['', 'mlx-whisper', 'whisper.cpp', 'macos-speech'];
+    const backendLabel = b => b === '' ? 'Default' : b;
+    const renderBackend = col => `
+        <select data-col="${col}" data-key="auto_transcribe_backend">
+            ${backendOpts.map(b => `<option value="${b}" ${(autoActions[col].auto_transcribe_backend || '') === b ? 'selected' : ''}>${backendLabel(b)}</option>`).join('')}
+        </select>
+    `;
+    rows += `
+        <tr class="sub-row">
+            <th>— transcribe backend</th>
+            <td>${renderBackend('upload')}</td>
+            <td>${renderBackend('import')}</td>
+        </tr>
+        <tr class="sub-row">
+            <th>— transcribe model</th>
+            <td><input type="text" data-col="upload" data-key="auto_transcribe_model"
+                       value="${autoActions.upload.auto_transcribe_model || ''}" placeholder="(backend default)"></td>
+            <td><input type="text" data-col="import" data-key="auto_transcribe_model"
+                       value="${autoActions.import.auto_transcribe_model || ''}" placeholder="(backend default)"></td>
+        </tr>
+    `;
+
     rows += `
         <tr>
             <th>Auto-tags mode</th>
@@ -233,7 +270,13 @@ function buildAutoActionsPayload() {
     inputs.forEach(input => {
         const col = input.dataset.col;
         const key = input.dataset.key;
-        const value = input.type === 'checkbox' ? input.checked : input.value;
+        let value = input.type === 'checkbox' ? input.checked : input.value;
+        // Treat blank text/select values for the transcribe backend/model as
+        // "use system default" so the auto-actions loader can fall through to
+        // its own defaults rather than persisting an empty string.
+        if ((key === 'auto_transcribe_backend' || key === 'auto_transcribe_model') && value === '') {
+            value = null;
+        }
         if (key.startsWith('socials.')) {
             const platform = key.substring('socials.'.length);
             next[col].auto_socials[platform] = value;
@@ -251,6 +294,7 @@ function updateAutoActionsButtonState() {
 }
 
 document.getElementById('auto-actions-body').addEventListener('change', updateAutoActionsButtonState);
+document.getElementById('auto-actions-body').addEventListener('input', updateAutoActionsButtonState);
 
 let postingBaseline = null;
 
@@ -518,10 +562,74 @@ window.addEventListener('focus', () => {
 
 loadAutoActions();
 loadPostingSettings();
+loadPromptTemplates();
 loadYouTube();
 loadSocialDefaults();
 loadProjectVariables();
 initProjectUrlForm();
+
+// --- LLM prompt templates ---------------------------------------------
+
+const promptDirty = new Map();
+
+async function loadPromptTemplates() {
+    const container = document.getElementById('prompt-templates-list');
+    if (!container) return;
+    let prompts;
+    try {
+        const resp = await fetch(`/api/projects/${slug}/prompts`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        prompts = await resp.json();
+    } catch (exc) {
+        container.innerHTML = `<p class="form-hint">Could not load prompts: ${exc}</p>`;
+        return;
+    }
+    promptDirty.clear();
+    container.innerHTML = prompts.map(p => `
+        <div class="prompt-row" data-key="${p.key}" style="margin-bottom: 1.25rem;">
+            <h3 style="margin: 0 0 0.25rem; font-size: 1rem;">${p.name}
+                <span class="form-hint" style="font-weight: normal;">(<code>${p.key}</code>)</span>
+                ${p.is_default ? '<span class="badge badge-draft" style="margin-left: 0.5rem;">Default</span>' : ''}
+            </h3>
+            <textarea class="prompt-body" rows="10" style="width: 100%; font-family: var(--font-mono, monospace); font-size: 0.85rem;">${escapeHtml(p.body)}</textarea>
+            <div class="modal-actions" style="justify-content: flex-end; margin-top: 0.25rem;">
+                <button type="button" class="btn btn-sm" data-action="reset" data-default="${escapeHtml(p.default_body)}">Reset to default</button>
+                <button type="button" class="btn btn-sm btn-primary" data-action="save" disabled>Save</button>
+            </div>
+        </div>
+    `).join('');
+    container.querySelectorAll('.prompt-row').forEach(row => {
+        const key = row.dataset.key;
+        const ta = row.querySelector('.prompt-body');
+        const saveBtn = row.querySelector('[data-action="save"]');
+        const resetBtn = row.querySelector('[data-action="reset"]');
+        const original = ta.value;
+        promptDirty.set(key, original);
+        ta.addEventListener('input', () => {
+            saveBtn.disabled = ta.value === promptDirty.get(key);
+        });
+        resetBtn.addEventListener('click', () => {
+            ta.value = resetBtn.dataset.default;
+            saveBtn.disabled = ta.value === promptDirty.get(key);
+        });
+        saveBtn.addEventListener('click', async () => {
+            saveBtn.disabled = true;
+            const resp = await fetch(`/api/projects/${slug}/prompts/${key}`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({body: ta.value}),
+            });
+            if (resp.ok) {
+                promptDirty.set(key, ta.value);
+                showToast('Prompt saved', 'success');
+                row.querySelector('.badge')?.remove();
+            } else {
+                saveBtn.disabled = false;
+                showToast('Save failed', 'error');
+            }
+        });
+    });
+}
 
 // --- Project URL editor ------------------------------------------------
 

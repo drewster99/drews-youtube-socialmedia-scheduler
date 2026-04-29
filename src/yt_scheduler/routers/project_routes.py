@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path
 from yt_scheduler.services import events as events_service
 from yt_scheduler.services import project_settings as project_settings_service
 from yt_scheduler.services import projects as project_service
+from yt_scheduler.services import prompts as prompts_service
 from yt_scheduler.services.auth import (
     get_credentials,
     is_authenticated,
@@ -180,6 +181,63 @@ async def put_posting_settings(slug: str, payload: dict) -> dict:
         raise HTTPException(400, "payload must be an object")
     await project_settings_service.set_json(project["id"], "posting", payload)
     return await project_settings_service.get_posting_settings(project["id"])
+
+
+# --- Per-project LLM prompt templates ---------------------------------------
+
+
+@router.get("/{slug}/prompts")
+async def list_project_prompts(slug: str) -> list[dict]:
+    """Return all LLM prompt templates for the project, merged with seed
+    fallbacks so the UI can always show every editable prompt — even before
+    the user has saved any changes.
+    """
+    project = await project_service.get_project_by_slug(slug)
+    if project is None:
+        raise HTTPException(404, f"Project '{slug}' not found")
+
+    saved = {row["key"]: row for row in await prompts_service.list_prompt_templates(project["id"])}
+    merged: list[dict] = []
+    for key, seed in prompts_service._SEEDS_BY_KEY.items():
+        if key in saved:
+            row = saved[key]
+            merged.append({
+                "key": key,
+                "name": row.get("name") or seed.name,
+                "body": row["body"],
+                "is_default": False,
+                "default_body": seed.body,
+            })
+        else:
+            merged.append({
+                "key": key,
+                "name": seed.name,
+                "body": seed.body,
+                "is_default": True,
+                "default_body": seed.body,
+            })
+    return merged
+
+
+@router.put("/{slug}/prompts/{key}")
+async def upsert_project_prompt(slug: str, key: str, payload: dict) -> dict:
+    project = await project_service.get_project_by_slug(slug)
+    if project is None:
+        raise HTTPException(404, f"Project '{slug}' not found")
+    if key not in prompts_service._SEEDS_BY_KEY:
+        raise HTTPException(404, f"Unknown prompt key '{key}'")
+    body = (payload.get("body") or "").strip()
+    if not body:
+        raise HTTPException(400, "body is required")
+    seed = prompts_service._SEEDS_BY_KEY[key]
+    name = payload.get("name") or seed.name
+    await prompts_service.upsert_prompt_template(
+        key=key,
+        name=name,
+        body=body,
+        project_id=project["id"],
+    )
+    return {"ok": True}
 
 
 # --- Per-project social defaults --------------------------------------------

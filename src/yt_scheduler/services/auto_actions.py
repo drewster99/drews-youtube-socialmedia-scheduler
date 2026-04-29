@@ -34,6 +34,8 @@ from yt_scheduler.services import (
     transcripts as transcript_service,
     youtube,
 )
+from yt_scheduler.services.auth import set_active_project
+from yt_scheduler.services.projects import get_project_by_id
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,12 @@ async def run_post_create_actions(video_id: str, project_id: int, source: Source
 
 
 async def _run_chain(video_id: str, project_id: int, source: Source) -> None:
+    # Bind the active project so every YouTube wrapper called below picks up
+    # the project's OAuth credentials, not the default project's.
+    project_row = await get_project_by_id(project_id)
+    if project_row:
+        set_active_project(project_row["slug"])
+
     try:
         actions = await project_settings.get_auto_actions(project_id)
         column = actions.get(source, {})

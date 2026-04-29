@@ -10,14 +10,34 @@ from pathlib import Path
 
 from fastapi import APIRouter, Form, UploadFile, File, HTTPException, Query
 
-logger = logging.getLogger(__name__)
-
 from yt_scheduler.config import UPLOAD_DIR
 from yt_scheduler.database import get_db
 from yt_scheduler.services import (
     ai, auto_actions, events, tiers,
     transcripts as transcript_service, youtube,
 )
+from yt_scheduler.services.auth import set_active_project
+from yt_scheduler.services.projects import get_project_by_id
+
+logger = logging.getLogger(__name__)
+
+
+async def _bind_project_for_video(video_id: str) -> None:
+    """Look up the video's project and bind it as the active project so any
+    ``youtube.*`` calls in this request use the right OAuth credentials.
+    Silent no-op if the video or project can't be resolved — the youtube
+    wrapper will surface a clearer error than we can here.
+    """
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT project_id FROM videos WHERE id = ?", (video_id,)
+    )
+    row = await cursor.fetchone()
+    if row is None or row["project_id"] is None:
+        return
+    project = await get_project_by_id(int(row["project_id"]))
+    if project:
+        set_active_project(project["slug"])
 
 
 _BACKEND_TO_SOURCE = {
@@ -107,6 +127,7 @@ async def get_video(video_id: str):
         raise HTTPException(404, "Video not found")
     result = dict(rows[0])
 
+    await _bind_project_for_video(video_id)
     # Also fetch live YouTube data
     try:
         yt_data = youtube.get_video(video_id)
@@ -163,6 +184,7 @@ async def upload_video(
             f"cannot upload an {item_type} item. Bind a channel via OAuth, "
             "or create the item as a standalone via POST /api/videos/items.",
         )
+    set_active_project(project["slug"])
 
     parent_item_id = (parent_item_id or "").strip()
     if parent_item_id and item_type == "episode":
@@ -394,6 +416,7 @@ async def update_video(video_id: str, data: dict):
     before = dict(rows[0])
     before["tags"] = _decode_tags(before.get("tags"))
 
+    await _bind_project_for_video(video_id)
     # Update on YouTube, then read back from YouTube to confirm. The
     # API can silently coerce values (privacy clamped on managed
     # channels, publish_at adjusted to comply with channel rules,
@@ -500,6 +523,7 @@ async def transcribe_video(
         raise HTTPException(404, "Video not found")
 
     video = dict(rows[0])
+    await _bind_project_for_video(video_id)
     video_file = video.get("video_file_path")
     if not video_file or not Path(video_file).exists():
         if not video.get("imported_from_youtube"):
@@ -652,6 +676,7 @@ async def generate_description(video_id: str, data: dict | None = None):
         raise HTTPException(404, "Video not found")
 
     video = dict(rows[0])
+    project_id = int(video.get("project_id") or 1)
     transcript = video.get("transcript", "")
     extra = (data or {}).get("extra_instructions", "")
     mode = ((data or {}).get("mode") or "auto").strip()
@@ -699,6 +724,7 @@ async def generate_description(video_id: str, data: dict | None = None):
                 title=video["title"],
                 transcript=transcript,
                 extra_instructions=extra,
+                project_id=project_id,
             )
     except HTTPException:
         raise
@@ -743,6 +769,7 @@ async def apply_description(video_id: str):
     if not desc:
         raise HTTPException(400, "No generated description. Generate one first.")
 
+    await _bind_project_for_video(video_id)
     youtube.update_video_metadata(video_id, description=desc)
 
     old_description = video.get("description") or ""
@@ -830,6 +857,7 @@ async def cancel_schedule(video_id: str):
 @router.get("/{video_id}/captions")
 async def list_captions(video_id: str):
     """List available caption tracks."""
+    await _bind_project_for_video(video_id)
     try:
         return youtube.list_captions(video_id)
     except Exception as e:
@@ -839,6 +867,7 @@ async def list_captions(video_id: str):
 @router.get("/{video_id}/comments")
 async def list_comments(video_id: str, max_results: int = 50):
     """List comments on a video."""
+    await _bind_project_for_video(video_id)
     try:
         return youtube.list_comment_threads(video_id, max_results=max_results)
     except Exception as e:
@@ -856,6 +885,7 @@ async def set_thumbnail(video_id: str, file: UploadFile = File(...)):
     with open(path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
+    await _bind_project_for_video(video_id)
     try:
         youtube.set_thumbnail(video_id, path)
     except Exception as e:

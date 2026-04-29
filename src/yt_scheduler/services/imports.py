@@ -14,6 +14,8 @@ from yt_scheduler.services import (
     auto_actions, events, tiers,
     transcripts as transcript_service, youtube,
 )
+from yt_scheduler.services.auth import set_active_project
+from yt_scheduler.services.projects import get_project_by_id
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,9 @@ async def list_available_imports(project_id: int = 1, max_results: int = 50) -> 
     rows = await db.execute_fetchall("SELECT id FROM videos")
     known_ids = {r["id"] for r in rows}
 
+    project = await get_project_by_id(project_id)
+    if project:
+        set_active_project(project["slug"])
     items = youtube.list_channel_videos(max_results=max_results)
     out: list[dict] = []
     for item in items:
@@ -61,6 +66,10 @@ async def import_video(video_id: str, project_id: int = 1) -> dict:
     rows = await db.execute_fetchall("SELECT id FROM videos WHERE id = ?", (video_id,))
     if rows:
         raise ValueError(f"Video {video_id} is already imported")
+
+    project = await get_project_by_id(project_id)
+    if project:
+        set_active_project(project["slug"])
 
     full = youtube.get_video(video_id)
     if not full:

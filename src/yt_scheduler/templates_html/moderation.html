@@ -55,7 +55,7 @@ function _ensureUtc(iso) {
 }
 
 async function loadBlocklist() {
-    const resp = await fetch('/api/settings/blocklist', {_silent: true});
+    const resp = await fetch(`/api/settings/blocklist?project_slug=${encodeURIComponent(projectSlug)}`, {_silent: true});
     const items = await resp.json();
     const area = document.getElementById('blocklist-area');
     if (items.length === 0) {
@@ -75,7 +75,7 @@ async function addKeyword() {
     const keyword = document.getElementById('new-keyword').value.trim();
     if (!keyword) return;
     const isRegex = document.getElementById('is-regex').checked;
-    await fetch('/api/settings/blocklist', {
+    await fetch(`/api/settings/blocklist?project_slug=${encodeURIComponent(projectSlug)}`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({keyword, is_regex: isRegex}),
@@ -85,7 +85,7 @@ async function addKeyword() {
 }
 
 async function removeKeyword(id) {
-    await fetch(`/api/settings/blocklist/${id}`, {method: 'DELETE'});
+    await fetch(`/api/settings/blocklist/${id}?project_slug=${encodeURIComponent(projectSlug)}`, {method: 'DELETE'});
     loadBlocklist();
 }
 
@@ -117,7 +117,7 @@ async function loadModerationStatus() {
 }
 
 async function loadLog() {
-    const resp = await fetch('/api/settings/moderation-log', {_silent: true});
+    const resp = await fetch(`/api/settings/moderation-log?project_slug=${encodeURIComponent(projectSlug)}`, {_silent: true});
     const items = await resp.json();
     const area = document.getElementById('log-area');
     if (items.length === 0) {
@@ -142,7 +142,7 @@ async function loadLog() {
 async function runNow() {
     showToast('Running moderation check...', 'info');
     try {
-        const resp = await fetch('/api/settings/moderation/run', { method: 'POST' });
+        const resp = await fetch(`/api/settings/moderation/run?project_slug=${encodeURIComponent(projectSlug)}`, { method: 'POST' });
         if (!resp.ok) {
             showToast('Moderation run failed', 'error');
             return;

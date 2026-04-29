@@ -118,22 +118,44 @@ async def _process_one(
     matched = matches_blocklist(text, blocklist)
     if not matched:
         return []
+    # Skip if we've already logged anything for this comment in this project.
+    # YouTube's commentThreads.list still returns already-rejected comments,
+    # and re-running moderation would otherwise insert a duplicate row every
+    # tick (every 30 min by default) — both for new errors and for
+    # already-deleted successes.
+    cursor = await db.execute(
+        "SELECT 1 FROM moderation_log WHERE project_id = ? AND comment_id = ? LIMIT 1",
+        (project_id, comment_id),
+    )
+    if await cursor.fetchone() is not None:
+        return []
+
     try:
         await asyncio.to_thread(youtube.moderate_comment, comment_id, "rejected")
+        action = "deleted"
+        error: str | None = None
     except Exception as exc:
-        logger.warning("Failed to reject comment %s: %s", comment_id, exc)
-        return []
+        logger.error(
+            "Failed to reject comment %s on video %s (project %s): %s",
+            comment_id, video_id, project_id, exc,
+        )
+        action = "error"
+        error = f"{type(exc).__name__}: {exc}"
+    # Log the attempt either way so the user can see why moderation 'didn't
+    # work' — silently swallowing the failure was the historical bug.
     await db.execute(
         """INSERT INTO moderation_log
         (project_id, video_id, comment_id, author, comment_text, matched_keyword, action)
         VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (project_id, video_id, comment_id, author, text[:500], matched, "deleted"),
+        (project_id, video_id, comment_id, author, text[:500], matched, action),
     )
     return [{
         "comment_id": comment_id,
         "author": author,
         "text": text[:100],
         "matched": matched,
+        "action": action,
+        "error": error,
     }]
 
 

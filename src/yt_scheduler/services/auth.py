@@ -17,6 +17,7 @@ cloud sync becomes real, swap to a project_uuid column and migrate.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 from pathlib import Path
@@ -215,12 +216,34 @@ def is_authenticated(project_slug: str = DEFAULT_PROJECT_SLUG) -> bool:
     return get_credentials(project_slug) is not None
 
 
-def get_youtube_service(project_slug: str = DEFAULT_PROJECT_SLUG):
-    """Build an authenticated YouTube API service for a project."""
-    creds = get_credentials(project_slug)
+_active_project_slug: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "active_project_slug", default=None
+)
+
+
+def set_active_project(slug: str | None) -> None:
+    """Bind an active project for callers (background jobs) that don't thread
+    a ``project_slug`` argument through every ``youtube.*`` wrapper. Callers
+    that pass an explicit ``project_slug`` always win over this binding.
+    """
+    _active_project_slug.set(slug)
+
+
+def get_active_project() -> str | None:
+    return _active_project_slug.get()
+
+
+def get_youtube_service(project_slug: str | None = None):
+    """Build an authenticated YouTube API service for a project.
+
+    Resolution order: explicit ``project_slug`` arg → ``set_active_project``
+    binding → ``DEFAULT_PROJECT_SLUG``.
+    """
+    slug = project_slug or _active_project_slug.get() or DEFAULT_PROJECT_SLUG
+    creds = get_credentials(slug)
     if not creds:
         raise RuntimeError(
-            f"Not authenticated for project '{project_slug}'. Run the OAuth flow."
+            f"Not authenticated for project '{slug}'. Run the OAuth flow."
         )
     return build("youtube", "v3", credentials=creds)
 

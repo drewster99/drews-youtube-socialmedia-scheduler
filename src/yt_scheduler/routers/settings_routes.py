@@ -425,26 +425,46 @@ async def delete_social_config(platform: str):
 # --- Blocklist ---
 
 
+async def _resolve_project_id(project_slug: str | None) -> int:
+    """Resolve a project_slug query param to an integer project_id.
+
+    Falls back to the default project (id=1) when no slug is given so legacy
+    callers and the global Settings page keep working unchanged.
+    """
+    if not project_slug:
+        return 1
+    from yt_scheduler.services import projects as _projects
+    project = await _projects.get_project_by_slug(project_slug)
+    if project is None:
+        raise HTTPException(404, f"Project '{project_slug}' not found")
+    return int(project["id"])
+
+
 @router.get("/blocklist")
-async def get_blocklist():
-    """Get all blocked keywords."""
-    return await moderation.get_blocklist()
+async def get_blocklist(project_slug: str | None = None):
+    """Get all blocked keywords for the given project."""
+    project_id = await _resolve_project_id(project_slug)
+    return await moderation.get_blocklist(project_id=project_id)
 
 
 @router.post("/blocklist")
-async def add_keyword(data: dict):
-    """Add a keyword to the blocklist."""
+async def add_keyword(data: dict, project_slug: str | None = None):
+    """Add a keyword to the project's blocklist."""
+    project_id = await _resolve_project_id(project_slug)
     keyword = data.get("keyword", "").strip()
     if not keyword:
         raise HTTPException(400, "Keyword is required")
-    await moderation.add_keyword(keyword, is_regex=data.get("is_regex", False))
+    await moderation.add_keyword(
+        keyword, is_regex=data.get("is_regex", False), project_id=project_id
+    )
     return {"status": "ok"}
 
 
 @router.delete("/blocklist/{keyword_id}")
-async def remove_keyword(keyword_id: int):
-    """Remove a keyword from the blocklist."""
-    await moderation.remove_keyword(keyword_id)
+async def remove_keyword(keyword_id: int, project_slug: str | None = None):
+    """Remove a keyword from the project's blocklist."""
+    project_id = await _resolve_project_id(project_slug)
+    await moderation.remove_keyword(keyword_id, project_id=project_id)
     return {"status": "ok"}
 
 
@@ -452,9 +472,10 @@ async def remove_keyword(keyword_id: int):
 
 
 @router.get("/moderation-log")
-async def get_moderation_log(limit: int = 50):
-    """Get recent moderation actions."""
-    return await moderation.get_moderation_log(limit)
+async def get_moderation_log(limit: int = 50, project_slug: str | None = None):
+    """Get recent moderation actions for the given project."""
+    project_id = await _resolve_project_id(project_slug)
+    return await moderation.get_moderation_log(limit, project_id=project_id)
 
 
 @router.get("/moderation-status")
@@ -487,14 +508,22 @@ async def get_moderation_status():
 
 
 @router.post("/moderation/run")
-async def run_moderation_now():
-    """Run comment moderation against the default project's videos right now.
+async def run_moderation_now(project_slug: str | None = None):
+    """Run comment moderation against the project's videos right now.
 
     Returns ``{checked, matched, actions_by_video, errors}`` so the toast can
     be informative — fixes the cosmetic-only Run Check Now button (req #3).
     """
+    project_id = await _resolve_project_id(project_slug)
+    # Bind the active project so the YouTube comment-list and moderate calls
+    # use the right OAuth credentials (not the default project's).
+    from yt_scheduler.services.auth import set_active_project
+    from yt_scheduler.services.projects import get_project_by_id
+    project = await get_project_by_id(project_id)
+    if project:
+        set_active_project(project["slug"])
     try:
-        results = await moderation.check_all_videos(project_id=1)
+        results = await moderation.check_all_videos(project_id=project_id)
     except Exception as exc:
         raise HTTPException(500, f"Moderation run failed: {exc}") from exc
     return results

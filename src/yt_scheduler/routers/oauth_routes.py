@@ -299,6 +299,7 @@ async def threads_callback(code: str | None = None, state: str | None = None, er
 
     # Fetch username (we already have user_id from the initial response)
     username = ""
+    me_error: str | None = None
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             me = await client.get(
@@ -310,11 +311,15 @@ async def threads_callback(code: str | None = None, state: str | None = None, er
             username = me_data.get("username", "")
             if not user_id:
                 user_id = me_data.get("id")
-    except Exception:
-        pass
+        else:
+            me_error = f"HTTP {me.status_code}: {me.text[:200]}"
+    except Exception as exc:
+        me_error = f"{type(exc).__name__}: {exc}"
+        logger.warning("Threads /me lookup failed: %s", me_error)
 
     if not user_id:
-        return _result_page(False, "Could not resolve Threads user_id.", platform="threads")
+        detail = f" ({me_error})" if me_error else ""
+        return _result_page(False, f"Could not resolve Threads user_id.{detail}", platform="threads")
 
     bundle = {
         "access_token": access_token,
@@ -546,6 +551,7 @@ async def twitter_callback(
     # Fetch the @handle + numeric id so we can identify the account stably.
     username = ""
     user_id = ""
+    me_error: str | None = None
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             me = await client.get(
@@ -556,13 +562,17 @@ async def twitter_callback(
             data = (me.json().get("data") or {})
             username = data.get("username", "")
             user_id = data.get("id", "")
-    except Exception:
-        pass
+        else:
+            me_error = f"HTTP {me.status_code}: {me.text[:200]}"
+    except Exception as exc:
+        me_error = f"{type(exc).__name__}: {exc}"
+        logger.warning("X /users/me lookup failed: %s", me_error)
 
     if not user_id:
+        detail = f" ({me_error})" if me_error else ""
         return _result_page(
             False,
-            "Could not resolve X user id. The provided OAuth scope must include users.read.",
+            f"Could not resolve X user id. The provided OAuth scope must include users.read.{detail}",
             platform="twitter",
         )
 
@@ -699,6 +709,7 @@ async def mastodon_callback(
 
     handle = ""
     account_id = ""
+    verify_error: str | None = None
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             verify = await client.get(
@@ -709,17 +720,21 @@ async def mastodon_callback(
             verify_data = verify.json()
             handle = verify_data.get("acct") or verify_data.get("username") or ""
             account_id = str(verify_data.get("id") or "")
-    except Exception:
-        pass
+        else:
+            verify_error = f"HTTP {verify.status_code}: {verify.text[:200]}"
+    except Exception as exc:
+        verify_error = f"{type(exc).__name__}: {exc}"
+        logger.warning("Mastodon verify_credentials failed: %s", verify_error)
 
     host = urlparse(instance).netloc
     if handle and "@" not in handle and host:
         handle = f"{handle}@{host}"
 
     if not account_id:
+        detail = f" ({verify_error})" if verify_error else ""
         return _result_page(
             False,
-            "Could not resolve Mastodon account id. Check that the access token has the read scope.",
+            f"Could not resolve Mastodon account id. Check that the access token has the read scope.{detail}",
             platform="mastodon",
         )
     provider_account_id = f"{account_id}@{host}" if host else account_id

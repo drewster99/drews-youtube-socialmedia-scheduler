@@ -103,11 +103,13 @@ All via environment variables (loaded from `.env`):
 |----------|---------|---------|
 | `ANTHROPIC_API_KEY` | — | Claude API key |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Model for AI generation |
-| `YTP_HOST` | `127.0.0.1` | Server bind address |
-| `YTP_PORT` | `8008` | Server port |
-| `YTP_DATA_DIR` | `~/.yt-scheduler` | Data directory |
-| `YTP_COMMENT_CHECK_MINUTES` | `30` | Comment moderation poll interval |
-| `YTP_CAPTION_CHECK_MINUTES` | `15` | Caption availability poll interval |
+| `DYS_HOST` | `127.0.0.1` | Server bind address |
+| `DYS_PORT` | `8008` | Server port |
+| `DYS_DATA_DIR` | `~/.yt-scheduler` | Data directory |
+| `DYS_COMMENT_CHECK_MINUTES` | `30` | Comment moderation poll interval |
+| `DYS_CAPTION_CHECK_MINUTES` | `15` | Caption availability poll interval |
+
+Legacy `YTP_*` names (`YTP_HOST`, `YTP_PORT`, `YTP_DATA_DIR`, etc.) are still honored as a fallback for older `.env` files.
 
 ## YouTube API Quota
 

@@ -9,6 +9,8 @@ from fastapi import APIRouter, HTTPException
 
 from yt_scheduler.database import get_db
 from yt_scheduler.services import events, transcripts, youtube
+from yt_scheduler.services.auth import set_active_project
+from yt_scheduler.services.projects import get_project_by_id
 
 logger = logging.getLogger(__name__)
 
@@ -40,11 +42,19 @@ async def set_active(video_id: str, payload: dict) -> dict:
 
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT transcript FROM videos WHERE id = ?", (video_id,)
+        "SELECT transcript, project_id FROM videos WHERE id = ?", (video_id,)
     )
     if not rows:
         raise HTTPException(404, "Video not found")
     old_text = rows[0]["transcript"] or ""
+
+    # Bind the active project so the YouTube caption upload below uses the
+    # right OAuth credentials.
+    project_id = rows[0]["project_id"]
+    if project_id is not None:
+        project = await get_project_by_id(int(project_id))
+        if project:
+            set_active_project(project["slug"])
 
     try:
         result = await transcripts.set_active_transcript(

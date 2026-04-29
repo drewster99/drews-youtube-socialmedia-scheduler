@@ -88,7 +88,12 @@ async def _build_render_context(db, video: dict) -> dict:
         # Best-effort YouTube duration lookup. Empty string for items without
         # a YT counterpart (standalone, hook-without-YT) — templates that
         # care can use {{tier??}}.
+        from yt_scheduler.services.auth import set_active_project
+        from yt_scheduler.services.projects import get_project_by_id
         try:
+            project_for_yt = await get_project_by_id(project_id)
+            if project_for_yt:
+                set_active_project(project_for_yt["slug"])
             yt = youtube.get_video(video_id)
             iso_dur = (yt or {}).get("contentDetails", {}).get("duration")
             tier = _tier_from_iso_duration(iso_dur)
@@ -131,24 +136,7 @@ async def _build_render_context(db, video: dict) -> dict:
     }
 
 
-def _decode_media_paths(post_row: dict) -> list[str]:
-    """Pull a media-paths list out of a social_posts row.
-
-    Prefers the new JSON-array column (``media_paths``) populated by the
-    post-generation paths; falls back to the legacy single-string column
-    (``media_path``) for any row written before migration 010 or by an
-    older code path that hasn't been updated. Empty / NULL ⇒ ``[]``.
-    """
-    raw = post_row.get("media_paths")
-    if raw:
-        try:
-            decoded = json.loads(raw)
-            if isinstance(decoded, list):
-                return [str(p) for p in decoded if p]
-        except (TypeError, ValueError):
-            pass
-    legacy = post_row.get("media_path")
-    return [str(legacy)] if legacy else []
+from yt_scheduler.services.social import decode_media_paths as _decode_media_paths  # noqa: E402
 
 
 def _legacy_media_for_slot(slot: dict, ctx: dict) -> str | None:

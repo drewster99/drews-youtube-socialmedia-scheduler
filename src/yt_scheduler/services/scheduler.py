@@ -11,6 +11,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from yt_scheduler.config import CAPTION_CHECK_INTERVAL_MINUTES, COMMENT_CHECK_INTERVAL_MINUTES
 from yt_scheduler.database import get_db
 from yt_scheduler.services import events, moderation, transcripts as transcript_service, youtube
+from yt_scheduler.services.auth import set_active_project
+from yt_scheduler.services.projects import get_project_by_id
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +109,14 @@ async def publish_video_job(video_id: str) -> dict:
         project_id = int(video_row["project_id"]) if video_row else 1
         item_type = (video_row["item_type"] if video_row else "episode") or "episode"
         item_url = (video_row["url"] if video_row else "") or ""
+
+        # Bind the active project so YouTube wrappers below pick the
+        # right OAuth credential — without this, a scheduled publish in
+        # any non-default project would publish via the default project's
+        # YouTube credentials (wrong channel, or 404).
+        project_row = await get_project_by_id(project_id)
+        if project_row:
+            set_active_project(project_row["slug"])
 
         # Step 1: YouTube publish step. Type-aware:
         # - episode/short/segment: required. The video MUST exist on YouTube;
@@ -255,10 +265,10 @@ async def publish_video_job(video_id: str) -> dict:
                 continue
 
             try:
-                from yt_scheduler.routers.social_routes import _decode_media_paths
+                from yt_scheduler.services.social import decode_media_paths
                 post_result = await poster.post(
                     post["content"],
-                    media_paths=_decode_media_paths(post),
+                    media_paths=decode_media_paths(post),
                 )
                 await db.execute(
                     """UPDATE social_posts
@@ -447,10 +457,10 @@ async def _send_scheduled_post(post_id: int) -> None:
         await db.commit()
         return
     try:
-        from yt_scheduler.routers.social_routes import _decode_media_paths
+        from yt_scheduler.services.social import decode_media_paths
         result = await poster.post(
             post["content"],
-            media_paths=_decode_media_paths(post),
+            media_paths=decode_media_paths(post),
         )
         await db.execute(
             "UPDATE social_posts SET status = 'posted', posted_at = datetime('now'), "
@@ -781,59 +791,84 @@ async def restore_scheduled_jobs() -> None:
     await restore_scheduled_posts()
 
 
-async def check_captions_job() -> None:
-    """Check for videos waiting on captions."""
+async def _iter_project_slugs() -> list[tuple[int, str]]:
+    """Yield ``(project_id, slug)`` for every project — caption/comment jobs
+    must rebind YouTube credentials per project, since each project has its
+    own OAuth grant against its own channel."""
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT id, title FROM videos WHERE status = 'uploaded'"
+        "SELECT id, slug FROM projects ORDER BY id"
     )
+    return [(int(r["id"]), r["slug"]) for r in rows]
 
-    for row in rows:
-        video_id = row["id"]
-        try:
-            captions = youtube.list_captions(video_id)
-            auto_captions = [
-                c for c in captions
-                if c["snippet"].get("trackKind") == "ASR"
-            ]
-            if auto_captions:
-                # Store SRT canonically — preserves segment timestamps for
-                # YouTube round-trip + chapter detection.
-                caption_text = youtube.download_caption(auto_captions[0]["id"], fmt="srt")
-                transcript_id = await transcript_service.upsert_transcript_for_source(
-                    video_id, "youtube", caption_text
-                )
-                await db.execute(
-                    """UPDATE videos SET
-                        transcript = ?,
-                        transcript_id = ?,
-                        transcript_source = 'youtube',
-                        transcript_created_at = COALESCE(transcript_created_at, datetime('now')),
-                        transcript_updated_at = datetime('now'),
-                        status = 'captioned',
-                        updated_at = datetime('now')
-                    WHERE id = ?""",
-                    (caption_text, transcript_id, video_id),
-                )
-                await db.commit()
-                logger.info(f"Captions ready for video {video_id}: {row['title']}")
-        except Exception as e:
-            logger.warning(f"Failed to check captions for {video_id}: {e}")
+
+async def check_captions_job() -> None:
+    """Check for videos waiting on captions, per-project."""
+    db = await get_db()
+    for project_id, slug in await _iter_project_slugs():
+        set_active_project(slug)
+
+        rows = await db.execute_fetchall(
+            "SELECT id, title FROM videos WHERE project_id = ? AND status = 'uploaded'",
+            (project_id,),
+        )
+        for row in rows:
+            video_id = row["id"]
+            try:
+                captions = youtube.list_captions(video_id)
+                auto_captions = [
+                    c for c in captions
+                    if c["snippet"].get("trackKind") == "ASR"
+                ]
+                if auto_captions:
+                    # Store SRT canonically — preserves segment timestamps for
+                    # YouTube round-trip + chapter detection.
+                    caption_text = youtube.download_caption(auto_captions[0]["id"], fmt="srt")
+                    transcript_id = await transcript_service.upsert_transcript_for_source(
+                        video_id, "youtube", caption_text
+                    )
+                    await db.execute(
+                        """UPDATE videos SET
+                            transcript = ?,
+                            transcript_id = ?,
+                            transcript_source = 'youtube',
+                            transcript_created_at = COALESCE(transcript_created_at, datetime('now')),
+                            transcript_updated_at = datetime('now'),
+                            status = 'captioned',
+                            updated_at = datetime('now')
+                        WHERE id = ?""",
+                        (caption_text, transcript_id, video_id),
+                    )
+                    await db.commit()
+                    logger.info(f"Captions ready for video {video_id} (project {slug}): {row['title']}")
+            except Exception as e:
+                logger.warning(f"Failed to check captions for {video_id} (project {slug}): {e}")
 
 
 async def moderate_comments_job() -> None:
-    """Run comment moderation on all tracked videos."""
-    try:
-        results = await moderation.check_all_videos()
+    """Run comment moderation on all tracked videos, per-project."""
+    for project_id, slug in await _iter_project_slugs():
+        set_active_project(slug)
+
+        try:
+            results = await moderation.check_all_videos(project_id=project_id)
+        except Exception as e:
+            logger.warning(
+                "Comment moderation job failed for project %s: %s", slug, e
+            )
+            continue
+
         actions_by_video = results.get("actions_by_video", {})
         for video_id, actions in actions_by_video.items():
             if actions:
-                logger.info(f"Moderated {len(actions)} comments on video {video_id}")
+                logger.info(
+                    "Moderated %d comments on video %s (project %s)",
+                    len(actions), video_id, slug,
+                )
         if results.get("checked"):
             logger.info(
-                "Moderation tick: checked %s, matched %s",
-                results.get("checked", 0),
-                results.get("matched", 0),
+                "Moderation tick (project %s): checked %s, matched %s",
+                slug, results.get("checked", 0), results.get("matched", 0),
             )
         # Surface auth-shaped errors loudly so they don't drown in the
         # generic per-video error list. Project Settings → YouTube card
@@ -850,18 +885,16 @@ async def moderate_comments_job() -> None:
         ]
         if auth_failures:
             logger.error(
-                "Moderation: YouTube auth failures on %d video(s); "
+                "Moderation (project %s): YouTube auth failures on %d video(s); "
                 "the project's YouTube credential likely needs re-auth. "
                 "First error: %s",
-                len(auth_failures), auth_failures[0]["error"],
+                slug, len(auth_failures), auth_failures[0]["error"],
             )
         elif errors:
             logger.warning(
-                "Moderation: %d video(s) errored (non-auth); first: %s",
-                len(errors), errors[0]["error"],
+                "Moderation (project %s): %d video(s) errored (non-auth); first: %s",
+                slug, len(errors), errors[0]["error"],
             )
-    except Exception as e:
-        logger.warning(f"Comment moderation job failed: {e}")
 
 
 def start_scheduler(
