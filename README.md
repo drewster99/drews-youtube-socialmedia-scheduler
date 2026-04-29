@@ -7,7 +7,7 @@ A local web app for managing YouTube video publishing across multiple projects, 
 1. **Multiple projects** — Each project pairs a YouTube channel with its own social accounts, templates, blocklist, and auto-action settings. Home page lists all projects + recent activity + upcoming scheduled items.
 2. **Upload or import** — Upload new videos directly, or import existing ones from YouTube. Imported videos pull description, tags, thumbnail (downloaded locally), and the YouTube transcript when available.
 3. **Tier-aware** — Videos are auto-classified by duration (hook < 50s, short 50–180s, segment 180–720s, video ≥ 720s). Each template declares which tiers it applies to.
-4. **Multi-transcript** — Each video can hold transcripts from YouTube auto-captions, mlx-whisper (per model), faster-whisper, whisper.cpp, macOS SFSpeechRecognizer, plus a user-edited version. Pick the active one in the chooser modal.
+4. **Multi-transcript** — Each video can hold transcripts from YouTube auto-captions, mlx-whisper (per model), whisper.cpp, macOS SFSpeechRecognizer, plus a user-edited version. Pick the active one in the chooser modal.
 5. **AI everywhere, prompts editable** — SEO description, tag generation, and per-platform social copy run through Claude. The prompt bodies live in `prompt_templates` and are editable like any other template.
 6. **Auto-actions** — Per-project matrix (Uploads | Imports) for: auto-transcribe, auto-description, auto-tags (add vs replace), auto-thumbnail (ffmpeg keyframe at 25%), per-platform auto-gen-socials. Wiring rules: tags + description fire only on first transcript set; socials fire only on first description set.
 7. **Per-video log** — Right-sidebar activity feed: created / imported / uploaded / metadata_updated (per-field diff modal) / publish_scheduled / published / social_post_scheduled (in-app modal of saved text) / social_post_published (link to live post).
@@ -61,7 +61,7 @@ Environment variables (loaded from `.env`; legacy `YTP_*` names are honoured as 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `ANTHROPIC_API_KEY` | — | Claude API key (also configurable from Settings) |
-| `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Default Claude model. Override per install via Settings → Anthropic → Model name (stored in DB). |
+| `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Default Claude model. Override per install via Settings → Anthropic → Model name (stored in DB). |
 | `DYS_HOST` | `127.0.0.1` | Bind address |
 | `DYS_PORT` | `8008` | Server port |
 | `DYS_DATA_DIR` | `~/.drews-yt-scheduler` | Data directory (legacy `~/.youtube-publisher` is auto-renamed on first run) |

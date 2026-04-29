@@ -256,6 +256,13 @@ body {
 .badge-unlisted { background: var(--warning); color: #000; }
 .badge-private { background: var(--danger); color: #fff; }
 .badge-public { background: var(--success); color: #fff; }
+
+/* Item-type badges (episode | short | segment | hook | standalone) */
+.badge-type-episode    { background: #3b82f6; color: #fff; }
+.badge-type-short      { background: #06b6d4; color: #fff; }
+.badge-type-segment    { background: #8b5cf6; color: #fff; }
+.badge-type-hook       { background: #f59e0b; color: #000; }
+.badge-type-standalone { background: #64748b; color: #fff; }
 .badge-approved { background: var(--accent); color: #000; }
 .badge-posted { background: var(--success); color: #fff; }
 .badge-failed { background: var(--danger); color: #fff; }
@@ -598,6 +605,13 @@ body {
 }
 
 .template-help p { font-size: 0.85rem; margin-bottom: 0.4rem; color: var(--text-secondary); }
+.template-help ul {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    margin: 0.25rem 0 0.75rem 0;
+    padding-left: 1.25rem;
+}
+.template-help ul li { margin-bottom: 0.2rem; }
 
 /* Preview */
 .preview-card {
@@ -769,6 +783,38 @@ body {
 .empty-state { color: var(--text-muted); font-size: 0.9rem; }
 .empty-state a { color: var(--accent); }
 .error { color: var(--danger); }
+
+.settings-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 0.5rem;
+    font-size: 0.9rem;
+}
+.settings-table th, .settings-table td {
+    padding: 0.4rem 0.5rem;
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+    vertical-align: middle;
+}
+.settings-table th {
+    color: var(--text-secondary);
+    font-weight: 600;
+    font-size: 0.8rem;
+}
+.settings-table input[type="text"] {
+    width: 100%;
+    padding: 0.25rem 0.4rem;
+    background: var(--bg-input);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+}
+.settings-table code {
+    background: var(--bg-primary);
+    padding: 0.1rem 0.3rem;
+    border-radius: var(--radius-sm);
+    font-size: 0.85em;
+}
 .section { margin-bottom: 2rem; }
 .section h2 { margin-bottom: 0.75rem; }
 

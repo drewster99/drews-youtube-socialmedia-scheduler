@@ -194,7 +194,6 @@ async def _maybe_transcribe(
 
     backend_to_source = {
         "mlx-whisper": "mlx_whisper",
-        "faster-whisper": "faster_whisper",
         "whisper.cpp": "whispercpp",
         "macos-speech": "apple_speech",
     }
@@ -314,9 +313,24 @@ async def _maybe_generate_description(video: dict, project_id: int) -> str | Non
 async def _maybe_generate_socials(
     video_id: str, project_id: int, platforms: list[str]
 ) -> None:
-    """Use the per-project default template for the video's tier."""
+    """Use the per-project default template for the video's tier.
+
+    Renders through the unified engine: the same `templates.merge_variables`
+    + `templates.extract_media_directives` + `templates.render` pipeline as
+    the synchronous `POST /api/social/generate-posts/{video_id}` route.
+    There is no second template engine — this auto-path produces identical
+    output to the manual path for the same template + item.
+    """
     if not platforms:
         return
+
+    # Lazy import to avoid the circular: social_routes imports from this
+    # module's neighbours. The shared helper lives in social_routes so both
+    # paths render identically.
+    from yt_scheduler.routers.social_routes import (
+        _build_render_context,
+        _legacy_media_for_slot,
+    )
 
     db = await get_db()
     rows = await db.execute_fetchall("SELECT * FROM videos WHERE id = ?", (video_id,))
@@ -333,39 +347,48 @@ async def _maybe_generate_socials(
         logger.info("Default template %s not found for tier %s", template_name, tier)
         return
 
-    tags = []
-    try:
-        tags = json.loads(video.get("tags") or "[]")
-    except json.JSONDecodeError:
-        pass
+    ctx = await _build_render_context(db, video)
 
-    from yt_scheduler.services.transcripts import srt_to_plain_text
-    variables = {
-        "title": video.get("title", ""),
-        "url": f"https://youtu.be/{video_id}",
-        "description": video.get("description", "") or "",
-        "description_short": (video.get("description") or "")[:150],
-        "description_medium": (video.get("description") or "")[:500],
-        "tags": ", ".join(tags),
-        "hashtags": " ".join(f"#{t.replace(' ', '')}" for t in tags[:5]),
-        "thumbnail_path": video.get("thumbnail_path") or "",
-        "tier": tier,
-        "transcript": srt_to_plain_text(video.get("transcript") or ""),
-        "user_message": "",
-    }
-
-    for platform in platforms:
-        cfg = template["platforms"].get(platform)
-        if not cfg or not cfg.get("template"):
+    for slot in template.get("slots", []):
+        if slot.get("is_disabled"):
+            continue
+        platform = slot["platform"]
+        if platform not in platforms:
+            continue
+        body = slot.get("body") or ""
+        if not body:
             continue
         try:
-            rendered = tmpl.render_template(cfg["template"], variables)
+            cleaned, media_paths, _alts = tmpl.extract_media_directives(
+                body,
+                video_path=ctx["video_path"],
+                thumbnail_path=ctx["thumb_path"],
+                images=ctx["images"],
+            )
+            rendered = tmpl.render(cleaned, ctx["variables"]).strip()
         except Exception as exc:
             logger.warning("auto-social render failed for %s: %s", platform, exc)
             continue
+
+        if not media_paths:
+            fallback = _legacy_media_for_slot(slot, ctx)
+            if fallback:
+                media_paths = [fallback]
+
+        media_paths_json = json.dumps(media_paths) if media_paths else None
+        primary_media = media_paths[0] if media_paths else None
+        media_type = slot.get("media", "thumbnail")
+        sa_id = slot.get("social_account_id")
+
         await db.execute(
-            """INSERT INTO social_posts (video_id, platform, content, media_type, status)
-            VALUES (?, ?, ?, ?, 'draft')""",
-            (video_id, platform, rendered, cfg.get("media", "thumbnail")),
+            """INSERT INTO social_posts
+                   (video_id, platform, content, media_path, media_paths,
+                    media_type, status, social_account_id)
+            VALUES (?, ?, ?, ?, ?, ?, 'draft', ?)""",
+            (
+                video_id, platform, rendered,
+                primary_media, media_paths_json,
+                media_type, sa_id,
+            ),
         )
     await db.commit()

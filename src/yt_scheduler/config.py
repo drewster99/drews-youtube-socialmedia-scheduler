@@ -92,7 +92,7 @@ YOUTUBE_SCOPES = [
 
 # Claude API — env var as fallback; Keychain is checked at runtime via get_anthropic_api_key()
 _ANTHROPIC_API_KEY_ENV = os.getenv("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 ANTHROPIC_NAMESPACE = "anthropic"
 ANTHROPIC_API_KEY_FIELD = "api_key"

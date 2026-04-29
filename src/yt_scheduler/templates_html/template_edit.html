@@ -30,9 +30,49 @@
     <div class="template-help card">
         <h4>Template syntax</h4>
         {% raw %}
-        <p><code>{{variable}}</code> — replaced with a value (title, url, description, description_short, description_medium, tags, hashtags, transcript, tier, user_message, …).</p>
-        <p><code>{{ai: prompt text here}}</code> — sent to Claude to generate content. Variables inside AI blocks are resolved first.</p>
-        <p>Example: <code>{{ai: Write a punchy tweet about {{title}} }}</code></p>
+        <p><strong>Variables</strong> — replaced with values from the surrounding context.</p>
+        <ul>
+            <li><code>{{name}}</code> — substitute. If the variable is missing, the placeholder stays literal so you can spot the typo.</li>
+            <li><code>{{name!}}</code> — <em>required</em>. If the variable is missing, rendering fails (the API returns 400 with the missing name; the auto-paths log and skip the slot).</li>
+            <li><code>{{name??default text}}</code> — substitute, or fall back to the literal default text when missing. The default text is absolute — a <code>{{title}}</code> inside the default stays literal, no recursion. Use <code>{{name??}}</code> for empty fallback.</li>
+        </ul>
+        <p><strong>Built-in variables</strong></p>
+        <ul>
+            <li><code>{{title}}</code>, <code>{{description}}</code>, <code>{{description_short}}</code> (≤150), <code>{{description_medium}}</code> (≤500), <code>{{tags}}</code>, <code>{{hashtags}}</code>, <code>{{tier}}</code>, <code>{{transcript}}</code>, <code>{{user_message}}</code>, <code>{{thumbnail_path}}</code></li>
+            <li><code>{{url}}</code> — this item's URL (YouTube URL for YT-uploaded items, or whatever you set on a standalone item).</li>
+            <li><code>{{episode_url}}</code> — the parent episode's URL when this item has a parent (e.g. a hook pointing at its primary episode).</li>
+            <li><code>{{project_url}}</code> — the project's URL (auto-filled from the YouTube channel handle on YT projects, or set explicitly on GitHub / social-only projects).</li>
+        </ul>
+        <p><strong>Custom variables</strong> — define your own at three scopes; later wins on collision.</p>
+        <ul>
+            <li><strong>Global</strong> (lowest priority) — install-wide. Set under <em>Settings</em>. Useful for things like a default sign-off.</li>
+            <li><strong>Project</strong> — overrides global for this project.</li>
+            <li><strong>Parent item</strong> — when this item has a parent, the parent's custom values flow in.</li>
+            <li><strong>This item</strong> (highest priority) — overrides everything else for this item.</li>
+        </ul>
+        <p><strong>Media directives</strong> — attach files to the post (substitute to empty in the body).</p>
+        <ul>
+            <li><code>{{video}}</code> — attach the item's primary video file.</li>
+            <li><code>{{thumbnail}}</code> — attach the item's thumbnail.</li>
+            <li><code>{{image:cat}}</code> — attach the image whose shortname is <code>cat</code> (set when uploading the image).</li>
+            <li><code>{{image:*}}</code> — attach every image, in upload order.</li>
+        </ul>
+        <p><strong>AI blocks</strong> — sent to Claude to generate content. Variables inside an AI block are resolved before the prompt ships.</p>
+        <ul>
+            <li><code>{{ai: prompt text}}</code> — one Claude call using the default system prompt.</li>
+            <li><code>{{ai[system text]: prompt text}}</code> — per-block system-prompt override (only this block uses it).</li>
+            <li>Nested AI blocks are evaluated leaves-first. The inner output is spliced into the outer prompt, then the outer call runs.</li>
+            <li>Sibling AI blocks at the same level are independent. Each is one Claude call.</li>
+        </ul>
+        <p style="margin-top: 0.5rem;"><strong>Examples</strong></p>
+        <ul>
+            <li><code>{{ai: Write a punchy tweet about {{title}}}} {{url}}</code></li>
+            <li><code>Watch the full episode: {{episode_url!}} — clip below: {{video}}</code></li>
+            <li><code>{{ai[Be terse, lowercase only]: 3-word summary of {{description_short}}}}</code></li>
+            <li><code>{{ai: Tweet about "{{title}}" using this hashtag list: {{ai: Write 3 CamelCase hashtags for {{tags}}}}}}</code></li>
+            <li><code>Photos from today {{image:*}} — more on {{project_url}}</code></li>
+        </ul>
+        <p class="form-hint" style="margin-top: 0.75rem;">All renderings (preview, generate-posts, auto-actions, prompt-template bodies) go through the same engine — the <code>POST /api/expand_text</code> endpoint exposes it directly.</p>
         {% endraw %}
     </div>
 
@@ -298,7 +338,7 @@ async function previewAll() {
         const bodyEl = document.querySelector(`[data-slot-body="${slot.id}"]`);
         const body = bodyEl ? bodyEl.value : slot.body;
         try {
-            const resp = await fetch('/api/templates/preview', {
+            const resp = await fetch('/api/expand_text', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({template: body, variables}),

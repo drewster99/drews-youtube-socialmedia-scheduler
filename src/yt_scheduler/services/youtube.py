@@ -407,3 +407,28 @@ def get_channel_info() -> dict | None:
     ).execute()
     items = result.get("items", [])
     return items[0] if items else None
+
+
+def compose_channel_url(handle: str | None, channel_id: str | None) -> str | None:
+    """Build the canonical channel URL for a YouTube channel.
+
+    Prefers the ``@handle`` form (``snippet.customUrl``) — the prettier URL
+    most channels surface publicly. Falls back to ``/channel/<id>`` when
+    no ``customUrl`` is published.
+
+    Audited the YouTube Data API v3 ``channels`` resource against the
+    ``snippet | statistics | brandingSettings | contentDetails`` parts:
+    no fully-formed URL field exists. Composing client-side is the only
+    option, and both forms resolve to the same channel page.
+    """
+    handle = (handle or "").strip()
+    if handle:
+        # `customUrl` already includes the leading `@` for modern channels.
+        # Older channels can have a slash-form like "user/foo" or "c/bar"
+        # — pass whatever the API gave us through verbatim.
+        if not handle.startswith(("@", "user/", "c/")):
+            handle = "@" + handle
+        return f"https://www.youtube.com/{handle}"
+    if channel_id:
+        return f"https://www.youtube.com/channel/{channel_id}"
+    return None

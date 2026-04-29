@@ -16,7 +16,7 @@ import re
 import aiosqlite
 
 from yt_scheduler.database import get_db
-from yt_scheduler.services.ai import render_ai_blocks
+from yt_scheduler.services.ai import DEFAULT_AI_SYSTEM, call_ai_block
 from yt_scheduler.services.social import ALL_PLATFORMS
 
 # Default templates shipped with the app
@@ -69,44 +69,286 @@ DEFAULT_TEMPLATE = {
 BUILTIN_TEMPLATE_NAMES = {"announce_video", "send_message"}
 
 
-def substitute_variables(text: str, variables: dict[str, str]) -> str:
-    """Replace {{variable_name}} with values from the variables dict.
+class MissingRequiredVariable(KeyError):
+    """Raised when a ``{{name!}}`` placeholder has no value in the variables
+    dict. The required marker is opt-in: plain ``{{name}}`` misses still
+    render literally."""
 
-    Skips {{ai: ...}} blocks — those are handled separately.
+    def __init__(self, name: str):
+        self.name = name
+        super().__init__(name)
+
+    def __str__(self) -> str:
+        return f"Required template variable not provided: {{{{{self.name}!}}}}"
+
+
+class UnknownImageShortname(KeyError):
+    """Raised when an ``{{image:shortname}}`` directive references a shortname
+    with no matching ``item_images`` row. The wildcard form ``{{image:*}}``
+    and the bare ``{{video}}`` / ``{{thumbnail}}`` directives never raise —
+    they silently skip when the file isn't present."""
+
+    def __init__(self, shortname: str):
+        self.shortname = shortname
+        super().__init__(shortname)
+
+    def __str__(self) -> str:
+        return f"Image shortname not found: {{{{image:{self.shortname}}}}}"
+
+
+def merge_variables(
+    *,
+    global_vars: dict[str, str] | None = None,
+    project_vars: dict[str, str] | None = None,
+    parent_item_vars: dict[str, str] | None = None,
+    self_builtins: dict[str, object] | None = None,
+    self_item_vars: dict[str, str] | None = None,
+) -> dict[str, object]:
+    """Combine the four custom-variable scopes with self's built-ins per the
+    inheritance rule (later wins on key collision):
+
+        1. ``global_vars``       (lowest priority)
+        2. ``project_vars``
+        3. ``parent_item_vars``  (only applies when self has a parent)
+        4. ``self_builtins``     (title, url, episode_url, project_url, …)
+        5. ``self_item_vars``    (highest priority)
+
+    Built-in keys never inherit from a parent — that would let ``{{title}}``
+    accidentally reflect the parent's title. Only custom k/v pairs inherit.
+    The named cross-scope accessors (``{{episode_url}}``, ``{{project_url}}``)
+    live in ``self_builtins`` because they're computed at the self-level
+    rather than literally pulled from the parent's variables.
     """
+    merged: dict[str, object] = {}
+    if global_vars:
+        merged.update(global_vars)
+    if project_vars:
+        merged.update(project_vars)
+    if parent_item_vars:
+        merged.update(parent_item_vars)
+    if self_builtins:
+        merged.update(self_builtins)
+    if self_item_vars:
+        merged.update(self_item_vars)
+    return merged
 
-    def replace_var(match: re.Match) -> str:
-        key = match.group(1).strip()
-        if key.startswith("ai:"):
-            return match.group(0)
-        return variables.get(key, match.group(0))
 
-    return re.sub(r"\{\{(\w+)\}\}", replace_var, text)
+# {{video}}, {{thumbnail}}, {{image:shortname}}, {{image:*}}.
+# `image:*` is the wildcard; `image:<shortname>` requires lowercase
+# alphanumerics + hyphens (matches the validation rule in `item_images`).
+_MEDIA_DIRECTIVE_PATTERN = re.compile(
+    r"\{\{(video|thumbnail|image:(?:\*|[a-z0-9-]+))\}\}"
+)
 
 
-def render_template(template_text: str, variables: dict[str, str]) -> str:
-    """Render a template: first substitute variables, then process AI blocks.
+def extract_media_directives(
+    body: str,
+    *,
+    video_path: str | None = None,
+    thumbnail_path: str | None = None,
+    images: list[dict] | None = None,
+) -> tuple[str, list[str], list[str]]:
+    """Pre-pass over the template body that pulls media directives out.
 
-    Variables inside AI blocks also get substituted before the AI sees them.
+    Returns ``(cleaned_body, media_paths, alt_texts)``. Each directive is
+    replaced by an empty string in the body and the corresponding file
+    path + alt-text are appended to the returned lists, in the order
+    directives appear.
+
+    Directive semantics:
+
+    - ``{{video}}`` — append ``video_path`` if non-empty, else skip silently.
+    - ``{{thumbnail}}`` — append ``thumbnail_path`` if non-empty, else skip.
+    - ``{{image:*}}`` — append every image's path, in the order of the
+      ``images`` list (caller pre-sorts by ``order_index``).
+    - ``{{image:shortname}}`` — append the matching image's path; raises
+      :class:`UnknownImageShortname` when no row matches (the user named a
+      specific image, so a miss is a real bug, not a silent fallback).
+
+    ``images`` is a list of dicts with at least ``shortname``, ``path``,
+    ``alt_text``. Pass ``None`` (or an empty list) when no images exist.
     """
-    result = re.sub(
-        r"\{\{(?!ai:)(\w+)\}\}",
-        lambda m: variables.get(m.group(1).strip(), m.group(0)),
-        template_text,
+    images = images or []
+    images_by_name = {img["shortname"]: img for img in images}
+
+    media_paths: list[str] = []
+    alt_texts: list[str] = []
+
+    def replace(match: re.Match) -> str:
+        directive = match.group(1)
+        if directive == "video":
+            if video_path:
+                media_paths.append(video_path)
+                alt_texts.append("")
+        elif directive == "thumbnail":
+            if thumbnail_path:
+                media_paths.append(thumbnail_path)
+                alt_texts.append("")
+        elif directive == "image:*":
+            for img in images:
+                media_paths.append(img["path"])
+                alt_texts.append(img.get("alt_text") or "")
+        elif directive.startswith("image:"):
+            shortname = directive[len("image:"):]
+            img = images_by_name.get(shortname)
+            if img is None:
+                raise UnknownImageShortname(shortname)
+            media_paths.append(img["path"])
+            alt_texts.append(img.get("alt_text") or "")
+        return ""
+
+    cleaned = _MEDIA_DIRECTIVE_PATTERN.sub(replace, body)
+    return cleaned, media_paths, alt_texts
+
+
+def render(
+    template_text: str,
+    variables: dict[str, object] | None = None,
+    *,
+    default_system_prompt: str | None = DEFAULT_AI_SYSTEM,
+    model: str | None = None,
+    max_tokens: int = 512,
+) -> str:
+    """Single rendering primitive. Two passes:
+
+    1. **Variable substitution.** Three placeholder forms:
+
+       * ``{{name}}`` — optional. Missing key stays literal in the output
+         so the user can spot typos.
+       * ``{{name!}}`` — required. Missing key raises
+         :class:`MissingRequiredVariable`.
+       * ``{{name??default text}}`` — optional with fallback. Missing key
+         renders ``default text`` (which may be empty for ``{{name??}}``).
+         Default text is taken as a literal string — no recursive
+         substitution inside it.
+
+       ``ai:`` and ``ai[...]:`` openers survive this pass because ``\\w+``
+       can't cross the colon or bracket.
+
+    2. **AI block evaluation.** ``{{ai: prompt}}`` and the system-override
+       form ``{{ai[system text]: prompt}}`` are matched with a balanced-
+       brace walker (Python ``re`` can't handle balanced delimiters).
+       Inner blocks resolve first and their output is spliced into the
+       parent's prompt before the parent is sent. Sibling blocks are
+       independent.
+
+    Per-block ``[system]`` overrides only that block's call; nested
+    blocks that don't specify their own override inherit
+    ``default_system_prompt``. Unbalanced ``{{ai`` openers are emitted
+    verbatim so the broken syntax surfaces in the output instead of
+    silently shipping a half-template to Claude.
+    """
+    variables = variables or {}
+    text = _substitute_variables(template_text, variables)
+    return _resolve_ai_blocks(
+        text,
+        default_system_prompt=default_system_prompt,
+        model=model,
+        max_tokens=max_tokens,
     )
 
-    def sub_vars_in_ai(match: re.Match) -> str:
-        ai_content = match.group(1)
-        resolved = re.sub(
-            r"\{\{(\w+)\}\}",
-            lambda m: variables.get(m.group(1).strip(), m.group(0)),
-            ai_content,
-        )
-        return "{{ai: " + resolved + "}}"
 
-    result = re.sub(r"\{\{ai:\s*(.*?)\s*\}\}", sub_vars_in_ai, result, flags=re.DOTALL)
-    result = render_ai_blocks(result)
-    return result
+# Backwards-compatible alias kept so older callers don't need a churn pass.
+def render_template(template_text: str, variables: dict[str, object]) -> str:
+    return render(template_text, variables)
+
+
+# {{name}}, {{name!}}, or {{name??default text}}. The trailing alternation
+# captures '!' (required) OR '??<default>' — never both, never neither-and-
+# bare-suffix. Default text is non-greedy so it stops at the next '}}'.
+_VAR_PATTERN = re.compile(r"\{\{(\w+)(?:(!)|\?\?(.*?))?\}\}")
+
+
+def _substitute_variables(text: str, variables: dict[str, object]) -> str:
+    def replace(match: re.Match) -> str:
+        name = match.group(1)
+        required = match.group(2) is not None
+        default_text = match.group(3)  # None when no `??...` was present
+        if name in variables:
+            value = variables[name]
+            return "" if value is None else str(value)
+        if required:
+            raise MissingRequiredVariable(name)
+        if default_text is not None:
+            return default_text
+        return match.group(0)
+
+    return _VAR_PATTERN.sub(replace, text)
+
+
+def _resolve_ai_blocks(
+    text: str,
+    *,
+    default_system_prompt: str | None,
+    model: str | None,
+    max_tokens: int,
+) -> str:
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        idx = text.find("{{ai", i)
+        if idx < 0:
+            out.append(text[i:])
+            break
+
+        cursor = idx + 4  # past "{{ai"
+        if cursor >= n or text[cursor] not in ":[":
+            # Not actually an ai opener (e.g. ``{{aitch}}`` or stray ``{{ai``).
+            out.append(text[i:cursor])
+            i = cursor
+            continue
+
+        out.append(text[i:idx])
+
+        system_override: str | None = None
+        if text[cursor] == "[":
+            close = text.find("]", cursor + 1)
+            if close < 0 or close + 1 >= n or text[close + 1] != ":":
+                # Unbalanced [ or missing ':' after ']' — surface the
+                # broken syntax instead of silently absorbing it.
+                out.append(text[idx:])
+                break
+            system_override = text[cursor + 1 : close]
+            cursor = close + 1  # now points at ':'
+
+        # cursor points at ':'; body starts after.
+        body_start = cursor + 1
+        depth = 1
+        j = body_start
+        while j < n and depth > 0:
+            pair = text[j:j + 2]
+            if pair == "{{":
+                depth += 1
+                j += 2
+            elif pair == "}}":
+                depth -= 1
+                j += 2
+            else:
+                j += 1
+        if depth != 0:
+            out.append(text[idx:])
+            break
+
+        inner_text = text[body_start : j - 2].strip()
+        prompt = _resolve_ai_blocks(
+            inner_text,
+            default_system_prompt=default_system_prompt,
+            model=model,
+            max_tokens=max_tokens,
+        )
+        effective_system = (
+            system_override if system_override is not None else default_system_prompt
+        )
+        out.append(call_ai_block(
+            prompt,
+            system=effective_system,
+            model=model,
+            max_tokens=max_tokens,
+        ))
+        i = j
+
+    return "".join(out)
 
 
 _DEFAULT_APPLIES_TO = ["hook", "short", "segment", "video"]

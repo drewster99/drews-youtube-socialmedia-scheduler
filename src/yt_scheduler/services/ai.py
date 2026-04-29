@@ -9,7 +9,6 @@ missing (e.g. install hasn't applied the migration yet).
 from __future__ import annotations
 
 import asyncio
-import re
 
 import anthropic
 
@@ -73,15 +72,15 @@ async def _resolve_model() -> str:
 
 
 def _render_template_body(body: str, variables: dict[str, str]) -> str:
-    """Substitute ``{{var}}`` placeholders in a prompt body. Missing variables
-    render as empty strings so a prompt referencing ``{{user_message}}`` from
-    a context that doesn't supply one doesn't leak the literal token."""
-    def repl(match: re.Match) -> str:
-        key = match.group(1).strip()
-        value = variables.get(key)
-        return "" if value is None else str(value)
+    """Substitute placeholders in a prompt body using the unified renderer
+    (`services/templates.render`). Prompt-template authors who want a
+    silent fallback for an optional variable should write
+    ``{{user_message??}}`` (or ``{{user_message??default text}}``) so the
+    fallback is explicit at the template site rather than implicit in
+    the renderer."""
+    from yt_scheduler.services import templates  # avoid import cycle at module load
 
-    return re.sub(r"\{\{(\w+)\}\}", repl, body)
+    return templates.render(body, variables)
 
 
 async def generate_seo_description(
@@ -269,24 +268,37 @@ async def generate_tags_from_metadata(
     return [t.strip().strip('"\'').lower() for t in raw.split(",") if t.strip()]
 
 
-def render_ai_blocks(text: str, variables: dict[str, str] | None = None) -> str:
-    """Process {{ai: ...}} blocks in a template string.
+DEFAULT_AI_SYSTEM = (
+    "You are a social media copywriter. Return ONLY the requested text, "
+    "no preamble, no quotes, no explanation."
+)
 
-    Variables inside AI blocks should already be substituted before calling this.
+
+def call_ai_block(
+    prompt: str,
+    *,
+    system: str | None = DEFAULT_AI_SYSTEM,
+    model: str | None = None,
+    max_tokens: int = 512,
+) -> str:
+    """One Claude round-trip for a single template ``{{ai: ...}}`` block.
+
+    ``system=None`` (or empty string) sends no system prompt; the renderer
+    passes a per-block override when the template uses
+    ``{{ai[system text]: ...}}`` syntax. ``model=None`` falls back to
+    ``settings.anthropic_model`` (or env). Used as the unified leaf call;
+    the walker in `services/templates.py` handles nesting itself.
     """
     client = get_client()
-
-    def replace_ai_block(match: re.Match) -> str:
-        prompt = match.group(1).strip()
-        message = client.messages.create(
-            model=_resolve_model_sync(),
-            max_tokens=512,
-            messages=[{"role": "user", "content": prompt}],
-            system="You are a social media copywriter. Return ONLY the requested text, no preamble, no quotes, no explanation.",
-        )
-        return message.content[0].text.strip()
-
-    return re.sub(r"\{\{ai:\s*(.*?)\s*\}\}", replace_ai_block, text, flags=re.DOTALL)
+    kwargs: dict[str, object] = {
+        "model": model or _resolve_model_sync(),
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if system:
+        kwargs["system"] = system
+    message = client.messages.create(**kwargs)
+    return message.content[0].text.strip()
 
 
 def generate_social_post(

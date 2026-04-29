@@ -58,7 +58,7 @@ async def list_projects() -> list[dict]:
 async def get_project_by_slug(slug: str) -> dict | None:
     db = await get_db()
     cursor = await db.execute(
-        "SELECT id, name, slug, youtube_channel_id, created_at, updated_at "
+        "SELECT id, name, slug, youtube_channel_id, project_url, created_at, updated_at "
         "FROM projects WHERE slug = ?",
         (slug,),
     )
@@ -69,7 +69,7 @@ async def get_project_by_slug(slug: str) -> dict | None:
 async def get_project_by_id(project_id: int) -> dict | None:
     db = await get_db()
     cursor = await db.execute(
-        "SELECT id, name, slug, youtube_channel_id, created_at, updated_at "
+        "SELECT id, name, slug, youtube_channel_id, project_url, created_at, updated_at "
         "FROM projects WHERE id = ?",
         (project_id,),
     )
@@ -77,10 +77,17 @@ async def get_project_by_id(project_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-async def create_project(name: str, slug: str | None = None) -> dict:
+async def create_project(
+    name: str, slug: str | None = None, *, project_url: str | None = None
+) -> dict:
     """Create a new project. Slug is auto-derived from name when not given.
 
     Slug is immutable after creation; renaming changes only the display name.
+
+    ``project_url`` is the value behind ``{{project_url}}`` in templates and
+    is optional at create time. For YouTube-bound projects, the OAuth flow
+    seeds it from ``snippet.customUrl``; for GitHub or social-only projects
+    the user supplies it explicitly.
     """
     name = name.strip()
     if not name:
@@ -95,14 +102,31 @@ async def create_project(name: str, slug: str | None = None) -> dict:
     db = await get_db()
     try:
         cursor = await db.execute(
-            "INSERT INTO projects (name, slug) VALUES (?, ?)",
-            (name, chosen_slug),
+            "INSERT INTO projects (name, slug, project_url) VALUES (?, ?, ?)",
+            (name, chosen_slug, (project_url or "").strip() or None),
         )
         await db.commit()
     except aiosqlite.IntegrityError as exc:
         raise ValueError(f"A project with slug '{chosen_slug}' already exists") from exc
 
     return await get_project_by_id(int(cursor.lastrowid))  # type: ignore[return-value]
+
+
+async def update_project_url(project_id: int, project_url: str | None) -> dict:
+    """Set or clear the project's ``project_url`` (the value behind
+    ``{{project_url}}`` in templates). Pass ``None`` or empty string to
+    clear."""
+    cleaned = (project_url or "").strip() or None
+    db = await get_db()
+    await db.execute(
+        "UPDATE projects SET project_url = ?, updated_at = datetime('now') WHERE id = ?",
+        (cleaned, project_id),
+    )
+    await db.commit()
+    project = await get_project_by_id(project_id)
+    if project is None:
+        raise ValueError(f"Project {project_id} not found")
+    return project
 
 
 async def rename_project(project_id: int, name: str) -> dict:

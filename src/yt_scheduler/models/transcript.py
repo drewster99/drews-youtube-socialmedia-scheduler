@@ -11,7 +11,6 @@ TranscriptSource = Literal[
     "youtube",
     "apple_speech",
     "mlx_whisper",
-    "faster_whisper",
     "whispercpp",
     "user_edited",
 ]

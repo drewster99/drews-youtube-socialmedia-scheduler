@@ -13,6 +13,9 @@ Generated from the router source. When endpoints change, update this file. (CLAU
 - [Transcripts (`/api/videos/{video_id}/transcripts`)](#transcripts-apivideosvideo_idtranscripts) — `transcript_routes.py`
 - [Social posts (`/api/social`)](#social-posts-apisocial) — `social_routes.py`
 - [Templates (`/api/templates`)](#templates-apitemplates) — `template_routes.py`
+- [Text expansion (`/api/expand_text`)](#text-expansion-apiexpand_text) — `expand_routes.py` (the canonical renderer; every other rendering path delegates here)
+- [Item images (`/api/videos/{video_id}/images`)](#item-images-apivideosvideo_idimages) — `item_image_routes.py`
+- [Custom variables](#custom-variables) — `global_variable_routes.py`, `project_variable_routes.py`, `item_variable_routes.py`
 - [Settings (`/api/settings`)](#settings-apisettings) — `settings_routes.py`
 - [Built-in social OAuth flows (`/api/oauth`)](#built-in-social-oauth-flows-apioauth) — `oauth_routes.py`
 - [Social credentials (`/api/social-credentials`)](#social-credentials-apisocial-credentials) — `social_credentials_routes.py`
@@ -188,10 +191,15 @@ Filters to videos with `publish_at IS NOT NULL AND status != 'published'`, order
 **Request body** — JSON:
 
 ```json
-{ "name": "My Channel", "slug": "my-channel" }
+{
+  "name": "AI Chess Machine",
+  "slug": "ai-chess",
+  "kind": "github",
+  "project_url": "https://github.com/me/ai-chess"
+}
 ```
 
-`name` is required; `slug` is optional and is auto-derived from `name` via `slugify()` when omitted. Slug must match `^[a-z0-9][a-z0-9-]*$`.
+`name` is required. `slug` is optional and is auto-derived from `name` via `slugify()` when omitted; must match `^[a-z0-9][a-z0-9-]*$`. `kind` is informational only at create time (`"youtube" | "github" | "social"`); the actual constraint that gates `episode/short/segment` items is whether `youtube_channel_id` is bound, and only the YouTube OAuth flow can bind one. `project_url` is the value behind `{{project_url}}`; for YouTube projects it's auto-populated by the OAuth bind, for GitHub or social-only projects the user supplies it here.
 
 **Response 200** — Newly inserted project row (same shape as `GET /api/projects/{slug}`).
 
@@ -213,6 +221,7 @@ Filters to videos with `publish_at IS NOT NULL AND status != 'published'`, order
   "name": "Default",
   "slug": "default",
   "youtube_channel_id": "UC..." | null,
+  "project_url": "https://www.youtube.com/@..." | null,
   "created_at": "...",
   "updated_at": "..."
 }
@@ -222,23 +231,45 @@ Filters to videos with `publish_at IS NOT NULL AND status != 'published'`, order
 
 ### `PATCH /api/projects/{slug}`
 
-**Purpose** — Rename a project. Slug is intentionally not renamed.
+**Purpose** — Update a project's display name and/or `project_url`. Slug is intentionally not renamed.
 
-**Request body** — `{ "name": "New Name" }`.
+**Request body** — Any subset:
+
+```json
+{ "name": "New Name", "project_url": "https://github.com/me/x" }
+```
+
+Pass `project_url: ""` (or `null`) to clear it.
 
 **Response 200** — Updated project dict.
 
 **Errors** — `404` (unknown slug), `400` (empty name).
 
+### `POST /api/projects/{slug}/youtube/refresh-channel-url`
+
+**Purpose** — Re-pull the channel handle from YouTube's `channels.list` and overwrite `projects.project_url` with the canonical channel URL. Used when the upstream channel handle changes (rare) or when the user wants to revert a hand-edited URL back to the canonical YouTube form.
+
+Unlike the OAuth bind, which only seeds `project_url` when it's `NULL`, this endpoint **always overwrites**.
+
+**Response 200** — `{"project_url": "https://www.youtube.com/@...", "channel_handle": "@..."}`.
+
+**Errors** — `404` (unknown slug), `400` (project has no YouTube channel bound), `401` (credentials missing/expired), `502` (YouTube API call failed).
+
 ### `DELETE /api/projects/{slug}`
 
-**Purpose** — Delete a project (cascades to its videos, templates, etc. via FK).
+**Purpose** — Delete a project and everything scoped to it.
 
 **Response 200** — `{"status": "ok"}`. Returns OK even when the project doesn't exist (idempotent).
 
 **Errors** — `400` if attempting to delete the Default project.
 
-**Side effects** — Enables `PRAGMA foreign_keys = ON` and deletes the row; FK cascades clean up children.
+**Cascades** — Enables `PRAGMA foreign_keys = ON` and deletes the `projects` row. Every table whose `project_id` column declares `REFERENCES projects(id) ON DELETE CASCADE` is wiped for this project (chain visible in `migrations/002_projects.sql`, `006_prompt_templates.sql`, `008_per_project_credentials.sql`):
+
+- `videos` → cascades again to `transcripts` and `video_events` (also `ON DELETE CASCADE` on `video_id`).
+- `templates` → cascades to `template_slots`.
+- `prompt_templates`, `project_settings`, `project_social_defaults`, `project_social_accounts`, `blocklist`, `moderation_log`.
+
+`social_accounts` rows survive (credentials are install-wide, not per-project). `social_posts` rows are deleted indirectly via the `videos → social_posts` chain. APScheduler jobs (`publish_<video_id>`, `social_post_<id>`) for the removed videos/posts **are NOT torn down by FK** — they become orphans that hit the "row vanished" no-op branch when they fire. (Practical impact is low because scheduled rows are rarely orphaned by project deletion, but worth knowing.)
 
 ### `GET /api/projects/{slug}/auto-actions`
 
@@ -460,7 +491,7 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 
 **Purpose** — Enumerate which on-device transcription backends are usable on this machine.
 
-**Response 200** — Array (shape determined by `services/transcription.list_available_backends()`); each element includes a backend id (e.g. `mlx-whisper`, `faster-whisper`, `whisper.cpp`, `macos-speech`) and human-readable info.
+**Response 200** — Array (shape determined by `services/transcription.list_available_backends()`); each element includes a backend id (e.g. `mlx-whisper`, `whisper.cpp`, `macos-speech`) and human-readable info.
 
 ### `GET /api/videos/scheduled`
 
@@ -505,6 +536,10 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 | `privacy_status` | string | no | `unlisted` (default), `private`, `public`. |
 | `publish_at` | string | no | ISO 8601 future timestamp; tells YouTube to scheduled-publish at that time. |
 | `project_slug` | string | no | Target project. Default `default`. |
+| `item_type` | string | no | One of `episode | short | segment | hook`. Default `episode`. `standalone` is rejected here — standalone items don't go through YouTube; use a separate creation path (forthcoming). |
+| `parent_item_id` | string | no | Optional parent item id. Required-shape only for `short`, `segment`, `hook`; rejected for `episode`. The FK is enforced by `videos.parent_item_id REFERENCES videos(id) ON DELETE SET NULL`. |
+
+The endpoint refuses with `400` when the target project has no YouTube channel bound (`youtube_channel_id IS NULL`) — uploads to YouTube need a bound channel.
 
 **Response 200**:
 
@@ -517,9 +552,47 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 }
 ```
 
-**Errors** — `404` (unknown `project_slug`), `500` (YouTube upload failed).
+**Errors** — `404` (unknown `project_slug`), `400` (project has no YT channel; invalid `item_type`; episode with non-empty `parent_item_id`; `parent_item_id` not found), `500` (YouTube upload failed).
 
-**Side effects** — Saves files to `UPLOAD_DIR`; calls `youtube.upload_video` (~100 quota); inserts into `videos`; records `created` and `uploaded` events; fires `auto_actions.run_post_create_actions(... source="upload")` in the background (transcribe / describe / etc.).
+**Side effects** — Saves files to `UPLOAD_DIR`; calls `youtube.upload_video` (~100 quota); inserts into `videos` with `item_type`, `parent_item_id`, and `url = "https://youtu.be/<id>"` populated from the upload result; records `created` (carrying `item_type`) and `uploaded` events; fires `auto_actions.run_post_create_actions(... source="upload")` in the background (transcribe / describe / etc.).
+
+**Renderer (background path)** — When the project's auto-actions matrix has auto-gen-socials enabled, the background job renders each platform's slot body through the same engine as [`POST /api/expand_text`](#post-apiexpand_text). Same variables and same `{{var!}}` / `{{var??default}}` / `{{ai: ...}}` / `{{ai[system]: ...}}` semantics — there is no separate template engine for the auto path.
+
+### `POST /api/videos/items`
+
+**Purpose** — Create an item that does **not** go through YouTube. Used for `standalone` items (a GitHub-repo post with screenshots, an "AI Chess" project announcement, an image-only Bluesky post) and for `hook` items where the user wants to post the clip directly to social without also uploading to YouTube.
+
+**Request body** — `multipart/form-data`:
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `title` | string | yes | Item title — also serves as the social-post body's `{{title}}`. |
+| `description` | string | no | Default `""`. Available as `{{description}}`. |
+| `tags` | string | no | Comma-separated. Available as `{{tags}}` / `{{hashtags}}`. |
+| `project_slug` | string | no | Default `default`. |
+| `item_type` | string | no | One of `standalone | hook`. Default `standalone`. `episode/short/segment` are rejected here — they need YouTube and go through `/api/videos/upload`. |
+| `parent_item_id` | string | no | Optional parent item id (e.g. a hook attaching to its episode). Rejected for `standalone`. |
+| `url` | string | no | The value behind `{{url}}` for this item. For a hook attached to a parent, omit this and `{{url}}` will resolve to the hook's own URL (NULL → empty); use `{{episode_url}}` to link to the parent. |
+| `video_file` | file | no | Optional video file. When present, this is the file `{{video}}` attaches in templates and what the platform-specific Posters upload as a media asset. |
+| `thumbnail_file` | file | no | Optional thumbnail image. |
+
+**Response 200**:
+
+```json
+{
+  "status": "ok",
+  "video_id": "<22-char id>",
+  "item_type": "standalone",
+  "url": "https://github.com/me/x" | null
+}
+```
+
+**Errors**
+
+- `400` — Invalid `item_type`; `parent_item_id` set on a standalone; `parent_item_id` not found.
+- `404` — `project_slug` not found.
+
+**Side effects** — Saves uploaded files under `UPLOAD_DIR`; inserts a `videos` row with `item_type`, `parent_item_id`, `url`, and `status='ready'`; records a `created` event. **Does not call YouTube.** Use `POST /api/videos/{video_id}/images` afterwards to attach additional images.
 
 ### `PUT /api/videos/{video_id}`
 
@@ -545,7 +618,7 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 { "model": "large-v3", "language": "en", "backend": "mlx-whisper" }
 ```
 
-`model` defaults to `large-v3`. `language` is auto-detected when omitted. `backend` forces a specific backend (`mlx-whisper`, `faster-whisper`, `whisper.cpp`, `macos-speech`); otherwise the service picks the best available.
+`model` defaults to `large-v3`. `language` is auto-detected when omitted. `backend` forces a specific backend (`mlx-whisper`, `whisper.cpp`, `macos-speech`); otherwise the service picks the best available.
 
 **Response 200**:
 
@@ -595,6 +668,8 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 
 **Side effects** — Calls Anthropic API; for frames mode also calls `ffmpeg` to extract keyframes; writes `videos.generated_description`. The applied description includes `pinned_links` appended after the AI text.
 
+**Renderer** — `mode=transcript` (and the transcript leg of `auto`) substitutes the prompt body from `prompt_templates.description_from_transcript` through the same engine as [`POST /api/expand_text`](#post-apiexpand_text), then sends the substituted prompt to Claude in a single call. Any `{{ai: ...}}`, `{{var!}}`, or `{{var??default}}` syntax in the prompt-template body is honoured. `mode=frames` skips substitution entirely — it sends the keyframes with a hardcoded vision instruction.
+
 ### `POST /api/videos/{video_id}/apply-description`
 
 **Purpose** — Push the previously generated description to YouTube and into the local row.
@@ -607,7 +682,13 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 
 ### `POST /api/videos/{video_id}/publish`
 
-**Purpose** — Publish a video immediately. Flips privacy to `public` and sends every approved social post.
+**Purpose** — Publish an item immediately. Behaviour branches on `item_type`:
+
+| `item_type` | YouTube step | Social step |
+|---|---|---|
+| `episode`, `short`, `segment` | Required: flip privacy to `public`. If the YT call fails, the social step does **not** run (so we don't blast a link to a non-public video). | Sends every `status='approved'` social post for the video. |
+| `hook` | Optional: when `videos.url` looks like a YouTube URL (i.e. the hook was uploaded to YT), flip privacy. Otherwise the YT step is skipped. | Sends every `status='approved'` social post (the hook's video file is the social post's media). |
+| `standalone` | **Skipped entirely.** No YT API call. The local row is still flipped to `status='published'`. | Sends every `status='approved'` social post. |
 
 **Response 200** — Summary dict produced by `scheduler.publish_video_job`:
 
@@ -615,11 +696,14 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 {
   "video_id": "abc",
   "published": true,
+  "youtube_skipped": true,           // present only when YT step was skipped
   "social_results": { "twitter": {"status": "posted", "url": "..."}, ... }
 }
 ```
 
-**Side effects** — Holds the per-video publish lock; calls `youtube.update_video_metadata(privacy_status="public")`; sets `videos.status = 'published'`; iterates over `status='approved'` social posts and sends each one (per-post status updates and `social_post_published` events).
+**Cascades** — **Sends every `status='approved'` social post for this video** (per-post status flipped to `'sending'` then `'posted'` on success, `'failed'` with `error` on failure). Posts already in `'sending'` are skipped (another worker holds them); per-post APScheduler jobs that were pending get claimed atomically — whichever path posts first wins, the loser sees the row already moved out of `'approved'` and bails.
+
+**Side effects** — Holds the per-video publish lock. For YT-publishing types: calls `youtube.update_video_metadata(privacy_status="public")` (50 quota). For all types: sets `videos.status = 'published'`; records a `published` event (carrying `item_type` and `url`); iterates over `status='approved'` social posts and sends each one.
 
 ### `POST /api/videos/{video_id}/schedule`
 
@@ -635,7 +719,9 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 
 **Errors** — `400` (missing `publish_at`, invalid format, time not in future).
 
-**Side effects** — Registers an APScheduler `DateTrigger` job (`publish_<video_id>`); sets `videos.status='scheduled'`, `videos.publish_at=<iso>`; records a `publish_scheduled` event.
+**Cascades** — **Re-baselines all per-post jobs.** Any pending scheduled posts for this video (rows with `scheduler_job_id IS NOT NULL`) are cancelled via `cancel_scheduled_post()` and re-scheduled at staggered offsets driven by the project's `post_video_delay_minutes` and `inter_post_spacing_minutes`. Hand-retimed per-post jobs from a prior `POST /api/social/posts/{post_id}/schedule` call are intentionally overwritten — re-scheduling the video is the explicit "reset everything" action.
+
+**Side effects** — Registers an APScheduler `DateTrigger` job (`publish_<video_id>`); cancels and re-attaches per-post jobs (see Cascades above); sets `videos.status='scheduled'`, `videos.publish_at=<iso>`; records `publish_scheduled` and one `social_post_scheduled` event per re-attached post.
 
 ### `DELETE /api/videos/{video_id}/schedule`
 
@@ -645,7 +731,9 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 
 **Errors** — `404` if the video has no scheduled publish.
 
-**Side effects** — Removes the APScheduler job; clears `videos.publish_at` and resets `status`.
+**Cascades** — **Cancels every pending per-post job for this video.** All `social_posts` rows with `scheduler_job_id IS NOT NULL` go through `cancel_scheduled_post()`: their APScheduler `DateTrigger` is removed and `scheduled_at` / `scheduler_job_id` are nulled. Already-posted rows are unaffected (their `scheduler_job_id` is already NULL).
+
+**Side effects** — Removes the publish APScheduler job and all per-post jobs (see Cascades); clears `videos.publish_at`; resets `videos.status` to `'ready'`.
 
 ### `GET /api/videos/{video_id}/captions`
 
@@ -690,7 +778,7 @@ Source: `src/yt_scheduler/routers/transcript_routes.py`
 **Response 200** — Array:
 
 ```json
-[ { "id": 1, "video_id": "abc", "source": "mlx_whisper" | "faster_whisper" | "whispercpp" | "apple_speech" | "youtube" | "user_edited", "source_detail": "large-v3" | null, "text": "...", "created_at": "..." } ]
+[ { "id": 1, "video_id": "abc", "source": "mlx_whisper" | "whispercpp" | "apple_speech" | "youtube" | "user_edited", "source_detail": "large-v3" | null, "text": "...", "created_at": "..." } ]
 ```
 
 ### `PUT /api/videos/{video_id}/transcripts/active`
@@ -747,9 +835,16 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 ]
 ```
 
-**Errors** — `404` (video not found, template not found).
+**Query params** — `confirm_overwrite_scheduled` (bool, default `false`). When false, the route refuses to regenerate if any unsent post for this video is currently scheduled (has a non-NULL `scheduler_job_id`).
 
-**Side effects** — Holds the per-video publish lock. Deletes existing `social_posts` for the video where `status NOT IN ('posted','sending')`. Inserts one fresh `draft` row per non-disabled, matching slot. Template variables exposed: `title`, `url`, `description`, `description_short` (≤150), `description_medium` (≤500), `tags`, `hashtags`, `thumbnail_path`, `tier`, `transcript` (plain text, SRT stripped), `user_message`. Also calls `youtube.get_video` to read the duration tier.
+**Errors**
+
+- `404` — Video or template not found.
+- `409` — One or more posts are scheduled. Body: `{"detail": {"scheduled_overwrite": true, "needs_confirm": true, "scheduled": [{"post_id": int, "platform": str, "scheduled_at": "<ISO>"}, ...]}}`. Re-issue with `?confirm_overwrite_scheduled=true` to proceed.
+
+**Side effects** — Holds the per-video publish lock. When `confirm_overwrite_scheduled=true`, calls `cancel_scheduled_post()` on each scheduled row first (tearing down its APScheduler `DateTrigger`) so no orphan jobs remain. Then deletes existing `social_posts` for the video where `status NOT IN ('posted','sending')` and inserts one fresh `draft` row per non-disabled, matching slot. Template variables exposed: `title`, `url`, `description`, `description_short` (≤150), `description_medium` (≤500), `tags`, `hashtags`, `thumbnail_path`, `tier`, `transcript` (plain text, SRT stripped), `user_message`. Also calls `youtube.get_video` to read the duration tier.
+
+**Renderer** — Each slot's `body` is rendered through the same engine as [`POST /api/expand_text`](#post-apiexpand_text) (`services/templates.render`). All variables, `{{var!}}` / `{{var??default}}` / `{{ai: ...}}` / `{{ai[system]: ...}}` syntax, and recursive AI-block evaluation behave identically.
 
 ### `GET /api/social/posts/{video_id}`
 
@@ -763,11 +858,19 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 
 **Request body** — Any subset of `{"content": str, "status": str, "media_path": str}`. `content` is auto-trimmed of leading/trailing whitespace at write time.
 
+**Note on media** — The `social_posts` table now has both `media_path` (legacy single-string column, kept for backwards compat) and `media_paths` (JSON array column, the canonical form). The post-generation paths and PUT endpoint write both. The send paths read `media_paths` first and fall back to `media_path`. Once all writers stop touching the legacy column it'll be dropped in a follow-up migration.
+
 **Response 200** — `{"status": "ok"}`.
 
 ### `POST /api/social/posts/{post_id}/send`
 
 **Purpose** — Send a single social post.
+
+**`post_id`** — `social_posts.id` returned by `POST /api/social/generate-posts/{video_id}` (in the array of created rows) or `GET /api/social/posts/{video_id}`.
+
+**Prerequisites** — The row must already exist; `status` is not checked, so an unedited AI-generated post can be sent directly. A prior `PUT /api/social/posts/{post_id}` is only needed if the caller wants to edit `content` or `media_path` before sending.
+
+**Request body** — None.
 
 **Query params** — `confirm_dup` (bool, default `false`). When false (default) the route refuses to resend duplicates of the last 30 days.
 
@@ -906,6 +1009,8 @@ All template endpoints implicitly scope to `project_id=1` (the Default project) 
 
 **Errors** — `400` if `name` is one of the protected built-in templates.
 
+**Cascades** — Deleting a template cascades to all of its `template_slots` rows via `ON DELETE CASCADE` (`migrations/008_per_project_credentials.sql:77`). Already-generated `social_posts` rows are unaffected — they're denormalized snapshots of the rendered text at generation time and don't carry a slot FK.
+
 ### `GET /api/templates/{name}/slots`
 
 **Purpose** — List every slot for a template.
@@ -942,15 +1047,137 @@ All template endpoints implicitly scope to `project_id=1` (the Default project) 
 
 **Errors** — `404` (unknown template, slot not found in this template), `400` (validation, e.g. trying to delete a built-in slot).
 
-### `POST /api/templates/preview`
+---
 
-**Purpose** — Preview a rendered template against arbitrary variables, without writing anything.
+## Text expansion (`/api/expand_text`)
 
-**Request body** — `{"template": "Hello {{name}}", "variables": {"name": "Drew"}}`.
+Source: `src/yt_scheduler/routers/expand_routes.py`
 
-**Response 200** — `{"rendered": "Hello Drew"}` on success, `{"rendered": null, "error": "..."}` on render error (always 200 for render errors).
+This is the canonical text-expansion endpoint. Every server-side rendering path delegates to the same engine — `services/templates.render(...)` — so the syntax and semantics described here are exactly what `POST /api/social/generate-posts/{video_id}`, the auto-gen-socials background job in `services/auto_actions.py`, and the prompt-template bodies in `services/ai.py` all see at runtime. There is no second renderer.
 
-**Errors** — `400` (`template` empty).
+### `POST /api/expand_text`
+
+**Purpose** — Render a template against variables, evaluating any `{{ai: ...}}` blocks via Claude. The UI's template editor preview pane uses this; you can also call it directly to render arbitrary text without writing a row anywhere.
+
+**Request body**:
+
+```json
+{
+  "template": "Hello {{name!}}, here is a {{ai[Be terse]: haiku about {{topic??the weather}}}}.",
+  "variables": {"name": "Drew", "topic": "rain"},
+  "default_system_prompt": "...optional system prompt for AI blocks without an inline override...",
+  "model": "claude-sonnet-4-6",
+  "max_tokens": 512
+}
+```
+
+Only `template` is required; everything else has defaults.
+
+**Template syntax**
+
+- `{{name}}` — substitute. Missing keys are left literal in the output so the user can see what didn't resolve.
+- `{{name!}}` — required substitute. Missing key returns **400** with `{"detail": {"missing_required": "<name>"}}`. No fallback; use `??` if you want one.
+- `{{name??default text}}` — optional with explicit fallback. When `name` is missing, the literal string between `??` and `}}` is rendered. Default text is **absolute** — a `{{title}}` inside the default stays literal, no recursive substitution. For empty fallback write `{{name??}}`.
+- `{{ai: prompt}}` — evaluate against Claude using `default_system_prompt` (or the built-in social-copywriter default).
+- `{{ai[system text]: prompt}}` — per-block system override. `default_system_prompt` is ignored for this block. Inner blocks without their own `[...]` inherit `default_system_prompt`, **not** the outer override.
+- AI blocks may be nested arbitrarily deep. The walker uses balanced `{{` / `}}` matching (Python `re` can't), resolves leaves first, splices each result into the parent prompt, then sends the parent. Sibling blocks are independent.
+- An unbalanced `{{ai` opener with no matching `}}` is left in the output verbatim — the broken syntax surfaces instead of half a template silently shipping to Claude.
+
+**Media directives** (only meaningful in the post-generation paths described below — `/api/expand_text` exposes the renderer but doesn't carry an item context, so directives there render as empty strings with no media attached):
+
+- `{{video}}` — attach the item's primary video file to the social post; substitute to empty in the body. Silently skipped if no video file is set.
+- `{{thumbnail}}` — attach the item's thumbnail; substitute to empty. Silently skipped if no thumbnail.
+- `{{image:shortname}}` — attach the matching `item_images` row's image. Returns **400** with `{"detail": "Image shortname not found: ..."}` if no row matches.
+- `{{image:*}}` — attach every image row in `order_index` order; substitute to empty.
+
+**Built-in variables** provided by the post-generation paths (`/api/social/generate-posts/{video_id}` and the auto-actions background path) on top of whatever the caller passes:
+
+- `{{title}}`, `{{description}}`, `{{description_short}}` (≤150), `{{description_medium}}` (≤500), `{{tags}}` (comma-joined), `{{hashtags}}` (top 5 as `#CamelCase`), `{{thumbnail_path}}`, `{{tier}}`, `{{transcript}}` (plain-text, SRT stripped), `{{user_message}}`.
+- `{{url}}` — `videos.url`. Populated from the YouTube URL at upload / import for YT-backed items, NULL→empty string for standalone items unless explicitly set.
+- `{{episode_url}}` — when the item has `parent_item_id` set, the parent's `url`; empty otherwise.
+- `{{project_url}}` — `projects.project_url`. Auto-populated from the YouTube channel handle on OAuth bind for YT projects; set explicitly via `POST /api/projects` for non-YT projects; editable via `PATCH /api/projects/{slug}` and refreshable via `POST /api/projects/{slug}/youtube/refresh-channel-url`.
+
+**Custom variables** are merged at every render via the four-level inheritance chain (lowest priority first): `global_variables` → `project_variables` → parent item's `item_variables` (when the item has a parent) → self item's `item_variables`. Built-ins always come from the self item — they never inherit. See "Custom variables" below for the per-scope CRUD endpoints.
+
+`POST /api/expand_text` is the bottom of that hierarchy: it has no item context, so project / parent / item layers don't apply, but it **does** merge in `global_variables` automatically (with the caller's `variables` taking precedence on any key collision — the caller acts as the "self" level). To exercise the full chain, use `POST /api/social/generate-posts/{video_id}` or call the renderer through one of the auto-action paths.
+
+**Response 200** — `{"rendered": "<rendered text>"}` on success, or `{"rendered": null, "error": "<message>"}` for non-required render failures (e.g., Anthropic API error).
+
+**Errors**
+
+- `400` if `template` is empty, or `{"detail": {"missing_required": "<name>"}}` when a `{{var!}}` placeholder isn't supplied.
+
+---
+
+## Item images (`/api/videos/{video_id}/images`)
+
+Source: `src/yt_scheduler/routers/item_image_routes.py`
+
+Multi-image attachments per item, referenced from templates as `{{image:shortname}}` or `{{image:*}}`. Each row carries a unique-per-item `shortname` ([a-z0-9-], can't start with hyphen) plus optional `alt_text` and an `order_index` that controls the order in `{{image:*}}` expansion.
+
+### `GET /api/videos/{video_id}/images`
+
+**Response 200** — Array of image rows in `(order_index, id)` order:
+
+```json
+[
+  { "id": 1, "video_id": "abc", "shortname": "cat", "path": "/u/...", "alt_text": "a cat", "order_index": 0, "created_at": "..." }
+]
+```
+
+### `POST /api/videos/{video_id}/images`
+
+Multipart form upload.
+
+**Form fields** — `file` (binary, required), `shortname` (required), `alt_text` (default `""`), `order_index` (int, default `0`).
+
+**Response 200** — The created image row.
+
+**Errors** — `404` (video not found), `400` (shortname collision, invalid shortname).
+
+### `PATCH /api/videos/{video_id}/images/{image_id}`
+
+**Body** — Any subset of `shortname`, `alt_text`, `order_index`. The image file is immutable; delete + re-upload to replace.
+
+### `DELETE /api/videos/{video_id}/images/{image_id}`
+
+Removes the row. The on-disk file is left in place (no cleanup) so accidental deletes are recoverable from `UPLOAD_DIR`.
+
+---
+
+## Custom variables
+
+Three scopes form the four-level inheritance chain (with parent items providing the third inheriting layer): `global → project → parent item → self item`, lowest priority first. Each scope has its own router; all three accept the same body shape and validation rules.
+
+**Key validation** — Keys must match `[a-z][a-z0-9_]*` (lowercase letter, then letters / digits / underscores). The validation is consistent with the renderer's variable pattern, so anything you can store here can be referenced as `{{key}}`.
+
+### Global variables
+
+Source: `src/yt_scheduler/routers/global_variable_routes.py`
+
+- `GET /api/global-variables` — list all install-wide rows.
+- `PUT /api/global-variables/{key}` — upsert. Body: `{"value": "..."}`. Returns the stored row.
+- `DELETE /api/global-variables/{key}` — remove.
+
+### Project variables
+
+Source: `src/yt_scheduler/routers/project_variable_routes.py`
+
+- `GET /api/projects/{slug}/variables` — list all rows for the project.
+- `PUT /api/projects/{slug}/variables/{key}` — upsert.
+- `DELETE /api/projects/{slug}/variables/{key}` — remove.
+
+Errors: `404` if the project doesn't exist.
+
+### Item variables
+
+Source: `src/yt_scheduler/routers/item_variable_routes.py`
+
+- `GET /api/videos/{video_id}/variables` — list all rows for the item.
+- `PUT /api/videos/{video_id}/variables/{key}` — upsert.
+- `DELETE /api/videos/{video_id}/variables/{key}` — remove.
+
+Errors: `404` if the item doesn't exist.
 
 ---
 
@@ -979,7 +1206,7 @@ Source: `src/yt_scheduler/routers/settings_routes.py`
 **Response 200**:
 
 ```json
-{ "configured": true, "masked_key": "sk-ant-A...", "model": "claude-sonnet-4-20250514", "storage": "keychain" | "encrypted_json" }
+{ "configured": true, "masked_key": "sk-ant-A...", "model": "claude-sonnet-4-6", "storage": "keychain" | "encrypted_json" }
 ```
 
 ### `PUT /api/settings/anthropic`
@@ -1423,3 +1650,5 @@ Source: `src/yt_scheduler/routers/import_routes.py`
 **Errors** — `404` (unknown slug), `400` (`video_id` missing, video not on YouTube, video already imported), `500` (any other failure).
 
 **Side effects** — Calls `youtube.get_video` (~1 quota); downloads the thumbnail to `UPLOAD_DIR`; inserts the row; records `imported`; tries to download the existing YouTube caption (50 quota) and store it as a transcript; runs `auto_actions.run_post_create_actions(... source="import")` in the background.
+
+**Renderer (background path)** — When auto-gen-socials is enabled for imports, the background job renders each platform's slot body through the same engine as [`POST /api/expand_text`](#post-apiexpand_text). Same variables and same syntax.

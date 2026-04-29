@@ -101,50 +101,82 @@ async def publish_video_job(video_id: str) -> dict:
         results: dict = {"video_id": video_id, "published": False, "social_results": {}}
 
         cursor = await db.execute(
-            "SELECT project_id FROM videos WHERE id = ?", (video_id,)
+            "SELECT project_id, item_type, url FROM videos WHERE id = ?", (video_id,)
         )
         video_row = await cursor.fetchone()
         project_id = int(video_row["project_id"]) if video_row else 1
+        item_type = (video_row["item_type"] if video_row else "episode") or "episode"
+        item_url = (video_row["url"] if video_row else "") or ""
 
-        # Step 1: Flip to public
-        try:
-            youtube.update_video_metadata(video_id, privacy_status="public")
+        # Step 1: YouTube publish step. Type-aware:
+        # - episode/short/segment: required. The video MUST exist on YouTube;
+        #   we flip it from unlisted -> public.
+        # - hook: optional. If item_url looks like a YouTube URL (i.e. the
+        #   item was uploaded to YT), flip privacy. Otherwise skip — the
+        #   hook's video will be uploaded directly to social media.
+        # - standalone: skipped entirely. Items live only in social posts.
+        needs_youtube_publish = item_type in ("episode", "short", "segment") or (
+            item_type == "hook" and "youtu.be" in item_url
+        )
+        if needs_youtube_publish:
+            try:
+                youtube.update_video_metadata(video_id, privacy_status="public")
+                await db.execute(
+                    """UPDATE videos SET privacy_status = 'public', status = 'published',
+                    updated_at = datetime('now') WHERE id = ?""",
+                    (video_id,),
+                )
+                await db.commit()
+                results["published"] = True
+                await events.record_event(
+                    video_id,
+                    "published",
+                    {"platform": "youtube", "url": f"https://youtu.be/{video_id}"},
+                )
+                logger.info(f"Video {video_id} is now public")
+            except Exception as e:
+                logger.error(f"Failed to publish video {video_id}: {e}")
+                results["publish_error"] = str(e)
+                # Auth-shaped failures need user action. Surface them in
+                # the Log so the user sees "Credential for YouTube is
+                # invalid — Update" instead of having to find the warning
+                # in the server logs.
+                err_text = str(e).lower()
+                if any(needle in err_text for needle in (
+                    "invalid_grant", "unauthorized", "401",
+                    "credentials", "refresh", "not authenticated",
+                )):
+                    await events.record_event(
+                        video_id,
+                        "credential_invalid",
+                        {
+                            "scope": "youtube",
+                            "account_label": "YouTube channel",
+                            "error": str(e),
+                        },
+                    )
+                # Don't fire social posts if a required YouTube publish failed.
+                return results
+        else:
+            # Item type doesn't require YouTube; mark the local row published
+            # so the same downstream UI ("video is published") works
+            # uniformly for non-YT items.
             await db.execute(
-                """UPDATE videos SET privacy_status = 'public', status = 'published',
+                """UPDATE videos SET status = 'published',
                 updated_at = datetime('now') WHERE id = ?""",
                 (video_id,),
             )
             await db.commit()
             results["published"] = True
+            results["youtube_skipped"] = True
             await events.record_event(
                 video_id,
                 "published",
-                {"platform": "youtube", "url": f"https://youtu.be/{video_id}"},
+                {"platform": None, "item_type": item_type, "url": item_url or None},
             )
-            logger.info(f"Video {video_id} is now public")
-        except Exception as e:
-            logger.error(f"Failed to publish video {video_id}: {e}")
-            results["publish_error"] = str(e)
-            # Auth-shaped failures need user action. Surface them in
-            # the Log so the user sees "Credential for YouTube is
-            # invalid — Update" instead of having to find the warning
-            # in the server logs.
-            err_text = str(e).lower()
-            if any(needle in err_text for needle in (
-                "invalid_grant", "unauthorized", "401",
-                "credentials", "refresh", "not authenticated",
-            )):
-                await events.record_event(
-                    video_id,
-                    "credential_invalid",
-                    {
-                        "scope": "youtube",
-                        "account_label": "YouTube channel",
-                        "error": str(e),
-                    },
-                )
-            # Don't fire social posts if video didn't go public
-            return results
+            logger.info(
+                "Video %s (%s) skipped YouTube publish step", video_id, item_type
+            )
 
         # Step 2: Fire all approved social posts
         rows = await db.execute_fetchall(
@@ -223,7 +255,11 @@ async def publish_video_job(video_id: str) -> dict:
                 continue
 
             try:
-                post_result = await poster.post(post["content"], post.get("media_path"))
+                from yt_scheduler.routers.social_routes import _decode_media_paths
+                post_result = await poster.post(
+                    post["content"],
+                    media_paths=_decode_media_paths(post),
+                )
                 await db.execute(
                     """UPDATE social_posts
                     SET status = 'posted', posted_at = datetime('now'), post_url = ?
@@ -411,7 +447,11 @@ async def _send_scheduled_post(post_id: int) -> None:
         await db.commit()
         return
     try:
-        result = await poster.post(post["content"], post.get("media_path"))
+        from yt_scheduler.routers.social_routes import _decode_media_paths
+        result = await poster.post(
+            post["content"],
+            media_paths=_decode_media_paths(post),
+        )
         await db.execute(
             "UPDATE social_posts SET status = 'posted', posted_at = datetime('now'), "
             "post_url = ?, scheduler_job_id = NULL WHERE id = ?",

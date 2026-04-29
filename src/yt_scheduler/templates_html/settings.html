@@ -100,6 +100,36 @@
     </div>
 </div>
 
+<!-- Custom global variables -->
+<div class="card">
+    <h2>Global template variables</h2>
+    <p class="form-hint">
+        Install-wide custom variables. Available as <code>{{ '{{key}}' }}</code> in any template across every project. Lowest-priority layer in the inheritance chain (project → parent item → self item override). Keys must match
+        <code>[a-z][a-z0-9_]*</code> (lowercase letter, then letters / digits / underscores).
+    </p>
+    <table class="settings-table" id="global-vars-table">
+        <thead>
+            <tr><th style="width: 30%;">Key</th><th>Value</th><th style="width: 90px;"></th></tr>
+        </thead>
+        <tbody id="global-vars-body">
+            <tr><td colspan="3" class="form-hint">Loading…</td></tr>
+        </tbody>
+    </table>
+    <div class="form-row" style="margin-top: 0.75rem;">
+        <div class="form-group">
+            <label>Add new — key</label>
+            <input type="text" id="new-global-var-key" placeholder="signoff" pattern="[a-z][a-z0-9_]*">
+        </div>
+        <div class="form-group flex-2">
+            <label>Value</label>
+            <input type="text" id="new-global-var-value" placeholder="-- Drew">
+        </div>
+        <div class="form-group" style="display: flex; align-items: flex-end;">
+            <button type="button" class="btn btn-primary" onclick="addGlobalVariable()">Add</button>
+        </div>
+    </div>
+</div>
+
 <!-- Background job intervals -->
 <div class="card">
     <h2>Background job intervals</h2>
@@ -651,5 +681,78 @@ loadNgrokStatus();
 loadOAuthClients();
 loadSocialPlatforms();
 loadSettings();
+loadGlobalVariables();
+
+// --- Global custom variables -------------------------------------------
+
+async function loadGlobalVariables() {
+    const body = document.getElementById('global-vars-body');
+    try {
+        const rows = await (await fetch('/api/global-variables')).json();
+        if (!Array.isArray(rows) || rows.length === 0) {
+            body.innerHTML = '<tr><td colspan="3" class="form-hint">No globals defined yet. Use the row below to add one.</td></tr>';
+            return;
+        }
+        body.innerHTML = rows.map(r => `
+            <tr data-key="${escapeHtml(r.key)}">
+                <td><code>{{ '{{' }}${escapeHtml(r.key)}{{ '}}' }}</code></td>
+                <td>
+                    <input type="text" class="gv-value" value="${escapeHtml(r.value)}" data-key="${escapeHtml(r.key)}">
+                </td>
+                <td style="text-align: right;">
+                    <button class="btn btn-sm" onclick="saveGlobalVariable('${escapeHtml(r.key)}')">Save</button>
+                    <button class="btn btn-sm btn-danger" onclick="deleteGlobalVariable('${escapeHtml(r.key)}')">Delete</button>
+                </td>
+            </tr>
+        `).join('');
+    } catch (e) {
+        body.innerHTML = `<tr><td colspan="3" class="error">Could not load: ${escapeHtml(e.message)}</td></tr>`;
+    }
+}
+
+async function saveGlobalVariable(key) {
+    const input = document.querySelector(`.gv-value[data-key="${CSS.escape(key)}"]`);
+    if (!input) return;
+    const resp = await fetch(`/api/global-variables/${encodeURIComponent(key)}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({value: input.value}),
+    });
+    if (resp.ok) showToast(`Saved {{ '{{' }}${key}{{ '}}' }}`, 'success');
+    else showToast(`Save failed: ${(await resp.json()).detail || resp.statusText}`, 'error');
+}
+
+async function deleteGlobalVariable(key) {
+    if (!confirm(`Delete global variable {{ '{{' }}${key}{{ '}}' }}?`)) return;
+    const resp = await fetch(`/api/global-variables/${encodeURIComponent(key)}`, {method: 'DELETE'});
+    if (resp.ok) {
+        showToast(`Deleted {{ '{{' }}${key}{{ '}}' }}`, 'success');
+        loadGlobalVariables();
+    } else {
+        showToast('Delete failed', 'error');
+    }
+}
+
+async function addGlobalVariable() {
+    const keyEl = document.getElementById('new-global-var-key');
+    const valEl = document.getElementById('new-global-var-value');
+    const key = keyEl.value.trim();
+    const value = valEl.value;
+    if (!key) { showToast('Key is required', 'error'); return; }
+    const resp = await fetch(`/api/global-variables/${encodeURIComponent(key)}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({value}),
+    });
+    if (resp.ok) {
+        keyEl.value = '';
+        valEl.value = '';
+        showToast(`Added {{ '{{' }}${key}{{ '}}' }}`, 'success');
+        loadGlobalVariables();
+    } else {
+        const detail = (await resp.json()).detail || resp.statusText;
+        showToast(`Add failed: ${detail}`, 'error');
+    }
+}
 </script>
 {% endblock %}

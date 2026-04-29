@@ -17,9 +17,14 @@ from yt_scheduler.config import UPLOAD_DIR, ensure_dirs
 from yt_scheduler.database import close_db, get_db
 from yt_scheduler.routers import (
     auth_routes,
+    expand_routes,
+    global_variable_routes,
     import_routes,
+    item_image_routes,
+    item_variable_routes,
     oauth_routes,
     project_routes,
+    project_variable_routes,
     settings_routes,
     social_credentials_routes,
     social_routes,
@@ -143,10 +148,15 @@ app.include_router(video_routes.router)
 app.include_router(transcript_routes.router)
 app.include_router(social_routes.router)
 app.include_router(template_routes.router)
+app.include_router(expand_routes.router)
 app.include_router(settings_routes.router)
 app.include_router(oauth_routes.router)
 app.include_router(social_credentials_routes.router)
 app.include_router(import_routes.router)
+app.include_router(global_variable_routes.router)
+app.include_router(project_variable_routes.router)
+app.include_router(item_variable_routes.router)
+app.include_router(item_image_routes.router)
 
 
 # --- HTML pages -------------------------------------------------------------

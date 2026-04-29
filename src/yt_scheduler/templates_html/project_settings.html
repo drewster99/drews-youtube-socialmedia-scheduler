@@ -23,6 +23,57 @@
 </section>
 
 <section class="card">
+    <div class="card-header"><h2>Project URL</h2></div>
+    <div class="card-body">
+        <p class="form-hint">
+            The value behind <code>{{ '{{project_url}}' }}</code> in templates. For YouTube projects this is
+            auto-populated from the channel's <code>customUrl</code> handle on OAuth bind (you can refresh
+            below). For GitHub or social-only projects, set it explicitly.
+        </p>
+        <div class="form-group">
+            <label for="project-url">URL</label>
+            <input type="url" id="project-url" value="{{ current_project.project_url or '' }}" placeholder="https://github.com/me/repo">
+        </div>
+        <div style="display: flex; gap: 0.5rem;">
+            <button class="btn btn-primary" id="project-url-save-btn" disabled>Save</button>
+            {% if current_project.youtube_channel_id %}
+            <button class="btn" id="project-url-refresh-btn" type="button">Re-pull from YouTube</button>
+            {% endif %}
+        </div>
+    </div>
+</section>
+
+<section class="card">
+    <div class="card-header"><h2>Project template variables</h2></div>
+    <div class="card-body">
+        <p class="form-hint">
+            Per-project custom variables. Available as <code>{{ '{{key}}' }}</code> in templates rendered for items in this project. Override <a href="/settings#global-vars">global variables</a> on key collision; overridden in turn by parent-item or self-item variables. Keys must match <code>[a-z][a-z0-9_]*</code>.
+        </p>
+        <table class="settings-table" id="project-vars-table">
+            <thead>
+                <tr><th style="width: 30%;">Key</th><th>Value</th><th style="width: 90px;"></th></tr>
+            </thead>
+            <tbody id="project-vars-body">
+                <tr><td colspan="3" class="form-hint">Loading…</td></tr>
+            </tbody>
+        </table>
+        <div class="form-row" style="margin-top: 0.75rem;">
+            <div class="form-group">
+                <label>Add new — key</label>
+                <input type="text" id="new-project-var-key" placeholder="signoff" pattern="[a-z][a-z0-9_]*">
+            </div>
+            <div class="form-group flex-2">
+                <label>Value</label>
+                <input type="text" id="new-project-var-value" placeholder="-- Drew (Podcast)">
+            </div>
+            <div class="form-group" style="display: flex; align-items: flex-end;">
+                <button type="button" class="btn btn-primary" onclick="addProjectVariable()">Add</button>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section class="card">
     <div class="card-header"><h2>Auto-actions</h2></div>
     <div class="card-body">
         <p class="form-hint">Each column controls what runs when a video is uploaded directly vs. imported from YouTube.</p>
@@ -469,5 +520,126 @@ loadAutoActions();
 loadPostingSettings();
 loadYouTube();
 loadSocialDefaults();
+loadProjectVariables();
+initProjectUrlForm();
+
+// --- Project URL editor ------------------------------------------------
+
+function initProjectUrlForm() {
+    const input = document.getElementById('project-url');
+    const saveBtn = document.getElementById('project-url-save-btn');
+    const refreshBtn = document.getElementById('project-url-refresh-btn');
+    if (!input || !saveBtn) return;
+    const original = input.value;
+    input.addEventListener('input', () => {
+        saveBtn.disabled = input.value === original;
+    });
+    saveBtn.addEventListener('click', async () => {
+        saveBtn.disabled = true;
+        const resp = await fetch(`/api/projects/${slug}`, {
+            method: 'PATCH',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({project_url: input.value}),
+        });
+        if (resp.ok) showToast('Project URL saved', 'success');
+        else showToast('Save failed', 'error');
+    });
+    if (refreshBtn) {
+        refreshBtn.addEventListener('click', async () => {
+            refreshBtn.disabled = true;
+            try {
+                const resp = await fetch(
+                    `/api/projects/${slug}/youtube/refresh-channel-url`,
+                    {method: 'POST'},
+                );
+                const data = await resp.json();
+                if (resp.ok) {
+                    input.value = data.project_url || '';
+                    showToast(`Refreshed: ${data.project_url}`, 'success');
+                } else {
+                    showToast(data.detail || 'Refresh failed', 'error');
+                }
+            } finally {
+                refreshBtn.disabled = false;
+            }
+        });
+    }
+}
+
+// --- Project variables --------------------------------------------------
+
+async function loadProjectVariables() {
+    const body = document.getElementById('project-vars-body');
+    if (!body) return;
+    try {
+        const rows = await (await fetch(`/api/projects/${slug}/variables`)).json();
+        if (!Array.isArray(rows) || rows.length === 0) {
+            body.innerHTML = '<tr><td colspan="3" class="form-hint">No project variables yet.</td></tr>';
+            return;
+        }
+        body.innerHTML = rows.map(r => `
+            <tr>
+                <td><code>{{ '{{' }}${escapeHtml(r.key)}{{ '}}' }}</code></td>
+                <td><input type="text" class="pv-value" value="${escapeHtml(r.value)}" data-key="${escapeHtml(r.key)}"></td>
+                <td style="text-align: right;">
+                    <button class="btn btn-sm" onclick="saveProjectVariable('${escapeHtml(r.key)}')">Save</button>
+                    <button class="btn btn-sm btn-danger" onclick="deleteProjectVariable('${escapeHtml(r.key)}')">Delete</button>
+                </td>
+            </tr>
+        `).join('');
+    } catch (e) {
+        body.innerHTML = `<tr><td colspan="3" class="error">Could not load: ${escapeHtml(e.message)}</td></tr>`;
+    }
+}
+
+async function saveProjectVariable(key) {
+    const input = document.querySelector(`.pv-value[data-key="${CSS.escape(key)}"]`);
+    if (!input) return;
+    const resp = await fetch(`/api/projects/${slug}/variables/${encodeURIComponent(key)}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({value: input.value}),
+    });
+    if (resp.ok) showToast(`Saved {{ '{{' }}${key}{{ '}}' }}`, 'success');
+    else showToast('Save failed', 'error');
+}
+
+async function deleteProjectVariable(key) {
+    if (!confirm(`Delete project variable {{ '{{' }}${key}{{ '}}' }}?`)) return;
+    const resp = await fetch(`/api/projects/${slug}/variables/${encodeURIComponent(key)}`, {method: 'DELETE'});
+    if (resp.ok) {
+        showToast(`Deleted {{ '{{' }}${key}{{ '}}' }}`, 'success');
+        loadProjectVariables();
+    } else {
+        showToast('Delete failed', 'error');
+    }
+}
+
+async function addProjectVariable() {
+    const keyEl = document.getElementById('new-project-var-key');
+    const valEl = document.getElementById('new-project-var-value');
+    const key = keyEl.value.trim();
+    if (!key) { showToast('Key is required', 'error'); return; }
+    const resp = await fetch(`/api/projects/${slug}/variables/${encodeURIComponent(key)}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({value: valEl.value}),
+    });
+    if (resp.ok) {
+        keyEl.value = '';
+        valEl.value = '';
+        loadProjectVariables();
+        showToast(`Added {{ '{{' }}${key}{{ '}}' }}`, 'success');
+    } else {
+        const detail = (await resp.json()).detail || resp.statusText;
+        showToast(`Add failed: ${detail}`, 'error');
+    }
+}
+
+function escapeHtml(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
 </script>
 {% endblock %}

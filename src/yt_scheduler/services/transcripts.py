@@ -19,7 +19,7 @@ _SRT_TIMESTAMP_RE = re.compile(
 def srt_to_plain_text(srt: str) -> str:
     """Strip SRT/VTT cue numbers and timestamp lines, leaving the spoken text.
 
-    Local transcribers (mlx-whisper, faster-whisper, Apple Speech) all return
+    Local transcribers (mlx-whisper, Apple Speech) all return
     clean plain text. YouTube's caption download returns SRT. This helper
     normalises imported captions so every transcript stored in our DB has the
     same shape — easier on Claude's context budget and easier for the user to
@@ -47,7 +47,6 @@ TranscriptSource = Literal[
     "youtube",
     "apple_speech",
     "mlx_whisper",
-    "faster_whisper",
     "whispercpp",
     "user_edited",
 ]
@@ -57,7 +56,6 @@ VALID_SOURCES: frozenset[str] = frozenset(
         "youtube",
         "apple_speech",
         "mlx_whisper",
-        "faster_whisper",
         "whispercpp",
         "user_edited",
     ]

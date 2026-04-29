@@ -73,7 +73,7 @@ Business logic layer, each service wraps one concern:
 - **`auth.py`** — YouTube OAuth flow + credential storage (Keychain on macOS, encrypted JSON fallback)
 - **`scheduler.py`** — APScheduler background jobs (scheduled publish, caption polling, comment moderation)
 - **`moderation.py`** — Comment filtering against blocklist (supports plain text and regex)
-- **`transcription.py`** — On-device transcription with multiple backends (MLX Whisper, faster-whisper, whisper.cpp, macOS SFSpeechRecognizer)
+- **`transcription.py`** — On-device transcription with multiple backends (MLX Whisper, whisper.cpp, macOS SFSpeechRecognizer)
 - **`media.py`** — FFmpeg clip/GIF extraction
 - **`keychain.py`** — macOS Keychain wrapper via `security` CLI
 - **`daemon.py`** — Service installation (launchd on macOS, systemd on Linux)
@@ -102,7 +102,7 @@ All via environment variables (loaded from `.env`):
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `ANTHROPIC_API_KEY` | — | Claude API key |
-| `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Model for AI generation |
+| `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Model for AI generation |
 | `YTP_HOST` | `127.0.0.1` | Server bind address |
 | `YTP_PORT` | `8008` | Server port |
 | `YTP_DATA_DIR` | `~/.yt-scheduler` | Data directory |

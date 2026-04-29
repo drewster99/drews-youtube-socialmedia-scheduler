@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from yt_scheduler.database import get_db
 from yt_scheduler.services import events, social, templates as tmpl, youtube
-from yt_scheduler.services.scheduler import get_publish_lock
+from yt_scheduler.services.scheduler import cancel_scheduled_post, get_publish_lock
 from yt_scheduler.services.transcripts import srt_to_plain_text
 
 
@@ -23,13 +23,166 @@ def _tier_from_iso_duration(iso: str | None) -> str:
 router = APIRouter(prefix="/api/social", tags=["social"])
 
 
+async def _build_render_context(db, video: dict) -> dict:
+    """Assemble everything the renderer needs for one item: project row, parent
+    item row (if any), images, custom variables at every scope, and the
+    self-level built-ins.
+
+    Returned dict keys:
+        ``variables``   — merged variable dict for ``templates.render``.
+        ``video_path``  — primary video file (for ``{{video}}`` directive).
+        ``thumb_path``  — thumbnail file (for ``{{thumbnail}}`` directive).
+        ``images``      — pre-sorted ``item_images`` rows for ``{{image:*}}``.
+    """
+    video_id = video["id"]
+    project_id = int(video.get("project_id") or 1)
+
+    proj_rows = await db.execute_fetchall(
+        "SELECT id, project_url, youtube_channel_id FROM projects WHERE id = ?",
+        (project_id,),
+    )
+    project_row = dict(proj_rows[0]) if proj_rows else {}
+
+    parent: dict | None = None
+    if video.get("parent_item_id"):
+        parent_rows = await db.execute_fetchall(
+            "SELECT * FROM videos WHERE id = ?", (video["parent_item_id"],)
+        )
+        if parent_rows:
+            parent = dict(parent_rows[0])
+
+    image_rows = await db.execute_fetchall(
+        "SELECT shortname, path, alt_text, order_index FROM item_images "
+        "WHERE video_id = ? ORDER BY order_index, id",
+        (video_id,),
+    )
+    images = [dict(r) for r in image_rows]
+
+    global_rows = await db.execute_fetchall(
+        "SELECT key, value FROM global_variables"
+    )
+    global_vars = {r["key"]: r["value"] for r in global_rows}
+
+    project_var_rows = await db.execute_fetchall(
+        "SELECT key, value FROM project_variables WHERE project_id = ?",
+        (project_id,),
+    )
+    project_vars = {r["key"]: r["value"] for r in project_var_rows}
+
+    parent_item_vars: dict[str, str] = {}
+    if parent is not None:
+        parent_var_rows = await db.execute_fetchall(
+            "SELECT key, value FROM item_variables WHERE video_id = ?",
+            (parent["id"],),
+        )
+        parent_item_vars = {r["key"]: r["value"] for r in parent_var_rows}
+
+    self_var_rows = await db.execute_fetchall(
+        "SELECT key, value FROM item_variables WHERE video_id = ?", (video_id,)
+    )
+    self_item_vars = {r["key"]: r["value"] for r in self_var_rows}
+
+    tags = json.loads(video.get("tags") or "[]")
+    tier = video.get("tier") or ""
+    if not tier:
+        # Best-effort YouTube duration lookup. Empty string for items without
+        # a YT counterpart (standalone, hook-without-YT) — templates that
+        # care can use {{tier??}}.
+        try:
+            yt = youtube.get_video(video_id)
+            iso_dur = (yt or {}).get("contentDetails", {}).get("duration")
+            tier = _tier_from_iso_duration(iso_dur)
+        except Exception:
+            tier = ""
+
+    description = video.get("description") or ""
+
+    self_builtins: dict[str, object] = {
+        "title": video.get("title") or "",
+        "description": description,
+        "description_short": description[:150],
+        "description_medium": description[:500],
+        "tags": ", ".join(tags),
+        "hashtags": " ".join(f"#{t.replace(' ', '')}" for t in tags[:5]),
+        "thumbnail_path": video.get("thumbnail_path") or "",
+        "tier": tier,
+        "transcript": srt_to_plain_text(video.get("transcript") or ""),
+        # URL family — read directly from columns; resolution is just
+        # "self.url -> empty" / "parent.url -> empty" / "project.project_url
+        # -> empty". The migration backfilled videos.url for existing rows.
+        "url": video.get("url") or "",
+        "episode_url": (parent or {}).get("url") or "",
+        "project_url": project_row.get("project_url") or "",
+    }
+
+    variables = tmpl.merge_variables(
+        global_vars=global_vars,
+        project_vars=project_vars,
+        parent_item_vars=parent_item_vars,
+        self_builtins=self_builtins,
+        self_item_vars=self_item_vars,
+    )
+
+    return {
+        "variables": variables,
+        "video_path": video.get("video_file_path") or "",
+        "thumb_path": video.get("thumbnail_path") or "",
+        "images": images,
+    }
+
+
+def _decode_media_paths(post_row: dict) -> list[str]:
+    """Pull a media-paths list out of a social_posts row.
+
+    Prefers the new JSON-array column (``media_paths``) populated by the
+    post-generation paths; falls back to the legacy single-string column
+    (``media_path``) for any row written before migration 010 or by an
+    older code path that hasn't been updated. Empty / NULL ⇒ ``[]``.
+    """
+    raw = post_row.get("media_paths")
+    if raw:
+        try:
+            decoded = json.loads(raw)
+            if isinstance(decoded, list):
+                return [str(p) for p in decoded if p]
+        except (TypeError, ValueError):
+            pass
+    legacy = post_row.get("media_path")
+    return [str(legacy)] if legacy else []
+
+
+def _legacy_media_for_slot(slot: dict, ctx: dict) -> str | None:
+    """Backwards-compat fallback when the template body uses NO media
+    directives. Reads the slot's legacy ``media`` field
+    (``thumbnail | video | none``) and returns the corresponding path.
+    Once Phase E lands and templates have migrated to directives, this
+    helper can be removed.
+    """
+    media_kind = (slot.get("media") or "thumbnail").lower()
+    if media_kind == "video":
+        return ctx["video_path"] or None
+    if media_kind == "thumbnail":
+        return ctx["thumb_path"] or None
+    return None
+
+
 @router.post("/generate-posts/{video_id}")
-async def generate_posts(video_id: str, data: dict | None = None):
+async def generate_posts(
+    video_id: str,
+    data: dict | None = None,
+    confirm_overwrite_scheduled: bool = Query(default=False),
+):
     """Generate social media posts for a video using a template.
 
     Optional body params:
         template_name: Template to use (default: "announce_video")
         platforms: List of platform names to generate for (default: all in template)
+        user_message: Free-form text bound to the ``{{user_message}}`` variable.
+
+    If any unsent post for this video is currently scheduled (has a pending
+    APScheduler job), the route returns 409 unless ``?confirm_overwrite_scheduled=true``
+    is passed. On confirm, scheduled posts are cancelled (APScheduler jobs torn
+    down) before the regenerate.
     """
     db = await get_db()
     rows = await db.execute_fetchall("SELECT * FROM videos WHERE id = ?", (video_id,))
@@ -57,37 +210,39 @@ async def generate_posts(video_id: str, data: dict | None = None):
         if row["social_account_id"] is not None
     }
 
-    # Build variables
-    tags = json.loads(video.get("tags", "[]"))
-
-    tier = ""
-    try:
-        yt = youtube.get_video(video_id)
-        iso_dur = (yt or {}).get("contentDetails", {}).get("duration")
-        tier = _tier_from_iso_duration(iso_dur)
-    except Exception:
-        tier = ""
-
-    variables = {
-        "title": video["title"],
-        "url": f"https://youtu.be/{video_id}",
-        "description": video.get("description", ""),
-        "description_short": (video.get("description", "") or "")[:150],
-        "description_medium": (video.get("description", "") or "")[:500],
-        "tags": ", ".join(tags),
-        "hashtags": " ".join(f"#{t.replace(' ', '')}" for t in tags[:5]),
-        "thumbnail_path": video.get("thumbnail_path", ""),
-        "tier": tier,
-        # Stored as SRT (with timestamps); template authors typically want
-        # plain text in their post copy.
-        "transcript": srt_to_plain_text(video.get("transcript", "") or ""),
-        "user_message": opts.get("user_message", "") or "",
-    }
+    ctx = await _build_render_context(db, video)
+    ctx["variables"]["user_message"] = opts.get("user_message", "") or ""
 
     # Acquire the per-video publish lock to prevent racing with a publish in progress.
-    # This ensures we don't delete/recreate posts while the scheduler is sending them.
     lock = get_publish_lock(video_id)
     async with lock:
+        # Refuse to silently nuke scheduled posts. Without this, a regenerate
+        # would DELETE 'approved' rows whose APScheduler jobs would then
+        # become orphans firing against rows that no longer exist.
+        scheduled_rows = await db.execute_fetchall(
+            "SELECT id, platform, scheduled_at FROM social_posts "
+            "WHERE video_id = ? AND scheduler_job_id IS NOT NULL",
+            (video_id,),
+        )
+        if scheduled_rows and not confirm_overwrite_scheduled:
+            raise HTTPException(
+                409,
+                {
+                    "scheduled_overwrite": True,
+                    "needs_confirm": True,
+                    "scheduled": [
+                        {
+                            "post_id": int(r["id"]),
+                            "platform": r["platform"],
+                            "scheduled_at": r["scheduled_at"],
+                        }
+                        for r in scheduled_rows
+                    ],
+                },
+            )
+        for r in scheduled_rows:
+            await cancel_scheduled_post(int(r["id"]))
+
         # Replace unsent posts on regenerate. Posts that already went out
         # ('posted') stay for the audit trail; in-flight scheduled posts
         # ('sending') stay because the per-post scheduler holds its own
@@ -108,11 +263,19 @@ async def generate_posts(video_id: str, data: dict | None = None):
                 continue
 
             template_text = slot.get("body", "") or ""
+            media_paths: list[str] = []
             if template_text:
                 try:
-                    rendered = tmpl.render_template(template_text, variables)
+                    cleaned, media_paths, _alts = tmpl.extract_media_directives(
+                        template_text,
+                        video_path=ctx["video_path"],
+                        thumbnail_path=ctx["thumb_path"],
+                        images=ctx["images"],
+                    )
+                    rendered = tmpl.render(cleaned, ctx["variables"])
                 except Exception as e:
                     rendered = f"[Error generating: {e}]"
+                    media_paths = []
             else:
                 rendered = ""
 
@@ -123,16 +286,30 @@ async def generate_posts(video_id: str, data: dict | None = None):
             # bypass the dedup check by accident.
             rendered = rendered.strip()
 
-            # Routing precedence: slot binding → project default → none
+            # If the template body had NO media directives, fall back to
+            # the slot's legacy `media` setting (thumbnail / video / none)
+            # so existing templates without directives still attach media.
+            if not media_paths:
+                fallback = _legacy_media_for_slot(slot, ctx)
+                if fallback:
+                    media_paths = [fallback]
+
             sa_id = slot.get("social_account_id") or defaults.get(platform)
             media = slot.get("media", "thumbnail")
             max_chars = slot.get("max_chars", 500)
+            media_paths_json = json.dumps(media_paths) if media_paths else None
+            primary_media = media_paths[0] if media_paths else None
 
             await db.execute(
                 """INSERT INTO social_posts
-                       (video_id, platform, content, media_type, status, social_account_id)
-                VALUES (?, ?, ?, ?, 'draft', ?)""",
-                (video_id, platform, rendered, media, sa_id),
+                       (video_id, platform, content, media_path, media_paths,
+                        media_type, status, social_account_id)
+                VALUES (?, ?, ?, ?, ?, ?, 'draft', ?)""",
+                (
+                    video_id, platform, rendered,
+                    primary_media, media_paths_json,
+                    media, sa_id,
+                ),
             )
 
             generated.append({
@@ -140,6 +317,7 @@ async def generate_posts(video_id: str, data: dict | None = None):
                 "platform": platform,
                 "content": rendered,
                 "media": media,
+                "media_paths": media_paths,
                 "max_chars": max_chars,
                 "social_account_id": sa_id,
             })
@@ -328,7 +506,10 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
         )
 
     try:
-        result = await poster.post(post["content"], post.get("media_path"))
+        result = await poster.post(
+            post["content"],
+            media_paths=_decode_media_paths(post),
+        )
         await db.execute(
             """UPDATE social_posts
             SET status = 'posted', posted_at = datetime('now'), post_url = ?
@@ -487,7 +668,10 @@ async def send_all_posts(
             continue
 
         try:
-            result = await poster.post(post["content"], post.get("media_path"))
+            result = await poster.post(
+                post["content"],
+                media_paths=_decode_media_paths(post),
+            )
             await db.execute(
                 """UPDATE social_posts
                 SET status = 'posted', posted_at = datetime('now'), post_url = ?

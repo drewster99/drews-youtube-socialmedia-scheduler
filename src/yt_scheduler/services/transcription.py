@@ -2,9 +2,8 @@
 
 Attempts backends in order of preference:
 1. MLX Whisper — fastest on Apple Silicon Macs
-2. faster-whisper — fast on any platform (CTranslate2 backend)
-3. whisper.cpp (CLI) — if installed as a system binary
-4. macOS SFSpeechRecognizer — built-in, no downloads needed
+2. whisper.cpp (CLI) — if installed as a system binary
+3. macOS SFSpeechRecognizer — built-in, no downloads needed
 
 Produces both plain text transcripts and SRT subtitle files.
 """
@@ -161,24 +160,6 @@ def _format_vtt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 
-def _audio_duration_seconds(audio_path: Path) -> float | None:
-    """Return audio duration in seconds via ffprobe; ``None`` on any
-    failure (caller treats as unknown)."""
-    try:
-        out = subprocess.check_output(
-            [
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                str(audio_path),
-            ],
-            text=True, timeout=10,
-        )
-        return float(out.strip())
-    except (subprocess.SubprocessError, FileNotFoundError, ValueError):
-        return None
-
-
 def _extract_audio(video_path: Path) -> Path:
     """Extract audio from video to a temp WAV file (16kHz mono, required by Whisper)."""
     fd, tmp_path = tempfile.mkstemp(suffix=".wav")
@@ -244,126 +225,6 @@ def _try_mlx_whisper(audio_path: Path, model: str, language: str | None) -> Tran
         segments=segments,
         backend="mlx-whisper",
         language=result.get("language"),
-        has_word_timestamps=has_words,
-    )
-
-
-# --- Backend: faster-whisper ---
-
-
-def _try_faster_whisper(audio_path: Path, model: str, language: str | None) -> TranscriptionResult | None:
-    """Transcribe using faster-whisper (CTranslate2 backend).
-
-    Note: CTranslate2 has no Metal/MPS support. On Apple Silicon this
-    runs entirely on CPU, which is roughly 0.1–0.3× realtime for
-    large-v3 — so a 12-minute video can take 40–120 minutes. We enforce
-    a wall-clock budget proportional to audio duration so a runaway
-    transcribe can't hang the request forever; partial results are
-    returned when the budget is exceeded.
-    """
-    import time
-
-    try:
-        from faster_whisper import WhisperModel
-    except ImportError:
-        logger.debug("faster-whisper not installed")
-        return None
-
-    logger.info(f"Transcribing with faster-whisper (model: {model})")
-
-    whisper_model = WhisperModel(model, device="auto", compute_type="auto")
-
-    # Surface the device + compute type CT2 actually selected so the user
-    # can see "device=cpu compute=int8" in the server log and understand
-    # why a large model is slow on Apple Silicon. The attributes live on
-    # the underlying CT2 model (whisper_model.model), not on the wrapper.
-    dev = "?"
-    ct = "?"
-    try:
-        ct2_model = getattr(whisper_model, "model", None)
-        if ct2_model is not None:
-            dev = getattr(ct2_model, "device", "?")
-            ct = getattr(ct2_model, "compute_type", "?")
-        logger.info(f"faster-whisper backend: device={dev} compute_type={ct}")
-        if dev == "cpu" and platform.machine() == "arm64" and platform.system() == "Darwin":
-            logger.warning(
-                "faster-whisper is running on CPU on Apple Silicon (CTranslate2 has no Metal "
-                "support). For best speed on this machine, switch the Transcribe-with picker to "
-                "mlx-whisper — same Whisper weights, ~30–50× faster on the GPU."
-            )
-    except Exception:
-        pass
-
-    kwargs = {"word_timestamps": True}
-    if language:
-        kwargs["language"] = language
-
-    raw_segments, info = whisper_model.transcribe(str(audio_path), **kwargs)
-
-    # Wall-clock budget tuned to real-world numbers. Even MLX medium runs
-    # at ~22× realtime, so transcription should comfortably finish in a
-    # tiny fraction of the audio length. Formula: 60s headroom for model
-    # download / load + 10% of audio length for inference, with a 2-min
-    # floor for short clips. Examples: 12-min video → 132s (2:12);
-    # 30-min video → 240s (4:00); 1-min clip → 120s floor.
-    audio_duration = _audio_duration_seconds(audio_path)
-    if audio_duration is not None and audio_duration > 0:
-        budget = max(120, int(60 + audio_duration * 0.1))
-    else:
-        budget = 180  # unknown length → 3-min ceiling
-    deadline = time.monotonic() + budget
-    logger.info(f"faster-whisper budget: {budget}s wall (audio ≈ {audio_duration or '?'}s)")
-
-    segments = []
-    has_words = False
-    aborted = False
-    last_log = time.monotonic()
-    for seg in raw_segments:
-        if time.monotonic() > deadline:
-            aborted = True
-            logger.warning(
-                "faster-whisper exceeded %ds budget — returning %d partial segments "
-                "(stopped at %.1fs of audio). Switch to mlx-whisper for full coverage.",
-                budget, len(segments), segments[-1].end if segments else 0.0,
-            )
-            break
-        words = None
-        if hasattr(seg, "words") and seg.words:
-            has_words = True
-            words = [
-                TranscriptWord(
-                    start=w.start, end=w.end,
-                    word=w.word, probability=w.probability,
-                )
-                for w in seg.words
-            ]
-        segments.append(TranscriptSegment(
-            start=seg.start, end=seg.end, text=seg.text, words=words,
-        ))
-        # Periodic progress so a long run isn't silent.
-        now = time.monotonic()
-        if now - last_log >= 15:
-            elapsed = now - (deadline - budget)
-            logger.info(
-                "faster-whisper progress: %d segments, %.1fs of audio transcribed in %.1fs wall",
-                len(segments), seg.end, elapsed,
-            )
-            last_log = now
-
-    if aborted and not segments:
-        # No partials at all in the budget — surface the timeout as an
-        # error so the route can show something actionable rather than
-        # an empty transcript.
-        raise RuntimeError(
-            f"faster-whisper produced no segments within the {budget}s budget. "
-            "On Apple Silicon, large models run on CPU and are very slow. "
-            "Switch to mlx-whisper for GPU acceleration."
-        )
-
-    return TranscriptionResult(
-        segments=segments,
-        backend="faster-whisper",
-        language=info.language,
         has_word_timestamps=has_words,
     )
 
@@ -664,7 +525,7 @@ def transcribe(
         model: Whisper model size (tiny, base, small, medium, large-v3)
         language: Language code (e.g., "en"). None for auto-detect.
         backend: Force a specific backend. None for auto-detect order:
-                 mlx-whisper → faster-whisper → whisper.cpp → macos-speech
+                 mlx-whisper → whisper.cpp → macos-speech
 
     Returns:
         TranscriptionResult with segments, timestamps, and text.
@@ -697,7 +558,6 @@ def transcribe(
         # not done yet.
         backends = [
             ("mlx-whisper", lambda: _try_mlx_whisper(audio_path, model, language)),
-            ("faster-whisper", lambda: _try_faster_whisper(audio_path, model, language)),
             ("whisper.cpp", lambda: _try_whisper_cpp(audio_path, model, language)),
             # ("macos-speech", lambda: _try_macos_speech(audio_path, language)),
         ]
@@ -709,7 +569,7 @@ def transcribe(
             if not backends:
                 raise ValueError(
                     f"Unknown backend: {backend}. "
-                    "Available: mlx-whisper, faster-whisper, whisper.cpp, macos-speech"
+                    "Available: mlx-whisper, whisper.cpp, macos-speech"
                 )
             name, try_fn = backends[0]
             try:
@@ -721,8 +581,7 @@ def transcribe(
                         " — macOS likely killed the helper for privacy. Open "
                         "System Settings → Privacy & Security → Speech "
                         "Recognition and enable access for Drew's YT "
-                        "Scheduler. If that doesn't help, switch the "
-                        "Transcribe-with picker to faster-whisper."
+                        "Scheduler."
                     )
                 raise RuntimeError(f"Backend {name} failed: {e}{hint}") from e
             if not (result and result.segments):
@@ -754,7 +613,6 @@ def transcribe(
         raise RuntimeError(
             "No transcription backend available. Install one of:\n"
             "  pip install mlx-whisper      # Apple Silicon Mac (recommended)\n"
-            "  pip install faster-whisper    # Any platform\n"
             "  brew install whisper-cpp      # macOS via Homebrew\n"
             "Or use macOS built-in speech recognition (limited quality)."
         )
@@ -772,11 +630,6 @@ def list_available_backends() -> list[dict]:
         available.append({"name": "mlx-whisper", "status": "available", "note": "Apple Silicon GPU acceleration"})
     elif platform.machine() == "arm64" and platform.system() == "Darwin":
         available.append({"name": "mlx-whisper", "status": "installable", "note": "pip install mlx-whisper"})
-
-    if importlib.util.find_spec("faster_whisper") is not None:
-        available.append({"name": "faster-whisper", "status": "available", "note": "CTranslate2 backend"})
-    else:
-        available.append({"name": "faster-whisper", "status": "installable", "note": "pip install faster-whisper"})
 
     # whisper.cpp
     for name in ["whisper-cpp", "whisper", "main"]:

@@ -57,10 +57,33 @@ async def list_projects() -> list[dict]:
 
 @router.post("")
 async def create_project(payload: dict) -> dict:
+    """Create a project.
+
+    Body shape::
+
+        {
+          "name": "AI Chess Machine",
+          "slug": "ai-chess",            // optional; derived from name if absent
+          "kind": "social",              // optional; "youtube" | "github" | "social"
+          "project_url": "https://..."   // optional; the {{project_url}} value
+        }
+
+    The ``kind`` field is informational at create time — projects don't carry
+    a kind column. The semantic effect is that ``kind == "youtube"`` is the
+    only path that lands here through the YouTube OAuth flow (which also
+    seeds ``project_url`` from ``snippet.customUrl``); ``kind == "github"``
+    or ``kind == "social"`` is a hint to the UI that the user is going to
+    create item types of ``standalone`` (or hooks-without-YT). The actual
+    constraint that gates ``episode/short/segment`` items is whether
+    ``youtube_channel_id`` is bound — the kind is just metadata for the UI.
+    """
     name = payload.get("name", "").strip() if isinstance(payload, dict) else ""
     slug = payload.get("slug") if isinstance(payload, dict) else None
+    project_url = payload.get("project_url") if isinstance(payload, dict) else None
     try:
-        return await project_service.create_project(name=name, slug=slug)
+        return await project_service.create_project(
+            name=name, slug=slug, project_url=project_url
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -75,14 +98,32 @@ async def get_project(slug: str) -> dict:
 
 @router.patch("/{slug}")
 async def rename_project(slug: str, payload: dict) -> dict:
+    """Update a project's display name and/or ``project_url``.
+
+    Body fields (any subset):
+        ``name`` — new display name. Slug is immutable.
+        ``project_url`` — new ``{{project_url}}`` value. Pass an empty string
+            (or ``null``) to clear.
+    """
     project = await project_service.get_project_by_slug(slug)
     if project is None:
         raise HTTPException(status_code=404, detail=f"Project '{slug}' not found")
-    name = payload.get("name", "").strip() if isinstance(payload, dict) else ""
-    try:
-        return await project_service.rename_project(project["id"], name=name)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "payload must be an object")
+
+    if "name" in payload:
+        name = (payload.get("name") or "").strip()
+        try:
+            await project_service.rename_project(project["id"], name=name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if "project_url" in payload:
+        await project_service.update_project_url(
+            project["id"], payload.get("project_url")
+        )
+
+    return await project_service.get_project_by_slug(slug)
 
 
 @router.delete("/{slug}")
@@ -292,6 +333,62 @@ async def get_project_youtube(slug: str) -> dict:
         "authenticated": authenticated,
         "needs_reauth": needs_reauth,
     }
+
+
+@router.post("/{slug}/youtube/refresh-channel-url")
+async def refresh_channel_url(slug: str) -> dict:
+    """Re-pull the channel handle from YouTube and update ``project_url``.
+
+    Used when the upstream channel handle changes (rare but real) or when
+    the user wants to overwrite a hand-edited ``project_url`` with the
+    canonical channel URL again. Always overwrites — unlike the OAuth
+    bind, which only seeds ``project_url`` when NULL.
+    """
+    from googleapiclient.discovery import build
+    from yt_scheduler.database import get_db
+    from yt_scheduler.services import youtube as yt_service
+    from yt_scheduler.services.auth import get_credentials, is_authenticated
+
+    project = await project_service.get_project_by_slug(slug)
+    if project is None:
+        raise HTTPException(404, f"Project '{slug}' not found")
+    if not project.get("youtube_channel_id"):
+        raise HTTPException(
+            400,
+            f"Project '{slug}' has no YouTube channel bound. "
+            "Connect via OAuth first.",
+        )
+    if not is_authenticated(slug):
+        raise HTTPException(401, "YouTube credentials missing or expired.")
+
+    creds = get_credentials(slug)
+    if creds is None:
+        raise HTTPException(401, "YouTube credentials missing or expired.")
+
+    def _fetch():
+        service = build("youtube", "v3", credentials=creds)
+        return service.channels().list(part="snippet", mine=True).execute()
+
+    try:
+        result = await asyncio.to_thread(_fetch)
+    except Exception as exc:
+        raise HTTPException(502, f"YouTube channels.list failed: {exc}") from exc
+    items = result.get("items") or []
+    if not items:
+        raise HTTPException(502, "YouTube returned no channel for these credentials.")
+
+    snippet = items[0].get("snippet", {})
+    handle = snippet.get("customUrl") or ""
+    new_url = yt_service.compose_channel_url(handle, project["youtube_channel_id"])
+
+    db = await get_db()
+    await db.execute(
+        "UPDATE projects SET project_url = ?, updated_at = datetime('now') WHERE id = ?",
+        (new_url, project["id"]),
+    )
+    await db.commit()
+
+    return {"project_url": new_url, "channel_handle": handle}
 
 
 # --- Reusable dependency for project-scoped routes ---------------------------

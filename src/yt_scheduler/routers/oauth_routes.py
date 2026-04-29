@@ -29,7 +29,7 @@ from yt_scheduler.services.auth import (
     has_client_secret,
     store_credentials,
 )
-from yt_scheduler.services import bluesky_oauth, oauth_clients
+from yt_scheduler.services import bluesky_oauth, oauth_clients, youtube as _youtube
 from yt_scheduler.services.projects import slugify
 from yt_scheduler.services.social_credentials import (
     display_name_for,
@@ -977,9 +977,15 @@ async def youtube_callback(
                     platform="youtube",
                 )
 
+        # Compose project_url from the channel handle (preferred — the
+        # @drewanddanmorning form) or fall back to the channel-id URL when
+        # the channel has no published custom URL.
+        project_url = _youtube.compose_channel_url(channel_handle, channel_id)
+
         cursor = await db.execute(
-            "INSERT INTO projects (name, slug, youtube_channel_id) VALUES (?, ?, ?)",
-            (name, slug, channel_id),
+            "INSERT INTO projects (name, slug, youtube_channel_id, project_url) "
+            "VALUES (?, ?, ?, ?)",
+            (name, slug, channel_id, project_url),
         )
         await db.commit()
         project_id = int(cursor.lastrowid)
@@ -1028,10 +1034,33 @@ async def youtube_callback(
         )
 
     if not bound:
+        # Seed project_url on first bind, AND upgrade migration-backfilled
+        # channel-id-form URLs to the prettier @handle form. The CASE
+        # detects three states:
+        #   - NULL                                       -> set to handle form
+        #   - channel-id form for THIS channel (auto)    -> upgrade
+        #   - anything else (user-edited / handle form)  -> preserve
+        # If a user genuinely wants the channel-id form back, they can
+        # PATCH the project; the OAuth flow stops mutating it after that.
+        composed_url = _youtube.compose_channel_url(channel_handle, channel_id)
+        canonical_channel_id_url = f"https://www.youtube.com/channel/{channel_id}"
         await db.execute(
-            "UPDATE projects SET youtube_channel_id = ?, updated_at = datetime('now') "
+            "UPDATE projects "
+            "SET youtube_channel_id = ?, "
+            "    project_url = CASE "
+            "        WHEN project_url IS NULL THEN ? "
+            "        WHEN project_url = ? THEN ? "
+            "        ELSE project_url "
+            "    END, "
+            "    updated_at = datetime('now') "
             "WHERE id = ?",
-            (channel_id, project["id"]),
+            (
+                channel_id,
+                composed_url,
+                canonical_channel_id_url,
+                composed_url,
+                project["id"],
+            ),
         )
         await db.commit()
 

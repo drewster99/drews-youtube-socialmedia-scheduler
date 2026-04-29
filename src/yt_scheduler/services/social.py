@@ -269,9 +269,49 @@ class SocialPoster:
         """Check whether the given bundle has all keys this poster needs."""
         return all(bundle.get(k) for k in cls.required_keys)
 
-    async def post(self, text: str, media_path: str | None = None) -> dict:
-        """Post content. Returns {"url": "...", "id": "..."} on success."""
+    async def post(
+        self,
+        text: str,
+        media_path: str | None = None,
+        *,
+        media_paths: list[str] | None = None,
+        alt_texts: list[str] | None = None,
+    ) -> dict:
+        """Post content. Returns ``{"url": "...", "id": "..."}`` on success.
+
+        Two media-input forms (back-compat + multi):
+
+        - ``media_path`` (legacy single-string positional) — preserved so
+          older callers don't need a churn pass.
+        - ``media_paths`` (keyword-only list) — preferred. When both are
+          supplied, ``media_paths`` wins. ``alt_texts`` is parallel to
+          ``media_paths``; defaults to empty strings if omitted.
+
+        Subclasses that only use the first item should call
+        :meth:`_resolve_media_inputs` to normalise inputs to a list.
+        """
         raise NotImplementedError
+
+    @staticmethod
+    def _resolve_media_inputs(
+        media_path: str | None,
+        media_paths: list[str] | None,
+        alt_texts: list[str] | None,
+    ) -> tuple[list[str], list[str]]:
+        """Centralise the legacy / multi-media reconciliation logic so each
+        poster handles inputs the same way. Returns ``(paths, alts)`` —
+        same length, alts padded with ``""`` when callers provide fewer
+        alts than paths."""
+        paths: list[str] = []
+        if media_paths:
+            paths = [p for p in media_paths if p]
+        elif media_path:
+            paths = [media_path]
+        alts = list(alt_texts or [])
+        # Pad alts to match paths length.
+        while len(alts) < len(paths):
+            alts.append("")
+        return paths, alts
 
     async def is_configured(self) -> bool:
         """Check if this poster's credentials are complete."""
@@ -286,7 +326,14 @@ class TwitterPoster(SocialPoster):
     # go through v2 ``POST /2/media/upload``.
     required_keys: list[str] = ["bearer_token"]
 
-    async def post(self, text: str, media_path: str | None = None) -> dict:
+    async def post(
+        self,
+        text: str,
+        media_path: str | None = None,
+        *,
+        media_paths: list[str] | None = None,
+        alt_texts: list[str] | None = None,
+    ) -> dict:
         text = (text or "").strip()
         creds = self._get_creds()
         bearer = creds.get("bearer_token")
@@ -296,28 +343,50 @@ class TwitterPoster(SocialPoster):
                 "X is not configured. Click 'Connect with X (OAuth 2.0)' in Settings.",
             )
 
-        has_media = bool(media_path) and Path(media_path).exists() if media_path else False
+        paths, _alts = self._resolve_media_inputs(media_path, media_paths, alt_texts)
+        # Twitter API caps: 4 images per tweet, OR exactly 1 video, OR 1 GIF.
+        # Mixed media (image + video) isn't supported by the API. We slice
+        # to the first 4 paths up front; if any is a video, the chunked
+        # upload path takes only that one.
+        paths = paths[:4]
+        existing_paths = [p for p in paths if Path(p).exists()]
 
         import tweepy
 
-        async def _upload_media(token: str) -> str | None:
+        async def _upload_one(token: str, p: Path) -> str | None:
             try:
-                return await _twitter_v2_upload(token, Path(media_path))
+                return await _twitter_v2_upload(token, p)
             except Exception as exc:
                 logger.warning(
-                    "Twitter v2 media upload failed (%s); posting text-only. "
-                    "Re-run Connect with X to refresh the media.write scope if "
-                    "this persists.",
-                    exc,
+                    "Twitter v2 media upload failed for %s (%s); skipping that "
+                    "asset. Re-run Connect with X to refresh the media.write "
+                    "scope if this persists.",
+                    p, exc,
                 )
                 return None
 
         try:
-            media_ids = None
-            if has_media:
-                media_id = await _upload_media(bearer)
-                if media_id:
-                    media_ids = [media_id]
+            media_ids: list[str] | None = None
+            if existing_paths:
+                # Detect video: video uploads are 1-and-only-1 per tweet, so
+                # if the first path is a video, ignore any siblings.
+                first = Path(existing_paths[0])
+                first_mime = mimetypes.guess_type(first.name)[0] or ""
+                if first_mime.startswith("video/"):
+                    upload_paths = [first]
+                else:
+                    # Image batch: drop anything that looks like a video so
+                    # mixed batches don't trip the API.
+                    upload_paths = [
+                        Path(p) for p in existing_paths
+                        if not (mimetypes.guess_type(p)[0] or "").startswith("video/")
+                    ][:4]
+                ids: list[str] = []
+                for p in upload_paths:
+                    mid = await _upload_one(bearer, p)
+                    if mid:
+                        ids.append(mid)
+                media_ids = ids or None
 
             try:
                 # Two stacked tweepy gotchas with OAuth 2.0 user-context:
@@ -341,11 +410,27 @@ class TwitterPoster(SocialPoster):
                         "X bearer expired and refresh failed — re-OAuth.",
                     ) from exc
                 logger.info("Twitter bearer refreshed; retrying tweet.")
-                # Re-upload media against the fresh token — the old media_id
-                # belongs to the original auth session and may not be valid.
-                if has_media:
-                    media_id = await _upload_media(new_bearer)
-                    media_ids = [media_id] if media_id else None
+                # Re-upload media against the fresh token — old media_ids
+                # belong to the original auth session and may not be valid.
+                if existing_paths:
+                    refreshed_ids: list[str] = []
+                    # Reuse the same first-is-video / multi-image rule as the
+                    # initial upload above so the retry doesn't pick a
+                    # different policy than the first attempt.
+                    first = Path(existing_paths[0])
+                    first_mime = mimetypes.guess_type(first.name)[0] or ""
+                    if first_mime.startswith("video/"):
+                        upload_paths = [first]
+                    else:
+                        upload_paths = [
+                            Path(p) for p in existing_paths
+                            if not (mimetypes.guess_type(p)[0] or "").startswith("video/")
+                        ][:4]
+                    for p in upload_paths:
+                        mid = await _upload_one(new_bearer, p)
+                        if mid:
+                            refreshed_ids.append(mid)
+                    media_ids = refreshed_ids or None
                 client = tweepy.Client(bearer_token=new_bearer)
                 try:
                     response = client.create_tweet(
@@ -383,7 +468,14 @@ class BlueskyPoster(SocialPoster):
         "redirect_uri",
     ]
 
-    async def post(self, text: str, media_path: str | None = None) -> dict:
+    async def post(
+        self,
+        text: str,
+        media_path: str | None = None,
+        *,
+        media_paths: list[str] | None = None,
+        alt_texts: list[str] | None = None,
+    ) -> dict:
         from datetime import datetime, timezone
 
         from yt_scheduler.services import bluesky_oauth
@@ -399,6 +491,19 @@ class BlueskyPoster(SocialPoster):
                 "Click Connect with Bluesky in Settings to re-authenticate.",
             )
 
+        paths, alts = self._resolve_media_inputs(media_path, media_paths, alt_texts)
+        existing = [(Path(p), a) for p, a in zip(paths, alts) if Path(p).exists()]
+
+        # Bluesky caps: 4 images per post OR 1 video per post (mutually
+        # exclusive). When the first asset is a video we use the
+        # `app.bsky.embed.video` lexicon and ignore any siblings; otherwise
+        # we batch up to 4 images via `app.bsky.embed.images`.
+        embed_kind: str | None = None
+        if existing:
+            first_path, _ = existing[0]
+            first_mime = mimetypes.guess_type(first_path.name)[0] or ""
+            embed_kind = "video" if first_mime.startswith("video/") else "images"
+
         async with httpx.AsyncClient(follow_redirects=True) as client:
             try:
                 await self._ensure_fresh_token(creds, client, bluesky_oauth, save_bundle)
@@ -409,12 +514,33 @@ class BlueskyPoster(SocialPoster):
                 raise CredentialAuthError(creds.get("uuid"), str(exc)) from exc
 
             embed = None
-            if media_path and Path(media_path).exists():
-                blob = await self._upload_blob(creds, Path(media_path), client, bluesky_oauth, save_bundle)
+            if embed_kind == "video":
+                first_path, first_alt = existing[0]
+                blob = await self._upload_blob(
+                    creds, first_path, client, bluesky_oauth, save_bundle
+                )
                 embed = {
-                    "$type": "app.bsky.embed.images",
-                    "images": [{"alt": "Video thumbnail", "image": blob}],
+                    "$type": "app.bsky.embed.video",
+                    "video": blob,
+                    "alt": first_alt or "",
                 }
+            elif embed_kind == "images":
+                images_payload: list[dict] = []
+                for path_obj, alt in existing[:4]:
+                    mime = mimetypes.guess_type(path_obj.name)[0] or ""
+                    if mime.startswith("video/"):
+                        # Mixed batches aren't supported by the embed.images
+                        # lexicon; skip the video so the batch still posts.
+                        continue
+                    blob = await self._upload_blob(
+                        creds, path_obj, client, bluesky_oauth, save_bundle
+                    )
+                    images_payload.append({"image": blob, "alt": alt or ""})
+                if images_payload:
+                    embed = {
+                        "$type": "app.bsky.embed.images",
+                        "images": images_payload,
+                    }
 
             record = {
                 "$type": "app.bsky.feed.post",
@@ -637,9 +763,22 @@ class MastodonPoster(SocialPoster):
     platform = "mastodon"
     required_keys = ["access_token", "instance_url"]
 
-    async def post(self, text: str, media_path: str | None = None) -> dict:
+    async def post(
+        self,
+        text: str,
+        media_path: str | None = None,
+        *,
+        media_paths: list[str] | None = None,
+        alt_texts: list[str] | None = None,
+    ) -> dict:
         text = (text or "").strip()
         creds = self._get_creds()
+
+        paths, _alts = self._resolve_media_inputs(media_path, media_paths, alt_texts)
+        # Mastodon's default cap is 4 media per status; some instances raise
+        # this. We cap conservatively. Video/image mixing is platform-
+        # configurable; we don't filter — let Mastodon reject if needed.
+        existing = [p for p in paths if Path(p).exists()][:4]
 
         try:
             from mastodon import Mastodon
@@ -651,10 +790,12 @@ class MastodonPoster(SocialPoster):
             )
 
             try:
-                media_ids = None
-                if media_path and Path(media_path).exists():
-                    media = client.media_post(media_path)
-                    media_ids = [media["id"]]
+                media_ids: list | None = None
+                if existing:
+                    media_ids = []
+                    for p in existing:
+                        media = client.media_post(p)
+                        media_ids.append(media["id"])
 
                 status = client.status_post(text, media_ids=media_ids)
             except MastodonUnauthorizedError as exc:
@@ -675,34 +816,106 @@ class LinkedInPoster(SocialPoster):
     platform = "linkedin"
     required_keys = ["access_token", "person_urn"]
 
-    async def post(self, text: str, media_path: str | None = None) -> dict:
+    async def post(
+        self,
+        text: str,
+        media_path: str | None = None,
+        *,
+        media_paths: list[str] | None = None,
+        alt_texts: list[str] | None = None,
+    ) -> dict:
+        """Post to LinkedIn with optional media.
+
+        Implements the three-step asset upload chain documented at
+        https://learn.microsoft.com/en-us/linkedin/marketing/integrations/community-management/shares/vector-asset-api ::
+
+            1. ``POST /v2/assets?action=registerUpload`` for each asset.
+            2. ``PUT`` the binary to the returned ``uploadUrl``.
+            3. ``POST /v2/ugcPosts`` with ``shareMediaCategory: IMAGE | VIDEO``
+               and the asset URN(s).
+
+        LinkedIn doesn't allow mixing image and video in a single share; if
+        the first asset is a video we use ``VIDEO`` and ignore image siblings.
+        Otherwise ``IMAGE`` with up to 9 image URNs (the personal-share UI
+        cap; the API itself accepts more on company pages — verify against
+        the live doc if a higher cap matters).
+        """
         text = (text or "").strip()
         creds = self._get_creds()
+        token = creds.get("access_token")
+        owner_urn = creds.get("person_urn")
+        if not token or not owner_urn:
+            raise CredentialAuthError(
+                creds.get("uuid"),
+                "LinkedIn is not configured. Click 'Connect with LinkedIn' in Settings.",
+            )
+
+        paths, alts = self._resolve_media_inputs(media_path, media_paths, alt_texts)
+        existing = [(Path(p), a) for p, a in zip(paths, alts) if Path(p).exists()]
+
+        share_media_category = "NONE"
+        media_blocks: list[dict] = []
+        if existing:
+            first_mime = mimetypes.guess_type(existing[0][0].name)[0] or ""
+            is_video = first_mime.startswith("video/")
+            share_media_category = "VIDEO" if is_video else "IMAGE"
+            uploadable = (
+                [existing[0]]
+                if is_video
+                else [
+                    (p, a) for (p, a) in existing
+                    if not (mimetypes.guess_type(p.name)[0] or "").startswith("video/")
+                ][:9]
+            )
+            try:
+                async with httpx.AsyncClient(timeout=120) as client:
+                    for path_obj, alt in uploadable:
+                        asset_urn = await self._linkedin_upload_asset(
+                            client, token, owner_urn, path_obj, is_video,
+                        )
+                        block: dict = {
+                            "status": "READY",
+                            "media": asset_urn,
+                        }
+                        if alt:
+                            block["description"] = {"text": alt}
+                        media_blocks.append(block)
+            except CredentialAuthError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "LinkedIn asset upload failed (%s); posting text-only.",
+                    exc,
+                )
+                share_media_category = "NONE"
+                media_blocks = []
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "X-Restli-Protocol-Version": "2.0.0",
+        }
+
+        share_content: dict = {
+            "shareCommentary": {"text": text},
+            "shareMediaCategory": share_media_category,
+        }
+        if media_blocks:
+            share_content["media"] = media_blocks
+
+        body = {
+            "author": owner_urn,
+            "lifecycleState": "PUBLISHED",
+            "specificContent": {
+                "com.linkedin.ugc.ShareContent": share_content,
+            },
+            "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
+        }
 
         try:
-            import httpx
-
-            headers = {
-                "Authorization": f"Bearer {creds['access_token']}",
-                "Content-Type": "application/json",
-                "X-Restli-Protocol-Version": "2.0.0",
-            }
-
-            body = {
-                "author": creds["person_urn"],
-                "lifecycleState": "PUBLISHED",
-                "specificContent": {
-                    "com.linkedin.ugc.ShareContent": {
-                        "shareCommentary": {"text": text},
-                        "shareMediaCategory": "NONE",
-                    }
-                },
-                "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
-            }
-
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=60) as client:
                 resp = await client.post(
-                    "https://api.linkedin.com/v2/ugcPosts", headers=headers, json=body
+                    "https://api.linkedin.com/v2/ugcPosts", headers=headers, json=body,
                 )
                 if resp.status_code == 401:
                     raise CredentialAuthError(
@@ -711,18 +924,102 @@ class LinkedInPoster(SocialPoster):
                     )
                 resp.raise_for_status()
                 post_id = resp.headers.get("x-restli-id", "")
-                return {"url": f"https://www.linkedin.com/feed/update/{post_id}", "id": post_id}
+                return {
+                    "url": f"https://www.linkedin.com/feed/update/{post_id}",
+                    "id": post_id,
+                }
         except CredentialAuthError:
             raise
         except Exception as e:
             raise RuntimeError(f"LinkedIn post failed: {e}") from e
+
+    @staticmethod
+    async def _linkedin_upload_asset(
+        client: httpx.AsyncClient,
+        token: str,
+        owner_urn: str,
+        path: Path,
+        is_video: bool,
+    ) -> str:
+        """Run the three-step LinkedIn asset upload. Returns the asset URN
+        (e.g. ``urn:li:digitalmediaAsset:abc123...``) on success."""
+        recipe = (
+            "urn:li:digitalmediaRecipe:feedshare-video"
+            if is_video
+            else "urn:li:digitalmediaRecipe:feedshare-image"
+        )
+        register_payload = {
+            "registerUploadRequest": {
+                "recipes": [recipe],
+                "owner": owner_urn,
+                "serviceRelationships": [
+                    {
+                        "relationshipType": "OWNER",
+                        "identifier": "urn:li:userGeneratedContent",
+                    }
+                ],
+            }
+        }
+        register_headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "X-Restli-Protocol-Version": "2.0.0",
+        }
+        # Step 1: registerUpload
+        resp = await client.post(
+            "https://api.linkedin.com/v2/assets?action=registerUpload",
+            headers=register_headers,
+            json=register_payload,
+        )
+        if resp.status_code == 401:
+            raise CredentialAuthError(None, "LinkedIn registerUpload 401")
+        resp.raise_for_status()
+        data = resp.json()
+        value = data.get("value") or {}
+        upload_mech = (
+            value.get("uploadMechanism", {})
+            .get("com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest", {})
+        )
+        upload_url = upload_mech.get("uploadUrl")
+        asset_urn = value.get("asset")
+        if not upload_url or not asset_urn:
+            raise RuntimeError(
+                f"LinkedIn registerUpload returned no uploadUrl/asset: {data}"
+            )
+
+        # Step 2: PUT bytes to the upload URL.
+        mime, _ = mimetypes.guess_type(path.name)
+        put_headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": mime or ("video/mp4" if is_video else "image/jpeg"),
+        }
+        with path.open("rb") as f:
+            put_resp = await client.put(
+                upload_url, headers=put_headers, content=f.read()
+            )
+        if put_resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"LinkedIn asset PUT failed: HTTP {put_resp.status_code} {put_resp.text}"
+            )
+
+        return asset_urn
 
 
 class ThreadsPoster(SocialPoster):
     platform = "threads"
     required_keys = ["access_token", "user_id"]
 
-    async def post(self, text: str, media_path: str | None = None) -> dict:
+    async def post(
+        self,
+        text: str,
+        media_path: str | None = None,
+        *,
+        media_paths: list[str] | None = None,
+        alt_texts: list[str] | None = None,
+    ) -> dict:
+        # Threads media is deliberately deferred (user not currently using
+        # Threads). The signature takes the new kwargs for base-class
+        # consistency, but media is not attached.
         text = (text or "").strip()
         creds = self._get_creds()
 

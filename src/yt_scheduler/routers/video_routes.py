@@ -22,7 +22,6 @@ from yt_scheduler.services import (
 
 _BACKEND_TO_SOURCE = {
     "mlx-whisper": "mlx_whisper",
-    "faster-whisper": "faster_whisper",
     "whisper.cpp": "whispercpp",
     "macos-speech": "apple_speech",
 }
@@ -119,6 +118,9 @@ async def get_video(video_id: str):
     return result
 
 
+_YT_BACKED_ITEM_TYPES = {"episode", "short", "segment", "hook"}
+
+
 @router.post("/upload")
 async def upload_video(
     video_file: UploadFile = File(...),
@@ -130,13 +132,48 @@ async def upload_video(
     privacy_status: str = Form("unlisted"),
     publish_at: str = Form(""),
     project_slug: str = Form("default"),
+    item_type: str = Form("episode"),
+    parent_item_id: str = Form(""),
 ):
-    """Upload a video to YouTube and track it inside a project."""
+    """Upload a video to YouTube and track it inside a project as a typed item.
+
+    Form fields:
+        item_type: one of ``episode | short | segment | hook``. ``standalone``
+            isn't valid here — standalone items don't go through YouTube; use
+            the ``POST /api/videos/items`` endpoint instead (Phase D).
+        parent_item_id: optional. Required-shape only for ``short``, ``segment``,
+            ``hook``; for ``episode`` it must be empty.
+    """
     from yt_scheduler.services import projects as project_service
+
+    if item_type not in _YT_BACKED_ITEM_TYPES:
+        raise HTTPException(
+            400,
+            f"item_type must be one of {sorted(_YT_BACKED_ITEM_TYPES)}; got {item_type!r}. "
+            "Use POST /api/videos/items for standalone items.",
+        )
 
     project = await project_service.get_project_by_slug(project_slug)
     if project is None:
         raise HTTPException(404, f"Project '{project_slug}' not found")
+    if not project.get("youtube_channel_id"):
+        raise HTTPException(
+            400,
+            f"Project '{project_slug}' has no YouTube channel bound; "
+            f"cannot upload an {item_type} item. Bind a channel via OAuth, "
+            "or create the item as a standalone via POST /api/videos/items.",
+        )
+
+    parent_item_id = (parent_item_id or "").strip()
+    if parent_item_id and item_type == "episode":
+        raise HTTPException(400, "An episode cannot have a parent_item_id.")
+    if parent_item_id:
+        parent_rows = await get_db()
+        parent_check = await parent_rows.execute_fetchall(
+            "SELECT id FROM videos WHERE id = ?", (parent_item_id,)
+        )
+        if not parent_check:
+            raise HTTPException(400, f"parent_item_id {parent_item_id!r} not found")
 
     db = await get_db()
 
@@ -182,12 +219,18 @@ async def upload_video(
     duration = tiers.probe_local_duration(video_path)
     tier = tiers.tier_for_duration(duration)
 
-    # Track in database
+    # Track in database. videos.url is set to the canonical YouTube URL
+    # right at insert so {{url}} in templates resolves without any
+    # at-render derivation. videos.item_type and videos.parent_item_id
+    # are set from the form so the type-aware publish flow knows what to
+    # do at publish time.
+    youtube_url = f"https://youtu.be/{video_id}"
     await db.execute(
         """INSERT INTO videos (id, project_id, title, description, tags, privacy_status, publish_at,
            thumbnail_path, video_file_path, pinned_links, status,
-           duration_seconds, tier)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uploaded', ?, ?)""",
+           duration_seconds, tier,
+           item_type, parent_item_id, url)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uploaded', ?, ?, ?, ?, ?)""",
         (
             video_id,
             project["id"],
@@ -201,12 +244,14 @@ async def upload_video(
             pinned_links,
             duration,
             tier,
+            item_type,
+            parent_item_id or None,
+            youtube_url,
         ),
     )
     await db.commit()
 
-    youtube_url = f"https://youtu.be/{video_id}"
-    await events.record_event(video_id, "created", {"tier": tier})
+    await events.record_event(video_id, "created", {"tier": tier, "item_type": item_type})
     await events.record_event(
         video_id,
         "uploaded",
@@ -223,6 +268,118 @@ async def upload_video(
     if thumbnail_error:
         resp["thumbnail_error"] = thumbnail_error
     return resp
+
+
+_NON_YT_ITEM_TYPES = {"hook", "standalone"}
+
+
+@router.post("/items")
+async def create_non_youtube_item(
+    title: str = Form(...),
+    description: str = Form(""),
+    tags: str = Form(""),
+    project_slug: str = Form("default"),
+    item_type: str = Form("standalone"),
+    parent_item_id: str = Form(""),
+    url: str = Form(""),
+    video_file: UploadFile | None = File(None),
+    thumbnail_file: UploadFile | None = File(None),
+):
+    """Create an item that does NOT go through YouTube.
+
+    Used for ``standalone`` items (text / image / video posts that don't get
+    a YouTube counterpart — e.g. a screenshot post about a GitHub repo) and
+    ``hook`` items that the user wants to post directly to social without
+    also uploading to YouTube. The video file is optional — a standalone
+    "post" can be text-only or images-only (use the per-item images endpoint
+    to attach images).
+
+    For YouTube-backed items (``episode | short | segment``, plus hooks that
+    you do want on YouTube), use ``POST /api/videos/upload`` instead.
+    """
+    import secrets
+    from yt_scheduler.services import projects as project_service
+
+    if item_type not in _NON_YT_ITEM_TYPES:
+        raise HTTPException(
+            400,
+            f"item_type must be one of {sorted(_NON_YT_ITEM_TYPES)}; got {item_type!r}. "
+            "Use POST /api/videos/upload for YouTube-backed item types.",
+        )
+
+    project = await project_service.get_project_by_slug(project_slug)
+    if project is None:
+        raise HTTPException(404, f"Project '{project_slug}' not found")
+
+    parent_item_id = (parent_item_id or "").strip() or None
+    if parent_item_id:
+        if item_type == "standalone":
+            raise HTTPException(
+                400,
+                "standalone items cannot have a parent_item_id. Use item_type=hook "
+                "if you want to attach to a parent episode.",
+            )
+        db_check = await get_db()
+        parent_rows = await db_check.execute_fetchall(
+            "SELECT id FROM videos WHERE id = ?", (parent_item_id,)
+        )
+        if not parent_rows:
+            raise HTTPException(400, f"parent_item_id {parent_item_id!r} not found")
+
+    # Generate a non-YouTube id. YT video ids are 11 chars; ours are 22 to
+    # eliminate any chance of collision with future YT-backed rows.
+    video_id = secrets.token_urlsafe(16)[:22]
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    video_path: Path | None = None
+    if video_file is not None and video_file.filename:
+        video_path = UPLOAD_DIR / f"{video_id}__{video_file.filename}"
+        with open(video_path, "wb") as f:
+            shutil.copyfileobj(video_file.file, f)
+
+    thumbnail_path: Path | None = None
+    if thumbnail_file is not None and thumbnail_file.filename:
+        thumbnail_path = UPLOAD_DIR / f"{video_id}__thumb__{thumbnail_file.filename}"
+        with open(thumbnail_path, "wb") as f:
+            shutil.copyfileobj(thumbnail_file.file, f)
+
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+    duration = tiers.probe_local_duration(video_path) if video_path else 0.0
+    tier = tiers.tier_for_duration(duration) if duration else ""
+
+    db = await get_db()
+    await db.execute(
+        """INSERT INTO videos (id, project_id, title, description, tags,
+           thumbnail_path, video_file_path, status,
+           duration_seconds, tier,
+           item_type, parent_item_id, url)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?)""",
+        (
+            video_id,
+            project["id"],
+            title,
+            description,
+            json.dumps(tag_list),
+            str(thumbnail_path) if thumbnail_path else None,
+            str(video_path) if video_path else None,
+            duration,
+            tier,
+            item_type,
+            parent_item_id,
+            (url or "").strip() or None,
+        ),
+    )
+    await db.commit()
+    await events.record_event(
+        video_id, "created", {"tier": tier, "item_type": item_type}
+    )
+
+    return {
+        "status": "ok",
+        "video_id": video_id,
+        "item_type": item_type,
+        "url": (url or "").strip() or None,
+    }
 
 
 @router.put("/{video_id}")
@@ -327,7 +484,7 @@ async def transcribe_video(
     Optional body params:
         model: Whisper model size (tiny, base, small, medium, large-v3). Default: large-v3
         language: Language code (e.g., "en"). Default: auto-detect
-        backend: Force specific backend (mlx-whisper, faster-whisper, whisper.cpp, macos-speech)
+        backend: Force specific backend (mlx-whisper, whisper.cpp, macos-speech)
 
     Imported videos that aren't on disk yet are pulled via pytubefix.
     Private videos can't be downloaded anonymously, so the route returns

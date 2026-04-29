@@ -8,6 +8,24 @@
 
 <form id="upload-form" class="form-card">
     <div class="form-row">
+        <div class="form-group">
+            <label for="item_type">Item type</label>
+            <select id="item_type" name="item_type">
+                <option value="episode">Episode (full primary video)</option>
+                <option value="short">Short</option>
+                <option value="segment">Segment (clip from an episode)</option>
+                <option value="hook">Hook (short clip; can also post the video direct to social)</option>
+            </select>
+            <small class="form-hint">For text/image/no-video posts that don't go to YouTube, use <a href="#" id="link-standalone-flow">Compose standalone post</a> on the dashboard instead.</small>
+        </div>
+        <div class="form-group" id="parent-item-group" style="display:none;">
+            <label for="parent_item_id">Parent episode <small>(optional)</small></label>
+            <input type="text" id="parent_item_id" name="parent_item_id" placeholder="abc123XYZ — paste the episode's video id">
+            <small class="form-hint">Shorts / segments / hooks can attach to a parent episode. <code>{{episode_url}}</code> in templates resolves to the parent's URL.</small>
+        </div>
+    </div>
+
+    <div class="form-row">
         <div class="form-group flex-2">
             <label for="title">Title</label>
             <input type="text" id="title" name="title" required placeholder="Video title">
@@ -130,10 +148,25 @@ document.getElementById('thumbnail_file').addEventListener('change', (e) => {
 });
 
 // Upload form
+// Show / hide the parent-episode field based on item type. Episodes don't
+// have parents; the other YT-backed types optionally do.
+function syncParentVisibility() {
+    const t = document.getElementById('item_type').value;
+    const grp = document.getElementById('parent-item-group');
+    grp.style.display = (t === 'episode') ? 'none' : '';
+}
+document.getElementById('item_type').addEventListener('change', syncParentVisibility);
+syncParentVisibility();
+
 // Pick up the current project from ?project_slug=… so the upload binds to
 // the right project. Falls back to "default" so a direct visit to /upload
 // still works.
 const uploadProjectSlug = new URLSearchParams(window.location.search).get('project_slug') || 'default';
+
+document.getElementById('link-standalone-flow').addEventListener('click', (e) => {
+    e.preventDefault();
+    window.location.href = `/projects/${uploadProjectSlug}#compose-standalone`;
+});
 
 document.getElementById('upload-form').addEventListener('submit', async (e) => {
     e.preventDefault();

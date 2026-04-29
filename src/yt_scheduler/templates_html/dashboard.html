@@ -4,7 +4,10 @@
 {% block content %}
 <div class="page-header">
     <h1>{{ current_project.name }} / Dashboard</h1>
-    <button class="btn btn-primary" id="upload-btn">Upload new video</button>
+    <div style="display:flex; gap:0.5rem;">
+        <button class="btn" id="compose-standalone-btn">Compose standalone post</button>
+        <button class="btn btn-primary" id="upload-btn">Upload new video</button>
+    </div>
 </div>
 
 <div class="section">
@@ -14,12 +17,68 @@
     </div>
 </div>
 
-<div class="section">
+<div class="section" id="import-section" {% if not current_project.youtube_channel_id %}style="display:none;"{% endif %}>
     <h2>YouTube videos available to import</h2>
     <div id="import-list" class="video-grid">
         <p class="loading">Checking YouTube...</p>
     </div>
 </div>
+
+<!-- Standalone-post composer (POST /api/videos/items). Lives in a <dialog>
+     so the dashboard isn't dominated by a form most visits won't use. -->
+<dialog id="compose-standalone-modal" class="modal modal-wide">
+    <h3>Compose standalone post</h3>
+    <p class="form-hint">
+        Creates a non-YouTube item — for posts about a GitHub repo, image-only
+        social posts, or short-form clips you want to upload directly to
+        social without going through YouTube.
+    </p>
+    <form id="compose-standalone-form">
+        <div class="form-group">
+            <label for="cs-title">Title</label>
+            <input type="text" id="cs-title" name="title" required maxlength="200">
+        </div>
+        <div class="form-group">
+            <label for="cs-description">Description (optional)</label>
+            <textarea id="cs-description" name="description" rows="3"></textarea>
+        </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label for="cs-item-type">Item type</label>
+                <select id="cs-item-type" name="item_type">
+                    <option value="standalone">Standalone (no YouTube)</option>
+                    <option value="hook">Hook (no YouTube; child of an episode)</option>
+                </select>
+            </div>
+            <div class="form-group" id="cs-parent-group" style="display:none;">
+                <label for="cs-parent">Parent episode id</label>
+                <input type="text" id="cs-parent" name="parent_item_id" placeholder="abc123XYZ">
+            </div>
+        </div>
+        <div class="form-group">
+            <label for="cs-url">URL <small>(promoted in <code>{{ '{{url}}' }}</code>)</small></label>
+            <input type="url" id="cs-url" name="url" placeholder="https://github.com/me/repo">
+        </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label for="cs-video">Video (optional)</label>
+                <input type="file" id="cs-video" name="video_file" accept="video/*">
+            </div>
+            <div class="form-group">
+                <label for="cs-thumb">Thumbnail (optional)</label>
+                <input type="file" id="cs-thumb" name="thumbnail_file" accept="image/*">
+            </div>
+        </div>
+        <div class="form-group">
+            <label for="cs-tags">Tags (comma-separated, optional)</label>
+            <input type="text" id="cs-tags" name="tags">
+        </div>
+        <div class="modal-actions">
+            <button type="button" class="btn" id="cs-cancel">Cancel</button>
+            <button type="submit" class="btn btn-primary" id="cs-submit">Create item</button>
+        </div>
+    </form>
+</dialog>
 {% endblock %}
 
 {% block scripts %}
@@ -94,8 +153,9 @@ async function loadVideos() {
                         <h3>${v.title}</h3>
                         ${scheduleLine}
                         <div class="video-meta">
+                            <span class="badge badge-type-${v.item_type || 'episode'}">${v.item_type || 'episode'}</span>
                             <span class="badge badge-${v.status}">${v.status}</span>
-                            <span class="badge badge-${v.privacy_status}">${v.privacy_status}</span>
+                            ${v.privacy_status ? `<span class="badge badge-${v.privacy_status}">${v.privacy_status}</span>` : ''}
                         </div>
                         <time>${new Date(_ensureUtc(v.created_at)).toLocaleDateString()}</time>
                     </div>
@@ -166,6 +226,59 @@ async function loadAvailableImports() {
 
 loadVideos();
 loadAvailableImports();
+
+// --- Standalone-post compose modal -------------------------------------
+//
+// Posts to /api/videos/items (the non-YouTube item-creation endpoint).
+// Hidden by default; opened from the "Compose standalone post" button.
+const csModal = document.getElementById('compose-standalone-modal');
+const csForm = document.getElementById('compose-standalone-form');
+const csType = document.getElementById('cs-item-type');
+const csParentGroup = document.getElementById('cs-parent-group');
+function csSyncParent() {
+    csParentGroup.style.display = (csType.value === 'hook') ? '' : 'none';
+}
+csType.addEventListener('change', csSyncParent);
+csSyncParent();
+
+function csOpen() { csModal.showModal(); }
+function csClose() { csModal.close(); csForm.reset(); csSyncParent(); }
+
+document.getElementById('compose-standalone-btn').addEventListener('click', csOpen);
+document.getElementById('cs-cancel').addEventListener('click', csClose);
+
+// Open the modal on direct hash navigation (#compose-standalone) so the
+// upload page's "use standalone instead" link lands here.
+if (window.location.hash === '#compose-standalone') {
+    csOpen();
+}
+
+csForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById('cs-submit');
+    btn.disabled = true;
+    btn.textContent = 'Creating…';
+    const fd = new FormData(csForm);
+    fd.set('project_slug', projectSlug);
+    try {
+        const resp = await fetch('/api/videos/items', { method: 'POST', body: fd });
+        const data = await resp.json();
+        if (!resp.ok) {
+            showToast(data.detail || 'Could not create item', 'error');
+            return;
+        }
+        showToast('Standalone item created.', 'success');
+        csClose();
+        // Navigate to the new item's detail page so the user can attach
+        // images, set custom variables, generate posts, etc.
+        window.location.href = `/projects/${projectSlug}/videos/${data.video_id}`;
+    } catch (err) {
+        showToast('Create failed: ' + err.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Create item';
+    }
+});
 
 // Background-driven state changes (a scheduled video flipping public,
 // a status update arriving from YouTube) won't show until the user

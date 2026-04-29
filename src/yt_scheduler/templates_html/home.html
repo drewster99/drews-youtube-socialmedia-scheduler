@@ -38,22 +38,52 @@
 
 <dialog id="add-project-dialog" class="modal modal-wide">
     <div data-step="1">
-        <h3>New project — step 1 of 3: connect YouTube</h3>
+        <h3>New project — pick a kind</h3>
         <p>
-            Sign in with the Google account that owns the YouTube channel
-            you'll post to from this project. The channel id you
-            authenticate as becomes the project's permanent posting target.
+            Projects either bind to a YouTube channel (so you can upload
+            episodes / shorts / segments and have them flow to the channel),
+            or they don't (for GitHub repos, social-only campaigns, or any
+            non-YT promotion target).
         </p>
+        <div class="form-group" style="margin: 1rem 0;">
+            <label><input type="radio" name="project-kind" value="youtube" checked> <strong>YouTube channel</strong> — connect via OAuth, channel handle becomes <code>{{ '{{project_url}}' }}</code></label><br>
+            <label><input type="radio" name="project-kind" value="generic"> <strong>Other / no YouTube</strong> — link to a GitHub repo or other URL; create standalone social posts</label>
+        </div>
         <p class="form-hint">
             The project row isn't created until OAuth completes successfully —
             you can cancel safely at any time during this step. After
-            OAuth, the next step lets you name the project (default is
-            your channel's display name).
+            OAuth, the next step lets you name the project.
         </p>
         <div id="wizard-step1-status" class="form-hint" style="margin-top: 0.5rem;"></div>
         <div class="modal-actions">
             <button class="btn" data-wizard-cancel>Cancel</button>
             <button class="btn btn-primary" id="wizard-step1-connect">Connect with YouTube</button>
+            <button class="btn btn-primary" id="wizard-step1-generic" hidden>Next: name &amp; URL</button>
+        </div>
+    </div>
+
+    <div data-step="generic" hidden>
+        <h3>New project — name &amp; URL</h3>
+        <p>
+            Pick a name and (optionally) a URL this project promotes —
+            the value behind <code>{{ '{{project_url}}' }}</code> in templates.
+            For a GitHub repo, that's the repo URL; for a social-only project,
+            anything you want links to.
+        </p>
+        <label>
+            Project name
+            <input type="text" id="generic-project-name" maxlength="80" placeholder="AI Chess Machine">
+        </label>
+        <label style="margin-top: 0.5rem; display: block;">
+            Project URL (optional)
+            <input type="url" id="generic-project-url" placeholder="https://github.com/me/repo">
+        </label>
+        <p class="form-hint" style="margin-top: 0.5rem;">
+            The slug is derived from the name and is fixed after creation.
+        </p>
+        <div class="modal-actions">
+            <button class="btn" data-wizard-cancel>Cancel</button>
+            <button class="btn btn-primary" id="wizard-generic-create">Create project</button>
         </div>
     </div>
 
@@ -304,8 +334,11 @@ const wizard = {
 };
 
 function setWizardStep(step) {
+    // Step values are mostly numeric (1, 2, 3) but the generic-project
+    // branch uses the string "generic". Compare loosely so both work.
+    const target = String(step);
     dialog.querySelectorAll('[data-step]').forEach(el => {
-        el.hidden = (Number(el.dataset.step) !== step);
+        el.hidden = (el.dataset.step !== target);
     });
 }
 
@@ -316,6 +349,13 @@ function resetWizard() {
     wizard.channel_title = '';
     wizard.finishing = false;
     document.getElementById('new-project-name').value = '';
+    const genName = document.getElementById('generic-project-name');
+    if (genName) genName.value = '';
+    const genUrl = document.getElementById('generic-project-url');
+    if (genUrl) genUrl.value = '';
+    const ytRadio = document.querySelector('input[name="project-kind"][value="youtube"]');
+    if (ytRadio) ytRadio.checked = true;
+    if (typeof syncStep1Buttons === 'function') syncStep1Buttons();
     // Channel-first wizard moved the OAuth status display to step 1.
     document.getElementById('wizard-step1-status').textContent = '';
     document.getElementById('wizard-social-defaults').innerHTML = '';
@@ -340,7 +380,48 @@ dialog.querySelectorAll('[data-wizard-cancel]').forEach(btn => {
     });
 });
 
-/* Step 1: open the OAuth popup. Calling ``openOAuthPopup`` synchronously
+/* Step 1 has two flavors: a YouTube-channel project (default — runs OAuth)
+ * or a generic non-YT project (GitHub / social-only). The radio inputs
+ * toggle which "next" button is visible; the generic path skips OAuth. */
+function syncStep1Buttons() {
+    const kind = document.querySelector('input[name="project-kind"]:checked')?.value || 'youtube';
+    document.getElementById('wizard-step1-connect').hidden = (kind !== 'youtube');
+    document.getElementById('wizard-step1-generic').hidden = (kind !== 'generic');
+}
+document.querySelectorAll('input[name="project-kind"]').forEach((el) =>
+    el.addEventListener('change', syncStep1Buttons)
+);
+
+document.getElementById('wizard-step1-generic').addEventListener('click', () => {
+    setWizardStep('generic');
+    document.getElementById('generic-project-name').focus();
+});
+
+document.getElementById('wizard-generic-create').addEventListener('click', async () => {
+    const name = document.getElementById('generic-project-name').value.trim();
+    const url = document.getElementById('generic-project-url').value.trim();
+    if (!name) { showToast('Project name is required.', 'error'); return; }
+    const resp = await fetch('/api/projects', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            name,
+            project_url: url || null,
+            // kind is informational; doesn't drive any backend behaviour
+            // beyond serving as a hint to UI authors.
+            kind: 'generic',
+        }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+        showToast(data.detail || 'Could not create project', 'error');
+        return;
+    }
+    showToast(`Created project "${data.name}".`, 'success');
+    window.location.href = `/projects/${data.slug}`;
+});
+
+/* YT path: open the OAuth popup. Calling ``openOAuthPopup`` synchronously
  * inside the click handler is what keeps the popup from being blocked —
  * see static/js/app.js for the gesture-token explanation. The
  * client_secret pre-flight is left to the start endpoint; it returns 400

@@ -165,17 +165,3 @@ async def delete_template_slot(name: str, slot_id: int):
     return {"status": "ok"}
 
 
-@router.post("/preview")
-async def preview_template(data: dict):
-    """Preview a rendered template with variables (without saving or posting)."""
-    template_text = data.get("template", "")
-    variables = data.get("variables", {})
-
-    if not template_text:
-        raise HTTPException(400, "Template text is required")
-
-    try:
-        rendered = tmpl.render_template(template_text, variables)
-        return {"rendered": rendered}
-    except Exception as e:
-        return {"rendered": None, "error": str(e)}

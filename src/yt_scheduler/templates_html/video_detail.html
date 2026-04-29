@@ -185,6 +185,64 @@
                 <button class="btn btn-sm" onclick="copyToClipboard('community-text')">Copy</button>
             </div>
         </div>
+
+        <div class="card">
+            <h3>Images</h3>
+            <p class="form-hint" style="margin: 0 0 0.5rem;">
+                Additional images attached to this item. Reference them in templates as
+                <code>{{ '{{image:shortname}}' }}</code> for one image or
+                <code>{{ '{{image:*}}' }}</code> for all of them in upload order.
+            </p>
+            <div id="item-images-list">
+                <p class="loading">Loading…</p>
+            </div>
+            <form id="item-image-upload-form" style="margin-top: 0.5rem;">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Image file</label>
+                        <input type="file" name="file" accept="image/*" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Shortname</label>
+                        <input type="text" name="shortname" pattern="[a-z0-9][a-z0-9-]*" placeholder="cat" required>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Alt text (optional)</label>
+                    <input type="text" name="alt_text" placeholder="A cat jumping">
+                </div>
+                <button type="submit" class="btn btn-sm btn-primary">Upload image</button>
+            </form>
+        </div>
+
+        <div class="card">
+            <h3>Item variables</h3>
+            <p class="form-hint" style="margin: 0 0 0.5rem;">
+                Per-item custom variables. Highest priority of the four-level inheritance
+                (override globals, project vars, and parent-item vars).
+            </p>
+            <table class="settings-table" id="item-vars-table">
+                <thead>
+                    <tr><th style="width: 30%;">Key</th><th>Value</th><th style="width: 90px;"></th></tr>
+                </thead>
+                <tbody id="item-vars-body">
+                    <tr><td colspan="3" class="form-hint">Loading…</td></tr>
+                </tbody>
+            </table>
+            <div class="form-row" style="margin-top: 0.5rem;">
+                <div class="form-group">
+                    <label>Add — key</label>
+                    <input type="text" id="new-item-var-key" pattern="[a-z][a-z0-9_]*" placeholder="footer">
+                </div>
+                <div class="form-group flex-2">
+                    <label>Value</label>
+                    <input type="text" id="new-item-var-value">
+                </div>
+                <div class="form-group" style="display: flex; align-items: flex-end;">
+                    <button type="button" class="btn btn-sm btn-primary" onclick="addItemVariable()">Add</button>
+                </div>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -1210,12 +1268,32 @@ async function doGeneratePosts(platforms) {
     try {
         const body = {};
         if (platforms) body.platforms = platforms;
-        const resp = await fetch(`/api/social/generate-posts/${videoId}`, {
+        const url = `/api/social/generate-posts/${videoId}`;
+        const init = {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(body),
             _silent: true,
-        });
+        };
+        let resp = await fetch(url, init);
+        if (resp.status === 409) {
+            const payload = await resp.json().catch(() => ({}));
+            const detail = payload && payload.detail;
+            if (detail && detail.scheduled_overwrite && Array.isArray(detail.scheduled)) {
+                const lines = detail.scheduled
+                    .map(s => `• ${s.platform}${s.scheduled_at ? ` — ${s.scheduled_at}` : ''}`)
+                    .join('\n');
+                const ok = confirm(
+                    `Regenerating will cancel ${detail.scheduled.length} scheduled post${detail.scheduled.length === 1 ? '' : 's'}:\n\n${lines}\n\nCancel and regenerate?`
+                );
+                if (!ok) {
+                    showToast('Regenerate cancelled — scheduled posts kept.', 'info');
+                    await loadSocialPosts();
+                    return;
+                }
+                resp = await fetch(`${url}?confirm_overwrite_scheduled=true`, init);
+            }
+        }
         if (resp.ok) {
             const generated = await resp.json();
             const count = Array.isArray(generated) ? generated.length : 0;
@@ -1229,7 +1307,7 @@ async function doGeneratePosts(platforms) {
         } else {
             let detail = 'Failed to generate posts';
             try { detail = (await resp.json()).detail || detail; } catch {}
-            showToast(detail, 'error');
+            showToast(typeof detail === 'string' ? detail : 'Failed to generate posts', 'error');
             await loadSocialPosts();
         }
     } finally {
@@ -1571,7 +1649,6 @@ async function transcribeLocally() {
 
 const BACKEND_DISPLAY = {
     'mlx-whisper':    'MLX Whisper',
-    'faster-whisper': 'Faster Whisper',
     'whisper.cpp':    'whisper.cpp',
     'macos-speech':   'Apple Speech',
 };
@@ -1614,5 +1691,138 @@ function copyToClipboard(elementId) {
 
 loadVideo();
 loadTranscriptionBackends();
+loadItemImages();
+loadItemVariables();
+initItemImageUpload();
+
+// --- Item images -------------------------------------------------------
+
+async function loadItemImages() {
+    const container = document.getElementById('item-images-list');
+    if (!container) return;
+    try {
+        const rows = await (await fetch(`/api/videos/${videoId}/images`)).json();
+        if (!Array.isArray(rows) || rows.length === 0) {
+            container.innerHTML = '<p class="form-hint">No images attached yet.</p>';
+            return;
+        }
+        container.innerHTML = `
+            <table class="settings-table">
+                <thead><tr><th>Shortname</th><th>Alt text</th><th>Filename</th><th></th></tr></thead>
+                <tbody>${rows.map(r => `
+                    <tr>
+                        <td><code>{{ '{{image:' }}${escapeHtml(r.shortname)}{{ '}}' }}</code></td>
+                        <td>${escapeHtml(r.alt_text || '')}</td>
+                        <td style="font-size: 0.8em; color: var(--text-muted);">${escapeHtml((r.path || '').split('/').pop())}</td>
+                        <td style="text-align: right;">
+                            <button class="btn btn-sm btn-danger" onclick="deleteItemImage(${r.id})">Delete</button>
+                        </td>
+                    </tr>
+                `).join('')}</tbody>
+            </table>
+        `;
+    } catch (e) {
+        container.innerHTML = `<p class="error">Could not load images: ${escapeHtml(e.message)}</p>`;
+    }
+}
+
+function initItemImageUpload() {
+    const form = document.getElementById('item-image-upload-form');
+    if (!form) return;
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const fd = new FormData(form);
+        const resp = await fetch(`/api/videos/${videoId}/images`, {method: 'POST', body: fd});
+        if (resp.ok) {
+            showToast('Image uploaded', 'success');
+            form.reset();
+            loadItemImages();
+        } else {
+            const detail = (await resp.json()).detail || resp.statusText;
+            showToast(`Upload failed: ${detail}`, 'error');
+        }
+    });
+}
+
+async function deleteItemImage(id) {
+    if (!confirm('Delete this image?')) return;
+    const resp = await fetch(`/api/videos/${videoId}/images/${id}`, {method: 'DELETE'});
+    if (resp.ok) {
+        showToast('Image deleted', 'success');
+        loadItemImages();
+    } else {
+        showToast('Delete failed', 'error');
+    }
+}
+
+// --- Item variables ----------------------------------------------------
+
+async function loadItemVariables() {
+    const body = document.getElementById('item-vars-body');
+    if (!body) return;
+    try {
+        const rows = await (await fetch(`/api/videos/${videoId}/variables`)).json();
+        if (!Array.isArray(rows) || rows.length === 0) {
+            body.innerHTML = '<tr><td colspan="3" class="form-hint">No item variables yet.</td></tr>';
+            return;
+        }
+        body.innerHTML = rows.map(r => `
+            <tr>
+                <td><code>{{ '{{' }}${escapeHtml(r.key)}{{ '}}' }}</code></td>
+                <td><input type="text" class="iv-value" value="${escapeHtml(r.value)}" data-key="${escapeHtml(r.key)}"></td>
+                <td style="text-align: right;">
+                    <button class="btn btn-sm" onclick="saveItemVariable('${escapeHtml(r.key)}')">Save</button>
+                    <button class="btn btn-sm btn-danger" onclick="deleteItemVariable('${escapeHtml(r.key)}')">Delete</button>
+                </td>
+            </tr>
+        `).join('');
+    } catch (e) {
+        body.innerHTML = `<tr><td colspan="3" class="error">Could not load: ${escapeHtml(e.message)}</td></tr>`;
+    }
+}
+
+async function saveItemVariable(key) {
+    const input = document.querySelector(`.iv-value[data-key="${CSS.escape(key)}"]`);
+    if (!input) return;
+    const resp = await fetch(`/api/videos/${videoId}/variables/${encodeURIComponent(key)}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({value: input.value}),
+    });
+    if (resp.ok) showToast(`Saved {{ '{{' }}${key}{{ '}}' }}`, 'success');
+    else showToast('Save failed', 'error');
+}
+
+async function deleteItemVariable(key) {
+    if (!confirm(`Delete item variable {{ '{{' }}${key}{{ '}}' }}?`)) return;
+    const resp = await fetch(`/api/videos/${videoId}/variables/${encodeURIComponent(key)}`, {method: 'DELETE'});
+    if (resp.ok) {
+        showToast(`Deleted {{ '{{' }}${key}{{ '}}' }}`, 'success');
+        loadItemVariables();
+    } else {
+        showToast('Delete failed', 'error');
+    }
+}
+
+async function addItemVariable() {
+    const keyEl = document.getElementById('new-item-var-key');
+    const valEl = document.getElementById('new-item-var-value');
+    const key = keyEl.value.trim();
+    if (!key) { showToast('Key is required', 'error'); return; }
+    const resp = await fetch(`/api/videos/${videoId}/variables/${encodeURIComponent(key)}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({value: valEl.value}),
+    });
+    if (resp.ok) {
+        keyEl.value = '';
+        valEl.value = '';
+        loadItemVariables();
+        showToast(`Added {{ '{{' }}${key}{{ '}}' }}`, 'success');
+    } else {
+        const detail = (await resp.json()).detail || resp.statusText;
+        showToast(`Add failed: ${detail}`, 'error');
+    }
+}
 </script>
 {% endblock %}
