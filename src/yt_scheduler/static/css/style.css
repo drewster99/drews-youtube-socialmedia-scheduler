@@ -263,6 +263,29 @@ body {
 .badge-type-segment    { background: #8b5cf6; color: #fff; }
 .badge-type-hook       { background: #f59e0b; color: #000; }
 .badge-type-standalone { background: #64748b; color: #fff; }
+
+/* YouTube native classification (independent of our internal item_type). */
+.badge-yt-video        { background: #1f2937; color: #fff; border: 1px solid #4b5563; }
+.badge-yt-short        { background: #ef4444; color: #fff; }
+.badge-yt-live         { background: #dc2626; color: #fff; }
+
+.badge-duration        { background: #1f2937; color: #d1d5db; border: 1px solid #4b5563; font-variant-numeric: tabular-nums; }
+.badge-deleted         { background: #7f1d1d; color: #fef2f2; }
+
+.video-card-deleted    { opacity: 0.6; }
+.video-card-deleted .video-thumb { filter: grayscale(0.7); }
+
+.banner {
+    padding: 0.6rem 0.85rem;
+    border-radius: var(--radius);
+    font-size: 0.85rem;
+    margin: 0.5rem 0 1rem;
+}
+.banner-danger {
+    background: #7f1d1d;
+    color: #fef2f2;
+    border: 1px solid #ef4444;
+}
 .badge-approved { background: var(--accent); color: #000; }
 .badge-posted { background: var(--success); color: #fff; }
 .badge-failed { background: var(--danger); color: #fff; }
@@ -879,6 +902,37 @@ body {
     color: inherit;
     text-decoration: none;
     transition: border-color 0.15s, transform 0.15s;
+    overflow: hidden;
+}
+.project-card-banner {
+    height: 60px;
+    margin: -1rem -1rem 0.75rem;
+    background-size: cover;
+    background-position: center;
+    background-color: var(--bg-input);
+    border-bottom: 1px solid var(--border);
+}
+.project-card-header {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.5rem;
+}
+.project-card-icon {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    object-fit: cover;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+}
+.project-card-icon-placeholder {
+    background: linear-gradient(135deg, var(--bg-input), var(--border));
+}
+.project-card-header h3 {
+    margin: 0 !important;
+    flex: 1;
 }
 .project-card:hover {
     border-color: var(--accent);

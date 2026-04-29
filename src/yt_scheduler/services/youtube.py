@@ -142,6 +142,109 @@ def get_video(video_id: str) -> dict | None:
     return items[0] if items else None
 
 
+def get_videos_content_details(video_ids: list[str]) -> dict[str, dict]:
+    """Batch-fetch ``contentDetails`` (which carries duration + dimension) for
+    a list of video ids. Returns ``{video_id: {duration: "PT12M3S", ...}}``.
+    Costs 1 API unit per call regardless of id count (max 50 per call)."""
+    if not video_ids:
+        return {}
+    youtube = get_youtube_service()
+    out: dict[str, dict] = {}
+    # YouTube caps `id` to 50 ids per request.
+    for i in range(0, len(video_ids), 50):
+        chunk = video_ids[i : i + 50]
+        result = youtube.videos().list(
+            part="contentDetails", id=",".join(chunk)
+        ).execute()
+        for item in result.get("items", []):
+            vid = item.get("id")
+            if vid:
+                out[vid] = item.get("contentDetails", {}) or {}
+    return out
+
+
+def get_videos_kind_metadata(video_ids: list[str]) -> dict[str, dict]:
+    """Batch-fetch the parts needed to classify a video as 'short' / 'live' /
+    'video'. Returns ``{video_id: {"contentDetails": {...},
+    "liveStreamingDetails": {...}}}`` (latter omitted when not present)."""
+    if not video_ids:
+        return {}
+    youtube = get_youtube_service()
+    out: dict[str, dict] = {}
+    for i in range(0, len(video_ids), 50):
+        chunk = video_ids[i : i + 50]
+        result = youtube.videos().list(
+            part="contentDetails,liveStreamingDetails", id=",".join(chunk)
+        ).execute()
+        for item in result.get("items", []):
+            vid = item.get("id")
+            if not vid:
+                continue
+            entry: dict = {"contentDetails": item.get("contentDetails", {}) or {}}
+            live = item.get("liveStreamingDetails")
+            if live:
+                entry["liveStreamingDetails"] = live
+            out[vid] = entry
+    return out
+
+
+def classify_youtube_kind(meta: dict | None) -> str | None:
+    """Coarse classification: 'live' | 'short' | 'video', or None if we can't tell.
+
+    YouTube doesn't expose a definitive "is this a Short" flag in the Data
+    API. We approximate: any video carrying ``liveStreamingDetails`` is
+    classified as ``live`` (covers upcoming, live-now, and past
+    broadcasts). Otherwise videos with a parsable duration ≤ 60s are
+    treated as ``short`` — that's strict enough to avoid false positives
+    on the longer 90-180s Shorts but consistent with the most common
+    case. Everything else is ``video``. The user can manually override
+    this on the detail page if our heuristic is wrong.
+    """
+    if not meta:
+        return None
+    if meta.get("liveStreamingDetails"):
+        return "live"
+    cd = meta.get("contentDetails") or {}
+    iso = cd.get("duration")
+    if not iso:
+        return None
+    from yt_scheduler.services.tiers import parse_iso8601_duration
+    seconds = parse_iso8601_duration(iso)
+    if seconds is None:
+        return None
+    if seconds <= 60:
+        return "short"
+    return "video"
+
+
+def get_channel_assets() -> dict:
+    """Return ``{thumbnail_url, banner_url, channel_id, title, handle}`` for
+    the authenticated channel. Used to populate the per-project channel
+    icon + banner cached on the Home page project cards."""
+    youtube = get_youtube_service()
+    result = youtube.channels().list(
+        part="snippet,brandingSettings", mine=True
+    ).execute()
+    items = result.get("items") or []
+    if not items:
+        return {}
+    item = items[0]
+    snippet = item.get("snippet", {}) or {}
+    thumbs = snippet.get("thumbnails", {}) or {}
+    thumb = (
+        thumbs.get("high") or thumbs.get("medium") or thumbs.get("default") or {}
+    ).get("url")
+    branding = (item.get("brandingSettings") or {}).get("image") or {}
+    banner = branding.get("bannerExternalUrl")
+    return {
+        "channel_id": item.get("id"),
+        "title": snippet.get("title"),
+        "handle": snippet.get("customUrl"),
+        "thumbnail_url": thumb,
+        "banner_url": banner,
+    }
+
+
 def list_channel_videos(max_results: int = 25) -> list[dict]:
     """List videos from the authenticated user's channel."""
     youtube = get_youtube_service()

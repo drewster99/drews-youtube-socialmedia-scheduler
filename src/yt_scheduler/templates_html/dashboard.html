@@ -96,6 +96,19 @@ function _ensureUtc(iso) {
     return iso;
 }
 
+function formatDuration(seconds) {
+    /* Compact mm:ss for under an hour, h:mm:ss otherwise. Returns '' for
+     * null / non-numeric so callers can omit the badge. */
+    if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return '';
+    const total = Math.round(Number(seconds));
+    if (total <= 0) return '';
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    const pad = (n) => String(n).padStart(2, '0');
+    return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
 function fmtScheduledWhen(iso) {
     /* Same shape as the Home page's fmtWhen — Mon 4/27 2:30pm — so the
      * dashboard scheduled-time line reads consistently with the Upcoming
@@ -142,8 +155,17 @@ async function loadVideos() {
             const scheduleLine = scheduledFuture
                 ? `<div class="video-schedule">⏰ Scheduled: <strong>${fmtScheduledWhen(v.publish_at)}</strong></div>`
                 : '';
+            const ytKindBadge = v.youtube_kind
+                ? `<span class="badge badge-yt-${v.youtube_kind}">${v.youtube_kind}</span>`
+                : '';
+            const durationBadge = formatDuration(v.duration_seconds)
+                ? `<span class="badge badge-duration">${formatDuration(v.duration_seconds)}</span>`
+                : '';
+            const deletedBadge = v.youtube_deleted
+                ? `<span class="badge badge-deleted">deleted on YouTube</span>`
+                : '';
             return `
-                <a href="/projects/${projectSlug}/videos/${v.id}" class="video-card">
+                <a href="/projects/${projectSlug}/videos/${v.id}" class="video-card${v.youtube_deleted ? ' video-card-deleted' : ''}">
                     <div class="video-thumb">
                         ${v.thumbnail_path
                             ? `<img src="/uploads/${v.thumbnail_path.split('/').pop()}" alt="${v.title}">`
@@ -154,8 +176,11 @@ async function loadVideos() {
                         ${scheduleLine}
                         <div class="video-meta">
                             <span class="badge badge-type-${v.item_type || 'episode'}">${v.item_type || 'episode'}</span>
+                            ${ytKindBadge}
+                            ${durationBadge}
                             <span class="badge badge-${v.status}">${v.status}</span>
                             ${v.privacy_status ? `<span class="badge badge-${v.privacy_status}">${v.privacy_status}</span>` : ''}
+                            ${deletedBadge}
                         </div>
                         <time>${new Date(_ensureUtc(v.created_at)).toLocaleDateString()}</time>
                     </div>
@@ -188,6 +213,13 @@ async function loadAvailableImports() {
             const embed = v.embeddable
                 ? `<iframe src="https://www.youtube.com/embed/${v.video_id}" frameborder="0" allowfullscreen></iframe>`
                 : (v.thumbnail_url ? `<img src="${v.thumbnail_url}" alt="${v.title}">` : '<div class="thumb-placeholder">No thumbnail</div>');
+            const durationLabel = formatDuration(v.duration_seconds);
+            const durationBadge = durationLabel
+                ? `<span class="badge badge-duration">${durationLabel}</span>`
+                : '';
+            const ytKindBadge = v.youtube_kind
+                ? `<span class="badge badge-yt-${v.youtube_kind}">${v.youtube_kind}</span>`
+                : '';
             return `
                 <div class="video-card import-card">
                     <div class="video-thumb">${embed}</div>
@@ -195,6 +227,8 @@ async function loadAvailableImports() {
                         <h3>${v.title}</h3>
                         <div class="video-meta">
                             <span class="badge badge-${v.privacy_status || 'unlisted'}">${v.privacy_status || 'unknown'}</span>
+                            ${ytKindBadge}
+                            ${durationBadge}
                             <time>${v.published_at ? new Date(_ensureUtc(v.published_at)).toLocaleDateString() : ''}</time>
                         </div>
                         <button class="btn btn-sm btn-primary" data-import-id="${v.video_id}">+ Import</button>

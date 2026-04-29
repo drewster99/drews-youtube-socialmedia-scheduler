@@ -139,10 +139,21 @@ async function loadProjects() {
             return;
         }
 
-        container.innerHTML = projects.map(p => `
+        container.innerHTML = projects.map(p => {
+            const banner = p.channel_banner_url
+                ? `<div class="project-card-banner" style="background-image: url('${escapeHtml(p.channel_banner_url)}');"></div>`
+                : '';
+            const icon = p.channel_thumbnail_url
+                ? `<img class="project-card-icon" src="${escapeHtml(p.channel_thumbnail_url)}" alt="${escapeHtml(p.name)} channel">`
+                : '<div class="project-card-icon project-card-icon-placeholder"></div>';
+            return `
             <div class="project-card-wrap">
                 <a href="/projects/${p.slug}" class="project-card">
-                    <h3>${escapeHtml(p.name)}</h3>
+                    ${banner}
+                    <div class="project-card-header">
+                        ${icon}
+                        <h3>${escapeHtml(p.name)}</h3>
+                    </div>
                     <div class="project-stats">
                         <span><strong>${p.video_count ?? 0}</strong> videos</span>
                         <span><strong>${p.scheduled_count ?? 0}</strong> scheduled</span>
@@ -153,7 +164,8 @@ async function loadProjects() {
                         data-slug="${p.slug}" data-name="${escapeHtml(p.name)}"
                         title="Rename project">✎</button>
             </div>
-        `).join('');
+        `;
+        }).join('');
 
         for (const btn of container.querySelectorAll('.project-card-rename')) {
             btn.addEventListener('click', async (event) => {

@@ -20,10 +20,32 @@ from yt_scheduler.services.projects import get_project_by_id
 logger = logging.getLogger(__name__)
 
 
+def _is_deleted_stub(snippet: dict, status: dict) -> bool:
+    """A playlistItems entry is a deletion stub when YouTube has stripped
+    the title to 'Deleted video' / 'Private video' and the privacyStatus
+    is 'privacyStatusUnspecified'. The videoId is still present so we can
+    cross-reference against our DB rows."""
+    title = (snippet.get("title") or "").strip().lower()
+    privacy = (status.get("privacyStatus") or "").strip()
+    if title in ("deleted video", "private video"):
+        return True
+    if privacy == "privacyStatusUnspecified":
+        return True
+    return False
+
+
 async def list_available_imports(project_id: int, max_results: int = 50) -> list[dict]:
     """Return YouTube videos on the authenticated channel that aren't already
     in our DB. Each entry includes enough metadata for the user to pick (id,
-    title, thumbnail URL, published date, privacy status, embeddable hint)."""
+    title, thumbnail URL, published date, privacy status, embeddable hint,
+    duration, youtube_kind).
+
+    Side effect: when the channel's uploads playlist still references a
+    video we previously imported, but YouTube has since deleted it (the
+    entry is a "Deleted video" stub), the corresponding ``videos`` row's
+    ``youtube_deleted`` flag is set to 1 so the dashboard / detail page
+    can surface the state.
+    """
     db = await get_db()
     rows = await db.execute_fetchall("SELECT id FROM videos")
     known_ids = {r["id"] for r in rows}
@@ -32,13 +54,23 @@ async def list_available_imports(project_id: int, max_results: int = 50) -> list
     if project:
         set_active_project(project["slug"])
     items = youtube.list_channel_videos(max_results=max_results)
+
+    deleted_known: list[str] = []
     out: list[dict] = []
     for item in items:
         snippet = item.get("snippet", {})
         status = item.get("status", {})
         resource_id = snippet.get("resourceId", {})
         video_id = resource_id.get("videoId") or item.get("id")
-        if not video_id or video_id in known_ids:
+        if not video_id:
+            continue
+        if _is_deleted_stub(snippet, status):
+            # Stub for a deleted video. If we know about it, mark it
+            # deleted on our side; either way, never offer it for import.
+            if video_id in known_ids:
+                deleted_known.append(video_id)
+            continue
+        if video_id in known_ids:
             continue
         thumbs = snippet.get("thumbnails", {})
         thumb_url = (
@@ -53,7 +85,31 @@ async def list_available_imports(project_id: int, max_results: int = 50) -> list
             "thumbnail_url": thumb_url,
             "privacy_status": status.get("privacyStatus"),
             "embeddable": status.get("privacyStatus") == "public",
+            "duration_seconds": None,
+            "youtube_kind": None,
         })
+
+    if deleted_known:
+        # Bulk update the youtube_deleted flag for any DB videos that the
+        # channel's uploads playlist now flags as deleted.
+        placeholders = ",".join(["?"] * len(deleted_known))
+        await db.execute(
+            f"UPDATE videos SET youtube_deleted = 1, updated_at = datetime('now') "
+            f"WHERE id IN ({placeholders})",
+            deleted_known,
+        )
+        await db.commit()
+
+    # Batch-fetch contentDetails + liveStreamingDetails for the candidate
+    # set so each card can show duration + a coarse kind (video / short /
+    # live). 1 API unit per chunk of 50 — cheap.
+    if out:
+        meta = youtube.get_videos_kind_metadata([v["video_id"] for v in out])
+        for v in out:
+            entry = meta.get(v["video_id"]) or {}
+            cd = entry.get("contentDetails") or {}
+            v["duration_seconds"] = tiers.parse_iso8601_duration(cd.get("duration"))
+            v["youtube_kind"] = youtube.classify_youtube_kind(entry)
     return out
 
 
@@ -80,6 +136,10 @@ async def import_video(video_id: str, *, project_id: int) -> dict:
 
     duration = tiers.parse_iso8601_duration(content_details.get("duration"))
     tier = tiers.tier_for_duration(duration)
+    youtube_kind = youtube.classify_youtube_kind({
+        "contentDetails": content_details,
+        "liveStreamingDetails": full.get("liveStreamingDetails"),
+    } if full.get("liveStreamingDetails") else {"contentDetails": content_details})
 
     title = snippet.get("title", "Untitled")
     description = snippet.get("description", "")
@@ -110,11 +170,11 @@ async def import_video(video_id: str, *, project_id: int) -> dict:
         """INSERT INTO videos (
             id, project_id, title, description, tags, privacy_status,
             thumbnail_path, status, imported_from_youtube,
-            duration_seconds, tier
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'uploaded', 1, ?, ?)""",
+            duration_seconds, tier, youtube_kind
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'uploaded', 1, ?, ?, ?)""",
         (
             video_id, project_id, title, description, json.dumps(tags_list),
-            privacy, thumbnail_path, duration, tier,
+            privacy, thumbnail_path, duration, tier, youtube_kind,
         ),
     )
     await db.commit()

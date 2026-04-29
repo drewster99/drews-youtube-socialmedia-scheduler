@@ -32,7 +32,7 @@ from yt_scheduler.routers import (
     transcript_routes,
     video_routes,
 )
-from yt_scheduler.services.auth import backfill_channel_ids
+from yt_scheduler.services.auth import backfill_channel_assets, backfill_channel_ids
 from yt_scheduler.services.keychain_migration import (
     migrate_to_per_credential_bundles,
 )
@@ -83,6 +83,7 @@ async def lifespan(app: FastAPI):
     await migrate_to_per_credential_bundles()
     await ensure_default_project()
     await backfill_channel_ids()
+    await backfill_channel_assets()
     await ensure_default_template()
 
     # Read scheduler intervals from DB settings (saved via Settings UI), fall back to config defaults

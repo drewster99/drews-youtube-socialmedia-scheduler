@@ -406,3 +406,42 @@ async def backfill_channel_ids() -> None:
         )
         await db.commit()
         logger.info("Stamped project %s with YouTube channel %s", slug, channel_id)
+
+
+async def backfill_channel_assets() -> None:
+    """For every project with credentials, fetch the channel's icon and
+    banner URLs and cache them on the projects row. We only refetch when
+    one of the URL columns is NULL — once cached, there's no automatic
+    refresh path; the user can clear and re-auth to refresh, or we can
+    add an explicit "refresh assets" button later."""
+    from yt_scheduler.database import get_db
+    from yt_scheduler.services import youtube as _youtube
+
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT id, slug, channel_thumbnail_url, channel_banner_url FROM projects"
+    )
+    projects = list(await cursor.fetchall())
+    for project in projects:
+        slug = project["slug"]
+        if project["channel_thumbnail_url"] and project["channel_banner_url"]:
+            continue
+        if not get_credentials(slug):
+            continue
+        set_active_project(slug)
+        try:
+            assets = await asyncio.to_thread(_youtube.get_channel_assets)
+        except Exception as exc:
+            logger.info("Channel asset backfill failed for %s: %s", slug, exc)
+            continue
+        thumb = assets.get("thumbnail_url") or project["channel_thumbnail_url"]
+        banner = assets.get("banner_url") or project["channel_banner_url"]
+        if not thumb and not banner:
+            continue
+        await db.execute(
+            "UPDATE projects SET channel_thumbnail_url = ?, "
+            "channel_banner_url = ?, updated_at = datetime('now') WHERE id = ?",
+            (thumb, banner, project["id"]),
+        )
+        await db.commit()
+        logger.info("Cached channel assets for project %s", slug)

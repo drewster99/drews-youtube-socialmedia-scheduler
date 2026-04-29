@@ -417,6 +417,21 @@ async function loadVideo() {
     videoData = video;
 
     document.getElementById('video-title').textContent = video.title;
+    // Surface a "deleted on YouTube" banner when the row was flagged by the
+    // import-list cross-reference (the video disappeared from the channel
+    // after we imported it). Inserted-or-updated each load.
+    let deletedBanner = document.getElementById('youtube-deleted-banner');
+    if (video.youtube_deleted) {
+        if (!deletedBanner) {
+            deletedBanner = document.createElement('div');
+            deletedBanner.id = 'youtube-deleted-banner';
+            deletedBanner.className = 'banner banner-danger';
+            deletedBanner.textContent = 'This video has been deleted on YouTube. Metadata and history are still available locally.';
+            document.getElementById('video-title').after(deletedBanner);
+        }
+    } else if (deletedBanner) {
+        deletedBanner.remove();
+    }
     const metaRow = document.getElementById('video-meta-row');
     const metaLeft = document.getElementById('video-meta-left');
     const durSec = parseIsoDuration(video.youtube_data?.contentDetails?.duration);

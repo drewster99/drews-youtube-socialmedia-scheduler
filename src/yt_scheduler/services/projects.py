@@ -44,7 +44,9 @@ async def ensure_default_project() -> int:
 async def list_projects() -> list[dict]:
     db = await get_db()
     cursor = await db.execute(
-        """SELECT p.id, p.name, p.slug, p.youtube_channel_id, p.created_at, p.updated_at,
+        """SELECT p.id, p.name, p.slug, p.youtube_channel_id,
+                  p.channel_thumbnail_url, p.channel_banner_url,
+                  p.created_at, p.updated_at,
                   (SELECT COUNT(*) FROM videos WHERE project_id = p.id)         AS video_count,
                   (SELECT COUNT(*) FROM videos
                    WHERE project_id = p.id AND publish_at IS NOT NULL
@@ -58,7 +60,8 @@ async def list_projects() -> list[dict]:
 async def get_project_by_slug(slug: str) -> dict | None:
     db = await get_db()
     cursor = await db.execute(
-        "SELECT id, name, slug, youtube_channel_id, project_url, created_at, updated_at "
+        "SELECT id, name, slug, youtube_channel_id, project_url, "
+        "channel_thumbnail_url, channel_banner_url, created_at, updated_at "
         "FROM projects WHERE slug = ?",
         (slug,),
     )
@@ -69,7 +72,8 @@ async def get_project_by_slug(slug: str) -> dict | None:
 async def get_project_by_id(project_id: int) -> dict | None:
     db = await get_db()
     cursor = await db.execute(
-        "SELECT id, name, slug, youtube_channel_id, project_url, created_at, updated_at "
+        "SELECT id, name, slug, youtube_channel_id, project_url, "
+        "channel_thumbnail_url, channel_banner_url, created_at, updated_at "
         "FROM projects WHERE id = ?",
         (project_id,),
     )
