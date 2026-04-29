@@ -792,25 +792,34 @@ async def restore_scheduled_jobs() -> None:
     await restore_pending_auto_actions()
 
 
+_AUTO_ACTION_RESUME_WINDOW_HOURS = 24
+
+
 async def restore_pending_auto_actions() -> None:
-    """Re-fire ``_run_chain`` for videos whose auto-action chain may not have
-    completed before the last shutdown.
+    """Re-fire ``_run_chain`` for *recently-touched* videos whose auto-action
+    chain may not have completed before the last shutdown.
 
     The chain itself has idempotency gates (skip transcribe if transcript
     exists, skip description if one exists, skip socials if they exist), so
-    re-firing on every applicable video is cheap when there's no work to do
-    and recovers in-flight work when there is. We pick candidates by the
-    presence of a ``video_file_path`` plus the ABSENCE of either a transcript
-    or a generated description — the two longest-running steps. Imported
-    videos and videos in any project status are eligible since the chain
-    decides per-step whether the auto-action settings ask for the work.
+    re-firing is cheap when there's no work to do and recovers in-flight
+    work when there is.
+
+    We *intentionally* limit to videos whose ``updated_at`` falls within
+    the last ``_AUTO_ACTION_RESUME_WINDOW_HOURS`` window. Without that
+    cap, a project with hundreds of historic imports lacking transcripts
+    would spawn hundreds of concurrent Whisper jobs on every server boot
+    — desirable for in-flight recovery, catastrophic for cold starts.
+    Older videos can be resumed by the user re-triggering the chain
+    explicitly (re-import / manual transcribe button).
     """
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT id, project_id, transcript, description_generated_at, "
-        "imported_from_youtube FROM videos "
-        "WHERE (transcript IS NULL OR transcript = '' "
-        "       OR description_generated_at IS NULL)"
+        f"""SELECT id, project_id, imported_from_youtube FROM videos
+        WHERE (transcript IS NULL OR transcript = ''
+               OR description_generated_at IS NULL)
+        AND COALESCE(updated_at, created_at) >=
+            datetime('now', '-{_AUTO_ACTION_RESUME_WINDOW_HOURS} hours')
+        """
     )
     if not rows:
         return
@@ -828,7 +837,10 @@ async def restore_pending_auto_actions() -> None:
                 "Could not restore auto-actions for %s: %s", row["id"], exc
             )
     if restored:
-        logger.info("Restored %d pending auto-action chain(s)", restored)
+        logger.info(
+            "Restored %d pending auto-action chain(s) from the last %dh",
+            restored, _AUTO_ACTION_RESUME_WINDOW_HOURS,
+        )
 
 
 async def _iter_project_slugs() -> list[tuple[int, str]]:
