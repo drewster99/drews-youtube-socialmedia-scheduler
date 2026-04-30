@@ -281,6 +281,20 @@
         </div>
     </form>
 </dialog>
+
+<dialog id="social-post-editor-dialog" class="modal modal-wide modal-tall">
+    <h3>Edit <span id="spe-platform"></span> post</h3>
+    <p class="form-hint" id="spe-meta" style="margin: 0 0 0.5rem;"></p>
+    <textarea id="spe-text" rows="20" style="width: 100%; min-height: 320px; font-family: var(--font-mono, monospace); font-size: 0.95rem; line-height: 1.4;"></textarea>
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 0.25rem;">
+        <span class="form-hint" id="spe-charcount"></span>
+        <span class="form-hint" style="font-size: 0.75rem;">⌘+Enter to save · Esc to cancel</span>
+    </div>
+    <div class="modal-actions" style="margin-top: 0.75rem;">
+        <button type="button" class="btn" id="spe-cancel">Cancel</button>
+        <button type="button" class="btn btn-primary" id="spe-save">Save</button>
+    </div>
+</dialog>
 {% endblock %}
 
 {% block scripts %}
@@ -957,6 +971,31 @@ async function loadSocialPosts() {
     await loadPlatformConfigs();
     await loadPostingSettings();
 
+    // Snapshot user-edited textarea state BEFORE the re-render so the
+    // 15s poll doesn't blow away anything the user is typing. We
+    // remember the focused post-id + selection range and any per-post
+    // values that differ from what the server last gave us; we re-apply
+    // those after the innerHTML replace below.
+    const editSnapshot = new Map();
+    let focusedPostId = null;
+    let focusedSelection = null;
+    const prevPostsById = new Map((socialPostsCache || []).map(p => [p.id, p]));
+    for (const ta of area.querySelectorAll('textarea[data-id]')) {
+        const id = Number(ta.dataset.id);
+        const prev = prevPostsById.get(id);
+        if (prev && ta.value !== prev.content) {
+            editSnapshot.set(id, ta.value);
+        }
+        if (document.activeElement === ta) {
+            focusedPostId = id;
+            focusedSelection = {
+                start: ta.selectionStart,
+                end: ta.selectionEnd,
+                value: ta.value,
+            };
+        }
+    }
+
     try {
         const resp = await fetch(`/api/social/posts/${videoId}`);
         const posts = await resp.json();
@@ -1022,6 +1061,7 @@ async function loadSocialPosts() {
                 // instead of having to re-Approve every time.
                 const wasApproved = p.status === 'approved' || p.status === 'failed';
                 actions = `
+                    <button class="btn btn-sm" onclick="openSocialPostEditor(${p.id})" title="Open in larger editor">Edit</button>
                     <button class="btn btn-sm" onclick="saveSocialPost(${p.id})">Save</button>
                     ${!wasApproved ? `<button class="btn btn-sm btn-primary" onclick="approvePost(${p.id})">Approve</button>` : ''}
                     <button class="btn btn-sm btn-success" onclick="sendPost(${p.id})"
@@ -1046,6 +1086,29 @@ async function loadSocialPosts() {
         }).join('');
 
         area.innerHTML = html;
+
+        // Re-apply per-post unsaved edits + restore focus + selection so
+        // the 15s poll doesn't yank the cursor out from under the user.
+        for (const [id, value] of editSnapshot) {
+            const ta = area.querySelector(`textarea[data-id="${id}"]`);
+            if (ta && !ta.readOnly) ta.value = value;
+        }
+        if (focusedPostId !== null) {
+            const ta = area.querySelector(`textarea[data-id="${focusedPostId}"]`);
+            if (ta) {
+                ta.focus({preventScroll: true});
+                if (focusedSelection) {
+                    // Clamp to whatever the textarea now holds (it might be
+                    // the snapshot value we just restored, or the server
+                    // value if the user hadn't actually edited yet).
+                    const len = ta.value.length;
+                    ta.setSelectionRange(
+                        Math.min(focusedSelection.start, len),
+                        Math.min(focusedSelection.end, len),
+                    );
+                }
+            }
+        }
     } catch (e) {
         area.innerHTML = '<p class="empty-state">Could not load posts.</p>';
     }
@@ -1353,6 +1416,102 @@ async function saveSocialPost(postId) {
         setPostCardBusy(postId, false);
     }
 }
+
+// --- Larger social-post editor modal -----------------------------------
+let _spePostId = null;
+let _speOriginalValue = '';
+
+function openSocialPostEditor(postId) {
+    const post = (socialPostsCache || []).find(p => p.id === postId);
+    if (!post) return;
+    const cardTextarea = document.querySelector(`textarea[data-id="${postId}"]`);
+    // Prefer the in-card textarea's CURRENT value over the cached server
+    // value — the user may have typed something the poll would have
+    // restored as a snapshot but never saved; opening the editor
+    // shouldn't discard that.
+    const currentValue = cardTextarea ? cardTextarea.value : post.content;
+
+    _spePostId = postId;
+    _speOriginalValue = currentValue;
+    document.getElementById('spe-platform').textContent = post.platform;
+    document.getElementById('spe-meta').textContent =
+        `Status: ${post.status}` +
+        (post.social_account_id ? ` · account #${post.social_account_id}` : '');
+    const ta = document.getElementById('spe-text');
+    ta.value = currentValue;
+    _speUpdateCharCount();
+    document.getElementById('social-post-editor-dialog').showModal();
+    // Focus + put cursor at end so the user can start typing immediately.
+    requestAnimationFrame(() => {
+        ta.focus();
+        ta.setSelectionRange(ta.value.length, ta.value.length);
+    });
+}
+
+function _speUpdateCharCount() {
+    const ta = document.getElementById('spe-text');
+    document.getElementById('spe-charcount').textContent =
+        `${ta.value.length} characters`;
+}
+
+async function _speSave() {
+    if (_spePostId === null) return;
+    const ta = document.getElementById('spe-text');
+    const newValue = ta.value;
+    const postId = _spePostId;
+    setPostCardBusy(postId, true);
+    try {
+        const resp = await fetch(`/api/social/posts/${postId}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({content: newValue}),
+        });
+        if (!resp.ok) {
+            showToast('Save failed', 'error');
+            return;
+        }
+        // Mirror the new value back into the in-card textarea so the user
+        // doesn't have to wait for the next poll to see their change.
+        const cardTextarea = document.querySelector(`textarea[data-id="${postId}"]`);
+        if (cardTextarea) cardTextarea.value = newValue;
+        // Update the cache so the dirty-snapshot logic in loadSocialPosts
+        // doesn't think the in-card value differs from server.
+        const cached = (socialPostsCache || []).find(p => p.id === postId);
+        if (cached) cached.content = newValue;
+        showToast('Saved', 'success');
+        document.getElementById('social-post-editor-dialog').close();
+        _spePostId = null;
+    } finally {
+        setPostCardBusy(postId, false);
+    }
+}
+
+function _speCancel() {
+    const ta = document.getElementById('spe-text');
+    if (ta.value !== _speOriginalValue) {
+        if (!confirm('Discard your edits?')) return;
+    }
+    document.getElementById('social-post-editor-dialog').close();
+    _spePostId = null;
+}
+
+document.getElementById('spe-save').addEventListener('click', _speSave);
+document.getElementById('spe-cancel').addEventListener('click', _speCancel);
+document.getElementById('spe-text').addEventListener('input', _speUpdateCharCount);
+document.getElementById('spe-text').addEventListener('keydown', (e) => {
+    // ⌘/Ctrl+Enter saves; Esc cancels (browsers fire 'cancel' on the
+    // dialog for native Esc which we treat as cancel-with-confirm).
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault();
+        _speSave();
+    }
+});
+document.getElementById('social-post-editor-dialog').addEventListener('cancel', (e) => {
+    // Native Esc fires 'cancel'; intercept and route through our
+    // confirm-if-dirty path.
+    e.preventDefault();
+    _speCancel();
+});
 
 async function approvePost(postId) {
     const textarea = document.querySelector(`textarea[data-id="${postId}"]`);
