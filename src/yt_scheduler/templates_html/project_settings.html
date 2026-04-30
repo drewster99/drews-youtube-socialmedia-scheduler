@@ -585,12 +585,18 @@ async function loadPromptTemplates() {
         return;
     }
     promptDirty.clear();
+    // Build the open/close brace pair from char codes so Jinja2 (which
+    // owns this file) doesn't try to parse the literal braces in our JS
+    // template literal as one of its own expressions when rendering the
+    // page. Without this, the page returns 500.
+    const TPL_OPEN = String.fromCharCode(123, 123);
+    const TPL_CLOSE = String.fromCharCode(125, 125);
     container.innerHTML = prompts.map(p => {
         const vars = (p.variables || []);
         const varsBlock = vars.length
             ? `<p class="form-hint" style="margin: 0.25rem 0;">
                 Available variables — referencing any other name renders literally:
-                ${vars.map(v => `<code style="margin-right: 0.25rem;">{{${v}}}</code>`).join('')}
+                ${vars.map(v => `<code style="margin-right: 0.25rem;">${TPL_OPEN}${v}${TPL_CLOSE}</code>`).join('')}
               </p>`
             : '';
         return `

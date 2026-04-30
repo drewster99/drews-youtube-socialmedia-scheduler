@@ -42,6 +42,25 @@ def test_default_project_dashboard_renders(client: TestClient) -> None:
     assert "Dashboard" in resp.text
 
 
+def test_project_settings_page_renders(client: TestClient) -> None:
+    """Catches template-syntax errors in project_settings.html (Jinja2
+    parses the file at request time; a stray ``{{`` in inlined JS
+    would 500 the page without this smoke test catching it)."""
+    resp = client.get("/projects/default/settings")
+    assert resp.status_code == 200, resp.text
+    assert "LLM prompt templates" in resp.text
+
+
+def test_project_templates_page_renders(client: TestClient) -> None:
+    resp = client.get("/projects/default/templates")
+    assert resp.status_code == 200, resp.text
+
+
+def test_project_moderation_page_renders(client: TestClient) -> None:
+    resp = client.get("/projects/default/moderation")
+    assert resp.status_code == 200, resp.text
+
+
 def test_unknown_project_404(client: TestClient) -> None:
     resp = client.get("/projects/does-not-exist")
     assert resp.status_code == 404
