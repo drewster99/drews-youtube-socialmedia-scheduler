@@ -204,13 +204,37 @@ async def generate_posts(
     # Acquire the per-video publish lock to prevent racing with a publish in progress.
     lock = get_publish_lock(video_id)
     async with lock:
-        # Refuse to silently nuke scheduled posts. Without this, a regenerate
-        # would DELETE 'approved' rows whose APScheduler jobs would then
-        # become orphans firing against rows that no longer exist.
+        # Resolve the platform set we're actually about to (re)generate so
+        # both the scheduled-overwrite guard and the DELETE below stay
+        # scoped to those platforms. Without this, a partial-platform
+        # regenerate (e.g. user only ticks Twitter in the picker) would
+        # nuke approved/draft rows on the OTHER platforms — silently
+        # losing prior approvals and confusing the user with a "will
+        # cancel N scheduled posts" dialog about platforms they aren't
+        # touching.
+        platforms_to_regen: set[str] = set()
+        for slot in template.get("slots", []):
+            if slot.get("is_disabled"):
+                continue
+            p = slot["platform"]
+            if requested_platforms and p not in requested_platforms:
+                continue
+            platforms_to_regen.add(p)
+        if not platforms_to_regen:
+            return []
+        platform_placeholders = ",".join("?" * len(platforms_to_regen))
+        platform_params = (video_id, *sorted(platforms_to_regen))
+
+        # Refuse to silently nuke scheduled posts on the platforms being
+        # regenerated. Posts on OTHER platforms with active jobs are not
+        # touched and never appear in the 409 detail. Without this scope,
+        # the UI dialog would warn the user about scheduled posts that
+        # aren't actually at risk.
         scheduled_rows = await db.execute_fetchall(
-            "SELECT id, platform, scheduled_at FROM social_posts "
-            "WHERE video_id = ? AND scheduler_job_id IS NOT NULL",
-            (video_id,),
+            f"SELECT id, platform, scheduled_at FROM social_posts "
+            f"WHERE video_id = ? AND platform IN ({platform_placeholders}) "
+            f"AND scheduler_job_id IS NOT NULL",
+            platform_params,
         )
         if scheduled_rows and not confirm_overwrite_scheduled:
             raise HTTPException(
@@ -231,15 +255,20 @@ async def generate_posts(
         for r in scheduled_rows:
             await cancel_scheduled_post(int(r["id"]))
 
-        # Replace unsent posts on regenerate. Posts that already went out
-        # ('posted') stay for the audit trail; in-flight scheduled posts
-        # ('sending') stay because the per-post scheduler holds its own
-        # per-post lock — not the per-video publish lock — so deleting a
-        # 'sending' row here would race with an active send.
+        # Replace unsent posts on the platforms being regenerated. Posts
+        # that already went out ('posted') stay for the audit trail;
+        # in-flight scheduled posts ('sending') stay because the per-post
+        # scheduler holds its own per-post lock — not the per-video
+        # publish lock — so deleting a 'sending' row here would race with
+        # an active send. Approved rows on OTHER platforms also stay,
+        # which is the bug fix: a Twitter-only regenerate must not delete
+        # the user's previously-approved LinkedIn / Mastodon / Bluesky
+        # rows.
         await db.execute(
-            "DELETE FROM social_posts "
-            "WHERE video_id = ? AND status NOT IN ('posted', 'sending')",
-            (video_id,),
+            f"DELETE FROM social_posts "
+            f"WHERE video_id = ? AND platform IN ({platform_placeholders}) "
+            f"AND status NOT IN ('posted', 'sending')",
+            platform_params,
         )
 
         generated: list[dict] = []
