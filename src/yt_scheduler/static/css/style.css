@@ -523,6 +523,34 @@ body {
     resize: vertical;
 }
 
+/* Read-only social post body — replaces the in-card textarea. Click
+   opens the editor modal. white-space: pre-wrap preserves the newlines
+   that templates produce; word-break stops long URLs from blowing the
+   card width out. */
+.social-post-display {
+    width: 100%;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 0.5rem;
+    font-size: 0.85rem;
+    font-family: inherit;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    overflow-wrap: anywhere;
+    min-height: 3.4em;
+    line-height: 1.4;
+}
+.social-post-display-clickable {
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+}
+.social-post-display-clickable:hover {
+    border-color: var(--accent);
+    background: var(--bg-card);
+}
+
 .social-post-actions {
     display: flex;
     gap: 0.4rem;
