@@ -47,10 +47,29 @@ async def list_projects() -> list[dict]:
         """SELECT p.id, p.name, p.slug, p.youtube_channel_id,
                   p.channel_thumbnail_url, p.channel_banner_url,
                   p.created_at, p.updated_at,
-                  (SELECT COUNT(*) FROM videos WHERE project_id = p.id)         AS video_count,
+                  (SELECT COUNT(*) FROM videos WHERE project_id = p.id)
+                      AS video_count,
+                  (SELECT COUNT(*) FROM videos
+                   WHERE project_id = p.id AND status = 'published')
+                      AS published_count,
                   (SELECT COUNT(*) FROM videos
                    WHERE project_id = p.id AND publish_at IS NOT NULL
-                     AND status != 'published')                                  AS scheduled_count
+                     AND status != 'published')
+                      AS scheduled_count,
+                  (SELECT COUNT(*) FROM social_posts sp
+                   JOIN videos sv ON sv.id = sp.video_id
+                   WHERE sv.project_id = p.id AND sp.status = 'posted')
+                      AS social_posted_count,
+                  (SELECT COUNT(*) FROM social_posts sp
+                   JOIN videos sv ON sv.id = sp.video_id
+                   WHERE sv.project_id = p.id
+                     AND sp.scheduler_job_id IS NOT NULL
+                     AND sp.status != 'posted')
+                      AS social_scheduled_count,
+                  (SELECT MAX(e.created_at) FROM video_events e
+                   JOIN videos ev ON ev.id = e.video_id
+                   WHERE ev.project_id = p.id)
+                      AS last_activity_at
            FROM projects p ORDER BY p.created_at"""
     )
     rows = await cursor.fetchall()
