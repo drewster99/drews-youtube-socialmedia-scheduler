@@ -132,7 +132,26 @@ async def create_project(
     except aiosqlite.IntegrityError as exc:
         raise ValueError(f"A project with slug '{chosen_slug}' already exists") from exc
 
-    return await get_project_by_id(int(cursor.lastrowid))  # type: ignore[return-value]
+    new_id = int(cursor.lastrowid)  # type: ignore[arg-type]
+    # Seed the two built-in social templates (announce_video,
+    # send_message) into the new project. Without this, the project
+    # has no templates and the Templates page renders empty AND the
+    # posting-settings defaults (which reference 'announce_video')
+    # point at a template that doesn't exist for this project.
+    from yt_scheduler.services import templates as _tmpl
+    try:
+        await _tmpl.ensure_default_template(project_id=new_id)
+    except Exception as exc:
+        # Don't roll back the project insert if seeding fails — the
+        # user can re-create the templates manually. But surface the
+        # failure in logs.
+        import logging
+        logging.getLogger(__name__).warning(
+            "Failed to seed default templates for project %s: %s",
+            chosen_slug, exc,
+        )
+
+    return await get_project_by_id(new_id)  # type: ignore[return-value]
 
 
 async def update_project_url(project_id: int, project_url: str | None) -> dict:

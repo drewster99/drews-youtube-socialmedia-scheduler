@@ -84,7 +84,17 @@ async def lifespan(app: FastAPI):
     await ensure_default_project()
     await backfill_channel_ids()
     await backfill_channel_assets()
-    await ensure_default_template()
+    # Seed the built-in templates into EVERY project that doesn't have
+    # them yet. Earlier installs (and the create-project route before
+    # we wired template seeding into create_project) could leave a
+    # project with an empty templates table, breaking the Templates
+    # page and the posting-settings defaults that point at
+    # 'announce_video'. Cheap startup pass — the per-project
+    # ensure_default_template skips when both built-in names already
+    # exist in that project.
+    project_rows = await db.execute_fetchall("SELECT id FROM projects")
+    for project_row in project_rows:
+        await ensure_default_template(project_id=int(project_row["id"]))
 
     # Read scheduler intervals from DB settings (saved via Settings UI), fall back to config defaults
     settings_rows = await db.execute_fetchall(
