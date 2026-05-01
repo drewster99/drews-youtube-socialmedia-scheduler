@@ -918,12 +918,15 @@ body {
    into a wall of grey "Updated" rows. */
 .event-verb { font-weight: 500; }
 .event-verb-major     { color: var(--success); font-weight: 700; }
-.event-verb-scheduled { color: #c084fc; font-weight: 600; } /* purple — matches scheduled status badge */
+.event-verb-scheduled { color: #c084fc; }                    /* purple — matches scheduled status badge */
 .event-verb-lifecycle { color: var(--accent); }
 .event-verb-warn      { color: var(--warning); }
 .event-verb-minor     { color: var(--text-secondary); font-weight: 400; }
-/* Pull the major rows slightly forward with a left accent bar. */
-.event-row-major { box-shadow: inset 3px 0 0 var(--success); padding-left: 0.5rem; }
+/* Pull the major rows forward with a left accent bar. Apply the same
+   border width to every row (transparent on non-major rows) so column
+   starts stay aligned regardless of severity. */
+.event-row { border-left: 3px solid transparent; padding-left: 0.5rem; }
+.event-row-major { border-left-color: var(--success); }
 
 .project-grid {
     display: grid;
