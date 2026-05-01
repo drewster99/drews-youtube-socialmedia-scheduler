@@ -273,6 +273,18 @@ function eventVerb(type) {
     }[type] || type;
 }
 
+// Event-row severity tiers used to color-code the Recent feed so the
+// "Video published" / "Social post published" landmark events don't
+// disappear into a sea of grey "Updated" rows. Tiers map to CSS
+// classes that set color + weight.
+function eventTier(type) {
+    if (type === 'published' || type === 'social_post_published') return 'major';
+    if (type === 'publish_scheduled' || type === 'social_post_scheduled') return 'scheduled';
+    if (type === 'created' || type === 'imported' || type === 'uploaded') return 'lifecycle';
+    if (type === 'social_post_skipped_duplicate') return 'warn';
+    return 'minor';
+}
+
 /* Per-event-type details rendered inline in the Recent feed.
  *
  * The default (for video-lifecycle events like ``created``,
@@ -323,9 +335,9 @@ async function loadRecent() {
             return;
         }
         container.innerHTML = items.map(i => `
-            <div class="event-row">
+            <div class="event-row event-row-${eventTier(i.type)}">
                 <span class="event-when">${fmtWhen(i.created_at)}</span>
-                <span>${eventVerb(i.type)}${eventDetails(i)}</span>
+                <span class="event-verb event-verb-${eventTier(i.type)}">${eventVerb(i.type)}${eventDetails(i)}</span>
                 <a href="/projects/${i.project_slug}/videos/${i.video_id}">${escapeHtml(i.video_title)}</a>
                 <span class="event-project">${escapeHtml(i.project_name)}</span>
             </div>

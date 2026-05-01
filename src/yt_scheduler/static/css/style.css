@@ -913,6 +913,18 @@ body {
 .event-row a { color: var(--accent); text-decoration: none; }
 .event-row a:hover { text-decoration: underline; }
 
+/* Color-code the event verb so landmark events (Video published, Social
+   post published) jump out of the Recent feed instead of disappearing
+   into a wall of grey "Updated" rows. */
+.event-verb { font-weight: 500; }
+.event-verb-major     { color: var(--success); font-weight: 700; }
+.event-verb-scheduled { color: #c084fc; font-weight: 600; } /* purple — matches scheduled status badge */
+.event-verb-lifecycle { color: var(--accent); }
+.event-verb-warn      { color: var(--warning); }
+.event-verb-minor     { color: var(--text-secondary); font-weight: 400; }
+/* Pull the major rows slightly forward with a left accent bar. */
+.event-row-major { box-shadow: inset 3px 0 0 var(--success); padding-left: 0.5rem; }
+
 .project-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
