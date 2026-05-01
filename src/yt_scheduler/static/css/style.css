@@ -164,6 +164,20 @@ body {
     flex: 1;
 }
 
+/* The global "* { margin: 0 }" reset (top of file) wipes the browser
+   default <p> margins, so any .form-hint paragraph sits flush against
+   the next element with zero gap — particularly visible at the top of
+   modal forms where an intro paragraph touches the first label.
+   Restore a sensible vertical rhythm so hints have breathing room
+   both above and below regardless of context. */
+.form-hint {
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    line-height: 1.45;
+    margin: 0.4rem 0 0.6rem;
+}
+.form-hint:first-child { margin-top: 0; }
+
 .form-group label {
     display: block;
     font-size: 0.85rem;
