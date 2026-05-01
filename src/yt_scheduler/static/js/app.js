@@ -110,16 +110,30 @@ function showToast(message, type = 'info') {
     }
 })();
 
-// Auth status in sidebar
+// Auth status in sidebar — scoped to the project we're currently
+// viewing. The sidebar template stamps the current project's slug onto
+// .nav-section-label[data-project] when one is in scope; without it
+// (Home page, General settings) we fall back to the install-wide
+// default project so the indicator still says something useful.
 async function checkAuth() {
     try {
-        const resp = await fetch('/auth/status', {_silent: true});
+        const projectEl = document.querySelector('.nav-section-label[data-project]');
+        const slug = projectEl ? projectEl.dataset.project : '';
+        const url = slug
+            ? `/auth/status?project_slug=${encodeURIComponent(slug)}`
+            : '/auth/status';
+        const resp = await fetch(url, {_silent: true});
         const data = await resp.json();
         const el = document.getElementById('auth-status');
+        // When we're on a project page, label the indicator with the
+        // project name so a casual glance tells the user *which*
+        // project's connection is being reported.
+        const label = projectEl ? projectEl.textContent.trim() : 'YouTube';
         if (data.authenticated) {
-            el.innerHTML = '<span class="status-dot" style="background: #2ea043;"></span><span>YouTube Connected</span>';
+            el.innerHTML = `<span class="status-dot" style="background: #2ea043;"></span><span>${label} • Connected</span>`;
         } else {
-            el.innerHTML = '<span class="status-dot" style="background: #f85149;"></span><a href="/settings" style="color: #f85149;">Not Connected</a>';
+            const settingsHref = slug ? `/projects/${encodeURIComponent(slug)}/settings` : '/settings';
+            el.innerHTML = `<span class="status-dot" style="background: #f85149;"></span><a href="${settingsHref}" style="color: #f85149;">${label} • Not connected</a>`;
         }
     } catch {
         // Ignore
