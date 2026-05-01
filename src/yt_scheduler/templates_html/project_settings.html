@@ -105,12 +105,39 @@
 <section class="card">
     <div class="card-header"><h2>LLM prompt templates</h2></div>
     <div class="card-body">
-        <p class="form-hint">Edit the prompts the app sends to Claude. Template
-            variables like <code>{{title}}</code>, <code>{{description}}</code>,
-            <code>{{transcript_truncated}}</code>, <code>{{channel_name_block}}</code>,
-            and <code>{{extra_instructions}}</code> are filled in at generation
-            time. Leave blank or hit Reset to default to fall back to the
-            built-in seed.</p>
+        <p class="form-hint">Edit the prompts the app sends to Claude. The
+            available template variables are listed above each prompt as
+            <code>{{ '{{' }}name{{ '}}' }}</code> chips. Leave blank or hit Reset to default
+            to fall back to the built-in seed.</p>
+
+        <details id="prompt-test-vars" style="margin: 0.5rem 0 1rem;">
+            <summary style="cursor: pointer; font-weight: 600; padding: 0.25rem 0;">Test variables (used by Preview)</summary>
+            <p class="form-hint" style="margin: 0.5rem 0;">
+                Edit these values, then click <strong>Preview</strong> on any prompt to
+                see what Claude would actually receive. Some variables
+                (<code>{{ '{{' }}channel_name_block{{ '}}' }}</code>, <code>{{ '{{' }}transcript_truncated{{ '}}' }}</code>,
+                <code>{{ '{{' }}extra_instructions_block{{ '}}' }}</code>, <code>{{ '{{' }}description_or_none{{ '}}' }}</code>)
+                are derived automatically from the values below — same way the
+                AI service derives them at generation time.
+            </p>
+            <div class="form-row">
+                <label>Title<input type="text" id="pv-title" value="My Latest Video"></label>
+                <label>Channel name<input type="text" id="pv-channel-name" value="My Channel"></label>
+            </div>
+            <div class="form-group">
+                <label>Description</label>
+                <textarea id="pv-description" rows="2">A quick demo of a new feature.</textarea>
+            </div>
+            <div class="form-group">
+                <label>Transcript</label>
+                <textarea id="pv-transcript" rows="3">Hey everyone, today we're going to walk through a feature I've been working on...</textarea>
+            </div>
+            <div class="form-group">
+                <label>Extra instructions <span class="form-hint" style="font-weight: normal;">(optional)</span></label>
+                <textarea id="pv-extra" rows="2"></textarea>
+            </div>
+        </details>
+
         <div id="prompt-templates-list">
             <p class="loading">Loading…</p>
         </div>
@@ -609,8 +636,16 @@ async function loadPromptTemplates() {
             <textarea class="prompt-body" rows="10" style="width: 100%; font-family: var(--font-mono, monospace); font-size: 0.85rem;">${escapeHtml(p.body)}</textarea>
             <div class="modal-actions" style="justify-content: flex-end; margin-top: 0.25rem;">
                 <button type="button" class="btn btn-sm" data-action="reset" data-default="${escapeHtml(p.default_body)}">Reset to default</button>
+                <button type="button" class="btn btn-sm" data-action="preview" title="Render this prompt with the test variables above">Preview</button>
                 <button type="button" class="btn btn-sm btn-primary" data-action="save" disabled>Save</button>
             </div>
+            <pre class="prompt-preview" data-preview-for="${p.key}"
+                 style="display: none; margin-top: 0.5rem; padding: 0.6rem;
+                        background: var(--bg-input); border: 1px solid var(--border);
+                        border-radius: var(--radius-sm); white-space: pre-wrap;
+                        word-wrap: break-word; max-height: 320px; overflow-y: auto;
+                        font-family: var(--font-mono, monospace); font-size: 0.8rem;
+                        line-height: 1.4;"></pre>
         </div>
         `;
     }).join('');
@@ -619,6 +654,8 @@ async function loadPromptTemplates() {
         const ta = row.querySelector('.prompt-body');
         const saveBtn = row.querySelector('[data-action="save"]');
         const resetBtn = row.querySelector('[data-action="reset"]');
+        const previewBtn = row.querySelector('[data-action="preview"]');
+        const previewBox = row.querySelector('.prompt-preview');
         const original = ta.value;
         promptDirty.set(key, original);
         ta.addEventListener('input', () => {
@@ -644,7 +681,70 @@ async function loadPromptTemplates() {
                 showToast('Save failed', 'error');
             }
         });
+        previewBtn.addEventListener('click', async () => {
+            await renderPromptPreview(ta.value, previewBox);
+            // Keep the test-variables panel open so the user can iterate.
+            const det = document.getElementById('prompt-test-vars');
+            if (det && !det.open) det.open = true;
+        });
     });
+}
+
+// Build the variable bag from the test-variables form, mirroring the
+// derivations the AI service does at generation time so the preview
+// matches what Claude would actually receive.
+function buildPromptTestVariables() {
+    const title = document.getElementById('pv-title')?.value || '';
+    const channelName = document.getElementById('pv-channel-name')?.value || '';
+    const description = document.getElementById('pv-description')?.value || '';
+    const transcript = document.getElementById('pv-transcript')?.value || '';
+    const extra = document.getElementById('pv-extra')?.value || '';
+    return {
+        title,
+        channel_name: channelName,
+        // ai.generate_seo_description: f"Channel: {channel_name}\n" if channel_name else ""
+        channel_name_block: channelName ? `Channel: ${channelName}\n` : '',
+        description,
+        // ai.generate_tags_from_frames: description or '(none yet)'
+        description_or_none: description || '(none yet)',
+        transcript,
+        // ai.generate_seo_description: srt_to_plain(transcript)[:8000]; for the
+        // preview the test transcript is already plain text, so just truncate.
+        transcript_truncated: transcript.slice(0, 8000),
+        extra_instructions: extra,
+        // ai.generate_seo_description_from_frames:
+        //   f"\n\nAdditional instructions:\n{extra_instructions}\n" if extra_instructions else ""
+        extra_instructions_block: extra
+            ? `\n\nAdditional instructions:\n${extra}\n`
+            : '',
+    };
+}
+
+async function renderPromptPreview(body, outputBox) {
+    outputBox.style.display = 'block';
+    outputBox.textContent = 'Rendering…';
+    try {
+        const resp = await fetch('/api/expand_text', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                template: body,
+                variables: buildPromptTestVariables(),
+            }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            const detail = data && data.detail;
+            const msg = (detail && detail.missing_required)
+                ? `Missing required variable: {${detail.missing_required}}`
+                : (typeof detail === 'string' ? detail : `HTTP ${resp.status}`);
+            outputBox.textContent = `Preview failed: ${msg}`;
+            return;
+        }
+        outputBox.textContent = data.rendered ?? '(empty render)';
+    } catch (exc) {
+        outputBox.textContent = `Preview failed: ${exc}`;
+    }
 }
 
 // --- Project URL editor ------------------------------------------------
