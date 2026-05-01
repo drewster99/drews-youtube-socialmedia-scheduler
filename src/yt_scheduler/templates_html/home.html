@@ -304,6 +304,8 @@ function eventVerb(type) {
         social_post_scheduled: 'Social post scheduled',
         social_post_published: 'Social post published',
         social_post_skipped_duplicate: 'Social post skipped (duplicate)',
+        social_post_failed_video_not_public: 'Social post failed (video not public)',
+        credential_invalid: 'Credential needs re-auth',
     }[type] || type;
 }
 
@@ -315,7 +317,9 @@ function eventTier(type) {
     if (type === 'published' || type === 'social_post_published') return 'major';
     if (type === 'publish_scheduled' || type === 'social_post_scheduled') return 'scheduled';
     if (type === 'created' || type === 'imported' || type === 'uploaded') return 'lifecycle';
-    if (type === 'social_post_skipped_duplicate') return 'warn';
+    if (type === 'social_post_skipped_duplicate'
+        || type === 'social_post_failed_video_not_public'
+        || type === 'credential_invalid') return 'warn';
     return 'minor';
 }
 
@@ -347,6 +351,24 @@ function eventDetails(item) {
         }
         case 'social_post_skipped_duplicate':
             return p.platform ? ` [${escapeHtml(p.platform)}]` : '';
+        case 'social_post_failed_video_not_public': {
+            // Same payload shape as the other social events; the verb
+            // already explains the "video not public" reason, but
+            // showing the platform helps the user know which post to
+            // retry from the detail page.
+            const platform = p.platform ? ` [${escapeHtml(p.platform)}]` : '';
+            const priv = p.video_privacy ? ` (video is ${escapeHtml(p.video_privacy)})` : '';
+            return `${platform}${priv}`;
+        }
+        case 'credential_invalid': {
+            // scope is 'youtube' or a social platform name; account_label
+            // is "@handle" or similar when known.
+            const scope = p.scope || 'account';
+            const label = p.account_label
+                ? `${escapeHtml(scope)}: ${escapeHtml(p.account_label)}`
+                : escapeHtml(scope);
+            return ` [${label}]`;
+        }
         case 'publish_scheduled':
             return p.publish_at
                 ? ` &lt;${fmtWhen(p.publish_at)}&gt; [${escapeHtml(p.platform || 'youtube')}]`
