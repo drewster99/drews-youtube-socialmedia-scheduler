@@ -85,6 +85,12 @@ async function addKeyword() {
 }
 
 async function removeKeyword(id) {
+    // Look up the keyword text from the rendered list so the confirm
+    // dialog shows what's actually being removed.
+    const btn = document.querySelector(`button[onclick="removeKeyword(${id})"]`);
+    const code = btn?.parentElement?.querySelector('code');
+    const label = code ? `"${code.textContent}"` : 'this keyword';
+    if (!confirm(`Remove ${label} from the blocklist?`)) return;
     await fetch(`/api/settings/blocklist/${id}?project_slug=${encodeURIComponent(projectSlug)}`, {method: 'DELETE'});
     loadBlocklist();
 }
