@@ -377,9 +377,34 @@ function renderSchedulePostPreview() {
     const approved = socialPostsCache.filter(p => p.status === 'approved');
     const draft = socialPostsCache.filter(p => p.status === 'draft');
 
-    btn.textContent = approved.length
-        ? `Schedule video + ${approved.length} post${approved.length === 1 ? '' : 's'}`
-        : 'Schedule video';
+    // Derive button state from whether the video is already scheduled
+    // and whether the user has changed the datetime input from the
+    // existing scheduled time:
+    //   - not scheduled                -> "Schedule video + N posts"   (enabled)
+    //   - scheduled, date unchanged    -> "Already scheduled"          (disabled)
+    //   - scheduled, date changed      -> "Reschedule video + N posts" (enabled)
+    const isScheduled = videoData?.status === 'scheduled'
+        && videoData?.publish_at
+        && (videoData?.youtube_data?.status?.privacyStatus !== 'public');
+    const currentScheduledLocal = isScheduled
+        ? toLocalInputValue(new Date(_ensureUtc(videoData.publish_at)))
+        : null;
+    const countSuffix = approved.length
+        ? ` video + ${approved.length} post${approved.length === 1 ? '' : 's'}`
+        : ' video';
+    if (isScheduled && dtStr === currentScheduledLocal) {
+        btn.textContent = 'Already scheduled';
+        btn.disabled = true;
+        btn.title = 'Pick a different date/time to reschedule, or use Cancel Schedule below.';
+    } else if (isScheduled) {
+        btn.textContent = `Reschedule${countSuffix}`;
+        btn.disabled = false;
+        btn.title = '';
+    } else {
+        btn.textContent = `Schedule${countSuffix}`;
+        btn.disabled = false;
+        btn.title = '';
+    }
 
     if (!approved.length && !draft.length) {
         preview.innerHTML = '';
@@ -523,6 +548,11 @@ async function loadVideo() {
         cancelBtn.style.display = 'inline-flex';
         document.getElementById('schedule-datetime').value = toLocalInputValue(pubDate);
         scheduleReveal();
+        // videoData was just assigned earlier in loadVideo; refresh the
+        // preview now that the input has its value so the button picks
+        // up the "Already scheduled" state instead of stale "Schedule
+        // video + N posts".
+        renderSchedulePostPreview();
     } else if (video.status === 'published' || ytIsPublic) {
         const ytPublishedAt = video.youtube_data?.status?.publishAt
                            || video.youtube_data?.snippet?.publishedAt
