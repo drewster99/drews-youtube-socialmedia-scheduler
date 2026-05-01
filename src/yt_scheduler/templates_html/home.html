@@ -316,7 +316,7 @@ function eventDetails(item) {
 async function loadRecent() {
     const container = document.getElementById('recent-list');
     try {
-        const resp = await fetch('/api/projects/recent-events?limit=7');
+        const resp = await fetch('/api/projects/recent-events?limit=30');
         const items = resp.ok ? await resp.json() : [];
         if (!items.length) {
             container.innerHTML = '<p class="empty-state">No recent activity yet.</p>';
