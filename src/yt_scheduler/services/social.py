@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import mimetypes
+import re
 import time
 from pathlib import Path
 
@@ -450,6 +451,76 @@ class TwitterPoster(SocialPoster):
             raise RuntimeError(f"Twitter post failed: {e}") from e
 
 
+# Trailing chars we always peel off the end of a URL — common sentence
+# punctuation that virtually never belongs to the URI itself.
+_BSKY_URL_ALWAYS_STRIP = ".,;:!?'\">"
+
+# Closing brackets that we only strip when there is no matching opener
+# inside the URL. This preserves URLs like
+# `https://en.wikipedia.org/wiki/Foo_(bar)` (where the `)` is part of the
+# path) while still trimming the prose-level wrapper in `(see …)`.
+_BSKY_URL_PAIRED_CLOSERS = {b")": b"(", b"]": b"[", b"}": b"{"}
+
+# URL detector — matches http(s) up to the next whitespace or angle bracket.
+# Bluesky facets work in UTF-8 byte offsets, so we run this over the encoded
+# bytes to keep `index.byteStart`/`byteEnd` aligned with what the server sees.
+_BSKY_URL_RE = re.compile(rb"https?://[^\s<>]+")
+
+# Hashtag detector — `#` followed by at least one letter, then word chars.
+# A leading letter avoids matching things like "#1" (numeric) which Bluesky
+# also rejects as a tag. Tag value sent to the server omits the leading `#`.
+_BSKY_TAG_RE = re.compile(rb"(?:^|(?<=\s))#([A-Za-z][\w]*)")
+
+
+def _trim_trailing_url_punct(uri_bytes: bytes) -> bytes:
+    while uri_bytes:
+        last = uri_bytes[-1:]
+        if last.decode("ascii", errors="ignore") in _BSKY_URL_ALWAYS_STRIP:
+            uri_bytes = uri_bytes[:-1]
+            continue
+        opener = _BSKY_URL_PAIRED_CLOSERS.get(last)
+        if opener is None:
+            break
+        if opener in uri_bytes[:-1]:
+            break
+        uri_bytes = uri_bytes[:-1]
+    return uri_bytes
+
+
+def _build_bluesky_facets(text: str) -> list[dict]:
+    """Return Bluesky richtext facets for URLs and hashtags found in *text*.
+
+    Bluesky's PDS does not auto-detect links or tags — without facets the
+    text renders as plain prose. Byte offsets are computed against the
+    UTF-8 encoding because that's the indexing the server uses.
+    """
+    encoded = text.encode("utf-8")
+    facets: list[dict] = []
+
+    for match in _BSKY_URL_RE.finditer(encoded):
+        start = match.start()
+        trimmed = _trim_trailing_url_punct(encoded[start:match.end()])
+        end = start + len(trimmed)
+        if end <= start:
+            continue
+        uri = trimmed.decode("utf-8", errors="ignore")
+        facets.append({
+            "index": {"byteStart": start, "byteEnd": end},
+            "features": [{"$type": "app.bsky.richtext.facet#link", "uri": uri}],
+        })
+
+    for match in _BSKY_TAG_RE.finditer(encoded):
+        start = match.start()
+        end = match.end()
+        tag = match.group(1).decode("utf-8", errors="ignore")
+        facets.append({
+            "index": {"byteStart": start, "byteEnd": end},
+            "features": [{"$type": "app.bsky.richtext.facet#tag", "tag": tag}],
+        })
+
+    return facets
+
+
 class BlueskyPoster(SocialPoster):
     platform = "bluesky"
     # OAuth-only: a Bluesky bundle must contain the per-credential ES256
@@ -547,6 +618,9 @@ class BlueskyPoster(SocialPoster):
                 "text": text,
                 "createdAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
+            facets = _build_bluesky_facets(text)
+            if facets:
+                record["facets"] = facets
             if embed is not None:
                 record["embed"] = embed
 
