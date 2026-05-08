@@ -1,4 +1,4 @@
-"""Entry point for the Drew's YT Scheduler application."""
+"""Entry point for the Drew's Video + Socials Scheduler application."""
 
 from __future__ import annotations
 
@@ -123,7 +123,7 @@ def main():
         print("Authentication successful!")
 
     else:
-        print("Drew's YT Scheduler")
+        print("Drew's Video + Socials Scheduler")
         print()
         print("Commands:")
         print("  yt-scheduler              Start the web server (default)")

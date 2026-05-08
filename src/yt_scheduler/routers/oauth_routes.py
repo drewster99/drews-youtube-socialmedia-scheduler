@@ -632,7 +632,7 @@ async def mastodon_start(data: dict):
             register = await client.post(
                 f"{instance}/api/v1/apps",
                 data={
-                    "client_name": "Drew's YT Scheduler",
+                    "client_name": "Drew's Video + Socials Scheduler",
                     "redirect_uris": redirect_uri,
                     "scopes": MASTODON_SCOPES,
                     "website": "https://github.com/drewster99/drews-youtube-socialmedia-scheduler",

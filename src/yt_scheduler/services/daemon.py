@@ -31,7 +31,7 @@ LINUX_SERVICE_PATH = LINUX_SERVICE_DIR / f"{LINUX_SERVICE_NAME}.service"
 
 
 _MACOS_INSTRUCTION = (
-    "On macOS the background server is managed by the Drew's YT Scheduler "
+    "On macOS the background server is managed by the Drew's Video + Socials Scheduler "
     ".app via SMAppService. Open the app and use Settings → Background "
     "service to install or restart it."
 )
@@ -52,7 +52,7 @@ def _generate_systemd_unit() -> str:
     exec_start = shlex.join(parts)
     return dedent(f"""\
         [Unit]
-        Description=Drew's YT Scheduler — video publishing and social media automation
+        Description=Drew's Video + Socials Scheduler — video publishing and social media automation
         After=network-online.target
         Wants=network-online.target
 

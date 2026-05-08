@@ -124,7 +124,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Drew's YT Scheduler",
+    title="Drew's Video + Socials Scheduler",
     version=build_info.VERSION,
     lifespan=lifespan,
 )

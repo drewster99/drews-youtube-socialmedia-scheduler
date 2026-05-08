@@ -49,7 +49,7 @@ struct SettingsView: View {
                             state.setLoginItemEnabled(newValue)
                             (NSApp.delegate as? AppDelegate)?.setMenuBarVisible(newValue)
                         }
-                    Text("Adds a status item to the menu bar with quick controls. Also registers Drew's YT Scheduler as a login item so the menu-bar item is available after restart. Background service is unaffected — it always starts on login.")
+                    Text("Adds a status item to the menu bar with quick controls. Also registers Drew's Video + Socials Scheduler as a login item so the menu-bar item is available after restart. Background service is unaffected — it always starts on login.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

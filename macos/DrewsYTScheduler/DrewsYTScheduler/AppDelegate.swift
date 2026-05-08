@@ -81,21 +81,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // App menu — title is replaced by AppKit with the app name.
         let appMenuItem = NSMenuItem()
-        appMenuItem.title = "Drew's YT Scheduler"
+        appMenuItem.title = "Drew's Video + Socials Scheduler"
         let appMenu = NSMenu()
-        appMenu.addItem(NSMenuItem(title: "About Drew's YT Scheduler", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: ""))
+        appMenu.addItem(NSMenuItem(title: "About Drew's Video + Socials Scheduler", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: ""))
         appMenu.addItem(.separator())
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(showSettingsAction), keyEquivalent: ",")
         settingsItem.target = self
         appMenu.addItem(settingsItem)
         appMenu.addItem(.separator())
-        appMenu.addItem(NSMenuItem(title: "Hide Drew's YT Scheduler", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h"))
+        appMenu.addItem(NSMenuItem(title: "Hide Drew's Video + Socials Scheduler", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h"))
         let hideOthers = NSMenuItem(title: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
         hideOthers.keyEquivalentModifierMask = [.command, .option]
         appMenu.addItem(hideOthers)
         appMenu.addItem(NSMenuItem(title: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: ""))
         appMenu.addItem(.separator())
-        appMenu.addItem(NSMenuItem(title: "Quit Drew's YT Scheduler", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        appMenu.addItem(NSMenuItem(title: "Quit Drew's Video + Socials Scheduler", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         appMenuItem.submenu = appMenu
         mainMenu.addItem(appMenuItem)
 
@@ -318,7 +318,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard statusItem == nil else { return }
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
-            button.image = NSImage(systemSymbolName: "play.rectangle.fill", accessibilityDescription: "Drew's YT Scheduler")
+            button.image = NSImage(systemSymbolName: "play.rectangle.fill", accessibilityDescription: "Drew's Video + Socials Scheduler")
             button.image?.size = NSSize(width: 18, height: 18)
         }
         let menu = NSMenu()
@@ -415,7 +415,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let button = statusItem?.button else { return }
         let mismatched = state.buildMismatch != nil
         let symbol = mismatched ? "exclamationmark.triangle.fill" : "play.rectangle.fill"
-        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Drew's YT Scheduler")
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Drew's Video + Socials Scheduler")
         image?.isTemplate = !mismatched
         button.image = image
         button.image?.size = NSSize(width: 18, height: 18)

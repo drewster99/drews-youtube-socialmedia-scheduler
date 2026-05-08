@@ -18,10 +18,10 @@ struct WelcomeView: View {
                 BuildMismatchBanner(bundle: mismatch.bundle, server: mismatch.server)
             }
 
-            Text("Welcome to Drew's YT Scheduler")
+            Text("Welcome to Drew's Video + Socials Scheduler")
                 .font(.title2.weight(.semibold))
 
-            Text("Drew's YT Scheduler runs a small local server in the background that handles uploads, scheduled publishing, transcript polling, and comment moderation. It needs to keep running even when this window is closed.")
+            Text("Drew's Video + Socials Scheduler runs a small local server in the background that handles uploads, scheduled publishing, transcript polling, and comment moderation. It needs to keep running even when this window is closed.")
                 .fixedSize(horizontal: false, vertical: true)
 
             GroupBox(label: Text("Step 1 — Install the background service").font(.headline)) {
@@ -37,7 +37,7 @@ struct WelcomeView: View {
                         }
                     }
                     if state.agentStatus == .requiresApproval {
-                        Text("macOS will open System Settings → Login Items. Enable “Drew's YT Scheduler”, then return here.")
+                        Text("macOS will open System Settings → Login Items. Enable “Drew's Video + Socials Scheduler”, then return here.")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }

@@ -1,4 +1,4 @@
-# Drew's YT Scheduler
+# Drew's Video + Socials Scheduler
 
 A local web app for managing YouTube video publishing across multiple projects, with AI-powered descriptions, multiple transcript backends, tier-aware templates, per-video activity logs, and cross-platform social media scheduling.
 
@@ -49,7 +49,7 @@ yt-scheduler            # serves http://127.0.0.1:8008
 
 ```bash
 macos/build.sh
-open "macos/build/Drew's YT Scheduler.app"
+open "macos/build/Drew's Video + Socials Scheduler.app"
 ```
 
 The build embeds a relocatable Python 3.12 + all deps, copies the source + migrations into `Contents/Resources/yt_scheduler_src/`, and produces a ~360 MB self-contained `.app`. The menu-bar icon is a play-rectangle ▶︎ in the top-right.

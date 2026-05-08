@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ============================================================================
-# Drew's YT Scheduler — macOS App Build Script
+# Drew's Video + Socials Scheduler — macOS App Build Script
 #
 # Produces a self-contained .app bundle with:
 #   - Swift window-based app (no menubar-only mode)
@@ -61,7 +61,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build"
-APP_NAME="Drew's YT Scheduler"
+APP_NAME="Drew's Video + Socials Scheduler"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 SWIFT_PACKAGE_DIR="$SCRIPT_DIR/DrewsYTScheduler"
 SWIFT_TARGET="DrewsYTScheduler"
@@ -114,7 +114,7 @@ fi
 
 # --- summary ----------------------------------------------------------------
 
-echo "=== Drew's YT Scheduler Build ==="
+echo "=== Drew's Video + Socials Scheduler Build ==="
 echo "Kind:       $BUILD_KIND"
 echo "Version:    $VERSION (#$BUILD_NUMBER)"
 echo "Build ID:   $BUILD_ID"
@@ -153,7 +153,8 @@ mkdir -p "$APP_BUNDLE/Contents/Library/LaunchAgents"
 cp "$SWIFT_BINARY" "$APP_BUNDLE/Contents/MacOS/$SWIFT_TARGET"
 
 # App icon: build a proper multi-resolution AppIcon.icns from the
-# 1024x1024 source PNG. Without this the .app shows the generic macOS
+# 1024x1024 source PNG (with squircle alpha). Without this the .app
+# shows the generic macOS
 # placeholder icon in Finder, the Dock, and the menu bar.
 ICON_SOURCE="$PROJECT_DIR/macos/Resources/AppIcon.png"
 if [ -f "$ICON_SOURCE" ]; then
@@ -192,9 +193,9 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>Drew's YT Scheduler</string>
+    <string>Drew's Video + Socials Scheduler</string>
     <key>CFBundleDisplayName</key>
-    <string>Drew's YT Scheduler</string>
+    <string>Drew's Video + Socials Scheduler</string>
     <key>CFBundleIdentifier</key>
     <string>$BUNDLE_ID</string>
     <key>CFBundleVersion</key>
@@ -218,9 +219,9 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
     <key>NSSupportsSuddenTermination</key>
     <false/>
     <key>NSSpeechRecognitionUsageDescription</key>
-    <string>Drew's YT Scheduler uses on-device Speech Recognition to transcribe your videos. The audio stays on this Mac.</string>
+    <string>Drew's Video + Socials Scheduler uses on-device Speech Recognition to transcribe your videos. The audio stays on this Mac.</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Drew's YT Scheduler uses Speech Recognition on local video files; macOS classifies this as microphone access.</string>
+    <string>Drew's Video + Socials Scheduler uses Speech Recognition on local video files; macOS classifies this as microphone access.</string>
     <key>DYSBuildKind</key>
     <string>$BUILD_KIND</string>
     <key>DYSBuildId</key>

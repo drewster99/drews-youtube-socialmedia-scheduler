@@ -212,6 +212,6 @@ We also need an app icon.
 
 The app itself should be renamed, as should the repo.
 repo slug drews-youtube-socialmedia-scheduler
-Displayname "Drew's YT Scheduler"
+Displayname "Drew's Video + Socials Scheduler"
 
 Or publisher?

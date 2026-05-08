@@ -1,4 +1,4 @@
-/* Drew's YT Scheduler — shared JS */
+/* Drew's Video + Socials Scheduler — shared JS */
 
 function showToast(message, type = 'info') {
     const container = document.getElementById('toast-container');
