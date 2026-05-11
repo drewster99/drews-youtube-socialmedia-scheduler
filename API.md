@@ -670,6 +670,30 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 
 **Renderer** — `mode=transcript` (and the transcript leg of `auto`) substitutes the prompt body from `prompt_templates.description_from_transcript` through the same engine as [`POST /api/expand_text`](#post-apiexpand_text), then sends the substituted prompt to Claude in a single call. Any `{{ai: ...}}`, `{{var!}}`, or `{{var??default}}` syntax in the prompt-template body is honoured. `mode=frames` skips substitution entirely — it sends the keyframes with a hardcoded vision instruction.
 
+### `POST /api/videos/{video_id}/generate-tags`
+
+**Purpose** — Suggest YouTube tags for a video with Claude, from its metadata or from extracted keyframes.
+
+**Request body** (optional):
+
+```json
+{ "mode": "metadata" | "frames" }
+```
+
+`mode=metadata` (default) uses the title + description + transcript. `mode=frames` samples keyframes from the local video file and tags from what's on screen — handy when there's no transcript.
+
+**Response 200** — `{"tags": ["...", "..."]}` (lowercased, comma-stripped). The result is **not** persisted; the caller stages it in the editor and commits via the normal metadata update, mirroring `generate-description`'s staging behaviour.
+
+**Errors**
+
+- `404` — Video not found.
+- `400` — `mode=frames` without a local video file.
+- `502` — Anthropic auth/transport failure (special-cased for 401 with a message asking the user to update their API key) or ffmpeg returning no usable keyframes.
+
+**Side effects** — Calls Anthropic API; for frames mode also calls `ffmpeg` to extract keyframes. No DB write.
+
+**Renderer** — `mode=metadata` substitutes the prompt body from `prompt_templates.tags_from_metadata` through the same engine as [`POST /api/expand_text`](#post-apiexpand_text). `mode=frames` substitutes `prompt_templates.tags_from_frames` and sends it alongside the keyframes. Both calls force a "comma-separated list only" system prompt.
+
 ### `POST /api/videos/{video_id}/apply-description`
 
 **Purpose** — Push the previously generated description to YouTube and into the local row.

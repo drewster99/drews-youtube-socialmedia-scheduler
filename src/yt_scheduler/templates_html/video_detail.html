@@ -57,6 +57,18 @@
                 <div class="form-group" data-field="tags">
                     <label>Tags</label>
                     <input type="text" id="meta-tags" name="tags">
+                    <div class="tag-actions" style="display: flex; gap: 0.5rem; margin-top: 0.5rem;">
+                        <button type="button" class="btn btn-sm" id="btn-gen-tags-meta"
+                                onclick="generateTags('metadata')"
+                                title="Have Claude suggest tags from the title, description, and transcript.">
+                            Generate tags
+                        </button>
+                        <button type="button" class="btn btn-sm" id="btn-gen-tags-frames"
+                                onclick="generateTags('frames')" style="display:none;"
+                                title="Sample keyframes from the video file and have Claude suggest tags from what's on screen.">
+                            Generate tags from video
+                        </button>
+                    </div>
                 </div>
                 <div class="form-group" data-field="privacy_status">
                     <label>Privacy</label>
@@ -509,6 +521,7 @@ async function loadVideo() {
     };
     refreshDirtyState();
     updateRegenerateVisibility();
+    updateTagGenVisibility();
 
     // Status panel
     document.getElementById('st-status').textContent = video.status;
@@ -1395,6 +1408,60 @@ async function regenerateDescription(mode) {
         btn.textContent = oldText;
         // Re-evaluate disabled state in case transcript appeared during the call.
         updateRegenerateVisibility();
+    }
+}
+
+// --- Generate tags -------------------------------------------------------
+
+function updateTagGenVisibility() {
+    const fromVideo = document.getElementById('btn-gen-tags-frames');
+    if (!fromVideo || !videoData) return;
+    fromVideo.style.display = videoData.video_file_path ? 'inline-flex' : 'none';
+}
+
+async function generateTags(mode) {
+    const btnId = mode === 'frames' ? 'btn-gen-tags-frames' : 'btn-gen-tags-meta';
+    const btn = document.getElementById(btnId);
+    if (!btn || btn.disabled) return;
+    const tagBtns = ['btn-gen-tags-meta', 'btn-gen-tags-frames']
+        .map(id => document.getElementById(id))
+        .filter(Boolean);
+    const oldText = btn.textContent;
+    tagBtns.forEach(b => b.disabled = true);
+    btn.textContent = mode === 'frames' ? 'Watching video…' : 'Thinking…';
+    try {
+        const resp = await fetch(`/api/videos/${videoId}/generate-tags`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ mode }),
+        });
+        if (resp.ok) {
+            const result = await resp.json();
+            const tags = Array.isArray(result.tags) ? result.tags : [];
+            // Drop the suggestions into the editor as a dirty edit; the user
+            // reviews them and commits with "Update to YouTube" or rolls back.
+            document.getElementById('meta-tags').value = tags.join(', ');
+            refreshDirtyState();
+            showToast(
+                tags.length
+                    ? `Suggested ${tags.length} tag${tags.length === 1 ? '' : 's'} — review and save`
+                    : 'Claude returned no tags',
+                tags.length ? 'info' : 'error',
+            );
+        } else {
+            let msg = 'Tag generation failed.';
+            try {
+                const err = await resp.json();
+                if (err && err.detail) msg = `Tag generation failed: ${err.detail}`;
+            } catch (_) { /* non-JSON error body */ }
+            showToast(msg, 'error');
+        }
+    } catch (e) {
+        showToast(`Tag generation failed: ${e.message}`, 'error');
+    } finally {
+        tagBtns.forEach(b => b.disabled = false);
+        btn.textContent = oldText;
+        updateTagGenVisibility();
     }
 }
 

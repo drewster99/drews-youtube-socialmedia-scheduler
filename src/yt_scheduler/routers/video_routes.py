@@ -777,6 +777,79 @@ async def generate_description(video_id: str, data: dict | None = None):
     return {"description": full_description, "raw_ai_description": description}
 
 
+@router.post("/{video_id}/generate-tags")
+async def generate_tags(video_id: str, data: dict | None = None):
+    """Suggest YouTube tags for a video with Claude.
+
+    Optional body keys:
+      * ``mode``: ``"metadata"`` (default — title + description + transcript)
+        or ``"frames"`` (sample keyframes from the local video file and tag
+        from what's visible; useful when there's no transcript).
+
+    Returns ``{"tags": [...]}``. The result is intentionally *not* persisted —
+    the caller drops it into the editor for review and saves through the
+    normal metadata update, mirroring how ``generate-description`` stages its
+    output rather than writing straight to the live field.
+    """
+    from pathlib import Path as _P
+
+    from yt_scheduler.services import media as media_service
+
+    db = await get_db()
+    rows = await db.execute_fetchall("SELECT * FROM videos WHERE id = ?", (video_id,))
+    if not rows:
+        raise HTTPException(404, "Video not found")
+
+    video = dict(rows[0])
+    project_id = int(video.get("project_id") or 1)
+    mode = ((data or {}).get("mode") or "metadata").strip()
+
+    try:
+        if mode == "frames":
+            video_file = video.get("video_file_path") or ""
+            if not (video_file and _P(video_file).exists()):
+                raise HTTPException(
+                    400,
+                    "No local video file to extract keyframes from. Re-import "
+                    "the video or upload a copy.",
+                )
+            frames = await asyncio.to_thread(
+                media_service.extract_keyframes, video_file, 6,
+            )
+            if not frames:
+                raise HTTPException(
+                    502,
+                    "ffmpeg returned no usable keyframes — the video file may "
+                    "be corrupted or in an unsupported format.",
+                )
+            tags = await ai.generate_tags_from_frames(
+                title=video.get("title", ""),
+                description=video.get("description", "") or "",
+                frames=frames,
+                project_id=project_id,
+            )
+        else:
+            tags = await ai.generate_tags_from_metadata(
+                title=video.get("title", ""),
+                description=video.get("description", "") or "",
+                transcript=video.get("transcript", "") or "",
+                project_id=project_id,
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        msg = str(e)
+        if "authentication_error" in msg or "invalid x-api-key" in msg or "401" in msg:
+            raise HTTPException(
+                502,
+                "Anthropic API key rejected (401). Open Settings and replace it "
+                "with a valid key from console.anthropic.com (starts with sk-ant-).",
+            )
+        raise HTTPException(502, f"Claude API call failed: {msg}")
+
+    return {"tags": tags}
+
+
 @router.post("/{video_id}/apply-description")
 async def apply_description(video_id: str):
     """Apply the generated description to the YouTube video."""
