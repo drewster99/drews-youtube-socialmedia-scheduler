@@ -580,8 +580,8 @@ def transcribe(
                     hint = (
                         " — macOS likely killed the helper for privacy. Open "
                         "System Settings → Privacy & Security → Speech "
-                        "Recognition and enable access for Drew's YT "
-                        "Scheduler."
+                        "Recognition and enable access for Drew's Video + "
+                        "Socials Scheduler."
                     )
                 raise RuntimeError(f"Backend {name} failed: {e}{hint}") from e
             if not (result and result.segments):

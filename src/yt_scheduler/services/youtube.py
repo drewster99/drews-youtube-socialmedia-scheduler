@@ -291,7 +291,14 @@ def download_caption(caption_id: str, fmt: str = "srt") -> str:
 # YouTube auto-captions live on a track owned by YouTube (ASR) that we can't
 # overwrite. Our own uploads create / update a separate user-owned track that
 # we tag with this name so we can find it again on subsequent saves.
-_OUR_CAPTION_TRACK_NAME = "Drew's YT Scheduler"
+#
+# The track ``name`` is publicly visible via the YouTube API and surfaces in
+# the player's captions submenu when a video has multiple tracks for the same
+# language, so it has to match the user-facing brand. Legacy tracks created
+# under the old name are migrated in place on the next save (the lookup below
+# matches either name, but we always write the new one).
+_OUR_CAPTION_TRACK_NAME = "Drew's Video + Socials Scheduler"
+_LEGACY_CAPTION_TRACK_NAMES: tuple[str, ...] = ("Drew's YT Scheduler",)
 
 
 def upload_caption(
@@ -324,10 +331,13 @@ def upload_caption(
     )
 
     # Look for an existing track with our name so we update instead of
-    # piling up duplicates on each save.
+    # piling up duplicates on each save. Legacy names are also accepted so
+    # tracks uploaded under the previous brand get migrated to the new name
+    # on the next save rather than left orphaned alongside a fresh duplicate.
+    recognized_names = {name, *_LEGACY_CAPTION_TRACK_NAMES}
     existing = list_captions(video_id)
     ours = next(
-        (c for c in existing if c.get("snippet", {}).get("name") == name),
+        (c for c in existing if c.get("snippet", {}).get("name") in recognized_names),
         None,
     )
 
