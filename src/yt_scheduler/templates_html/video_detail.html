@@ -1312,9 +1312,12 @@ document.getElementById('metadata-form').addEventListener('submit', async (event
     try {
         let resp;
         try {
+            // _silent: this handler shows its own contextual error toasts;
+            // without it the global fetch wrapper would also toast → two.
             resp = await fetch(`/api/videos/${videoId}`, {
                 method: 'PUT',
                 headers: {'Content-Type': 'application/json'},
+                _silent: true,
                 body: JSON.stringify(data),
             });
         } catch (e) {
@@ -1433,21 +1436,21 @@ async function generateTags(mode) {
         const resp = await fetch(`/api/videos/${videoId}/generate-tags`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
+            _silent: true,  // we toast our own contextual errors below
             body: JSON.stringify({ mode }),
         });
         if (resp.ok) {
             const result = await resp.json();
             const tags = Array.isArray(result.tags) ? result.tags : [];
-            // Drop the suggestions into the editor as a dirty edit; the user
-            // reviews them and commits with "Update to YouTube" or rolls back.
-            document.getElementById('meta-tags').value = tags.join(', ');
-            refreshDirtyState();
-            showToast(
-                tags.length
-                    ? `Suggested ${tags.length} tag${tags.length === 1 ? '' : 's'} — review and save`
-                    : 'Claude returned no tags',
-                tags.length ? 'info' : 'error',
-            );
+            if (tags.length) {
+                // Drop the suggestions into the editor as a dirty edit; the
+                // user reviews them and commits with "Update to YouTube".
+                document.getElementById('meta-tags').value = tags.join(', ');
+                refreshDirtyState();
+                showToast(`Suggested ${tags.length} tag${tags.length === 1 ? '' : 's'} — review and save`, 'info');
+            } else {
+                showToast('Claude returned no tags — leaving the field unchanged.', 'error');
+            }
         } else {
             let msg = 'Tag generation failed.';
             try {
