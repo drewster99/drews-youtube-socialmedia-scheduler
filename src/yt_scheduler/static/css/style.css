@@ -267,6 +267,21 @@ body {
 .btn-sm { padding: 0.3rem 0.6rem; font-size: 0.8rem; }
 .btn-lg { padding: 0.75rem 1.5rem; font-size: 1rem; }
 
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Inline busy spinner for buttons mid-request (e.g. "Updating…"). */
+.btn-spinner {
+    display: inline-block;
+    width: 0.8em;
+    height: 0.8em;
+    margin-right: 0.45em;
+    border: 2px solid currentColor;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    vertical-align: -0.05em;
+}
+
 /* Badges */
 .badge {
     display: inline-block;
@@ -1317,8 +1332,11 @@ dialog.modal-tall { max-height: 86vh; overflow-y: auto; }
 /* Diff modal body */
 .diff-body { font-size: 0.85rem; }
 .diff-section { margin-top: 0.75rem; }
-.diff-section h4 { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
-.diff-section pre {
+.diff-section h4,
+.diff-col h4 { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.25rem; }
+.diff-section pre,
+.diff-inline,
+.diff-col pre {
     background: var(--bg-input);
     border: 1px solid var(--border);
     border-radius: 4px;
@@ -1326,6 +1344,55 @@ dialog.modal-tall { max-height: 86vh; overflow-y: auto; }
     overflow: auto;
     white-space: pre-wrap;
     word-break: break-word;
+    line-height: 1.5;
+}
+
+/* Three-way diff view toggle (segmented control) */
+.diff-mode-toggle {
+    display: inline-flex;
+    margin: 0.25rem 0 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+}
+.diff-mode-btn {
+    -webkit-appearance: none;
+    appearance: none;
+    background: var(--bg-input);
+    color: var(--text-secondary);
+    border: none;
+    border-right: 1px solid var(--border);
+    padding: 0.35rem 0.8rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+}
+.diff-mode-btn:last-child { border-right: none; }
+.diff-mode-btn:hover { color: var(--text-primary); }
+.diff-mode-btn.active { background: var(--accent); color: #000; font-weight: 600; }
+
+/* Inline / side-by-side change highlights */
+.diff-body del {
+    background: rgba(248, 81, 73, 0.18);
+    color: #f3a8a3;
+    text-decoration: line-through;
+    text-decoration-color: rgba(248, 81, 73, 0.85);
+    border-radius: 2px;
+}
+.diff-body ins {
+    background: rgba(46, 160, 67, 0.22);
+    color: #7ee787;
+    text-decoration: none;
+    border-radius: 2px;
+}
+.diff-cols {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+    margin-top: 0.5rem;
+}
+.diff-col { min-width: 0; }
+@media (max-width: 700px) {
+    .diff-cols { grid-template-columns: 1fr; }
 }
 
 /* Toast notifications */

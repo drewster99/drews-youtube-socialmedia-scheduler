@@ -250,6 +250,11 @@
     <form method="dialog">
         <h3><span id="diff-field-name"></span></h3>
         <p class="form-hint">Updated <span id="diff-when"></span></p>
+        <div class="diff-mode-toggle" id="diff-mode-toggle" role="group" aria-label="Diff view mode">
+            <button type="button" class="diff-mode-btn" data-mode="inline">Inline diff</button>
+            <button type="button" class="diff-mode-btn" data-mode="split">Side-by-side</button>
+            <button type="button" class="diff-mode-btn" data-mode="plain">Before / after</button>
+        </div>
         <div class="diff-body"></div>
         <div class="modal-actions">
             <button class="btn btn-primary">Close</button>
@@ -888,8 +893,16 @@ document.addEventListener('click', (event) => {
         const eventId = Number(platformLink.dataset.eventId);
         const ev = eventCache.find(e => e.id === eventId);
         if (ev) showScheduledPostModal(ev);
+        return;
+    }
+    const diffModeBtn = event.target.closest?.('.diff-mode-btn');
+    if (diffModeBtn) {
+        setFieldDiffMode(diffModeBtn.dataset.mode);
     }
 });
+
+// Diff modal state. ``mode`` persists across opens so a chosen view sticks.
+const fieldDiffState = { before: '', after: '', mode: 'inline', hasChange: false };
 
 function showFieldDiffModal(event, field) {
     const dialog = document.getElementById('field-diff-dialog');
@@ -897,16 +910,114 @@ function showFieldDiffModal(event, field) {
     document.getElementById('diff-when').textContent = fmtEventDate(event.created_at);
     const change = event.payload?.[field];
     if (!change) {
-        dialog.querySelector('.diff-body').textContent = '(no change recorded)';
+        fieldDiffState.before = '';
+        fieldDiffState.after = '';
+        fieldDiffState.hasChange = false;
     } else {
-        const before = formatDiffValue(change.old);
-        const after = formatDiffValue(change.new);
-        dialog.querySelector('.diff-body').innerHTML = `
-            <div class="diff-section"><h4>Before</h4><pre>${escapeHtml(before)}</pre></div>
-            <div class="diff-section"><h4>After</h4><pre>${escapeHtml(after)}</pre></div>
-        `;
+        fieldDiffState.before = formatDiffValue(change.old);
+        fieldDiffState.after = formatDiffValue(change.new);
+        fieldDiffState.hasChange = true;
     }
+    document.getElementById('diff-mode-toggle').style.display = fieldDiffState.hasChange ? '' : 'none';
+    renderFieldDiff();
     dialog.showModal();
+}
+
+function setFieldDiffMode(mode) {
+    if (mode !== 'inline' && mode !== 'split' && mode !== 'plain') return;
+    fieldDiffState.mode = mode;
+    renderFieldDiff();
+}
+
+function renderFieldDiff() {
+    const { before, after, mode, hasChange } = fieldDiffState;
+    const body = document.getElementById('field-diff-dialog').querySelector('.diff-body');
+    document.querySelectorAll('#diff-mode-toggle .diff-mode-btn').forEach(b => {
+        const active = b.dataset.mode === mode;
+        b.classList.toggle('active', active);
+        b.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+    if (!hasChange) {
+        body.textContent = '(no change recorded)';
+        return;
+    }
+    const beforeAfterPanes = () =>
+        `<div class="diff-section"><h4>Before</h4><pre>${escapeHtml(before)}</pre></div>` +
+        `<div class="diff-section"><h4>After</h4><pre>${escapeHtml(after)}</pre></div>`;
+    if (mode === 'plain') {
+        body.innerHTML = beforeAfterPanes();
+        return;
+    }
+    const aTok = tokenizeForDiff(before);
+    const bTok = tokenizeForDiff(after);
+    // The LCS table is O(n*m) memory; bail to the plain panes if a field is so
+    // large that the diff would be both slow and unreadable anyway.
+    if (aTok.length * bTok.length > 4_000_000) {
+        body.innerHTML =
+            '<p class="form-hint">Too large to diff — showing before / after.</p>' + beforeAfterPanes();
+        return;
+    }
+    const parts = coalesceDiff(diffTokens(aTok, bTok));
+    if (mode === 'split') {
+        let left = '', right = '';
+        for (const p of parts) {
+            const t = escapeHtml(p.text);
+            if (p.type === 'eq') { left += t; right += t; }
+            else if (p.type === 'del') left += `<del>${t}</del>`;
+            else right += `<ins>${t}</ins>`;
+        }
+        body.innerHTML =
+            `<div class="diff-cols">` +
+            `<div class="diff-col"><h4>Before</h4><pre>${left}</pre></div>` +
+            `<div class="diff-col"><h4>After</h4><pre>${right}</pre></div>` +
+            `</div>`;
+        return;
+    }
+    let html = '';
+    for (const p of parts) {
+        const t = escapeHtml(p.text);
+        if (p.type === 'eq') html += t;
+        else if (p.type === 'del') html += `<del>${t}</del>`;
+        else html += `<ins>${t}</ins>`;
+    }
+    body.innerHTML = `<pre class="diff-inline">${html}</pre>`;
+}
+
+// Split into word and whitespace runs so the diff highlights at word
+// granularity while still tracking added / removed line breaks.
+function tokenizeForDiff(s) {
+    return String(s ?? '').match(/\s+|\S+/g) || [];
+}
+
+// Classic LCS walk → list of {type: 'eq'|'del'|'ins', text} token ops.
+function diffTokens(a, b) {
+    const n = a.length, m = b.length;
+    const dp = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+    for (let i = n - 1; i >= 0; i--) {
+        for (let j = m - 1; j >= 0; j--) {
+            dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+        }
+    }
+    const out = [];
+    let i = 0, j = 0;
+    while (i < n && j < m) {
+        if (a[i] === b[j]) { out.push({ type: 'eq', text: a[i] }); i++; j++; }
+        else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push({ type: 'del', text: a[i] }); i++; }
+        else { out.push({ type: 'ins', text: b[j] }); j++; }
+    }
+    while (i < n) { out.push({ type: 'del', text: a[i] }); i++; }
+    while (j < m) { out.push({ type: 'ins', text: b[j] }); j++; }
+    return out;
+}
+
+function coalesceDiff(parts) {
+    const out = [];
+    for (const p of parts) {
+        const last = out[out.length - 1];
+        if (last && last.type === p.type) last.text += p.text;
+        else out.push({ type: p.type, text: p.text });
+    }
+    return out;
 }
 
 function showScheduledPostModal(event) {
@@ -1171,6 +1282,9 @@ function revertMetadata() {
 
 document.getElementById('metadata-form').addEventListener('submit', async (event) => {
     event.preventDefault();
+    const saveBtn = document.getElementById('btn-save-meta');
+    const revertBtn = document.getElementById('btn-revert-meta');
+    if (saveBtn.disabled) return;
     const current = readMetaForm();
     const data = {
         title: current.title,
@@ -1178,14 +1292,40 @@ document.getElementById('metadata-form').addEventListener('submit', async (event
         tags: current.tags.split(',').map(t => t.trim()).filter(Boolean),
         privacy_status: current.privacy_status,
     };
-    const resp = await fetch(`/api/videos/${videoId}`, {
-        method: 'PUT',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(data),
-    });
-    if (resp.ok) {
+    const savedLabel = saveBtn.textContent;
+    saveBtn.disabled = true;
+    revertBtn.disabled = true;
+    saveBtn.innerHTML = '<span class="btn-spinner" aria-hidden="true"></span>Updating…';
+    try {
+        let resp;
+        try {
+            resp = await fetch(`/api/videos/${videoId}`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(data),
+            });
+        } catch (e) {
+            showToast(`Update to YouTube failed: ${e.message}`, 'error');
+            return;
+        }
+        if (!resp.ok) {
+            let msg = 'Update to YouTube failed.';
+            try {
+                const err = await resp.json();
+                if (err && err.detail) msg = `Update to YouTube failed: ${err.detail}`;
+            } catch (_) { /* non-JSON error body */ }
+            showToast(msg, 'error');
+            return;
+        }
         showToast('Updated to YouTube', 'success');
-        await loadVideo();  // refreshes snapshot + log
+        try {
+            await loadVideo();  // refreshes snapshot + log
+        } catch (e) {
+            showToast(`Saved — but couldn't refresh the page: ${e.message}`, 'error');
+        }
+    } finally {
+        saveBtn.textContent = savedLabel;
+        refreshDirtyState();  // re-enables Save/Revert iff edits remain unsaved
     }
 });
 
