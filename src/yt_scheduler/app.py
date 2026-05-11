@@ -140,8 +140,25 @@ ensure_dirs()
 static_dir = Path(__file__).parent / "static"
 templates_dir = Path(__file__).parent / "templates_html"
 
-app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
-app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+class _RevalidatingStaticFiles(StaticFiles):
+    """StaticFiles that asks the browser to revalidate via etag every request.
+
+    Browsers fall back to heuristic freshness when no Cache-Control is set,
+    which can leave a CSS or template-driven asset stuck on a stale copy long
+    after the file has been edited and the server is serving the new bytes.
+    ``no-cache`` keeps the entry in the disk cache but forces a conditional
+    request, so unchanged files come back as 304 — cheap, and the next edit
+    is visible immediately.
+    """
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers.setdefault("Cache-Control", "no-cache")
+        return response
+
+
+app.mount("/static", _RevalidatingStaticFiles(directory=str(static_dir)), name="static")
+app.mount("/uploads", _RevalidatingStaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 html_templates = Jinja2Templates(directory=str(templates_dir))
 
