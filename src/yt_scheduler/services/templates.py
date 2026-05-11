@@ -591,6 +591,72 @@ async def delete_template(name: str, *, project_id: int) -> None:
     await db.commit()
 
 
+async def duplicate_template(
+    source_name: str, new_name: str, *, project_id: int
+) -> dict:
+    """Create ``new_name`` as a deep copy of ``source_name`` within a project.
+
+    Every slot is copied verbatim — built-in slots stay built-in, disabled
+    slots stay disabled, account bindings and order are preserved — but the
+    new *template* is never marked built-in (that flag is reserved for the
+    two protected names, and a copy is always deletable). Raises
+    :class:`ValueError` if the source is missing, the target name is taken,
+    or the target name collides with a reserved built-in name.
+    """
+    new_name = (new_name or "").strip()
+    if not new_name:
+        raise ValueError("New template name is required")
+    if new_name in BUILTIN_TEMPLATE_NAMES:
+        raise ValueError(f"'{new_name}' is a reserved built-in template name")
+
+    source = await get_template(source_name, project_id=project_id)
+    if source is None:
+        raise ValueError(f"Template '{source_name}' not found")
+
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT id FROM templates WHERE project_id = ? AND name = ?",
+        (project_id, new_name),
+    )
+    if await cursor.fetchone() is not None:
+        raise ValueError(f"A template named '{new_name}' already exists")
+
+    try:
+        cursor = await db.execute(
+            "INSERT INTO templates (project_id, name, description, applies_to, is_builtin) "
+            "VALUES (?, ?, ?, ?, 0)",
+            (project_id, new_name, source["description"], json.dumps(source["applies_to"])),
+        )
+    except aiosqlite.IntegrityError as exc:
+        raise ValueError(str(exc)) from exc
+    new_template_id = int(cursor.lastrowid)
+
+    for slot in source["slots"]:
+        await db.execute(
+            "INSERT INTO template_slots "
+            "(template_id, platform, social_account_id, is_builtin, is_disabled, "
+            " order_index, body, media, max_chars) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                new_template_id,
+                slot["platform"],
+                slot["social_account_id"],
+                1 if slot["is_builtin"] else 0,
+                1 if slot["is_disabled"] else 0,
+                int(slot["order_index"]),
+                slot["body"],
+                slot["media"],
+                int(slot["max_chars"]),
+            ),
+        )
+    await db.commit()
+
+    copied = await get_template(new_name, project_id=project_id)
+    if copied is None:
+        raise RuntimeError("Duplicated template disappeared between write and read")
+    return copied
+
+
 # --- Slot CRUD --------------------------------------------------------------
 
 

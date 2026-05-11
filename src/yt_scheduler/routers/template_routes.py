@@ -8,12 +8,22 @@ working.
 
 from __future__ import annotations
 
+import re
+
 from fastapi import APIRouter, HTTPException
 
 from yt_scheduler.services import projects as project_service
 from yt_scheduler.services import templates as tmpl
 
 router = APIRouter(prefix="/api/templates", tags=["templates"])
+
+# Template names live in URL paths and get echoed into the edit page's
+# inline JS, so keep them to a plain identifier shape.
+_TEMPLATE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_BAD_NAME_MSG = (
+    "Template name may contain only letters, digits, '_' and '-' "
+    "(and must start with a letter or digit)."
+)
 
 
 async def _resolve_project_id(project_slug: str | None) -> int:
@@ -46,9 +56,11 @@ async def get_template(name: str, project_slug: str | None = None):
 async def create_template(data: dict, project_slug: str | None = None):
     """Create or update a template."""
     project_id = await _resolve_project_id(project_slug)
-    name = data.get("name")
+    name = (data.get("name") or "").strip()
     if not name:
         raise HTTPException(400, "Template name is required")
+    if not _TEMPLATE_NAME_RE.match(name):
+        raise HTTPException(400, _BAD_NAME_MSG)
 
     try:
         await tmpl.save_template(
@@ -93,6 +105,27 @@ async def delete_template(name: str, project_slug: str | None = None):
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"status": "ok"}
+
+
+@router.post("/{name}/duplicate")
+async def duplicate_template(name: str, data: dict, project_slug: str | None = None):
+    """Create a new template as a deep copy of ``name``.
+
+    Body: ``{"new_name": "..."}``. Returns the newly created template
+    (same shape as ``GET /api/templates/{name}``).
+    """
+    project_id = await _resolve_project_id(project_slug)
+    new_name = (data.get("new_name") or "").strip()
+    if not new_name:
+        raise HTTPException(400, "new_name is required")
+    if not _TEMPLATE_NAME_RE.match(new_name):
+        raise HTTPException(400, _BAD_NAME_MSG)
+    try:
+        return await tmpl.duplicate_template(name, new_name, project_id=project_id)
+    except ValueError as exc:
+        msg = str(exc)
+        status = 404 if "not found" in msg.lower() else 409
+        raise HTTPException(status, msg) from exc
 
 
 # --- Slot CRUD --------------------------------------------------------------

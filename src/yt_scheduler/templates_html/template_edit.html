@@ -6,6 +6,7 @@
     <h1>Template: <span id="template-name">{{ template_name }}</span></h1>
     <div class="header-actions">
         <button class="btn btn-primary" onclick="saveTemplateMeta()">Save description &amp; applies-to</button>
+        <button class="btn btn-secondary" onclick="duplicateTemplate()">Duplicate template</button>
         <button class="btn btn-danger" id="delete-template-btn" onclick="deleteTemplate()">Delete template</button>
     </div>
 </div>
@@ -309,8 +310,46 @@ async function saveTemplateMeta() {
 
 async function deleteTemplate() {
     if (!confirm(`Delete template "${templateName}"?`)) return;
-    const resp = await fetch(`/api/templates/${templateName}?project_slug=${encodeURIComponent(projectSlug)}`, {method: 'DELETE'});
+    const resp = await fetch(`/api/templates/${encodeURIComponent(templateName)}?project_slug=${encodeURIComponent(projectSlug)}`, {method: 'DELETE'});
     if (resp.ok) window.location.href = `/projects/${projectSlug}/templates`;
+}
+
+const TEMPLATE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+
+async function duplicateTemplate() {
+    const raw = prompt(`Name for the copy of "${templateName}":`, `${templateName}_copy`);
+    if (raw === null) return;
+    const newName = raw.trim();
+    if (!newName) return;
+    if (!TEMPLATE_NAME_RE.test(newName)) {
+        showToast('Use letters, numbers, "_" and "-" only (must start with a letter or number).', 'error');
+        return;
+    }
+    if (newName === templateName) {
+        showToast('Pick a different name for the copy.', 'error');
+        return;
+    }
+    const slug = encodeURIComponent(projectSlug);
+    let resp;
+    try {
+        resp = await fetch(`/api/templates/${encodeURIComponent(templateName)}/duplicate?project_slug=${slug}`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            _silent: true,
+            body: JSON.stringify({ new_name: newName }),
+        });
+    } catch (e) {
+        showToast(`Could not duplicate: ${e.message}`, 'error');
+        return;
+    }
+    if (!resp.ok) {
+        let msg = 'Could not duplicate template.';
+        try { const e = await resp.json(); if (e && e.detail) msg = `Could not duplicate: ${e.detail}`; } catch (_) {}
+        showToast(msg, 'error');
+        return;
+    }
+    showToast(`Created "${newName}" — a copy of "${templateName}"`, 'success');
+    window.location.href = `/projects/${projectSlug}/templates/${encodeURIComponent(newName)}`;
 }
 
 async function previewAll() {
@@ -369,12 +408,32 @@ async function loadCredentialsForVisiblePlatforms() {
     credentialsByPlatform = Object.fromEntries(fetched);
 }
 
+const TEMPLATE_URL = `/api/templates/${encodeURIComponent(templateName)}?project_slug=${encodeURIComponent(projectSlug)}`;
+
+async function fetchTemplate() {
+    // Returns the template payload, or null on failure. A 404 here means the
+    // row was never persisted (e.g. an old "create" flow that only navigated)
+    // — so create it with defaults and retry, which makes Save / Add slot work.
+    // All fetches are silent so `loadTemplate` owns the single error toast.
+    let resp = await fetch(TEMPLATE_URL, {_silent: true});
+    if (resp.status === 404) {
+        const created = await fetch(`/api/templates?project_slug=${encodeURIComponent(projectSlug)}`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            _silent: true,
+            body: JSON.stringify({ name: templateName, description: '', applies_to: ['hook', 'short', 'segment', 'video'], platforms: {} }),
+        });
+        if (!created.ok) return null;
+        resp = await fetch(TEMPLATE_URL, {_silent: true});
+    }
+    return resp.ok ? await resp.json() : null;
+}
+
 async function loadTemplate() {
     let appliesTo = ['hook', 'short', 'segment', 'video'];
     try {
-        const resp = await fetch(`/api/templates/${templateName}?project_slug=${encodeURIComponent(projectSlug)}`);
-        if (resp.ok) {
-            template = await resp.json();
+        template = await fetchTemplate();
+        if (template) {
             slots = template.slots || [];
             document.getElementById('template-desc').value = template.description || '';
             if (Array.isArray(template.applies_to) && template.applies_to.length) {
@@ -387,9 +446,11 @@ async function loadTemplate() {
             }
         } else {
             slots = [];
+            showToast(`Couldn't load template "${templateName}".`, 'error');
         }
-    } catch {
+    } catch (e) {
         slots = [];
+        showToast(`Couldn't load template "${templateName}": ${e.message}`, 'error');
     }
     document.querySelectorAll('input[name="applies_to"]').forEach(box => {
         box.checked = appliesTo.includes(box.value);

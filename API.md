@@ -1011,7 +1011,7 @@ All template endpoints implicitly scope to `project_id=1` (the Default project) 
 
 **Response 200** — `{"status": "ok"}`.
 
-**Errors** — `400` (no `name`, empty `applies_to`, or DB integrity error).
+**Errors** — `400` (no `name`, name not matching `^[A-Za-z0-9][A-Za-z0-9_-]*$`, empty `applies_to`, or DB integrity error).
 
 **Side effects** — Upserts the template row plus one built-in slot per `platforms` key.
 
@@ -1034,6 +1034,18 @@ All template endpoints implicitly scope to `project_id=1` (the Default project) 
 **Errors** — `400` if `name` is one of the protected built-in templates.
 
 **Cascades** — Deleting a template cascades to all of its `template_slots` rows via `ON DELETE CASCADE` (`migrations/008_per_project_credentials.sql:77`). Already-generated `social_posts` rows are unaffected — they're denormalized snapshots of the rendered text at generation time and don't carry a slot FK.
+
+### `POST /api/templates/{name}/duplicate`
+
+**Purpose** — Create a new template as a deep copy of `{name}` within the same project.
+
+**Request body** — `{"new_name": "..."}`.
+
+**Response 200** — The newly created template (same shape as `GET /api/templates/{name}`).
+
+**Behaviour** — Copies the description, `applies_to`, and **every** slot verbatim (built-in slots stay built-in, disabled stays disabled, account bindings and order preserved). The new *template* row is never flagged `is_builtin` — only the two protected names carry that — so the copy is freely deletable.
+
+**Errors** — `400` (missing `new_name`, or name not matching `^[A-Za-z0-9][A-Za-z0-9_-]*$`), `404` (source `{name}` not found), `409` (`new_name` already exists, or collides with a reserved built-in name).
 
 ### `GET /api/templates/{name}/slots`
 

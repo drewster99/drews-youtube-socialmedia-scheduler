@@ -39,10 +39,43 @@ async function loadTemplates() {
     `).join('');
 }
 
-function createTemplate() {
-    const name = prompt('Template name (e.g., "announce_video", "premiere"):');
+const TEMPLATE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+
+async function createTemplate() {
+    const raw = prompt('Template name (e.g., "announce_video", "premiere"):');
+    if (raw === null) return;
+    const name = raw.trim();
     if (!name) return;
-    window.location.href = `/projects/${projectSlug}/templates/${name}`;
+    if (!TEMPLATE_NAME_RE.test(name)) {
+        showToast('Use letters, numbers, "_" and "-" only (must start with a letter or number).', 'error');
+        return;
+    }
+    // Persist the row up front so the edit page lands on a real template —
+    // its "Save" and "Add slot" actions both require the template to exist.
+    const slug = encodeURIComponent(projectSlug);
+    try {
+        const existing = await fetch(`/api/templates/${encodeURIComponent(name)}?project_slug=${slug}`, {_silent: true});
+        if (existing.ok) {
+            showToast(`A template named "${name}" already exists — open it from the list to edit.`, 'error');
+            return;
+        }
+        const resp = await fetch(`/api/templates?project_slug=${slug}`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            _silent: true,
+            body: JSON.stringify({ name, description: '', applies_to: ['hook', 'short', 'segment', 'video'], platforms: {} }),
+        });
+        if (!resp.ok) {
+            let msg = 'Could not create template.';
+            try { const e = await resp.json(); if (e && e.detail) msg = `Could not create template: ${e.detail}`; } catch (_) {}
+            showToast(msg, 'error');
+            return;
+        }
+    } catch (e) {
+        showToast(`Could not create template: ${e.message}`, 'error');
+        return;
+    }
+    window.location.href = `/projects/${projectSlug}/templates/${encodeURIComponent(name)}`;
 }
 
 loadTemplates();
