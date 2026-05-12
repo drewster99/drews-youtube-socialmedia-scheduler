@@ -504,7 +504,16 @@ class TwitterPoster(SocialPoster):
                     ) from exc2
 
             tweet_id = response.data["id"]
-            return {"url": f"https://x.com/i/status/{tweet_id}", "id": tweet_id}
+            out: dict = {"url": f"https://x.com/i/status/{tweet_id}", "id": tweet_id}
+            if existing_paths and not media_ids:
+                # The tweet went out, but every attachment upload failed —
+                # surface it so the caller doesn't report a clean success.
+                out["warning"] = (
+                    "Posted to X, but the attached media couldn't be uploaded. "
+                    "Re-run Connect with X to refresh the media.write scope, or "
+                    "check the file size/format."
+                )
+            return out
         except CredentialAuthError:
             raise
         except Exception as e:
@@ -1257,11 +1266,13 @@ class ThreadsPoster(SocialPoster):
         media_paths: list[str] | None = None,
         alt_texts: list[str] | None = None,
     ) -> dict:
-        # Threads media is deliberately deferred (user not currently using
-        # Threads). The signature takes the new kwargs for base-class
-        # consistency, but media is not attached.
+        # Threads' API posts text only — it can't attach media. Generation now
+        # drops a Threads slot's media and warns there, but a post created by
+        # older code may still carry media_paths; warn here too rather than
+        # letting it vanish silently.
         text = (text or "").strip()
         creds = self._get_creds()
+        had_media = bool(self._resolve_media_inputs(media_path, media_paths, alt_texts)[0])
 
         try:
             import httpx
@@ -1295,7 +1306,13 @@ class ThreadsPoster(SocialPoster):
                 post_id = publish_resp.json()["id"]
 
                 username = creds.get("username", "")
-                return {"url": f"https://threads.net/@{username}/post/{post_id}", "id": post_id}
+                out: dict = {"url": f"https://threads.net/@{username}/post/{post_id}", "id": post_id}
+                if had_media:
+                    out["warning"] = (
+                        "Posted to Threads as text only — Threads can't attach media yet, "
+                        "so the image/video wasn't included."
+                    )
+                return out
         except CredentialAuthError:
             raise
         except Exception as e:

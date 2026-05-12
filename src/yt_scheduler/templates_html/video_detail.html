@@ -1216,7 +1216,8 @@ async function loadSocialPosts() {
 
             const content = p.content || '';
             const limit = p.max_chars || PLATFORM_LIMITS[p.platform] || 0;
-            const overLimit = limit && content.length > limit;
+            const effLen = platformContentLength(p.platform, content);
+            const overLimit = limit && effLen > limit;
 
             let actions = '';
             if (isPosted) {
@@ -1256,7 +1257,7 @@ async function loadSocialPosts() {
                                       ${bodyClickable ? `onclick="openSocialPostEditor(${p.id})" title="Click to edit"` : ''}
                                  >${highlightUnresolvedTags(escapeHtml(content))}</div>`;
             const overWarn = overLimit
-                ? `<div class="post-warn">${content.length} exceeds max characters of ${limit}</div>`
+                ? `<div class="post-warn">${effLen} exceeds max characters of ${limit}</div>`
                 : '';
             return `
                 <div class="social-post-card ${overLimit ? 'social-post-over-limit' : ''}" data-post-card="${p.id}" style="${opacity}">
@@ -1937,6 +1938,7 @@ async function sendPost(postId) {
         const result = await resp.json();
         if (resp.ok) {
             showToast(`Posted! ${result.url || ''}`, 'success');
+            if (result.warning) showToast(result.warning, 'error');
             loadSocialPosts();
         } else {
             showToast(result.detail || 'Failed', 'error');
@@ -1993,6 +1995,7 @@ async function sendAllPosts() {
         if (sendResp.ok) {
             const result = await sendResp.json();
             showToast(`Posted to ${p.platform}! ${result.url || ''}`, 'success');
+            if (result.warning) showToast(result.warning, 'error');
             successes++;
         } else {
             const err = await sendResp.json();

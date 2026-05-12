@@ -676,7 +676,7 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
                 "posted_at": _dt.now(_tz.utc).isoformat(),
             },
         )
-        return {"status": "ok", "url": result.get("url", "")}
+        return {"status": "ok", "url": result.get("url", ""), "warning": result.get("warning")}
     except social.CredentialAuthError as e:
         if e.uuid:
             await mark_needs_reauth(e.uuid)
@@ -826,7 +826,9 @@ async def send_all_posts(
                 WHERE id = ?""",
                 (result.get("url", ""), post["id"]),
             )
-            results[post["platform"]] = {"status": "posted", "url": result.get("url", "")}
+            results[post["platform"]] = {
+                "status": "posted", "url": result.get("url", ""), "warning": result.get("warning"),
+            }
             from datetime import datetime as _dt, timezone as _tz
             await events.record_event(
                 video_id,

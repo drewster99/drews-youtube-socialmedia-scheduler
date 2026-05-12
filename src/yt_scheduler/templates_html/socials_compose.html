@@ -85,8 +85,28 @@ if (!videoId) {
 
 let templates = [];
 let accounts = [];
-let posts = [];     // post ids/state per platform after Generate
+let posts = [];     // the just-generated, still-actionable posts (drafts etc.)
 let postingSettings = null;
+let composedPlatforms = [];          // platforms the user checked for this generate
+let priorPostsByPlatform = {};       // platform -> most recent already-posted row (for the note)
+
+// Split a full /api/social/posts list into: (a) the actionable cards for the
+// platforms we just generated for — drafts / failed / approved, but never the
+// already-posted or in-flight rows; and (b) the most-recent already-posted row
+// per platform, surfaced as a "you already posted this" note on the new card.
+function applyPostFilter(all) {
+    const list = Array.isArray(all) ? all : [];
+    posts = list.filter(p =>
+        composedPlatforms.includes(p.platform) && p.status !== 'posted' && p.status !== 'sending'
+    );
+    priorPostsByPlatform = {};
+    const tOf = (p) => new Date(_ensureUtc(p.posted_at || p.updated_at || p.created_at)).getTime() || 0;
+    for (const p of list) {
+        if (!composedPlatforms.includes(p.platform) || p.status !== 'posted') continue;
+        const cur = priorPostsByPlatform[p.platform];
+        if (!cur || tOf(p) >= tOf(cur)) priorPostsByPlatform[p.platform] = p;
+    }
+}
 
 function projectSlugFromBody() {
     return "{{ current_project.slug if current_project else 'default' }}";
@@ -198,8 +218,9 @@ async function generatePreviews() {
         for (const w of warnings) showToast(w, 'error');
         document.getElementById('picker-card').style.display = 'none';
 
+        composedPlatforms = platforms.slice();
         const postsResp = await fetch(`/api/social/posts/${videoId}`);
-        posts = postsResp.ok ? await postsResp.json() : [];
+        applyPostFilter(postsResp.ok ? await postsResp.json() : []);
         renderPreviews();
         document.getElementById('btn-post-now').disabled = false;
         document.getElementById('btn-schedule').disabled = false;
@@ -236,25 +257,31 @@ function renderPreviews() {
         return;
     }
     container.innerHTML = posts.map(p => {
-        const isPosted = p.status === 'posted';
         const isFailed = p.status === 'failed';
         const cls = isFailed ? 'compose-card error' : 'compose-card';
+        const prior = priorPostsByPlatform[p.platform];
+        let priorNote = '';
+        if (prior) {
+            const when = new Date(_ensureUtc(prior.posted_at || prior.updated_at || prior.created_at)).toLocaleString();
+            const link = prior.post_url
+                ? ` — <a href="${escapeHtmlBasic(prior.post_url)}" target="_blank" rel="noopener">open</a>`
+                : '';
+            priorNote = `<div class="form-hint" style="margin: 0.25rem 0; color: var(--warning, #d29922);">⚠ Already posted to ${escapeHtmlBasic(p.platform)} for this video on ${escapeHtmlBasic(when)}${link}</div>`;
+        }
         return `
         <div class="${cls}" data-post-id="${p.id}" data-platform="${p.platform}">
             <div class="compose-header">
                 <label class="compose-include">
-                    <input type="checkbox" name="include" data-id="${p.id}" ${isPosted ? 'disabled' : 'checked'}>
+                    <input type="checkbox" name="include" data-id="${p.id}" checked>
                     <span class="platform-badge platform-${p.platform}">${p.platform}</span>
                 </label>
-                <span class="compose-status">${
-                    isPosted ? 'Posted ' + new Date(_ensureUtc(p.posted_at)).toLocaleString() :
-                    isFailed ? 'Error: ' + (p.error || 'unknown') : ''
-                }</span>
+                <span class="compose-status">${isFailed ? 'Error: ' + (p.error || 'unknown') : ''}</span>
             </div>
-            <textarea data-id="${p.id}" rows="4" ${isPosted ? 'disabled' : ''}>${(p.content || '').replace(/</g,'&lt;')}</textarea>
+            <textarea data-id="${p.id}" rows="4">${(p.content || '').replace(/</g,'&lt;')}</textarea>
             ${mediaSummaryHtml(p)}
+            ${priorNote}
             <div class="compose-actions">
-                <button class="btn btn-sm btn-outline-primary" onclick="postOne(${p.id})" ${isPosted ? 'disabled' : ''}>Post now</button>
+                <button class="btn btn-sm btn-outline-primary" onclick="postOne(${p.id})">Post now</button>
             </div>
         </div>`;
     }).join('');
@@ -301,7 +328,9 @@ async function postOne(postId) {
         await persistEdits();
         const resp = await fetch(`/api/social/posts/${postId}/send`, { method: 'POST' });
         if (resp.ok) {
+            const data = await resp.json().catch(() => ({}));
             showToast('Posted', 'success');
+            if (data && data.warning) showToast(data.warning, 'error');
         } else {
             const err = await resp.json().catch(() => ({}));
             showToast('Failed: ' + (err.detail || resp.status), 'error');
@@ -333,7 +362,11 @@ async function postNowAll() {
         }
         const resp = await fetch(`/api/social/posts/${videoId}/send-all`, { method: 'POST' });
         if (resp.ok) {
+            const results = await resp.json().catch(() => ({}));
             showToast('Done', 'success');
+            for (const r of Object.values(results || {})) {
+                if (r && r.warning) showToast(r.warning, 'error');
+            }
         } else {
             const err = await resp.json().catch(() => ({}));
             showToast('Send-all failed: ' + (err.detail || resp.status), 'error');
@@ -427,7 +460,7 @@ function confirmDuplicateInline(dup) {
 
 async function refresh() {
     const postsResp = await fetch(`/api/social/posts/${videoId}`);
-    posts = postsResp.ok ? await postsResp.json() : [];
+    applyPostFilter(postsResp.ok ? await postsResp.json() : []);
     renderPreviews();
 }
 

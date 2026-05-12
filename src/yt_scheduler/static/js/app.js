@@ -110,6 +110,25 @@ function showToast(message, type = 'info') {
     }
 })();
 
+// Twitter wraps every URL to ~23 chars (t.co) regardless of its real length,
+// so a tweet with links is shorter to X than its raw character count suggests.
+// Approximate that so over-limit warnings on link-heavy tweets don't cry wolf.
+// (X's full counting is more nuanced — weighted code points etc. — but the URL
+// adjustment covers the common case.)
+function tweetLength(text) {
+    const s = String(text || '');
+    let len = s.length;
+    for (const m of s.matchAll(/https?:\/\/\S+/g)) {
+        len += 23 - m[0].length;
+    }
+    return len;
+}
+
+// Platform-aware "length that counts toward the limit" for a piece of post text.
+function platformContentLength(platform, text) {
+    return platform === 'twitter' ? tweetLength(text) : String(text || '').length;
+}
+
 // Auth status in sidebar — scoped to the project we're currently
 // viewing. The sidebar template stamps the current project's slug onto
 // .nav-section-label[data-project] when one is in scope; without it
