@@ -13,6 +13,7 @@ still pointing at the deleted credential render as
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid as uuidlib
@@ -27,6 +28,22 @@ from yt_scheduler.services.keychain import (
 logger = logging.getLogger(__name__)
 
 CREDENTIAL_KEY_PREFIX = "cred."
+
+# One asyncio.Lock per credential UUID, serialising token refreshes so the
+# background refresh job and a post-time refresh never present the same
+# (single-use, rotating) refresh token concurrently — which would otherwise
+# fail one of them and spuriously flag the credential as needing re-auth.
+# Process-wide; the scheduler and the request handlers share the event loop.
+_credential_locks: dict[str, asyncio.Lock] = {}
+
+
+def get_credential_lock(uuid: str) -> asyncio.Lock:
+    """Return the shared refresh lock for a credential UUID (created on first use)."""
+    lock = _credential_locks.get(uuid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _credential_locks[uuid] = lock
+    return lock
 
 PLATFORM_DISPLAY_NAMES: dict[str, str] = {
     "twitter": "X",

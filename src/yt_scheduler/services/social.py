@@ -63,6 +63,10 @@ async def _twitter_refresh_bearer(creds: dict[str, str]) -> str | None:
     creds["bearer_token"] = new_bearer
     if new_refresh:
         creds["refresh_token"] = new_refresh
+    # X access tokens live ~2h; persist the expiry so the background refresh
+    # job can pre-emptively renew before it lapses.
+    if payload.get("expires_in"):
+        creds["expires_at"] = int(time.time()) + int(payload["expires_in"])
 
     cred_uuid = creds.get("uuid")
     if cred_uuid:
@@ -319,6 +323,17 @@ class SocialPoster:
         creds = self._get_creds()
         return all(creds.get(k) for k in self.required_keys)
 
+    async def refresh_if_stale(self, *, window_secs: int = 0) -> bool:
+        """Proactively refresh this credential's access token if it expires
+        within ``window_secs``. Returns ``True`` if a refresh happened.
+
+        Default: no-op (``False``) — the platform has no refresh flow (tokens
+        are long-lived or never expire). Subclasses with refresh tokens
+        override this. A terminal failure raises :class:`CredentialAuthError`
+        so the caller can mark the credential ``needs_reauth``.
+        """
+        return False
+
 
 class TwitterPoster(SocialPoster):
     platform = "twitter"
@@ -326,6 +341,32 @@ class TwitterPoster(SocialPoster):
     # path. Tweets go through v2 ``POST /2/tweets``; image/GIF/video uploads
     # go through v2 ``POST /2/media/upload``.
     required_keys: list[str] = ["bearer_token"]
+
+    async def refresh_if_stale(self, *, window_secs: int = 0) -> bool:
+        creds = self._get_creds()
+        uuid = creds.get("uuid")
+        # Need the rotating refresh token + the OAuth client id, and an
+        # expiry to compare against (older bundles predate the expires_at
+        # field — those get renewed lazily on the next 401 instead).
+        if not (uuid and creds.get("refresh_token") and creds.get("client_id")):
+            return False
+        expires_at = int(creds.get("expires_at") or 0)
+        if not expires_at or expires_at - window_secs > int(time.time()):
+            return False
+        from yt_scheduler.services.social_credentials import get_credential_lock, load_bundle
+        async with get_credential_lock(uuid):
+            fresh = load_bundle("twitter", uuid)
+            if fresh:
+                creds.update(fresh)
+            expires_at = int(creds.get("expires_at") or 0)
+            if expires_at and expires_at - window_secs > int(time.time()):
+                return False
+            new_bearer = await _twitter_refresh_bearer(creds)
+            if new_bearer is None:
+                raise CredentialAuthError(
+                    uuid, "X token refresh was rejected — re-authenticate from Settings."
+                )
+            return True
 
     async def post(
         self,
@@ -607,7 +648,7 @@ class BlueskyPoster(SocialPoster):
 
         async with httpx.AsyncClient(follow_redirects=True) as client:
             try:
-                await self._ensure_fresh_token(creds, client, bluesky_oauth, save_bundle)
+                await self._ensure_fresh_token(creds, client)
             except RuntimeError as exc:
                 # refresh_tokens raises RuntimeError on a non-200 from the
                 # AS — invalid_grant, expired_token, etc. all mean the
@@ -774,15 +815,67 @@ class BlueskyPoster(SocialPoster):
     # caught lazily on a 401 from the PDS.
     _PRE_REFRESH_WINDOW_SECS = 15 * 60
 
-    async def _ensure_fresh_token(
-        self, creds: dict, client: httpx.AsyncClient, bluesky_oauth, save_bundle,
-    ) -> None:
+    async def _refresh_under_lock(
+        self, creds: dict, *, window_secs: int, client: httpx.AsyncClient | None = None,
+    ) -> bool:
+        """Refresh the access token, serialised per-credential via
+        ``get_credential_lock``. Re-reads the stored bundle inside the lock so
+        a concurrent refresh on another path (e.g. the background job vs a
+        post) doesn't leave us presenting a now-consumed refresh token.
+        Returns True if a refresh was performed, False if it was already
+        fresh / not possible. RuntimeError from the AS propagates."""
+        from yt_scheduler.services import bluesky_oauth
+        from yt_scheduler.services.social_credentials import (
+            get_credential_lock,
+            load_bundle,
+            save_bundle,
+        )
+        uuid = creds.get("uuid")
+
+        async def _do() -> bool:
+            if uuid:
+                fresh = load_bundle("bluesky", uuid)
+                if fresh:
+                    creds.update(fresh)
+            expires_at = int(creds.get("expires_at") or 0)
+            if expires_at and expires_at - window_secs > int(time.time()):
+                return False
+            if not creds.get("refresh_token"):
+                return False
+            if client is not None:
+                await self._refresh_access_token(creds, client, bluesky_oauth, save_bundle)
+            else:
+                async with httpx.AsyncClient(follow_redirects=True) as c:
+                    await self._refresh_access_token(creds, c, bluesky_oauth, save_bundle)
+            return True
+
+        if uuid:
+            async with get_credential_lock(uuid):
+                return await _do()
+        return await _do()
+
+    async def _ensure_fresh_token(self, creds: dict, client: httpx.AsyncClient) -> None:
+        # Quick out before taking the lock; _refresh_under_lock re-checks inside it.
         expires_at = int(creds.get("expires_at") or 0)
         if expires_at and expires_at - self._PRE_REFRESH_WINDOW_SECS > int(time.time()):
             return
         if not creds.get("refresh_token"):
             return
-        await self._refresh_access_token(creds, client, bluesky_oauth, save_bundle)
+        await self._refresh_under_lock(
+            creds, window_secs=self._PRE_REFRESH_WINDOW_SECS, client=client
+        )
+
+    async def refresh_if_stale(self, *, window_secs: int = 0) -> bool:
+        creds = self._get_creds()
+        if not creds.get("refresh_token"):
+            return False
+        expires_at = int(creds.get("expires_at") or 0)
+        if expires_at and expires_at - window_secs > int(time.time()):
+            return False
+        try:
+            return await self._refresh_under_lock(creds, window_secs=window_secs)
+        except RuntimeError as exc:
+            raise CredentialAuthError(creds.get("uuid"), str(exc)) from exc
 
     async def _refresh_access_token(
         self, creds: dict, client: httpx.AsyncClient, bluesky_oauth, save_bundle,

@@ -949,6 +949,64 @@ async def moderate_comments_job() -> None:
             )
 
 
+# How often to sweep social credentials looking for tokens to pre-emptively
+# refresh, and the lookahead window — anything whose access token expires
+# within this many seconds gets renewed now rather than lapsing into
+# "needs re-auth" between posts.
+_TOKEN_REFRESH_INTERVAL_MINUTES = 20
+_TOKEN_REFRESH_WINDOW_SECS = 45 * 60
+
+
+async def refresh_social_tokens_job() -> None:
+    """Pre-emptively refresh social access tokens nearing expiry.
+
+    Walks every (non-deleted) social credential; for those whose access token
+    is within ``_TOKEN_REFRESH_WINDOW_SECS`` of expiry, runs the platform's
+    refresh flow (serialised per-credential against the post-time refresh, so
+    the two never present the same rotating refresh token concurrently).
+    Credentials are handled independently — one bad one doesn't stop the rest.
+    A *terminal* refresh failure flags the credential ``needs_reauth`` (same as
+    the post path); a transient/network error is left for the next sweep.
+    """
+    from yt_scheduler.services.social import CredentialAuthError, get_poster_for_uuid
+    from yt_scheduler.services.social_credentials import list_credentials, mark_needs_reauth
+
+    try:
+        creds = await list_credentials()
+    except Exception as exc:
+        logger.warning("Token refresh sweep: could not list credentials: %s", exc)
+        return
+
+    renewed = 0
+    for cred in creds:
+        uuid = cred.get("uuid")
+        platform = cred.get("platform")
+        label = cred.get("label") or f"{platform}:{(uuid or '')[:8]}"
+        if not uuid or not platform:
+            continue
+        try:
+            poster = await get_poster_for_uuid(platform, uuid)
+        except Exception as exc:
+            logger.warning("Token refresh sweep: skipping %s — %s", label, exc)
+            continue
+        try:
+            if await poster.refresh_if_stale(window_secs=_TOKEN_REFRESH_WINDOW_SECS):
+                renewed += 1
+                logger.info("Token refresh sweep: renewed %s", label)
+        except CredentialAuthError as exc:
+            logger.warning("Token refresh sweep: %s needs re-auth — %s", label, exc)
+            try:
+                await mark_needs_reauth(uuid)
+            except Exception as me:
+                logger.warning("Token refresh sweep: failed to flag %s: %s", uuid, me)
+        except Exception as exc:
+            # Transient (network, etc.) — don't flag re-auth on flakiness;
+            # the next sweep retries.
+            logger.warning("Token refresh sweep: transient error on %s — %s", label, exc)
+    if renewed:
+        logger.info("Token refresh sweep: renewed %d credential(s)", renewed)
+
+
 def start_scheduler(
     caption_interval: int | None = None,
     comment_interval: int | None = None,
@@ -974,8 +1032,18 @@ def start_scheduler(
         id="moderate_comments",
         replace_existing=True,
     )
+    scheduler.add_job(
+        refresh_social_tokens_job,
+        "interval",
+        minutes=_TOKEN_REFRESH_INTERVAL_MINUTES,
+        id="refresh_social_tokens",
+        replace_existing=True,
+    )
     scheduler.start()
-    logger.info(f"Scheduler started (captions every {cap_mins}m, moderation every {mod_mins}m)")
+    logger.info(
+        f"Scheduler started (captions every {cap_mins}m, moderation every {mod_mins}m, "
+        f"social-token refresh every {_TOKEN_REFRESH_INTERVAL_MINUTES}m)"
+    )
 
 
 def stop_scheduler() -> None:

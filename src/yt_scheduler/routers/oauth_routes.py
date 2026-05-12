@@ -655,6 +655,9 @@ async def twitter_callback(
     }
     if refresh_token:
         bundle["refresh_token"] = refresh_token
+    if token_data.get("expires_in"):
+        # ~2h for X; lets the background refresh job renew it before it lapses.
+        bundle["expires_at"] = int(time.time()) + int(token_data["expires_in"])
     if pending.get("client_secret"):
         bundle["client_secret"] = pending["client_secret"]
     if username:
