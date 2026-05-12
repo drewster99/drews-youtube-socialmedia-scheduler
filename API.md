@@ -889,7 +889,7 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 
 **Purpose** — Edit a draft social post in place.
 
-**Request body** — Any subset of `{"content": str, "status": str, "media_path": str}`. `content` is auto-trimmed of leading/trailing whitespace at write time.
+**Request body** — Any subset of `{"content": str, "status": str, "media_path": str, "media_paths": list[str] | null}`. `content` is auto-trimmed of leading/trailing whitespace at write time. `media_paths` accepts a list (replace the attachment set) or `[]`/`null` (clear all attachments); writing it also rewrites the legacy `media_path` column to the first entry (or null) so the two stay in sync.
 
 **Note on media** — The `social_posts` table now has both `media_path` (legacy single-string column, kept for backwards compat) and `media_paths` (JSON array column, the canonical form). The post-generation paths and PUT endpoint write both. The send paths read `media_paths` first and fall back to `media_path`. Once all writers stop touching the legacy column it'll be dropped in a follow-up migration.
 
@@ -927,7 +927,7 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 - `400` — Resolved poster is misconfigured (no credentials), or platform routing yielded no usable poster.
 - `401` — Resolved credential is flagged `needs_reauth=1` (pre-check), or the platform itself rejected the request as unauthorized (post-call). On post-call failure the credential's `needs_reauth` flag is set.
 - `409` — A post with same `(platform, account, content, media_path)` was sent within the last 30 days. Body is `{"detail": {"duplicate": true, "platform": "...", "previous": {"id": int, "video_id": str, "posted_at": str, "post_url": str, "content_preview": str}, "needs_confirm": true}}`. Re-issue with `?confirm_dup=true`.
-- `500` — Anything else from the platform.
+- `500` — Anything else from the platform, **including a media-attachment failure**: if the post has media attached but it can't be uploaded/attached (failed upload, missing file, or a platform that can't take media at all — e.g. Threads), the send is aborted and nothing is posted. The error message tells the user to re-attach or remove the attachment (`PUT …/posts/{id}` with `{"media_paths": []}`) and retry. The post is never published in a degraded, text-only form.
 
 **Side effects** — Picks the poster via slot binding → project default → first active credential. On success: updates `social_posts.status='posted'`, `posted_at`, `post_url`; records `social_post_published`. On failure: sets `status='failed'`, `error=<message>`.
 

@@ -80,17 +80,30 @@ async def _twitter_refresh_bearer(creds: dict[str, str]) -> str | None:
 # --- Twitter / X v2 media upload (OAuth 2.0 user context) ------------------
 
 # https://docs.x.com/x-api/media/upload-media — simple upload for small
-# images, chunked (INIT / APPEND / FINALIZE / STATUS) for video and large
-# files. Single-file size limits per X docs:
+# images, chunked (initialize / append / finalize / status) for video and
+# large files. Single-file size limits per X docs:
 #   images: 5 MB     — simple upload
 #   GIFs:   15 MB    — simple upload
 #   video:  512 MB   — chunked upload required
 # We pick the path based on content type + size and fall back to text-only
 # with a logged warning if anything fails.
+#
+# The chunked flow uses the v2 sub-path endpoints — POST /initialize
+# (JSON body), POST /{id}/append (multipart per segment), POST /{id}/finalize
+# (empty body). The old v1.1-style "POST /2/media/upload with command=INIT"
+# form is *not* accepted on the v2 base path (it's treated as the simple,
+# image-only upload there).
 
 _TWITTER_V2_MEDIA = "https://api.x.com/2/media/upload"
+_TWITTER_V2_MEDIA_INIT = "https://api.x.com/2/media/upload/initialize"
 _TWITTER_SIMPLE_LIMIT = 5 * 1024 * 1024  # 5 MB; images only
 _TWITTER_VIDEO_CHUNK = 4 * 1024 * 1024
+
+
+class _TwitterBearerExpired(RuntimeError):
+    """Internal: a media-upload call got a 401. Kept distinct from a generic
+    upload failure so :meth:`TwitterPoster.post` can run its refresh-and-retry
+    instead of giving up on the attachment."""
 
 
 def _twitter_media_category(mime: str | None) -> str:
@@ -117,6 +130,8 @@ async def _twitter_v2_simple_upload(
                 files=files,
                 data=data,
             )
+    if resp.status_code == 401:
+        raise _TwitterBearerExpired(resp.text)
     if resp.status_code != 200:
         raise RuntimeError(f"v2 media upload failed ({resp.status_code}): {resp.text}")
     body = resp.json() or {}
@@ -129,51 +144,46 @@ async def _twitter_v2_simple_upload(
 async def _twitter_v2_chunked_upload(
     bearer_token: str, media_path: Path, mime: str
 ) -> str:
-    """Chunked INIT / APPEND / FINALIZE / STATUS for video and large files."""
+    """Chunked upload (initialize / append / finalize / status) for video and
+    large files via the v2 media-upload sub-path endpoints."""
     headers = {"Authorization": f"Bearer {bearer_token}"}
     total_bytes = media_path.stat().st_size
 
     async with httpx.AsyncClient(timeout=120) as client:
-        # INIT — X's v2 /2/media/upload expects the command steps as
-        # multipart/form-data, not url-encoded; httpx only emits multipart
-        # when a `files=` mapping is present, so the fields go through there as
-        # ``(None, value)`` tuples even though there's no actual file here.
+        # initialize — JSON body; returns the media id used by every later step.
         init = await client.post(
-            _TWITTER_V2_MEDIA,
+            _TWITTER_V2_MEDIA_INIT,
             headers=headers,
-            files={
-                "command": (None, "INIT"),
-                "total_bytes": (None, str(total_bytes)),
-                "media_type": (None, mime),
-                "media_category": (None, _twitter_media_category(mime)),
+            json={
+                "media_type": mime,
+                "total_bytes": total_bytes,
+                "media_category": _twitter_media_category(mime),
             },
         )
+        if init.status_code == 401:
+            raise _TwitterBearerExpired(init.text)
         if init.status_code != 200:
             raise RuntimeError(f"v2 media INIT failed ({init.status_code}): {init.text}")
-        body = init.json() or {}
-        media_id = (body.get("data") or {}).get("id") or body.get("media_id_string")
+        media_id = ((init.json() or {}).get("data") or {}).get("id")
         if not media_id:
-            raise RuntimeError(f"v2 media INIT response missing id: {body}")
+            raise RuntimeError(f"v2 media INIT response missing id: {init.json()}")
         media_id = str(media_id)
 
-        # APPEND
+        # append — one multipart request per segment.
         with media_path.open("rb") as f:
             segment = 0
             while True:
                 chunk = f.read(_TWITTER_VIDEO_CHUNK)
                 if not chunk:
                     break
-                files = {"media": (media_path.name, chunk, mime)}
                 append = await client.post(
-                    _TWITTER_V2_MEDIA,
+                    f"{_TWITTER_V2_MEDIA}/{media_id}/append",
                     headers=headers,
-                    data={
-                        "command": "APPEND",
-                        "media_id": media_id,
-                        "segment_index": str(segment),
-                    },
-                    files=files,
+                    data={"segment_index": str(segment)},
+                    files={"media": (media_path.name, chunk, mime)},
                 )
+                if append.status_code == 401:
+                    raise _TwitterBearerExpired(append.text)
                 if append.status_code not in (200, 204):
                     raise RuntimeError(
                         f"v2 media APPEND segment {segment} failed "
@@ -181,18 +191,17 @@ async def _twitter_v2_chunked_upload(
                     )
                 segment += 1
 
-        # FINALIZE — same multipart-only requirement as INIT.
+        # finalize — empty body.
         finalize = await client.post(
-            _TWITTER_V2_MEDIA,
-            headers=headers,
-            files={"command": (None, "FINALIZE"), "media_id": (None, str(media_id))},
+            f"{_TWITTER_V2_MEDIA}/{media_id}/finalize", headers=headers,
         )
+        if finalize.status_code == 401:
+            raise _TwitterBearerExpired(finalize.text)
         if finalize.status_code != 200:
             raise RuntimeError(f"v2 media FINALIZE failed ({finalize.status_code}): {finalize.text}")
 
-        # STATUS — wait for async transcoding (videos only)
-        info = (finalize.json() or {}).get("data") or finalize.json() or {}
-        processing = info.get("processing_info")
+        # status — wait for async transcoding (videos only).
+        processing = ((finalize.json() or {}).get("data") or {}).get("processing_info")
         deadline = time.monotonic() + 120
         while processing and processing.get("state") in {"pending", "in_progress"}:
             wait = max(int(processing.get("check_after_secs") or 1), 1)
@@ -204,10 +213,11 @@ async def _twitter_v2_chunked_upload(
                 headers=headers,
                 params={"command": "STATUS", "media_id": media_id},
             )
+            if status.status_code == 401:
+                raise _TwitterBearerExpired(status.text)
             if status.status_code != 200:
                 raise RuntimeError(f"v2 media STATUS failed ({status.status_code}): {status.text}")
-            processing = ((status.json() or {}).get("data") or {}).get("processing_info") \
-                or (status.json() or {}).get("processing_info")
+            processing = ((status.json() or {}).get("data") or {}).get("processing_info")
 
         if processing and processing.get("state") == "failed":
             raise RuntimeError(f"v2 media transcoding failed: {processing}")
@@ -236,6 +246,15 @@ class CredentialAuthError(RuntimeError):
     def __init__(self, uuid: str | None, message: str) -> None:
         super().__init__(message)
         self.uuid = uuid
+
+
+class MediaUploadError(RuntimeError):
+    """Raised by a poster when the caller asked for media to be attached but
+    it couldn't be — a failed upload, an unsupported attachment, or a missing
+    file. The send-path treats this like any other post failure (marks the
+    post ``failed`` and surfaces the message), so nothing is published in a
+    degraded form. The user can then drop the attachment and retry.
+    """
 
 
 class SocialPoster:
@@ -320,6 +339,23 @@ class SocialPoster:
             alts.append("")
         return paths, alts
 
+    @staticmethod
+    def _require_paths_exist(paths: list[str], platform: str) -> None:
+        """Abort the post if any requested attachment is gone from disk.
+
+        Posting the text without an attachment the user explicitly composed
+        is worse than not posting — surface it so they can re-attach or drop
+        it and retry.
+        """
+        missing = [p for p in paths if not Path(p).exists()]
+        if missing:
+            names = ", ".join(Path(p).name for p in missing)
+            raise MediaUploadError(
+                f"Can't post to {platform}: attachment file{'s' if len(missing) > 1 else ''} "
+                f"missing — {names}. Re-attach or remove the attachment, then retry. "
+                "Nothing was posted."
+            )
+
     async def is_configured(self) -> bool:
         """Check if this poster's credentials are complete."""
         creds = self._get_creds()
@@ -397,67 +433,64 @@ class TwitterPoster(SocialPoster):
 
         paths, _alts = self._resolve_media_inputs(media_path, media_paths, alt_texts)
         # Twitter API caps: 4 images per tweet, OR exactly 1 video, OR 1 GIF.
-        # Mixed media (image + video) isn't supported by the API. We slice
-        # to the first 4 paths up front; if any is a video, the chunked
-        # upload path takes only that one.
+        # Mixed media (image + video) isn't supported by the API. Slice to the
+        # first 4 up front; if the first asset is a video, only that one goes.
         paths = paths[:4]
-        existing_paths = [p for p in paths if Path(p).exists()]
+        self._require_paths_exist(paths, "X")
+        if paths:
+            first_mime = mimetypes.guess_type(Path(paths[0]).name)[0] or ""
+            if first_mime.startswith("video/"):
+                upload_paths = [Path(paths[0])]
+            else:
+                upload_paths = [
+                    Path(p) for p in paths
+                    if not (mimetypes.guess_type(p)[0] or "").startswith("video/")
+                ][:4]
+        else:
+            upload_paths = []
 
         import tweepy
 
-        async def _upload_one(token: str, p: Path) -> str | None:
-            try:
-                return await _twitter_v2_upload(token, p)
-            except Exception as exc:
-                logger.warning(
-                    "Twitter v2 media upload failed for %s (%s); skipping that "
-                    "asset. Re-run Connect with X to refresh the media.write "
-                    "scope if this persists.",
-                    p, exc,
-                )
-                return None
+        async def _upload_all(token: str) -> list[str] | None:
+            """Upload every selected asset against ``token``. A 401 surfaces as
+            :class:`_TwitterBearerExpired` so the caller can refresh and retry;
+            any other failure is a :class:`MediaUploadError` — we never post
+            without an attachment the caller explicitly composed."""
+            ids: list[str] = []
+            for p in upload_paths:
+                try:
+                    ids.append(await _twitter_v2_upload(token, p))
+                except (_TwitterBearerExpired, CredentialAuthError):
+                    raise
+                except Exception as exc:
+                    raise MediaUploadError(
+                        f"Couldn't attach {p.name} to the X post: {exc}. Re-run "
+                        "Connect with X to refresh the media.write scope, or check "
+                        "the file size/format. Nothing was posted — remove the "
+                        "attachment to post text only."
+                    ) from exc
+            return ids or None
+
+        def _tweet(token: str, media_ids: list[str] | None):
+            # Two stacked tweepy gotchas with OAuth 2.0 user-context:
+            # 1. ``tweepy.Client(access_token=...)`` makes tweepy build an
+            #    OAuth1Session — must use ``bearer_token=``.
+            # 2. ``create_tweet`` defaults ``user_auth=True``, which again
+            #    routes through OAuth1 even when constructed with bearer_token
+            #    only — must pass ``user_auth=False``. Skipping either yields
+            #    "Consumer key must be string or bytes, not NoneType".
+            return tweepy.Client(bearer_token=token).create_tweet(
+                text=text, media_ids=media_ids, user_auth=False,
+            )
 
         try:
-            media_ids: list[str] | None = None
-            if existing_paths:
-                # Detect video: video uploads are 1-and-only-1 per tweet, so
-                # if the first path is a video, ignore any siblings.
-                first = Path(existing_paths[0])
-                first_mime = mimetypes.guess_type(first.name)[0] or ""
-                if first_mime.startswith("video/"):
-                    upload_paths = [first]
-                else:
-                    # Image batch: drop anything that looks like a video so
-                    # mixed batches don't trip the API.
-                    upload_paths = [
-                        Path(p) for p in existing_paths
-                        if not (mimetypes.guess_type(p)[0] or "").startswith("video/")
-                    ][:4]
-                ids: list[str] = []
-                for p in upload_paths:
-                    mid = await _upload_one(bearer, p)
-                    if mid:
-                        ids.append(mid)
-                media_ids = ids or None
-
             try:
-                # Two stacked tweepy gotchas with OAuth 2.0 user-context:
-                # 1. ``tweepy.Client(access_token=...)`` makes tweepy try
-                #    to build an OAuth1Session — must use ``bearer_token=``.
-                # 2. ``create_tweet`` defaults ``user_auth=True``, which
-                #    again routes through OAuth1 even when constructed
-                #    with bearer_token only — must pass ``user_auth=False``
-                #    so tweepy uses our bearer. Skipping either one yields
-                #    "Consumer key must be string or bytes, not NoneType".
-                client = tweepy.Client(bearer_token=bearer)
-                response = client.create_tweet(
-                    text=text, media_ids=media_ids, user_auth=False,
-                )
-            except tweepy.errors.Unauthorized as exc:
-                # Bearer expired (~2h lifetime). Try once with refresh_token.
-                # A *rejected* refresh is terminal (re-OAuth); a network blip
-                # propagates and is reported as a generic post failure, not a
-                # re-auth prompt.
+                media_ids = await _upload_all(bearer)
+                response = _tweet(bearer, media_ids)
+            except (tweepy.errors.Unauthorized, _TwitterBearerExpired) as exc:
+                # Bearer expired (~2h lifetime). One refresh attempt; a
+                # *rejected* refresh is terminal (re-OAuth), a network blip
+                # propagates as a generic post failure.
                 try:
                     new_bearer = await _twitter_refresh_bearer(creds)
                 except RuntimeError as rexc:
@@ -471,50 +504,20 @@ class TwitterPoster(SocialPoster):
                         "X bearer expired and there's no refresh token — re-OAuth.",
                     ) from exc
                 logger.info("Twitter bearer refreshed; retrying tweet.")
-                # Re-upload media against the fresh token — old media_ids
-                # belong to the original auth session and may not be valid.
-                if existing_paths:
-                    refreshed_ids: list[str] = []
-                    # Reuse the same first-is-video / multi-image rule as the
-                    # initial upload above so the retry doesn't pick a
-                    # different policy than the first attempt.
-                    first = Path(existing_paths[0])
-                    first_mime = mimetypes.guess_type(first.name)[0] or ""
-                    if first_mime.startswith("video/"):
-                        upload_paths = [first]
-                    else:
-                        upload_paths = [
-                            Path(p) for p in existing_paths
-                            if not (mimetypes.guess_type(p)[0] or "").startswith("video/")
-                        ][:4]
-                    for p in upload_paths:
-                        mid = await _upload_one(new_bearer, p)
-                        if mid:
-                            refreshed_ids.append(mid)
-                    media_ids = refreshed_ids or None
-                client = tweepy.Client(bearer_token=new_bearer)
+                # Re-upload against the fresh token — media ids from the prior
+                # auth session may not be valid.
                 try:
-                    response = client.create_tweet(
-                        text=text, media_ids=media_ids, user_auth=False,
-                    )
-                except tweepy.errors.Unauthorized as exc2:
+                    media_ids = await _upload_all(new_bearer)
+                    response = _tweet(new_bearer, media_ids)
+                except (tweepy.errors.Unauthorized, _TwitterBearerExpired) as exc2:
                     raise CredentialAuthError(
                         creds.get("uuid"),
                         "X rejected the refreshed bearer — re-OAuth.",
                     ) from exc2
 
             tweet_id = response.data["id"]
-            out: dict = {"url": f"https://x.com/i/status/{tweet_id}", "id": tweet_id}
-            if existing_paths and not media_ids:
-                # The tweet went out, but every attachment upload failed —
-                # surface it so the caller doesn't report a clean success.
-                out["warning"] = (
-                    "Posted to X, but the attached media couldn't be uploaded. "
-                    "Re-run Connect with X to refresh the media.write scope, or "
-                    "check the file size/format."
-                )
-            return out
-        except CredentialAuthError:
+            return {"url": f"https://x.com/i/status/{tweet_id}", "id": tweet_id}
+        except (CredentialAuthError, MediaUploadError):
             raise
         except Exception as e:
             raise RuntimeError(f"Twitter post failed: {e}") from e
@@ -662,7 +665,8 @@ class BlueskyPoster(SocialPoster):
             )
 
         paths, alts = self._resolve_media_inputs(media_path, media_paths, alt_texts)
-        existing = [(Path(p), a) for p, a in zip(paths, alts) if Path(p).exists()]
+        self._require_paths_exist(paths, "Bluesky")
+        existing = [(Path(p), a) for p, a in zip(paths, alts)]
 
         # Bluesky caps: 4 images per post OR 1 video per post (mutually
         # exclusive). When the first asset is a video we use the
@@ -1005,10 +1009,11 @@ class MastodonPoster(SocialPoster):
         creds = self._get_creds()
 
         paths, _alts = self._resolve_media_inputs(media_path, media_paths, alt_texts)
+        self._require_paths_exist(paths, "Mastodon")
         # Mastodon's default cap is 4 media per status; some instances raise
         # this. We cap conservatively. Video/image mixing is platform-
         # configurable; we don't filter — let Mastodon reject if needed.
-        existing = [p for p in paths if Path(p).exists()][:4]
+        existing = paths[:4]
 
         try:
             from mastodon import Mastodon
@@ -1100,7 +1105,8 @@ class LinkedInPoster(SocialPoster):
             )
 
         paths, alts = self._resolve_media_inputs(media_path, media_paths, alt_texts)
-        existing = [(Path(p), a) for p, a in zip(paths, alts) if Path(p).exists()]
+        self._require_paths_exist(paths, "LinkedIn")
+        existing = [(Path(p), a) for p, a in zip(paths, alts)]
 
         share_media_category = "NONE"
         media_blocks: list[dict] = []
@@ -1132,12 +1138,11 @@ class LinkedInPoster(SocialPoster):
             except CredentialAuthError:
                 raise
             except Exception as exc:
-                logger.warning(
-                    "LinkedIn asset upload failed (%s); posting text-only.",
-                    exc,
-                )
-                share_media_category = "NONE"
-                media_blocks = []
+                raise MediaUploadError(
+                    f"Couldn't attach media to the LinkedIn post: {exc}. Nothing "
+                    "was posted — remove the attachment to post text only, then "
+                    "retry."
+                ) from exc
 
         headers = {
             "Authorization": f"Bearer {token}",
@@ -1177,7 +1182,7 @@ class LinkedInPoster(SocialPoster):
                     "url": f"https://www.linkedin.com/feed/update/{post_id}",
                     "id": post_id,
                 }
-        except CredentialAuthError:
+        except (CredentialAuthError, MediaUploadError):
             raise
         except Exception as e:
             raise RuntimeError(f"LinkedIn post failed: {e}") from e
@@ -1266,13 +1271,18 @@ class ThreadsPoster(SocialPoster):
         media_paths: list[str] | None = None,
         alt_texts: list[str] | None = None,
     ) -> dict:
-        # Threads' API posts text only — it can't attach media. Generation now
-        # drops a Threads slot's media and warns there, but a post created by
-        # older code may still carry media_paths; warn here too rather than
-        # letting it vanish silently.
+        # Threads' API posts text only — it can't attach media. Generation
+        # drops a Threads slot's media (and warns there), so a freshly
+        # generated post never reaches this. A post created by older code may
+        # still carry media_paths — refuse to post it silently text-only;
+        # surface it so the user removes the attachment and retries.
         text = (text or "").strip()
         creds = self._get_creds()
-        had_media = bool(self._resolve_media_inputs(media_path, media_paths, alt_texts)[0])
+        if self._resolve_media_inputs(media_path, media_paths, alt_texts)[0]:
+            raise MediaUploadError(
+                "Threads can't attach media — its API is text-only. Remove the "
+                "attachment from this post to send it as text, then retry."
+            )
 
         try:
             import httpx
@@ -1306,14 +1316,8 @@ class ThreadsPoster(SocialPoster):
                 post_id = publish_resp.json()["id"]
 
                 username = creds.get("username", "")
-                out: dict = {"url": f"https://threads.net/@{username}/post/{post_id}", "id": post_id}
-                if had_media:
-                    out["warning"] = (
-                        "Posted to Threads as text only — Threads can't attach media yet, "
-                        "so the image/video wasn't included."
-                    )
-                return out
-        except CredentialAuthError:
+                return {"url": f"https://threads.net/@{username}/post/{post_id}", "id": post_id}
+        except (CredentialAuthError, MediaUploadError):
             raise
         except Exception as e:
             raise RuntimeError(f"Threads post failed: {e}") from e

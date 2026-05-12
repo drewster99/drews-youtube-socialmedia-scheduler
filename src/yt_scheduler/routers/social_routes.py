@@ -447,6 +447,16 @@ async def update_post(post_id: int, data: dict):
     if "media_path" in data:
         updates.append("media_path = ?")
         params.append(data["media_path"])
+    if "media_paths" in data:
+        # Accept a list (re-attach a different set) or null/[] (clear). Keep
+        # the legacy single-string ``media_path`` column in sync so old read
+        # paths and the duplicate matcher don't see a stale attachment.
+        raw = data["media_paths"]
+        cleaned = [p for p in raw if p] if isinstance(raw, list) else []
+        updates.append("media_paths = ?")
+        params.append(json.dumps(cleaned) if cleaned else None)
+        updates.append("media_path = ?")
+        params.append(cleaned[0] if cleaned else None)
 
     if updates:
         params.append(post_id)
