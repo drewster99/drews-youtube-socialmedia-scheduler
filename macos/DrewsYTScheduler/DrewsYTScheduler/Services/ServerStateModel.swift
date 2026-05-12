@@ -52,6 +52,22 @@ final class ServerStateModel: ObservableObject {
         }
     }
 
+    /// Probe the server repeatedly (≈1s apart) until it's listening or we hit
+    /// the timeout. Used right after register/restart: the Python process
+    /// needs a few seconds to come up, and a single probe would catch it
+    /// mid-launch — leaving the UI stuck on "not running" until the user
+    /// happened to trigger another refresh (e.g. by toggling a checkbox).
+    private func pollUntilRunning(timeoutSeconds: Double) async {
+        agentStatus = LaunchAgentController.shared.agentStatus
+        loginItemStatus = LaunchAgentController.shared.loginItemStatus
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while !Task.isCancelled {
+            await probeServer()
+            if isRunning || Date() >= deadline { break }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+    }
+
     private func probeServer() async {
         let result = await BuildInfoReader.probeServer(port: AppPaths.serverPort)
         let prev = reachability
@@ -104,10 +120,10 @@ final class ServerStateModel: ObservableObject {
             } catch {
                 lastError = "Register failed: \(error.localizedDescription)"
             }
-            // Wait briefly for launchd to bring the new process up before
-            // probing — otherwise reachability lags one refresh cycle.
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            refresh()
+            // launchd needs a moment to bring the process up; keep probing
+            // until it answers (or we time out) so the UI flips to "running"
+            // on its own without needing another manual refresh.
+            await pollUntilRunning(timeoutSeconds: 25)
         }
     }
 
@@ -135,8 +151,10 @@ final class ServerStateModel: ObservableObject {
             } catch {
                 lastError = "Restart failed: \(error.localizedDescription)"
             }
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            refresh()
+            // The server is coming back up — keep probing until it answers
+            // (or we time out) instead of a single early probe that would
+            // leave "Open UI" disabled until the next manual refresh.
+            await pollUntilRunning(timeoutSeconds: 25)
         }
     }
 
