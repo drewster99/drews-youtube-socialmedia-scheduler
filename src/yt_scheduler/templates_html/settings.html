@@ -513,19 +513,19 @@ function renderPlatformCard(name, config, accounts) {
 }
 
 const SOCIAL_CONNECTORS = {
-    twitter: () => connectTwitter(),
-    bluesky: () => connectBluesky(),
-    mastodon: () => connectMastodon(),
-    linkedin: () => connectLinkedIn(),
-    threads: () => connectThreads(),
+    twitter: (_h) => connectTwitter(),
+    bluesky: (h) => connectBluesky(null, h),
+    mastodon: (_h) => connectMastodon(),
+    linkedin: (_h) => connectLinkedIn(),
+    threads: (_h) => connectThreads(),
 };
 
-function reconnectCredential(platform) {
+function reconnectCredential(platform, handle) {
     const fn = SOCIAL_CONNECTORS[platform];
     if (!fn) { showToast(`No connector for ${platform}`, 'error'); return; }
     // Re-running the connect flow for the same account refreshes its tokens
-    // and clears the needs-reauth flag. (Bluesky: enter the same handle.)
-    fn();
+    // and clears the needs-reauth flag. For Bluesky we pre-fill the handle.
+    fn(handle || '');
 }
 
 function renderCredentialRow(cred) {
@@ -535,7 +535,7 @@ function renderCredentialRow(cred) {
         : '';
     const reconnectBtn = cred.needs_reauth
         ? `<button class="btn btn-sm btn-warning" title="Re-authenticate this account"
-                   onclick="reconnectCredential('${escapeHtml(cred.platform)}')">Reconnect</button>`
+                   onclick="reconnectCredential('${escapeHtml(cred.platform)}', '${escapeHtml(cred.username || '')}')">Reconnect</button>`
         : '';
     const borderStyle = cred.needs_reauth
         ? 'border:1px solid var(--danger)'
@@ -669,6 +669,12 @@ window.addEventListener('message', (ev) => {
         showToast(`${nice} connection failed — see popup for details.`, 'error');
     }
 });
+
+// Safari / WKWebView sometimes drops window.opener across the OAuth popup's
+// cross-origin navigation, so the postMessage above never arrives. Re-pull the
+// account list whenever the tab regains focus — covers a successful (re)auth
+// even when the message was lost, so a "Reconnect" badge clears on its own.
+window.addEventListener('focus', () => loadSocialPlatforms());
 
 function toggleSetupGuide(name) {
     const el = document.getElementById(`setup-guide-${name}`);

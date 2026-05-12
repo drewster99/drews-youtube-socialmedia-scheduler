@@ -283,34 +283,65 @@ async function persistEdits() {
     await Promise.all(tasks);
 }
 
+function _setComposeCardBusy(postId, busy) {
+    const card = document.querySelector(`.compose-card[data-post-id="${postId}"]`);
+    if (!card) return null;
+    card.querySelectorAll('button, textarea, input').forEach(el => { el.disabled = !!busy; });
+    card.style.opacity = busy ? '0.6' : '';
+    const btn = card.querySelector('.compose-actions button');
+    if (btn) btn.textContent = busy ? 'Posting…' : 'Post now';
+    return card;
+}
+
 async function postOne(postId) {
     if (!confirm('Post this now?')) return;
-    await persistEdits();
-    const resp = await fetch(`/api/social/posts/${postId}/send`, { method: 'POST' });
-    if (resp.ok) {
-        showToast('Posted', 'success');
-    } else {
-        const err = await resp.json().catch(() => ({}));
-        showToast('Failed: ' + (err.detail || resp.status), 'error');
+    _setComposeCardBusy(postId, true);
+    showToast('Posting…', 'info');
+    try {
+        await persistEdits();
+        const resp = await fetch(`/api/social/posts/${postId}/send`, { method: 'POST' });
+        if (resp.ok) {
+            showToast('Posted', 'success');
+        } else {
+            const err = await resp.json().catch(() => ({}));
+            showToast('Failed: ' + (err.detail || resp.status), 'error');
+        }
+    } finally {
+        _setComposeCardBusy(postId, false);
     }
     await refresh();
 }
 
 async function postNowAll() {
     if (!confirm('Post every checked card now?')) return;
-    await persistEdits();
-    // Approve checked posts then send-all
-    const includedIds = Array.from(document.querySelectorAll('input[name="include"]:checked'))
-        .map(cb => Number(cb.dataset.id));
-    for (const id of includedIds) {
-        await fetch(`/api/social/posts/${id}`, {
-            method: 'PUT',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({status: 'approved'}),
-        });
+    const btn = document.getElementById('btn-post-now');
+    const origText = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = 'Posting…'; }
+    document.querySelectorAll('.compose-card').forEach(c => { c.style.opacity = '0.6'; });
+    showToast('Posting all checked cards…', 'info');
+    try {
+        await persistEdits();
+        // Approve checked posts then send-all
+        const includedIds = Array.from(document.querySelectorAll('input[name="include"]:checked'))
+            .map(cb => Number(cb.dataset.id));
+        for (const id of includedIds) {
+            await fetch(`/api/social/posts/${id}`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({status: 'approved'}),
+            });
+        }
+        const resp = await fetch(`/api/social/posts/${videoId}/send-all`, { method: 'POST' });
+        if (resp.ok) {
+            showToast('Done', 'success');
+        } else {
+            const err = await resp.json().catch(() => ({}));
+            showToast('Send-all failed: ' + (err.detail || resp.status), 'error');
+        }
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = origText || 'Post now'; }
+        document.querySelectorAll('.compose-card').forEach(c => { c.style.opacity = ''; });
     }
-    const resp = await fetch(`/api/social/posts/${videoId}/send-all`, { method: 'POST' });
-    if (resp.ok) showToast('Done', 'success');
     await refresh();
     maybeShowDone();
 }

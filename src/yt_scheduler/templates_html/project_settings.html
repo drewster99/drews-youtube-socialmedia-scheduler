@@ -516,7 +516,7 @@ async function loadSocialDefaults() {
         if (isMissing) {
             badge = '<span class="badge badge-draft" style="margin-left: 0.5rem;">Missing credential</span>';
         } else if (currentCred && currentCred.needs_reauth) {
-            badge = `<button class="btn btn-sm btn-warning" data-platform-reauth="${key}" style="margin-left: 0.5rem;" title="Re-authenticate this ${label} account">Needs re-auth — Reconnect</button>`;
+            badge = `<button class="btn btn-sm btn-warning" data-platform-reauth="${key}" data-reauth-handle="${escapeHtml(currentCred.username || '')}" style="margin-left: 0.5rem;" title="Re-authenticate this ${label} account">Needs re-auth — Reconnect</button>`;
         }
         return `
             <div class="form-row" data-platform="${key}" style="align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
@@ -535,20 +535,22 @@ async function loadSocialDefaults() {
         btn.addEventListener('click', () => addCredentialForPlatform(btn.dataset.platformAdd));
     });
     root.querySelectorAll('button[data-platform-reauth]').forEach(btn => {
-        btn.addEventListener('click', () => addCredentialForPlatform(btn.dataset.platformReauth));
+        btn.addEventListener('click', () => addCredentialForPlatform(btn.dataset.platformReauth, btn.dataset.reauthHandle));
     });
 }
 
-function addCredentialForPlatform(platform) {
+function addCredentialForPlatform(platform, prefillHandle) {
     // Each connector function lives in /static/js/oauth-connectors.js and
     // is shared with /settings. Passing ``slug`` flips the OAuth callback
-    // into "bind as this project's default for the platform" mode.
+    // into "bind as this project's default for the platform" mode. Only
+    // connectBluesky uses the optional pre-fill-handle arg; the others
+    // ignore it.
     const connectors = {
-        twitter: connectTwitter,
-        bluesky: connectBluesky,
-        mastodon: connectMastodon,
-        linkedin: connectLinkedIn,
-        threads: connectThreads,
+        twitter: (s) => connectTwitter(s),
+        bluesky: (s) => connectBluesky(s, prefillHandle || ''),
+        mastodon: (s) => connectMastodon(s),
+        linkedin: (s) => connectLinkedIn(s),
+        threads: (s) => connectThreads(s),
     };
     const fn = connectors[platform];
     if (!fn) {

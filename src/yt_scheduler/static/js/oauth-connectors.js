@@ -78,8 +78,10 @@ async function connectThreads(projectSlug = null) {
     } catch (_) {}
 }
 
-async function connectBluesky(projectSlug = null) {
-    const handle = prompt('Your Bluesky handle (e.g. you.bsky.social — no @):');
+async function connectBluesky(projectSlug = null, prefillHandle = null) {
+    // When reconnecting an existing account we pre-fill its handle so the
+    // user just confirms instead of re-typing it.
+    const handle = prompt('Your Bluesky handle (e.g. you.bsky.social — no @):', (prefillHandle || '').replace(/^@/, ''));
     if (!handle) return;
     try {
         await openOAuthPopup('/api/oauth/bluesky/start', {

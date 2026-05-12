@@ -131,8 +131,13 @@ async function checkAuth() {
         const label = projectEl ? projectEl.textContent.trim() : 'YouTube';
         if (data.authenticated) {
             el.innerHTML = `<span class="status-dot" style="background: #2ea043;"></span><span>${label} • Connected</span>`;
+        } else if (!slug) {
+            // No project in scope (Home / General settings): YouTube auth is
+            // per-project, so don't raise a red "not connected" alarm here —
+            // just note it neutrally and point at where projects live.
+            el.innerHTML = `<span class="status-dot" style="background: var(--text-muted, #717171);"></span><a href="/" style="color: var(--text-muted, #717171);">YouTube • per project</a>`;
         } else {
-            const settingsHref = slug ? `/projects/${encodeURIComponent(slug)}/settings` : '/settings';
+            const settingsHref = `/projects/${encodeURIComponent(slug)}/settings`;
             el.innerHTML = `<span class="status-dot" style="background: #f85149;"></span><a href="${settingsHref}" style="color: #f85149;">${label} • Not connected</a>`;
         }
     } catch {
