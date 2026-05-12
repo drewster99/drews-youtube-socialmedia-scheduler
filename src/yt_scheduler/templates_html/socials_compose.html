@@ -29,8 +29,8 @@
             </div>
         </div>
         <div class="form-group">
-            <label>User message <code>{{user_message}}</code></label>
-            <textarea id="user-message" rows="2" placeholder="Free-form text passed to the template as {{user_message}}."></textarea>
+            <label>User message <code>{{ '{{user_message}}' }}</code></label>
+            <textarea id="user-message" rows="2" placeholder="Free-form text passed to the template as {{ '{{user_message}}' }}."></textarea>
         </div>
         <div class="form-actions">
             <button class="btn" onclick="cancelComposer()">Cancel</button>
@@ -153,8 +153,8 @@ async function generatePreviews() {
     const templateName = document.getElementById('template-picker').value;
     const userMessage = document.getElementById('user-message').value;
 
-    // send_message is the only built-in whose body is literally
-    // {{user_message}}. With nothing typed, every generated post is
+    // send_message is the only built-in whose body is literally the
+    // user_message placeholder. With nothing typed, every generated post is
     // empty — easy to mistake for "the template was ignored".
     if (templateName === 'send_message' && !userMessage.trim()) {
         showToast('send_message needs text in "User message" — every post will be empty otherwise.', 'error');
