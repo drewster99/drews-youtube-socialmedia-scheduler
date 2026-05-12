@@ -97,10 +97,10 @@ Backwards-compatibility redirect to `/projects/<DEFAULT_PROJECT_SLUG>/templates/
 ### `GET /moderation` → 307 Redirect
 Backwards-compatibility redirect to `/projects/<DEFAULT_PROJECT_SLUG>/moderation`.
 
-### Static mounts
+### Static & media
 
-- `GET /static/*` — serves files from `src/yt_scheduler/static/`.
-- `GET /uploads/*` — serves files from the configured `UPLOAD_DIR` (typically `~/.yt-scheduler/uploads/`).
+- `GET /static/*` — `StaticFiles` mount serving the app's own bundled assets from `src/yt_scheduler/static/`.
+- `GET /media/{filename}` — serves a single file from the configured `UPLOAD_DIR` (typically `~/.yt-scheduler/uploads/`). This is an explicit handler (`media_routes.py`), **not** a directory mount: `filename` must be a single bare name (no separators, no `..`, no leading slash); anything else, a non-existent file, or a missing upload dir → `404`. Supports HTTP `Range` requests (so `<video>` seeking works); responses carry `Cache-Control: no-cache` but the handler does not emit `304`. The API never hands the client absolute filesystem paths — it returns `/media/<name>` URLs (see `thumbnail_url`, `video_file_url`, item-image `url`, `media_urls`), which keeps the client portable and a remotely-hosted server / CLI client viable.
 
 ---
 
@@ -483,7 +483,7 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 |---|---|---|---|
 | `project_slug` | string | optional | Filter to one project. When omitted, returns every video across every project (used by import / admin views). |
 
-**Response 200** — Array of full video rows from `videos` (every column), ordered `created_at DESC`. `tags` is the raw JSON-encoded string from the column (the frontend `JSON.parse`s it).
+**Response 200** — Array of video rows from `videos` (every column), ordered `created_at DESC`, with one transformation: the absolute-path columns `thumbnail_path` and `video_file_path` are **removed** and replaced by `thumbnail_url` (`/media/<name>` or `null`), `video_file_url` (`/media/<name>` or `null`), and `video_file_name` (the bare filename or `null`). `tags` is the raw JSON-encoded string from the column (the frontend `JSON.parse`s it).
 
 **Errors** — `404` if `project_slug` is given but unknown.
 
@@ -515,7 +515,7 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 
 **Purpose** — Full details for a single video, plus a live YouTube readback.
 
-**Response 200** — The local row (all `videos` columns) plus either `youtube_data` (the full `videos.list()` response) or `youtube_data_error` (string) if the readback failed.
+**Response 200** — The local row (all `videos` columns, with the same `thumbnail_path`/`video_file_path` → `thumbnail_url`/`video_file_url`/`video_file_name` transformation as `GET /api/videos`) plus either `youtube_data` (the full `videos.list()` response) or `youtube_data_error` (string) if the readback failed.
 
 **Errors** — `404` (no local row).
 
@@ -860,11 +860,13 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 ```json
 {
   "posts": [
-    { "slot_id": 7, "platform": "twitter", "content": "...", "media": "thumbnail" | "video" | "none", "max_chars": 280, "social_account_id": 1 }
+    { "slot_id": 7, "platform": "twitter", "content": "...", "media": "thumbnail" | "video" | "none", "media_urls": ["/media/<name>", ...], "media_filenames": ["<name>", ...], "max_chars": 280, "social_account_id": 1 }
   ],
   "warnings": ["Threads slot skipped — {{video}} attachments aren't supported on Threads yet (its API posts text only)."]
 }
 ```
+
+`media_urls` / `media_filenames` describe the media that was attached to the freshly-inserted row (resolved from the template's media directives, or the slot's legacy `media` fallback). The browser typically ignores this and re-fetches `GET /api/social/posts/{video_id}` instead.
 
 **Query params** — `confirm_overwrite_scheduled` (bool, default `false`). When false, the route refuses to regenerate if any unsent post for this video is currently scheduled (has a non-NULL `scheduler_job_id`).
 
@@ -883,7 +885,7 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 
 **Purpose** — All social posts for a video.
 
-**Response 200** — Array of full `social_posts` rows ordered by platform.
+**Response 200** — Array of `social_posts` rows ordered by platform, with one transformation: the absolute-path columns `media_path` and `media_paths` are **removed** and replaced by `media_urls` (array of `/media/<name>` strings) and `media_filenames` (array of bare filenames). Both arrays are empty when the post has no attachment.
 
 ### `PUT /api/social/posts/{post_id}`
 
@@ -1175,11 +1177,11 @@ Multi-image attachments per item, referenced from templates as `{{image:shortnam
 
 ### `GET /api/videos/{video_id}/images`
 
-**Response 200** — Array of image rows in `(order_index, id)` order:
+**Response 200** — Array of image rows in `(order_index, id)` order. The absolute-path column `path` is **removed** and replaced by `url` (`/media/<name>`) and `filename` (the bare name):
 
 ```json
 [
-  { "id": 1, "video_id": "abc", "shortname": "cat", "path": "/u/...", "alt_text": "a cat", "order_index": 0, "created_at": "..." }
+  { "id": 1, "video_id": "abc", "shortname": "cat", "url": "/media/abc__cat__photo.jpg", "filename": "abc__cat__photo.jpg", "alt_text": "a cat", "order_index": 0, "created_at": "..." }
 ]
 ```
 
@@ -1189,13 +1191,15 @@ Multipart form upload.
 
 **Form fields** — `file` (binary, required), `shortname` (required), `alt_text` (default `""`), `order_index` (int, default `0`).
 
-**Response 200** — The created image row.
+**Response 200** — The created image row (same shape as above: `url` + `filename`, no `path`).
 
 **Errors** — `404` (video not found), `400` (shortname collision, invalid shortname).
 
 ### `PATCH /api/videos/{video_id}/images/{image_id}`
 
 **Body** — Any subset of `shortname`, `alt_text`, `order_index`. The image file is immutable; delete + re-upload to replace.
+
+**Response 200** — The updated image row (same shape: `url` + `filename`, no `path`).
 
 ### `DELETE /api/videos/{video_id}/images/{image_id}`
 

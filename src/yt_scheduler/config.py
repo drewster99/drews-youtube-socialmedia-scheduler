@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import urllib.parse
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -82,6 +83,32 @@ LOG_DIR = _resolve_log_dir()
 DB_PATH = DATA_DIR / "publisher.db"
 TEMPLATES_DIR = DATA_DIR / "templates"
 UPLOAD_DIR = DATA_DIR / "uploads"
+
+# Public URL prefix under which files in ``UPLOAD_DIR`` are served (see
+# ``routers/media_routes.py``). The browser only ever sees these URLs, never
+# the server's absolute filesystem paths — keeps the client portable across
+# machines and viable for a future remotely-hosted server / CLI client.
+MEDIA_URL_PREFIX = "/media"
+
+
+def media_filename(path: str | None) -> str | None:
+    """Return just the basename of a stored upload path, or ``None``."""
+    if not path:
+        return None
+    return Path(path).name
+
+
+def media_url(path: str | None) -> str | None:
+    """Map a stored absolute upload path to its public ``/media/<name>`` URL.
+
+    Returns ``None`` when ``path`` is falsy. The basename is URL-encoded since
+    user-uploaded files can keep their original names (spaces, ``#``, etc.).
+    """
+    name = media_filename(path)
+    if name is None:
+        return None
+    return f"{MEDIA_URL_PREFIX}/{urllib.parse.quote(name)}"
+
 
 # YouTube OAuth scopes
 YOUTUBE_SCOPES = [

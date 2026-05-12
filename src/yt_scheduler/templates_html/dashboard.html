@@ -167,8 +167,8 @@ async function loadVideos() {
             return `
                 <a href="/projects/${projectSlug}/videos/${v.id}" class="video-card${v.youtube_deleted ? ' video-card-deleted' : ''}">
                     <div class="video-thumb">
-                        ${v.thumbnail_path
-                            ? `<img src="/uploads/${v.thumbnail_path.split('/').pop()}" alt="${v.title}">`
+                        ${v.thumbnail_url
+                            ? `<img src="${v.thumbnail_url}" alt="${v.title}">`
                             : '<div class="thumb-placeholder">No thumbnail</div>'}
                     </div>
                     <div class="video-info">

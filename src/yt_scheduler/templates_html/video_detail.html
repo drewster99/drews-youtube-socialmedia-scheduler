@@ -513,9 +513,9 @@ async function loadVideo() {
     }
     // Whether there's a local video file is what {{video}} attaches; surface it
     // so it's obvious before generating socials.
-    if (video.video_file_path) {
-        const name = String(video.video_file_path).split('/').pop();
-        metaHtml += ` <span class="badge badge-published" title="${escapeHtml(video.video_file_path)}">🎬 local file: ${escapeHtml(name)}</span>`;
+    if (video.video_file_url) {
+        const name = video.video_file_name || '';
+        metaHtml += ` <span class="badge badge-published" title="${escapeHtml(name)}">🎬 local file: ${escapeHtml(name)}</span>`;
     } else {
         metaHtml += ` <span class="form-hint" style="margin-left:0.25rem;">no local video file — {{ '{{video}}' }} won't attach</span>`;
     }
@@ -610,9 +610,9 @@ async function loadVideo() {
     }
 
     // Thumbnail
-    if (video.thumbnail_path) {
+    if (video.thumbnail_url) {
         document.getElementById('thumbnail-area').innerHTML = `
-            <img src="/uploads/${video.thumbnail_path.split('/').pop()}" alt="Thumbnail">
+            <img src="${video.thumbnail_url}" alt="Thumbnail">
         `;
     }
 
@@ -1451,7 +1451,7 @@ function updateRegenerateVisibility() {
      * frames button is gated on having a local file to extract from;
      * the transcript button is gated on having a transcript at all. */
     const imported = !!videoData.imported_from_youtube;
-    const hasLocalFile = !!videoData.video_file_path;
+    const hasLocalFile = !!videoData.video_file_url;
     const hasTranscript = !!(videoData.transcript && videoData.transcript.trim());
     const transcriptUpdated = videoData.transcript_updated_at;
     const descriptionGenAt = videoData.description_generated_at;
@@ -1513,7 +1513,7 @@ async function regenerateDescription(mode) {
 function updateTagGenVisibility() {
     const fromVideo = document.getElementById('btn-gen-tags-frames');
     if (!fromVideo || !videoData) return;
-    fromVideo.style.display = videoData.video_file_path ? 'inline-flex' : 'none';
+    fromVideo.style.display = videoData.video_file_url ? 'inline-flex' : 'none';
 }
 
 async function generateTags(mode) {
@@ -2306,7 +2306,7 @@ async function loadItemImages() {
                     <tr>
                         <td><code>{{ '{{image:' }}${escapeHtml(r.shortname)}{{ '}}' }}</code></td>
                         <td>${escapeHtml(r.alt_text || '')}</td>
-                        <td style="font-size: 0.8em; color: var(--text-muted);">${escapeHtml((r.path || '').split('/').pop())}</td>
+                        <td style="font-size: 0.8em; color: var(--text-muted);">${escapeHtml(r.filename || '')}</td>
                         <td style="text-align: right;">
                             <button class="btn btn-sm btn-danger" onclick="deleteItemImage(${r.id})">Delete</button>
                         </td>

@@ -10,7 +10,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Form, UploadFile, File, HTTPException, Query
 
-from yt_scheduler.config import UPLOAD_DIR
+from yt_scheduler.config import UPLOAD_DIR, media_filename, media_url
 from yt_scheduler.database import get_db
 from yt_scheduler.services import (
     ai, auto_actions, events, tiers,
@@ -70,6 +70,18 @@ def _decode_tags(raw: str | None) -> list[str]:
     return []
 
 
+def _video_public(row: dict) -> dict:
+    """Project a ``videos`` row for the API: expose ``/media/...`` URLs and a
+    display filename instead of the server's absolute filesystem paths."""
+    out = dict(row)
+    out["thumbnail_url"] = media_url(out.get("thumbnail_path"))
+    out["video_file_url"] = media_url(out.get("video_file_path"))
+    out["video_file_name"] = media_filename(out.get("video_file_path"))
+    out.pop("thumbnail_path", None)
+    out.pop("video_file_path", None)
+    return out
+
+
 @router.get("")
 async def list_videos(project_slug: str | None = None):
     """List tracked videos.
@@ -95,7 +107,7 @@ async def list_videos(project_slug: str | None = None):
         rows = await db.execute_fetchall(
             "SELECT * FROM videos ORDER BY created_at DESC"
         )
-    return [dict(r) for r in rows]
+    return [_video_public(dict(r)) for r in rows]
 
 
 @router.get("/transcription-backends")
@@ -137,7 +149,7 @@ async def get_video(video_id: str):
     rows = await db.execute_fetchall("SELECT * FROM videos WHERE id = ?", (video_id,))
     if not rows:
         raise HTTPException(404, "Video not found")
-    result = dict(rows[0])
+    result = _video_public(dict(rows[0]))
 
     await _bind_project_for_video(video_id)
     # Also fetch live YouTube data

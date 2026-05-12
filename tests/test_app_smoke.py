@@ -15,8 +15,6 @@ def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Boot the FastAPI app against an isolated data dir."""
     monkeypatch.setenv("DYS_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("DYS_HOST", "127.0.0.1")
-    # StaticFiles validates its directory at module-import time, so the upload
-    # dir must exist before we import the app.
     (tmp_path / "uploads").mkdir(parents=True, exist_ok=True)
     (tmp_path / "templates").mkdir(parents=True, exist_ok=True)
     # Clear cached modules so config picks up the env var.
@@ -123,6 +121,37 @@ def test_video_events_endpoint_returns_log(client: TestClient) -> None:
     assert len(rows) == 2
     assert rows[0]["type"] == "metadata_updated"
     assert rows[0]["payload"] == {"title": {"old": "Hello", "new": "Hi"}}
+
+
+def test_media_route_serves_upload(client: TestClient) -> None:
+    from yt_scheduler import config
+
+    (config.UPLOAD_DIR / "hello world.txt").write_bytes(b"PNGDATA")
+    resp = client.get("/media/hello%20world.txt")
+    assert resp.status_code == 200
+    assert resp.content == b"PNGDATA"
+    assert resp.headers["cache-control"] == "no-cache"
+
+
+def test_media_route_missing_file_404(client: TestClient) -> None:
+    resp = client.get("/media/does-not-exist.png")
+    assert resp.status_code == 404
+
+
+def test_media_route_rejects_traversal(client: TestClient) -> None:
+    # A nested path / parent-dir escape must never resolve to a real file.
+    assert client.get("/media/..%2f..%2fconfig.py").status_code == 404
+    assert client.get("/media/sub%2fx.png").status_code == 404
+
+
+def test_media_route_supports_range(client: TestClient) -> None:
+    from yt_scheduler import config
+
+    (config.UPLOAD_DIR / "clip.bin").write_bytes(b"0123456789")
+    resp = client.get("/media/clip.bin", headers={"Range": "bytes=0-3"})
+    assert resp.status_code == 206
+    assert resp.content == b"0123"
+    assert resp.headers["content-range"] == "bytes 0-3/10"
 
 
 def test_video_detail_page_renders(client: TestClient) -> None:

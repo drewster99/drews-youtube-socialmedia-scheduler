@@ -13,7 +13,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from yt_scheduler import build_info
-from yt_scheduler.config import UPLOAD_DIR, ensure_dirs
+from yt_scheduler.config import ensure_dirs
 from yt_scheduler.database import close_db, get_db
 from yt_scheduler.routers import (
     auth_routes,
@@ -22,6 +22,7 @@ from yt_scheduler.routers import (
     import_routes,
     item_image_routes,
     item_variable_routes,
+    media_routes,
     oauth_routes,
     project_routes,
     project_variable_routes,
@@ -130,10 +131,9 @@ app = FastAPI(
 )
 app.add_middleware(BuildIdentityMiddleware)
 
-# StaticFiles validates the upload dir at mount time, so we have to ensure
-# it exists before the mount below. Migration runs in the lifespan instead —
-# triggering it at module load means a stray ``python -c "import yt_scheduler.app"``
-# touches real data, which is a footgun.
+# Make sure the data directories exist before anything tries to use them.
+# Migration runs in the lifespan instead — triggering it at module load means
+# a stray ``python -c "import yt_scheduler.app"`` touches real data, a footgun.
 ensure_dirs()
 
 # Static files and templates
@@ -158,7 +158,6 @@ class _RevalidatingStaticFiles(StaticFiles):
 
 
 app.mount("/static", _RevalidatingStaticFiles(directory=str(static_dir)), name="static")
-app.mount("/uploads", _RevalidatingStaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 html_templates = Jinja2Templates(directory=str(templates_dir))
 
@@ -185,6 +184,7 @@ app.include_router(global_variable_routes.router)
 app.include_router(project_variable_routes.router)
 app.include_router(item_variable_routes.router)
 app.include_router(item_image_routes.router)
+app.include_router(media_routes.router)
 
 
 # --- HTML pages -------------------------------------------------------------

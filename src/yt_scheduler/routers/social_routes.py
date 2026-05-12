@@ -7,6 +7,7 @@ import re
 
 from fastapi import APIRouter, HTTPException, Query
 
+from yt_scheduler.config import media_filename, media_url
 from yt_scheduler.database import get_db
 from yt_scheduler.services import events, social, templates as tmpl, youtube
 from yt_scheduler.services.scheduler import cancel_scheduled_post, get_publish_lock
@@ -148,6 +149,20 @@ async def _build_render_context(db, video: dict) -> dict:
 
 
 from yt_scheduler.services.social import decode_media_paths as _decode_media_paths  # noqa: E402
+
+
+def _post_public(row: dict) -> dict:
+    """Project a ``social_posts`` row for the API: expose attached media as
+    ``/media/...`` URLs + display filenames instead of absolute disk paths.
+    The raw ``media_path`` / ``media_paths`` columns are kept out of the
+    response (the ``PUT`` endpoint still accepts them in request bodies)."""
+    out = dict(row)
+    paths = _decode_media_paths(row)
+    out["media_urls"] = [media_url(p) for p in paths]
+    out["media_filenames"] = [media_filename(p) for p in paths]
+    out.pop("media_path", None)
+    out.pop("media_paths", None)
+    return out
 
 
 def _legacy_media_for_slot(slot: dict, ctx: dict) -> str | None:
@@ -407,7 +422,8 @@ async def generate_posts(
                 "platform": platform,
                 "content": item["rendered"],
                 "media": media,
-                "media_paths": media_paths,
+                "media_urls": [media_url(p) for p in media_paths],
+                "media_filenames": [media_filename(p) for p in media_paths],
                 "max_chars": item["max_chars"],
                 "social_account_id": sa_id,
             })
@@ -424,7 +440,7 @@ async def get_posts(video_id: str):
         "SELECT * FROM social_posts WHERE video_id = ? ORDER BY platform",
         (video_id,),
     )
-    return [dict(r) for r in rows]
+    return [_post_public(dict(r)) for r in rows]
 
 
 @router.put("/posts/{post_id}")

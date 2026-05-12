@@ -13,12 +13,22 @@ import shutil
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from yt_scheduler.config import UPLOAD_DIR
+from yt_scheduler.config import UPLOAD_DIR, media_filename, media_url
 from yt_scheduler.database import get_db
 
 router = APIRouter(prefix="/api/videos/{video_id}/images", tags=["item-images"])
 
 _SHORTNAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def _image_public(row: dict) -> dict:
+    """Project an ``item_images`` row for the API: a ``/media/...`` URL and a
+    display filename instead of the server's absolute filesystem path."""
+    out = dict(row)
+    out["url"] = media_url(out.get("path"))
+    out["filename"] = media_filename(out.get("path"))
+    out.pop("path", None)
+    return out
 
 
 def _validate_shortname(value: str) -> str:
@@ -49,7 +59,7 @@ async def list_item_images(video_id: str) -> list[dict]:
         "FROM item_images WHERE video_id = ? ORDER BY order_index, id",
         (video_id,),
     )
-    return [dict(r) for r in rows]
+    return [_image_public(dict(r)) for r in rows]
 
 
 @router.post("")
@@ -96,7 +106,7 @@ async def upload_item_image(
         "FROM item_images WHERE id = ?",
         (cursor.lastrowid,),
     )
-    return dict(rows[0])
+    return _image_public(dict(rows[0]))
 
 
 @router.patch("/{image_id}")
@@ -150,7 +160,7 @@ async def update_item_image(video_id: str, image_id: int, payload: dict) -> dict
         "FROM item_images WHERE id = ?",
         (image_id,),
     )
-    return dict(rows[0])
+    return _image_public(dict(rows[0]))
 
 
 @router.delete("/{image_id}")

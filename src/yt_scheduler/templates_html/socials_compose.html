@@ -230,21 +230,18 @@ async function generatePreviews() {
     }
 }
 
-function postMediaPaths(p) {
-    let paths = [];
-    try { paths = JSON.parse(p.media_paths || '[]'); } catch (_) { paths = []; }
-    if ((!paths || !paths.length) && p.media_path) paths = [p.media_path];
-    return Array.isArray(paths) ? paths.filter(Boolean) : [];
+function postMediaFilenames(p) {
+    const names = p.media_filenames;
+    return Array.isArray(names) ? names.filter(Boolean) : [];
 }
 
 function mediaSummaryHtml(p) {
-    const paths = postMediaPaths(p);
-    if (!paths.length) {
+    const names = postMediaFilenames(p);
+    if (!names.length) {
         return '<div class="form-hint" style="margin: 0.25rem 0;">📎 No media attached.</div>';
     }
-    const names = paths.map(x => String(x).split('/').pop()).join(', ');
     return `<div class="form-hint" style="margin: 0.25rem 0; display: flex; align-items: center; gap: 0.5rem;">
-        <span>📎 Attaching ${paths.length} file${paths.length === 1 ? '' : 's'}: ${escapeHtmlBasic(names)}</span>
+        <span>📎 Attaching ${names.length} file${names.length === 1 ? '' : 's'}: ${escapeHtmlBasic(names.join(', '))}</span>
         <button type="button" class="btn btn-sm btn-link" style="padding: 0; color: var(--danger, #cf222e);" onclick="removeAttachment(${p.id})">Remove attachment</button>
     </div>`;
 }
