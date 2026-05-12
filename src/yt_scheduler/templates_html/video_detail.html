@@ -504,14 +504,22 @@ async function loadVideo() {
     }
     const metaRow = document.getElementById('video-meta-row');
     const metaLeft = document.getElementById('video-meta-left');
+    let metaHtml = '';
     const durSec = parseIsoDuration(video.youtube_data?.contentDetails?.duration);
     if (durSec != null) {
         const tier = tierFor(durSec);
-        metaLeft.innerHTML = `<span class="badge ${tier.cls}">${tier.label}</span>`
-                            + `<span class="video-duration">${formatDuration(durSec)}</span>`;
-    } else {
-        metaLeft.innerHTML = '';
+        metaHtml += `<span class="badge ${tier.cls}">${tier.label}</span>`
+                  + `<span class="video-duration">${formatDuration(durSec)}</span>`;
     }
+    // Whether there's a local video file is what {{video}} attaches; surface it
+    // so it's obvious before generating socials.
+    if (video.video_file_path) {
+        const name = String(video.video_file_path).split('/').pop();
+        metaHtml += ` <span class="badge badge-published" title="${escapeHtml(video.video_file_path)}">🎬 local file: ${escapeHtml(name)}</span>`;
+    } else {
+        metaHtml += ` <span class="form-hint" style="margin-left:0.25rem;">no local video file — {{ '{{video}}' }} won't attach</span>`;
+    }
+    metaLeft.innerHTML = metaHtml;
     metaRow.style.display = 'flex';
 
     // Player

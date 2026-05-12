@@ -264,6 +264,8 @@ body {
 .btn-primary:hover { background: var(--accent-hover); }
 .btn-success { background: var(--success); border-color: var(--success); }
 .btn-danger { background: var(--danger); border-color: var(--danger); }
+.btn-warning { background: var(--warning); color: #000; border-color: var(--warning); font-weight: 600; }
+.btn-warning:hover { filter: brightness(1.1); }
 .btn-sm { padding: 0.3rem 0.6rem; font-size: 0.8rem; }
 .btn-lg { padding: 0.75rem 1.5rem; font-size: 1rem; }
 

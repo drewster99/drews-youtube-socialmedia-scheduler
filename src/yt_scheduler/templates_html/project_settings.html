@@ -516,7 +516,7 @@ async function loadSocialDefaults() {
         if (isMissing) {
             badge = '<span class="badge badge-draft" style="margin-left: 0.5rem;">Missing credential</span>';
         } else if (currentCred && currentCred.needs_reauth) {
-            badge = '<span class="badge badge-draft" style="margin-left: 0.5rem;">Needs re-auth</span>';
+            badge = `<button class="btn btn-sm btn-warning" data-platform-reauth="${key}" style="margin-left: 0.5rem;" title="Re-authenticate this ${label} account">Needs re-auth — Reconnect</button>`;
         }
         return `
             <div class="form-row" data-platform="${key}" style="align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
@@ -533,6 +533,9 @@ async function loadSocialDefaults() {
     });
     root.querySelectorAll('button[data-platform-add]').forEach(btn => {
         btn.addEventListener('click', () => addCredentialForPlatform(btn.dataset.platformAdd));
+    });
+    root.querySelectorAll('button[data-platform-reauth]').forEach(btn => {
+        btn.addEventListener('click', () => addCredentialForPlatform(btn.dataset.platformReauth));
     });
 }
 

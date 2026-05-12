@@ -512,10 +512,30 @@ function renderPlatformCard(name, config, accounts) {
     </div>`;
 }
 
+const SOCIAL_CONNECTORS = {
+    twitter: () => connectTwitter(),
+    bluesky: () => connectBluesky(),
+    mastodon: () => connectMastodon(),
+    linkedin: () => connectLinkedIn(),
+    threads: () => connectThreads(),
+};
+
+function reconnectCredential(platform) {
+    const fn = SOCIAL_CONNECTORS[platform];
+    if (!fn) { showToast(`No connector for ${platform}`, 'error'); return; }
+    // Re-running the connect flow for the same account refreshes its tokens
+    // and clears the needs-reauth flag. (Bluesky: enter the same handle.)
+    fn();
+}
+
 function renderCredentialRow(cred) {
     const created = cred.created_at ? new Date(cred.created_at + 'Z').toLocaleDateString() : '';
     const reauthBadge = cred.needs_reauth
         ? ' <span class="badge badge-draft" style="margin-left:0.4rem;">Needs re-auth</span>'
+        : '';
+    const reconnectBtn = cred.needs_reauth
+        ? `<button class="btn btn-sm btn-warning" title="Re-authenticate this account"
+                   onclick="reconnectCredential('${escapeHtml(cred.platform)}')">Reconnect</button>`
         : '';
     const borderStyle = cred.needs_reauth
         ? 'border:1px solid var(--danger)'
@@ -529,7 +549,8 @@ function renderCredentialRow(cred) {
                     ${cred.is_nickname ? '<em>nickname</em> · ' : ''}Connected ${escapeHtml(created)}
                 </div>
             </div>
-            <div style="display:flex; gap:0.25rem;">
+            <div style="display:flex; gap:0.25rem; align-items:center;">
+                ${reconnectBtn}
                 <button class="btn-icon" title="Refresh username from provider"
                         onclick="refreshCredentialUsername('${escapeHtml(cred.uuid)}')">↻</button>
                 <button class="btn-icon" title="Remove"
