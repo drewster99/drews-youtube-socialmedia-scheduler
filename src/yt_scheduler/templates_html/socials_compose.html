@@ -161,29 +161,52 @@ async function generatePreviews() {
         return;
     }
 
-    document.getElementById('btn-generate').disabled = true;
-    const resp = await fetch(`/api/social/generate-posts/${videoId}`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-            template_name: templateName,
-            platforms: platforms,
-            user_message: userMessage,
-            unresolved_ack: true,
-        }),
-    });
-    document.getElementById('btn-generate').disabled = false;
-    if (!resp.ok) {
-        showToast('Generation failed.', 'error');
-        return;
-    }
-    document.getElementById('picker-card').style.display = 'none';
+    const btn = document.getElementById('btn-generate');
+    const previewArea = document.getElementById('preview-cards');
+    const platformsLabel = platforms.join(', ');
+    btn.disabled = true;
+    btn.textContent = 'Generating…';
+    // AI rendering can take 5–30s per platform — show an explicit spinner so
+    // the screen doesn't look dead while the request is in flight.
+    previewArea.innerHTML = `
+        <div style="text-align: center; padding: 2rem; color: var(--text-muted);">
+            <div style="display:inline-block; width:24px; height:24px; border:3px solid var(--border); border-top-color: var(--accent); border-radius:50%; animation: spin 1s linear infinite;"></div>
+            <p style="margin-top: 0.5rem;">Generating posts for ${platformsLabel}… (AI blocks can take a moment)</p>
+            <style>@keyframes spin { to { transform: rotate(360deg); } }</style>
+        </div>`;
+    try {
+        const resp = await fetch(`/api/social/generate-posts/${videoId}`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                template_name: templateName,
+                platforms: platforms,
+                user_message: userMessage,
+                unresolved_ack: true,
+            }),
+        });
+        if (!resp.ok) {
+            showToast('Generation failed.', 'error');
+            previewArea.innerHTML = '<p class="empty-state">Generation failed — try again.</p>';
+            return;
+        }
+        let warnings = [];
+        try {
+            const result = await resp.json();
+            if (result && !Array.isArray(result) && Array.isArray(result.warnings)) warnings = result.warnings;
+        } catch (_) {}
+        for (const w of warnings) showToast(w, 'error');
+        document.getElementById('picker-card').style.display = 'none';
 
-    const postsResp = await fetch(`/api/social/posts/${videoId}`);
-    posts = postsResp.ok ? await postsResp.json() : [];
-    renderPreviews();
-    document.getElementById('btn-post-now').disabled = false;
-    document.getElementById('btn-schedule').disabled = false;
+        const postsResp = await fetch(`/api/social/posts/${videoId}`);
+        posts = postsResp.ok ? await postsResp.json() : [];
+        renderPreviews();
+        document.getElementById('btn-post-now').disabled = false;
+        document.getElementById('btn-schedule').disabled = false;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Generate';
+    }
 }
 
 function renderPreviews() {
