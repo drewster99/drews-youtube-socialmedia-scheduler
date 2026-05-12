@@ -41,6 +41,11 @@ final class ServerStateModel: ObservableObject {
 
     private var refreshTask: Task<Void, Never>?
 
+    /// One-shot guard: we auto-restart a stale server at most once per app
+    /// session, so a restart that doesn't take (the old process keeps
+    /// answering) can't trap us in a restart loop.
+    private var didAutoRestartStaleServer = false
+
     private init() {}
 
     func refresh() {
@@ -78,6 +83,7 @@ final class ServerStateModel: ObservableObject {
                 ActivityLog.shared.log(.info, .probe,
                     "/api/build OK — server is \(info.kind) \(info.version) (#\(info.buildNumber)) build_id=\(info.buildId.prefix(8))")
             }
+            autoRestartIfServerIsStale()
         case .responseError(let msg):
             reachability = .responseError(msg)
             ActivityLog.shared.log(.warn, .probe,
@@ -106,6 +112,28 @@ final class ServerStateModel: ObservableObject {
             return (bundle, server)
         }
         return nil
+    }
+
+    /// When a probe finds the running server is *older* than the server this
+    /// .app shell ships, restart it for the user — same path as clicking
+    /// "Restart server" (so the button disables, the agent gets bounced, and
+    /// we poll the new process up). Fires at most once per app session.
+    private func autoRestartIfServerIsStale() {
+        guard !didAutoRestartStaleServer, !busy else { return }
+        guard case let .ok(server) = reachability else { return }
+        let bundle = BuildInfoReader.bundle
+        guard server.buildId != bundle.buildId else { return }
+        // build_number is a Unix timestamp (`date +%s` in build.sh) — a larger
+        // value is a newer build. Only auto-restart when the running server is
+        // demonstrably behind us; an equal/newer/unparseable number leaves the
+        // existing mismatch banner to do its job.
+        guard let serverNum = Int(server.buildNumber),
+              let bundleNum = Int(bundle.buildNumber),
+              serverNum < bundleNum else { return }
+        didAutoRestartStaleServer = true
+        ActivityLog.shared.log(.info, .lifecycle,
+            "running server is \(server.kind) \(server.version) (#\(server.buildNumber)) — older than bundled \(bundle.kind) \(bundle.version) (#\(bundle.buildNumber)); restarting it automatically")
+        restartAgent()
     }
 
     // --- agent actions ------------------------------------------------------
