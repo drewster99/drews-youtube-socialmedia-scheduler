@@ -621,20 +621,25 @@ async def twitter_callback(
     if not access_token:
         return _result_page(False, f"Missing access_token: {token_data}", platform="twitter")
 
-    # Fetch the @handle + numeric id so we can identify the account stably.
+    # Fetch the @handle + numeric id so we can identify the account stably,
+    # plus verified_type — 'blue'/'business'/'government' (anything but 'none')
+    # means X Premium, which raises the post limit from 280 to 25,000.
     username = ""
     user_id = ""
+    verified_type = ""
     me_error: str | None = None
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             me = await client.get(
                 "https://api.twitter.com/2/users/me",
                 headers={"Authorization": f"Bearer {access_token}"},
+                params={"user.fields": "verified_type"},
             )
         if me.status_code == 200:
             data = (me.json().get("data") or {})
             username = data.get("username", "")
             user_id = data.get("id", "")
+            verified_type = data.get("verified_type") or ""
         else:
             me_error = f"HTTP {me.status_code}: {me.text[:200]}"
     except Exception as exc:
@@ -662,6 +667,8 @@ async def twitter_callback(
         bundle["client_secret"] = pending["client_secret"]
     if username:
         bundle["username"] = username
+    if verified_type:
+        bundle["verified_type"] = verified_type
 
     cred = await _persist_oauth_credential(
         platform="twitter",

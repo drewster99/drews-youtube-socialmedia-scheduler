@@ -537,6 +537,10 @@ function renderCredentialRow(cred) {
         ? `<button class="btn btn-sm btn-warning" title="Re-authenticate this account"
                    onclick="reconnectCredential('${escapeHtml(cred.platform)}', '${escapeHtml(cred.username || '')}')">Reconnect</button>`
         : '';
+    const xPremium = cred.platform === 'twitter' && cred.verified_type && cred.verified_type !== 'none';
+    const premiumBadge = xPremium
+        ? ` <span class="badge badge-published" title="verified_type: ${escapeHtml(cred.verified_type)}" style="margin-left:0.4rem;">X Premium · 25,000-char posts</span>`
+        : '';
     const borderStyle = cred.needs_reauth
         ? 'border:1px solid var(--danger)'
         : 'border:1px solid var(--border)';
@@ -544,9 +548,10 @@ function renderCredentialRow(cred) {
         <div class="credential-row" data-uuid="${escapeHtml(cred.uuid)}"
              style="display:flex; justify-content:space-between; align-items:center; padding:0.5rem 0.75rem; ${borderStyle}; border-radius:6px; margin-bottom:0.5rem;">
             <div>
-                <div style="font-weight:600;">${escapeHtml(cred.label)}${reauthBadge}</div>
+                <div style="font-weight:600;">${escapeHtml(cred.label)}${reauthBadge}${premiumBadge}</div>
                 <div style="font-size:0.8rem; color:var(--text-muted);">
                     ${cred.is_nickname ? '<em>nickname</em> · ' : ''}Connected ${escapeHtml(created)}
+                    ${cred.platform === 'twitter' && !xPremium ? ' · free tier (280-char posts)' : ''}
                 </div>
             </div>
             <div style="display:flex; gap:0.25rem; align-items:center;">

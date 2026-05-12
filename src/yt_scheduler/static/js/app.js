@@ -129,6 +129,18 @@ function platformContentLength(platform, text) {
     return platform === 'twitter' ? tweetLength(text) : String(text || '').length;
 }
 
+// X's post character limit for an account: 280 on the free tier, 25,000 on X
+// Premium / a verified org (verified_type is 'blue' | 'business' | 'government'
+// rather than 'none'/empty).
+const X_FREE_POST_LIMIT = 280;
+const X_PREMIUM_POST_LIMIT = 25000;
+function xIsPremium(verifiedType) {
+    return !!verifiedType && verifiedType !== 'none';
+}
+function xPostLimit(verifiedType) {
+    return xIsPremium(verifiedType) ? X_PREMIUM_POST_LIMIT : X_FREE_POST_LIMIT;
+}
+
 // Auth status in sidebar — scoped to the project we're currently
 // viewing. The sidebar template stamps the current project's slug onto
 // .nav-section-label[data-project] when one is in scope; without it

@@ -86,6 +86,9 @@ def _row_to_dict(row) -> dict:
         # failed (or no refresh path exists). Cleared on next successful
         # ``upsert_credential`` (i.e. after the user re-OAuths).
         "needs_reauth": bool(row["needs_reauth"]) if "needs_reauth" in row.keys() else False,
+        # For X accounts: 'none' | 'blue' | 'business' | 'government' — anything
+        # but 'none'/NULL means X Premium (25,000-char posts). NULL elsewhere.
+        "verified_type": (row["verified_type"] if "verified_type" in row.keys() else None),
         "label": format_account_label(row["platform"], row["username"]),
     }
 
@@ -182,6 +185,9 @@ async def upsert_credential(
     it back to life.
     """
     db = await get_db()
+    # Captured for X accounts; COALESCE keeps a previously-known value when a
+    # re-auth couldn't fetch it (e.g. the /users/me lookup hiccuped).
+    verified_type = bundle.get("verified_type")
     cursor = await db.execute(
         "SELECT id, uuid FROM social_accounts "
         "WHERE platform = ? AND provider_account_id = ?",
@@ -196,9 +202,10 @@ async def upsert_credential(
         await db.execute(
             "UPDATE social_accounts "
             "SET username = ?, display_name = ?, is_nickname = ?, "
-            "    deleted_at = NULL, needs_reauth = 0 "
+            "    deleted_at = NULL, needs_reauth = 0, "
+            "    verified_type = COALESCE(?, verified_type) "
             "WHERE id = ?",
-            (username, display_name, 1 if is_nickname else 0, existing_id),
+            (username, display_name, 1 if is_nickname else 0, verified_type, existing_id),
         )
         await db.commit()
         save_bundle(platform, existing_uuid, dict(bundle, provider_account_id=provider_account_id, username=username))
@@ -208,11 +215,11 @@ async def upsert_credential(
     cursor = await db.execute(
         "INSERT INTO social_accounts "
         "(uuid, platform, provider_account_id, username, display_name, "
-        " is_nickname, credentials_ref) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        " is_nickname, credentials_ref, verified_type) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             new_uuid, platform, provider_account_id, username, display_name,
-            1 if is_nickname else 0, f"{CREDENTIAL_KEY_PREFIX}{new_uuid}",
+            1 if is_nickname else 0, f"{CREDENTIAL_KEY_PREFIX}{new_uuid}", verified_type,
         ),
     )
     await db.commit()

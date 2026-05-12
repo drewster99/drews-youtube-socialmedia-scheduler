@@ -521,16 +521,24 @@ async function previewAll() {
 
     container.innerHTML = results.map(r => {
         const len = r.rendered.length;
-        const limit = r.slot.max_chars;
         const effLen = platformContentLength(r.slot.platform, r.rendered);
+        let limit, lenExtra = '';
+        if (r.slot.platform === 'twitter') {
+            const xCred = (credentialsByPlatform['twitter'] || []).find(c => c.id === r.slot.social_account_id);
+            limit = xPostLimit(xCred ? xCred.verified_type : null);
+            const prem = xCred && xIsPremium(xCred.verified_type);
+            const tco = (effLen !== len) ? ` (≈${effLen} on X after link shortening)` : '';
+            lenExtra = `${tco} · X limit ${limit.toLocaleString()}${prem ? ' — Premium account' : (xCred ? ' — free tier' : '')}`;
+        } else {
+            limit = r.slot.max_chars;
+        }
         const over = limit && effLen > limit;
-        const xHint = (r.slot.platform === 'twitter' && effLen !== len) ? ` (≈${effLen} on X after link shortening)` : '';
         return `
         <div class="preview-card">
             <span class="platform-badge platform-${r.slot.platform}">${escapeHtml(PLATFORM_LABELS[r.slot.platform] || r.slot.platform)}</span>
             ${r.slot.is_builtin ? '<span class="badge badge-published" style="margin-left: 0.5rem;">Built-in</span>' : ''}
             <pre>${highlightUnresolved(escapeHtml(r.rendered))}</pre>
-            <small class="${over ? 'tag-unresolved' : ''}">${len} characters${xHint}${over ? ` — exceeds max characters of ${limit}` : ''}</small>
+            <small class="${over ? 'tag-unresolved' : ''}">${len} characters${lenExtra}${over ? ` — exceeds the limit (${limit.toLocaleString()})` : ''}</small>
         </div>`;
     }).join('');
 }

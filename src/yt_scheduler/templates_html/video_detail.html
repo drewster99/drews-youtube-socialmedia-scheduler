@@ -1161,6 +1161,23 @@ async function loadSocialPosts() {
     await loadPlatformConfigs();
     await loadPostingSettings();
 
+    // For X posts the character limit depends on the *resolved* account
+    // (slot binding → project default): 280 free, 25,000 on X Premium.
+    let xCredById = {};
+    let xDefaultId = null;
+    try {
+        const [xCredsResp, xDefaultsResp] = await Promise.all([
+            fetch('/api/social-credentials?platform=twitter', {_silent: true}),
+            fetch(`/api/projects/${projectSlug}/social-defaults`, {_silent: true}),
+        ]);
+        if (xCredsResp.ok) for (const c of await xCredsResp.json()) xCredById[c.id] = c;
+        if (xDefaultsResp.ok) {
+            const d = await xDefaultsResp.json();
+            xDefaultId = (d && d.twitter) ? d.twitter.social_account_id : null;
+        }
+    } catch (_) {}
+    const resolveXCred = (post) => xCredById[(post.social_account_id != null) ? post.social_account_id : xDefaultId] || null;
+
     try {
         const resp = await fetch(`/api/social/posts/${videoId}`);
         const posts = await resp.json();
@@ -1215,8 +1232,14 @@ async function loadSocialPosts() {
             }
 
             const content = p.content || '';
-            const limit = p.max_chars || PLATFORM_LIMITS[p.platform] || 0;
             const effLen = platformContentLength(p.platform, content);
+            let limit, xCred = null;
+            if (p.platform === 'twitter') {
+                xCred = resolveXCred(p);
+                limit = xPostLimit(xCred ? xCred.verified_type : null);
+            } else {
+                limit = p.max_chars || PLATFORM_LIMITS[p.platform] || 0;
+            }
             const overLimit = limit && effLen > limit;
 
             let actions = '';
@@ -1256,9 +1279,20 @@ async function loadSocialPosts() {
                                       data-id="${p.id}"
                                       ${bodyClickable ? `onclick="openSocialPostEditor(${p.id})" title="Click to edit"` : ''}
                                  >${highlightUnresolvedTags(escapeHtml(content))}</div>`;
-            const overWarn = overLimit
-                ? `<div class="post-warn">${effLen} exceeds max characters of ${limit}</div>`
-                : '';
+            // Length note. Over the limit → red (the platform will reject it).
+            // For X, when the post is over the 280 free cap but under the
+            // account's actual limit because it's X Premium, show a neutral
+            // note so it's clear *why* there's no warning.
+            let lenNote = '';
+            if (overLimit) {
+                const extra = (p.platform === 'twitter')
+                    ? ` — X ${xCred && xIsPremium(xCred.verified_type) ? 'Premium' : 'free'} accounts cap at ${limit.toLocaleString()} chars.`
+                    : '';
+                lenNote = `<div class="post-warn">${effLen.toLocaleString()} exceeds max characters of ${limit.toLocaleString()}${extra}</div>`;
+            } else if (p.platform === 'twitter' && effLen > X_FREE_POST_LIMIT) {
+                const who = xCred ? `@${escapeHtml(xCred.username || '')}` : 'this account';
+                lenNote = `<div class="form-hint" style="margin-top:0.3rem;">X Premium (${who}) · ${effLen.toLocaleString()} / ${limit.toLocaleString()} chars</div>`;
+            }
             return `
                 <div class="social-post-card ${overLimit ? 'social-post-over-limit' : ''}" data-post-card="${p.id}" style="${opacity}">
                     <div class="social-post-header">
@@ -1266,7 +1300,7 @@ async function loadSocialPosts() {
                         ${statusBadge}
                     </div>
                     ${displayBody}
-                    ${overWarn}
+                    ${lenNote}
                     <div class="social-post-actions">${actions}</div>
                 </div>
             `;
