@@ -209,6 +209,26 @@ async function generatePreviews() {
     }
 }
 
+function postMediaPaths(p) {
+    let paths = [];
+    try { paths = JSON.parse(p.media_paths || '[]'); } catch (_) { paths = []; }
+    if ((!paths || !paths.length) && p.media_path) paths = [p.media_path];
+    return Array.isArray(paths) ? paths.filter(Boolean) : [];
+}
+
+function mediaSummaryHtml(p) {
+    const paths = postMediaPaths(p);
+    if (!paths.length) {
+        return '<div class="form-hint" style="margin: 0.25rem 0;">📎 No media attached.</div>';
+    }
+    const names = paths.map(x => String(x).split('/').pop()).join(', ');
+    return `<div class="form-hint" style="margin: 0.25rem 0;">📎 Attaching ${paths.length} file${paths.length === 1 ? '' : 's'}: ${escapeHtmlBasic(names)}</div>`;
+}
+
+function escapeHtmlBasic(s) {
+    return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function renderPreviews() {
     const container = document.getElementById('preview-cards');
     if (!posts.length) {
@@ -232,6 +252,7 @@ function renderPreviews() {
                 }</span>
             </div>
             <textarea data-id="${p.id}" rows="4" ${isPosted ? 'disabled' : ''}>${(p.content || '').replace(/</g,'&lt;')}</textarea>
+            ${mediaSummaryHtml(p)}
             <div class="compose-actions">
                 <button class="btn btn-sm btn-outline-primary" onclick="postOne(${p.id})" ${isPosted ? 'disabled' : ''}>Post now</button>
             </div>
