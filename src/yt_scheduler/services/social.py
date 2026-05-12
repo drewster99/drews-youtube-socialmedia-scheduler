@@ -134,15 +134,18 @@ async def _twitter_v2_chunked_upload(
     total_bytes = media_path.stat().st_size
 
     async with httpx.AsyncClient(timeout=120) as client:
-        # INIT
+        # INIT — X's v2 /2/media/upload expects the command steps as
+        # multipart/form-data, not url-encoded; httpx only emits multipart
+        # when a `files=` mapping is present, so the fields go through there as
+        # ``(None, value)`` tuples even though there's no actual file here.
         init = await client.post(
             _TWITTER_V2_MEDIA,
             headers=headers,
-            data={
-                "command": "INIT",
-                "total_bytes": str(total_bytes),
-                "media_type": mime,
-                "media_category": _twitter_media_category(mime),
+            files={
+                "command": (None, "INIT"),
+                "total_bytes": (None, str(total_bytes)),
+                "media_type": (None, mime),
+                "media_category": (None, _twitter_media_category(mime)),
             },
         )
         if init.status_code != 200:
@@ -178,11 +181,11 @@ async def _twitter_v2_chunked_upload(
                     )
                 segment += 1
 
-        # FINALIZE
+        # FINALIZE — same multipart-only requirement as INIT.
         finalize = await client.post(
             _TWITTER_V2_MEDIA,
             headers=headers,
-            data={"command": "FINALIZE", "media_id": media_id},
+            files={"command": (None, "FINALIZE"), "media_id": (None, str(media_id))},
         )
         if finalize.status_code != 200:
             raise RuntimeError(f"v2 media FINALIZE failed ({finalize.status_code}): {finalize.text}")
@@ -344,13 +347,15 @@ class TwitterPoster(SocialPoster):
     async def refresh_if_stale(self, *, window_secs: int = 0) -> bool:
         creds = self._get_creds()
         uuid = creds.get("uuid")
-        # Need the rotating refresh token + the OAuth client id, and an
-        # expiry to compare against (older bundles predate the expires_at
-        # field — those get renewed lazily on the next 401 instead).
+        # Need the rotating refresh token + the OAuth client id to refresh.
         if not (uuid and creds.get("refresh_token") and creds.get("client_id")):
             return False
         expires_at = int(creds.get("expires_at") or 0)
-        if not expires_at or expires_at - window_secs > int(time.time()):
+        # Skip only when we *know* it's still fresh. If the bundle predates the
+        # expires_at field (it's 0), refresh once anyway — that backfills the
+        # expiry so future sweeps behave normally and the bearer doesn't drift
+        # stale while waiting for a 401.
+        if expires_at and expires_at - window_secs > int(time.time()):
             return False
         from yt_scheduler.services.social_credentials import (
             clear_needs_reauth,
@@ -1010,7 +1015,10 @@ class MastodonPoster(SocialPoster):
                 if existing:
                     media_ids = []
                     for p in existing:
-                        media = client.media_post(p)
+                        # mastodon.py is synchronous; uploading a multi-MB
+                        # video this way would block the event loop for the
+                        # whole transfer. Run it on a worker thread instead.
+                        media = await asyncio.to_thread(client.media_post, p)
                         mid = media["id"]
                         # Video / large uploads come back still processing
                         # (``url`` is null); attaching one to a status 422s
@@ -1022,14 +1030,14 @@ class MastodonPoster(SocialPoster):
                             for _ in range(60):  # up to ~60s
                                 await asyncio.sleep(1)
                                 try:
-                                    media = client.media(mid)
+                                    media = await asyncio.to_thread(client.media, mid)
                                 except Exception:
                                     break
                                 if media.get("url") is not None:
                                     break
                         media_ids.append(mid)
 
-                status = client.status_post(text, media_ids=media_ids)
+                status = await asyncio.to_thread(client.status_post, text, media_ids=media_ids)
             except MastodonUnauthorizedError as exc:
                 # Either media_post or status_post can raise this if the
                 # access token has been revoked/expired.
