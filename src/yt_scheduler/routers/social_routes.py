@@ -337,6 +337,18 @@ async def generate_posts(
                 if fallback:
                     media_paths = [fallback]
 
+            # Threads' API posts text only — it can't attach any media. Drop
+            # whatever was resolved (a {{thumbnail}}/{{image:...}} directive or
+            # the slot's media fallback) and warn, rather than silently
+            # discarding it at send time. ({{video}} slots were already
+            # skipped above.)
+            if platform == "threads" and media_paths:
+                warnings.append(
+                    "Threads slot will post text-only — Threads can't attach media yet, "
+                    "so its image/video attachment was dropped."
+                )
+                media_paths = []
+
             prepared.append({
                 "slot": slot,
                 "platform": platform,

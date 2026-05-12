@@ -396,6 +396,12 @@ async def _maybe_generate_socials(
             if fallback:
                 media_paths = [fallback]
 
+        # Threads can't attach media — drop it (the {{video}} case was already
+        # skipped above; this catches {{thumbnail}}/{{image:...}}/fallbacks).
+        if platform == "threads" and media_paths:
+            logger.info("auto-social: Threads slot for %s — dropping media (Threads is text-only)", video_id)
+            media_paths = []
+
         media_paths_json = json.dumps(media_paths) if media_paths else None
         primary_media = media_paths[0] if media_paths else None
         media_type = slot.get("media", "thumbnail")

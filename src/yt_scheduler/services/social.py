@@ -1011,7 +1011,23 @@ class MastodonPoster(SocialPoster):
                     media_ids = []
                     for p in existing:
                         media = client.media_post(p)
-                        media_ids.append(media["id"])
+                        mid = media["id"]
+                        # Video / large uploads come back still processing
+                        # (``url`` is null); attaching one to a status 422s
+                        # with "files that have not finished processing". Poll
+                        # until the server reports it's done (best-effort —
+                        # if polling fails or times out we let status_post try
+                        # anyway, which behaves the same as before).
+                        if media.get("url") is None:
+                            for _ in range(60):  # up to ~60s
+                                await asyncio.sleep(1)
+                                try:
+                                    media = client.media(mid)
+                                except Exception:
+                                    break
+                                if media.get("url") is not None:
+                                    break
+                        media_ids.append(mid)
 
                 status = client.status_post(text, media_ids=media_ids)
             except MastodonUnauthorizedError as exc:
