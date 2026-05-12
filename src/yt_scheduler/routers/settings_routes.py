@@ -13,7 +13,7 @@ from yt_scheduler.config import (
 )
 from yt_scheduler.database import get_db
 from yt_scheduler.services import moderation
-from yt_scheduler.services import ngrok, oauth_clients
+from yt_scheduler.services import oauth_clients
 from yt_scheduler.services.keychain import (
     delete_secret,
     get_storage_type,
@@ -156,9 +156,10 @@ OAUTH_CLIENT_HELP = {
         "instructions": (
             "Register a Threads app, then open your app → Use cases → "
             "Threads API → Settings. Both Client ID and Client Secret are "
-            "required. Threads OAuth requires HTTPS, so connect the account "
-            "with the app open via the ngrok tunnel URL (see the HTTPS "
-            "tunnel card)."
+            "required. Threads OAuth requires an HTTPS redirect — the app "
+            "routes it through the bounce page in cloudflare/ (deploy that "
+            "to your site), or use 'Paste long-lived token' below for "
+            "local testing."
         ),
     },
 }
@@ -229,23 +230,23 @@ async def delete_oauth_client(platform: str):
     return {"status": "ok"}
 
 
-# --- ngrok HTTPS tunnel detection (for OAuth flows that require HTTPS) ---
+# --- Threads OAuth redirect status (Meta requires an HTTPS redirect URL) ---
 
 
-@router.get("/ngrok")
-async def get_ngrok_status():
-    """Report whether an ngrok tunnel is forwarding to our local port.
+@router.get("/threads-oauth")
+async def get_threads_oauth_status():
+    """Report the configured Threads OAuth redirect URL (``DYS_THREADS_REDIRECT_URL``).
 
-    Used by the Settings UI to surface the ``https://...ngrok-free.app``
-    URL the user should open the app at when running an OAuth flow that
-    Meta / others reject from plain ``http://`` origins.
+    Meta only redirects to HTTPS, so the popup-based Threads flow needs this
+    set to a public "bounce" page that forwards ?code&state back to
+    ``/api/oauth/threads/callback`` (see ``cloudflare/`` in the repo). When it
+    is empty the Settings UI tells the user to configure it (or to use the
+    "Paste long-lived token" shortcut for local testing).
     """
-    from yt_scheduler.config import PORT
+    from yt_scheduler.config import PORT, THREADS_REDIRECT_URL
 
-    public_url = await ngrok.detect_https_tunnel(PORT)
     return {
-        "detected": public_url is not None,
-        "public_url": public_url or "",
+        "redirect_url": THREADS_REDIRECT_URL,
         "local_port": PORT,
     }
 

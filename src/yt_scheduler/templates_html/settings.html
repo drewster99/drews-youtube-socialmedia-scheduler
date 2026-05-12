@@ -59,18 +59,20 @@
     </div>
 </div>
 
-<!-- HTTPS tunnel (ngrok) — needed for OAuth flows like Meta/Threads that
-     reject http:// origins -->
+<!-- Threads OAuth redirect — Meta only redirects to HTTPS, so the popup flow
+     needs DYS_THREADS_REDIRECT_URL pointing at a public bounce page. -->
 <div class="card">
-    <h2>HTTPS tunnel (ngrok)</h2>
+    <h2>Threads OAuth redirect</h2>
     <p class="form-hint">
-        Meta / Threads OAuth refuses to issue tokens from <code>http://</code>
-        pages — so to connect a Threads account, the app needs to be loaded
-        over HTTPS. The simplest path is to run
-        <code>ngrok http <span id="ngrok-port-hint">8008</span></code>
-        in a terminal; this card auto-detects the resulting tunnel.
+        Meta only redirects OAuth back to <strong>HTTPS</strong> URLs, so the
+        Threads "Add account" popup goes through a public "bounce" page that
+        forwards the response back to this app — by default the one shown below,
+        whose source lives in <code>cloudflare/</code> (deploy it to your site,
+        or override with the <code>DYS_THREADS_REDIRECT_URL</code> env var). For
+        quick local testing you can skip all that and use "Paste long-lived
+        token" under the Threads section below.
     </p>
-    <div id="ngrok-status">
+    <div id="threads-oauth-status">
         <p class="loading">Checking…</p>
     </div>
 </div>
@@ -305,41 +307,34 @@ async function removeAnthropicKey() {
     }
 }
 
-// --- ngrok HTTPS tunnel ---
+// --- Threads OAuth redirect ---
 
-async function loadNgrokStatus() {
-    const root = document.getElementById('ngrok-status');
-    const resp = await fetch('/api/settings/ngrok', {_silent: true});
+async function loadThreadsOAuthStatus() {
+    const root = document.getElementById('threads-oauth-status');
+    const resp = await fetch('/api/settings/threads-oauth', {_silent: true});
     if (!resp.ok) {
-        root.innerHTML = '<p class="form-hint">Could not check tunnel status.</p>';
+        root.innerHTML = '<p class="form-hint">Could not check status.</p>';
         return;
     }
     const data = await resp.json();
-    document.getElementById('ngrok-port-hint').textContent = data.local_port;
-    if (data.detected) {
-        const onTunnel = window.location.origin === data.public_url.replace(/\/$/, '');
-        const onTunnelBadge = onTunnel
-            ? '<span class="badge badge-published" style="margin-left: 0.5rem;">App loaded via tunnel</span>'
-            : '<button class="btn btn-sm btn-primary" style="margin-left: 0.5rem;" onclick="window.open(this.dataset.url + window.location.pathname, \'_blank\')" data-url="' + escapeHtml(data.public_url) + '">Open this app via the tunnel</button>';
+    if (data.redirect_url) {
         root.innerHTML = `
             <div style="display:flex; align-items:center; gap:0.5rem; flex-wrap:wrap;">
-                <span class="badge badge-published">Tunnel detected</span>
-                <code style="background: var(--bg-input); padding: 0.2rem 0.5rem; border-radius: 4px;">${escapeHtml(data.public_url)}</code>
-                ${onTunnelBadge}
+                <span class="badge badge-published">Configured</span>
+                <code style="background: var(--bg-input); padding: 0.2rem 0.5rem; border-radius: 4px;">${escapeHtml(data.redirect_url)}</code>
             </div>
             <p class="form-hint" style="margin-top: 0.5rem;">
-                For Threads OAuth: register
-                <code>${escapeHtml(data.public_url)}/api/oauth/threads/callback</code>
-                as a Valid OAuth Redirect URI in your Meta app settings, then load the
-                app via the tunnel URL above and click + New on Threads.
+                Register that exact URL as a <strong>Redirect Callback URL</strong> in your Meta app
+                (Threads → Settings), along with your Uninstall and Delete callback URLs, and deploy
+                the matching files from <code>cloudflare/</code> to that host. Then "Add account" on
+                Threads works directly from <code>http://${escapeHtml(window.location.host)}</code>.
             </p>`;
     } else {
         root.innerHTML = `
             <p class="form-hint">
-                <span class="badge badge-draft">No tunnel detected</span>
-                Start one with <code>ngrok http ${data.local_port}</code> (install
-                ngrok from <a href="https://ngrok.com/download" target="_blank" rel="noopener">ngrok.com/download</a>),
-                then refresh this page.
+                <span class="badge badge-draft">No redirect configured</span>
+                Couldn't read the configured redirect URL. Use "Paste long-lived token" below for
+                local testing, or check the server logs.
             </p>`;
     }
 }
@@ -484,8 +479,14 @@ function renderPlatformCard(name, config, accounts) {
     const blueskyForm = '';
     const threadsExchange = name === 'threads'
         ? `<p class="form-hint" style="margin-top: 0.75rem;">
-              Local installs can also paste a short-lived token from the Graph API Explorer:
+              For quick local testing you can skip the OAuth flow:
+              <button class="btn btn-sm btn-secondary" onclick="pasteThreadsToken()">Paste long-lived token</button>
               <button class="btn btn-sm btn-secondary" onclick="exchangeThreadsToken()">Exchange short-lived token</button>
+              <br><small style="color:var(--text-muted);">
+                  "Paste long-lived token": use <em>User Token Generator → Generate Access Token</em> on your
+                  Meta app's Threads → Settings page (works for accounts added as Threads Testers).
+                  "Exchange short-lived token": paste a short-lived token from the Graph API Explorer.
+              </small>
            </p>`
         : '';
 
@@ -566,6 +567,22 @@ async function exchangeThreadsToken() {
         const result = await resp.json();
         const days = Math.round((result.expires_in || 0) / 86400);
         showToast(`Threads connected as @${result.username || result.user_id} (token valid ~${days} days)`, 'success');
+        loadSocialPlatforms();
+    }
+}
+
+async function pasteThreadsToken() {
+    const token = prompt('Long-lived Threads Access Token\n\nGet it from your Meta app: Threads → Settings → User Token Generator → "Generate Access Token" next to your tester account.');
+    if (!token) return;
+    showToast('Saving Threads token…', 'info');
+    const resp = await fetch('/api/oauth/threads/token', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({access_token: token.trim()}),
+    });
+    if (resp.ok) {
+        const result = await resp.json();
+        showToast(`Threads connected as @${result.username || result.user_id}`, 'success');
         loadSocialPlatforms();
     }
 }
@@ -677,7 +694,7 @@ async function loadSettings() {
 // Load everything
 loadAuthStatus();
 loadAnthropicStatus();
-loadNgrokStatus();
+loadThreadsOAuthStatus();
 loadOAuthClients();
 loadSocialPlatforms();
 loadSettings();

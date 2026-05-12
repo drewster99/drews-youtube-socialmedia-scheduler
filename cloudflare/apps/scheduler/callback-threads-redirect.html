@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Finishing sign-in…</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #0d1117; color: #e6edf3; display: flex; align-items: center;
+         justify-content: center; min-height: 100vh; margin: 0; padding: 1rem; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+          padding: 2rem 2.5rem; max-width: 480px; text-align: center; }
+  h1 { margin: 0 0 .5rem; font-size: 1.2rem; }
+  p { color: #8b949e; font-size: .92rem; line-height: 1.55; }
+  a { color: #58a6ff; }
+  code { background: #0d1117; padding: .15rem .35rem; border-radius: 4px; font-size: .85em; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Finishing sign-in…</h1>
+  <p>Sending you back to <strong>Drew's Video&nbsp;+&nbsp;Socials Scheduler</strong> running on your computer.</p>
+  <p id="fallback" style="display:none">
+    If this page doesn't redirect automatically,
+    <a id="link" href="#">click here to continue</a>.
+    <br>The Scheduler must be running locally — by default at <code>http://127.0.0.1:8008</code>.
+  </p>
+</div>
+<script>
+(function () {
+  // Where the local Scheduler listens. Change the port here if you run the
+  // app on something other than the default 8008 (DYS_PORT).
+  var LOCAL_BASE = "http://127.0.0.1:8008";
+  var CALLBACK_PATH = "/api/oauth/threads/callback";
+
+  var qs = window.location.search || "";
+  var target = LOCAL_BASE + CALLBACK_PATH + qs;
+
+  var link = document.getElementById("link");
+  link.href = target;
+  document.getElementById("fallback").style.display = "block";
+
+  // Only forward an actual OAuth response (a `code` or an `error`). A bare
+  // visit to this page just sees it — no point bouncing to a local endpoint
+  // that would 422 without those params.
+  if (/[?&](code|error)=/.test(qs)) {
+    window.location.replace(target);
+  }
+})();
+</script>
+</body>
+</html>

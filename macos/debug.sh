@@ -4,7 +4,10 @@
 
 set +e  # don't bail on the first missing thing
 BUNDLE_ID="com.nuclearcyborg.drews-socialmedia-scheduler"
-APP="/Users/andrew/Documents/ncc_source/cursor/drews-youtube-socialmedia-scheduler/macos/build/Drew's Video + Socials Scheduler.app"
+# Derived from this script's own location so a rename / move of the repo
+# directory doesn't silently point us at a stale path.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP="$SCRIPT_DIR/build/Drew's Video + Socials Scheduler.app"
 PORT=8008
 
 bar() { printf "\n========== %s ==========\n" "$1"; }

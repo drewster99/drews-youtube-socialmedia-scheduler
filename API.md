@@ -847,16 +847,23 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 {
   "template_name": "announce_video",  // default
   "platforms": ["twitter", "bluesky"], // optional whitelist
-  "user_message": "..."                // exposed to templates as {{user_message}}
+  "user_message": "...",               // exposed to templates as {{user_message}}
+  "unresolved": {"repo": "empty", "video": "literal"},  // see "Errors" below
+  "unresolved_ack": true               // proceed even with unresolved vars (all left literal)
 }
 ```
 
-**Response 200** — Array of generated post snapshots:
+`unresolved` maps each unresolved variable name to `"empty"` (substitute an empty string) or `"literal"` (leave `{{name}}` in the post). Passing the `unresolved` key — even `{}` — acknowledges the unresolved set so generation proceeds; `unresolved_ack: true` does the same without choosing per-name behavior.
+
+**Response 200** — `{"posts": [...], "warnings": [...]}`. `posts` is the array of generated post snapshots; `warnings` is a list of human-readable strings (e.g. a Threads slot skipped because it uses `{{video}}`).
 
 ```json
-[
-  { "slot_id": 7, "platform": "twitter", "content": "...", "media": "thumbnail" | "video" | "none", "max_chars": 280, "social_account_id": 1 }
-]
+{
+  "posts": [
+    { "slot_id": 7, "platform": "twitter", "content": "...", "media": "thumbnail" | "video" | "none", "max_chars": 280, "social_account_id": 1 }
+  ],
+  "warnings": ["Threads slot skipped — {{video}} attachments aren't supported on Threads yet (its API posts text only)."]
+}
 ```
 
 **Query params** — `confirm_overwrite_scheduled` (bool, default `false`). When false, the route refuses to regenerate if any unsent post for this video is currently scheduled (has a non-NULL `scheduler_job_id`).
@@ -865,8 +872,10 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 
 - `404` — Video or template not found.
 - `409` — One or more posts are scheduled. Body: `{"detail": {"scheduled_overwrite": true, "needs_confirm": true, "scheduled": [{"post_id": int, "platform": str, "scheduled_at": "<ISO>"}, ...]}}`. Re-issue with `?confirm_overwrite_scheduled=true` to proceed.
+- `409` — Template has variables with no value and neither `unresolved` nor `unresolved_ack` was provided. Body: `{"detail": {"unresolved": ["name", ...]}}`. Re-issue with `unresolved` (or `unresolved_ack: true`). Nothing is written or deleted before this gate.
+- `500` — A non-disabled slot has no `max_chars` (a data bug — every slot is created with a positive value).
 
-**Side effects** — Holds the per-video publish lock. When `confirm_overwrite_scheduled=true`, calls `cancel_scheduled_post()` on each scheduled row first (tearing down its APScheduler `DateTrigger`) so no orphan jobs remain. Then deletes existing `social_posts` for the video where `status NOT IN ('posted','sending')` and inserts one fresh `draft` row per non-disabled, matching slot. Template variables exposed: `title`, `url`, `description`, `description_short` (≤150), `description_medium` (≤500), `tags`, `hashtags`, `thumbnail_path`, `tier`, `transcript` (plain text, SRT stripped), `user_message`. Also calls `youtube.get_video` to read the duration tier.
+**Side effects** — Holds the per-video publish lock. Renders every slot up front (before any destructive op) so the unresolved-vars gate can fire harmlessly. When `confirm_overwrite_scheduled=true`, calls `cancel_scheduled_post()` on each scheduled row first (tearing down its APScheduler `DateTrigger`) so no orphan jobs remain. Then deletes existing `social_posts` for the video where `status NOT IN ('posted','sending')` and inserts one fresh `draft` row per non-disabled, matching slot (each carrying the slot's `max_chars`). Threads slots whose body contains `{{video}}` are skipped (and reported in `warnings`). Template variables exposed: `title`, `url`, `description`, `description_short` (≤150), `description_medium` (≤500), `tags`, `hashtags`, `thumbnail_path`, `tier`, `transcript` (plain text, SRT stripped), `user_message`, `max_chars` (the slot's "Max characters" value). Also calls `youtube.get_video` to read the duration tier.
 
 **Renderer** — Each slot's `body` is rendered through the same engine as [`POST /api/expand_text`](#post-apiexpand_text) (`services/templates.render`). All variables, `{{var!}}` / `{{var??default}}` / `{{ai: ...}}` / `{{ai[system]: ...}}` syntax, and recursive AI-block evaluation behave identically.
 
@@ -885,6 +894,18 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 **Note on media** — The `social_posts` table now has both `media_path` (legacy single-string column, kept for backwards compat) and `media_paths` (JSON array column, the canonical form). The post-generation paths and PUT endpoint write both. The send paths read `media_paths` first and fall back to `media_path`. Once all writers stop touching the legacy column it'll be dropped in a follow-up migration.
 
 **Response 200** — `{"status": "ok"}`.
+
+### `POST /api/social/posts/{post_id}/shorten`
+
+**Purpose** — Ask the model to rewrite a generated post shorter, preserving meaning and every URL. Applies the result to `social_posts.content` in place.
+
+**Request body** — `{"target_chars": int}` (optional; defaults to the post's `max_chars`, or 280 if that's null).
+
+**Response 200** — `{"content": "<new text>", "previous": "<old text>", "char_count": int, "warning": str | null}`. `previous` lets the caller offer an Undo (via `PUT /api/social/posts/{post_id}` with `{"content": <previous>}`). `warning` is set if a URL from the original appears to be missing in the rewrite.
+
+**Errors** — `404` (post not found), `400` (post is empty, or `target_chars` not positive), `502` (the model call failed or returned nothing).
+
+**Renderer** — Uses `services/ai.call_ai_block` (one Claude round-trip).
 
 ### `POST /api/social/posts/{post_id}/send`
 
@@ -1129,6 +1150,7 @@ Only `template` is required; everything else has defaults.
 **Built-in variables** provided by the post-generation paths (`/api/social/generate-posts/{video_id}` and the auto-actions background path) on top of whatever the caller passes:
 
 - `{{title}}`, `{{description}}`, `{{description_short}}` (≤150), `{{description_medium}}` (≤500), `{{tags}}` (comma-joined), `{{hashtags}}` (top 5 as `#CamelCase`), `{{thumbnail_path}}`, `{{tier}}`, `{{transcript}}` (plain-text, SRT stripped), `{{user_message}}`.
+- `{{max_chars}}` — the rendering slot's "Max characters" value, as a string of digits. Only the slot-rendering paths supply it (`/api/social/generate-posts/{video_id}`, the template-editor preview, and the auto-gen-socials job); other render paths leave `{{max_chars}}` literal. Handy inside an `{{ai:}}` block so the model knows the platform limit.
 - `{{url}}` — `videos.url`. Populated from the YouTube URL at upload / import for YT-backed items, NULL→empty string for standalone items unless explicitly set.
 - `{{episode_url}}` — when the item has `parent_item_id` set, the parent's `url`; empty otherwise.
 - `{{project_url}}` — `projects.project_url`. Auto-populated from the YouTube channel handle on OAuth bind for YT projects; set explicitly via `POST /api/projects` for non-YT projects; editable via `PATCH /api/projects/{slug}` and refreshable via `POST /api/projects/{slug}/youtube/refresh-channel-url`.
@@ -1306,14 +1328,14 @@ Source: `src/yt_scheduler/routers/settings_routes.py`
 
 **Errors** — `400` (unsupported platform).
 
-### `GET /api/settings/ngrok`
+### `GET /api/settings/threads-oauth`
 
-**Purpose** — Detect whether an ngrok tunnel is forwarding to our local port. Used by the Settings UI to surface the HTTPS URL needed for OAuth flows that reject `http://`.
+**Purpose** — Report the configured Threads OAuth redirect URL. Used by the Settings UI: Meta only redirects OAuth back to HTTPS, so the popup-based Threads flow goes through a public "bounce" page (`DYS_THREADS_REDIRECT_URL`, defaulting to `https://nuclearcyborg.com/apps/scheduler/callback-threads-redirect`) that forwards `?code&state` back to `/api/oauth/threads/callback`; bounce-page source is in `cloudflare/`.
 
 **Response 200**:
 
 ```json
-{ "detected": true, "public_url": "https://...ngrok-free.app", "local_port": 8008 }
+{ "redirect_url": "https://nuclearcyborg.com/apps/scheduler/callback-threads-redirect", "local_port": 8008 }
 ```
 
 ### `GET /api/settings/social`
@@ -1468,9 +1490,9 @@ These routes implement OAuth start/callback for each platform. The browser pre-o
 
 **Response 200** — `{"auth_url": "...", "redirect_uri": "..."}`.
 
-**Errors** — `400` (client missing, origin missing).
+**Errors** — `400` (client missing, origin missing, or the resolved `redirect_uri` is not HTTPS).
 
-**Notes** — Threads requires HTTPS; on local `http://` origins, use `POST /api/oauth/threads/exchange` instead.
+**Notes** — `redirect_uri` is the configured Threads bounce page — `DYS_THREADS_REDIRECT_URL`, which defaults to `https://nuclearcyborg.com/apps/scheduler/callback-threads-redirect` (a static page that forwards `?code&state` back to `/api/oauth/threads/callback`; source in `cloudflare/`). Meta only allows HTTPS redirect URIs, so this must be HTTPS. Whatever `redirect_uri` is used here is replayed verbatim in the token exchange (Meta requires an exact match). For local testing without a deployed bounce page, use `POST /api/oauth/threads/exchange` or `POST /api/oauth/threads/token` instead.
 
 ### `GET /api/oauth/threads/callback`
 
@@ -1493,6 +1515,22 @@ These routes implement OAuth start/callback for each platform. The browser pre-o
 ```
 
 **Errors** — `400` (missing token, missing app secret), `502` (network error or upstream error from Graph API).
+
+### `POST /api/oauth/threads/token`
+
+**Purpose** — Store a long-lived Threads access token pasted directly by the user (e.g. from the Meta app dashboard's *User Token Generator* → "Generate Access Token"). No OAuth redirect, no short→long exchange — handy for local testing.
+
+**Request body** — `{"access_token": "..."}`.
+
+**Response 200**:
+
+```json
+{ "ok": true, "user_id": "...", "username": "...", "social_account_id": 1, "uuid": "..." }
+```
+
+**Side effects** — Calls `https://graph.threads.net/v1.0/me`; upserts the credential row + Keychain bundle (`access_token`, `user_id`, `username`, plus the stored Threads app secret if one is configured).
+
+**Errors** — `400` (missing `access_token`), `502` (network error or `/me` failed — status passed through).
 
 ### `POST /api/oauth/twitter/start`
 

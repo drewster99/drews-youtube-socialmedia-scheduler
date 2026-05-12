@@ -21,7 +21,7 @@ import httpx
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 
-from yt_scheduler.config import YOUTUBE_SCOPES
+from yt_scheduler.config import THREADS_REDIRECT_URL, YOUTUBE_SCOPES
 from yt_scheduler.database import get_db
 from yt_scheduler.services.auth import (
     channel_id_from_credentials,
@@ -219,9 +219,21 @@ async def threads_start(data: dict):
     if not origin:
         raise HTTPException(400, "origin is required")
 
+    # Meta only redirects to (and only lets you register) HTTPS URIs. When
+    # ``DYS_THREADS_REDIRECT_URL`` is set we use that public bounce page —
+    # it forwards ?code&state back here — otherwise we fall back to the
+    # local callback path, which only works if ``origin`` is itself HTTPS.
+    redirect_uri = THREADS_REDIRECT_URL or f"{origin}{THREADS_REDIRECT_PATH}"
+    if not redirect_uri.startswith("https://"):
+        raise HTTPException(
+            400,
+            "Threads OAuth needs an HTTPS redirect URL. Set DYS_THREADS_REDIRECT_URL "
+            "to your public bounce page (see cloudflare/ in the repo), reach this app "
+            "over an HTTPS tunnel, or use 'Exchange short-lived token' instead.",
+        )
+
     _gc_pending()
     state = secrets.token_urlsafe(24)
-    redirect_uri = f"{origin}{THREADS_REDIRECT_PATH}"
     _pending[state] = {
         "platform": "threads",
         "client_id": client_id,
@@ -352,9 +364,11 @@ async def threads_exchange(data: dict):
     resolve user_id + username, and store everything in Keychain.
 
     This is the Meta-friendly alternative to the 3-legged OAuth flow — Meta
-    requires HTTPS redirects, so the popup-based flow only works behind
-    HTTPS (ngrok / production). For local use, grab a short-lived token from
-    the Graph API Explorer and paste it here.
+    requires an HTTPS redirect (see ``DYS_THREADS_REDIRECT_URL`` and the
+    ``cloudflare/`` bounce page), so for local use grab a short-lived token
+    from the Graph API Explorer and paste it here instead. (See also
+    ``POST /threads/token`` for pasting an already-long-lived token straight
+    from the app dashboard's User Token Generator.)
 
     Request body: {"app_secret": "...", "short_lived_token": "..."}
     """
@@ -434,6 +448,65 @@ async def threads_exchange(data: dict):
         "social_account_id": cred["id"],
         "uuid": cred["uuid"],
         "expires_in": long_data.get("expires_in"),
+    }
+
+
+@router.post("/threads/token")
+async def threads_paste_token(data: dict):
+    """Store a long-lived Threads access token pasted directly by the user.
+
+    The Meta app dashboard's *User Token Generator* ("Generate Access Token"
+    next to a Threads Tester) mints a long-lived (~60-day) token in one click —
+    no OAuth redirect, no short→long exchange. Paste it here for local testing.
+    For details see the Threads "Get Access Tokens and Permissions" docs.
+
+    Request body: ``{"access_token": "..."}``
+    """
+    access_token = (data.get("access_token") or "").strip()
+    if not access_token:
+        raise HTTPException(400, "access_token is required")
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            me = await client.get(
+                "https://graph.threads.net/v1.0/me",
+                params={"fields": "id,username", "access_token": access_token},
+            )
+    except Exception as e:
+        raise HTTPException(502, f"Network error fetching userinfo: {e}")
+
+    if me.status_code != 200:
+        raise HTTPException(me.status_code, f"/me failed: {me.text}")
+
+    me_data = me.json()
+    user_id = me_data.get("id")
+    username = me_data.get("username", "")
+    if not user_id:
+        raise HTTPException(502, "Threads /me response missing user id")
+
+    bundle = {"access_token": access_token, "user_id": str(user_id)}
+    # Carry the stored app secret along so a future token refresh has it; the
+    # poster itself only needs access_token + user_id.
+    _, app_secret = oauth_clients.get_oauth_client("threads")
+    if app_secret:
+        bundle["client_secret"] = app_secret
+    if username:
+        bundle["username"] = username
+
+    cred = await upsert_credential(
+        platform="threads",
+        provider_account_id=str(user_id),
+        username=username or str(user_id),
+        bundle=bundle,
+        is_nickname=not username,
+    )
+
+    return {
+        "ok": True,
+        "user_id": str(user_id),
+        "username": username,
+        "social_account_id": cred["id"],
+        "uuid": cred["uuid"],
     }
 
 

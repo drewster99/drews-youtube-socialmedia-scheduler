@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Data deletion status</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #0d1117; color: #e6edf3; display: flex; align-items: center;
+         justify-content: center; min-height: 100vh; margin: 0; padding: 1rem; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+          padding: 2rem 2.5rem; max-width: 560px; }
+  h1 { margin: 0 0 .75rem; font-size: 1.25rem; }
+  p { color: #c9d1d9; font-size: .95rem; line-height: 1.6; }
+  .muted { color: #8b949e; font-size: .85rem; margin-top: 1rem; }
+  code { background: #0d1117; padding: .15rem .35rem; border-radius: 4px; font-size: .85em; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Data deletion — nothing stored on our servers</h1>
+  <p>
+    <strong>Drew's Video&nbsp;+&nbsp;Socials Scheduler</strong> is a self-hosted application:
+    your Threads access token and all related data live only on the computer where you run it
+    (in your operating system's keychain and a local SQLite database). There is no server
+    operated by us that stores your data, so there is nothing for us to delete.
+  </p>
+  <p>
+    To fully remove the app's access: revoke it in your Threads / Meta account settings,
+    then on your own machine delete the app's data directory
+    (<code>~/Library/Application Support/com.nuclearcyborg.drews-socialmedia-scheduler/</code>
+    on macOS) and the matching keychain entries
+    (search Keychain Access for <code>com.nuclearcyborg.drews-socialmedia-scheduler</code>).
+  </p>
+  <p class="muted" id="ref"></p>
+</div>
+<script>
+(function () {
+  var p = new URLSearchParams(window.location.search);
+  var id = p.get("id"), code = p.get("code");
+  var parts = [];
+  if (code) parts.push("confirmation code " + code);
+  if (id && id !== "unknown") parts.push("user " + id);
+  if (parts.length) document.getElementById("ref").textContent = "Reference: " + parts.join(", ") + ".";
+})();
+</script>
+</body>
+</html>

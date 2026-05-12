@@ -108,6 +108,7 @@ All via environment variables (loaded from `.env`):
 | `DYS_DATA_DIR` | `~/.yt-scheduler` | Data directory |
 | `DYS_COMMENT_CHECK_MINUTES` | `30` | Comment moderation poll interval |
 | `DYS_CAPTION_CHECK_MINUTES` | `15` | Caption availability poll interval |
+| `DYS_THREADS_REDIRECT_URL` | `https://nuclearcyborg.com/apps/scheduler/callback-threads-redirect` | Override for the Threads OAuth `redirect_uri` bounce page (Meta rejects `http://`); bounce-page source is in `cloudflare/` |
 
 Legacy `YTP_*` names (`YTP_HOST`, `YTP_PORT`, `YTP_DATA_DIR`, etc.) are still honored as a fallback for older `.env` files.
 

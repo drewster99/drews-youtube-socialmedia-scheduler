@@ -111,6 +111,20 @@ def get_anthropic_api_key() -> str:
 HOST = os.getenv("DYS_HOST") or os.getenv("YTP_HOST", "127.0.0.1")
 PORT = int(os.getenv("DYS_PORT") or os.getenv("YTP_PORT", "8008"))
 
+# Public HTTPS "bounce" URL used as the OAuth ``redirect_uri`` for Threads.
+# Meta refuses to register/redirect to plain ``http://`` URIs, so when the
+# app runs locally over http the redirect has to land on an HTTPS page that
+# forwards ``?code&state`` back to this server's /api/oauth/threads/callback.
+# The default points at the nuclearcyborg.com static bounce page (the source
+# of which lives in ``cloudflare/`` in this repo); override with the
+# ``DYS_THREADS_REDIRECT_URL`` env var if you host the bounce page elsewhere.
+_DEFAULT_THREADS_REDIRECT_URL = (
+    "https://nuclearcyborg.com/apps/scheduler/callback-threads-redirect"
+)
+THREADS_REDIRECT_URL = (
+    os.getenv("DYS_THREADS_REDIRECT_URL") or _DEFAULT_THREADS_REDIRECT_URL
+).strip().rstrip("/")
+
 # Scheduler
 COMMENT_CHECK_INTERVAL_MINUTES = int(
     os.getenv("DYS_COMMENT_CHECK_MINUTES") or os.getenv("YTP_COMMENT_CHECK_MINUTES", "30")
