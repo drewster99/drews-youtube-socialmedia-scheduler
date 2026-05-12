@@ -41,9 +41,13 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[social,dev,transcription-mlx]"
 
-cp .env.example .env  # then edit and set ANTHROPIC_API_KEY
+cp .env.example .env  # optional; only non-secret settings live here
 yt-scheduler            # serves http://127.0.0.1:8008
 ```
+
+Set your Anthropic API key from the web UI (Settings → Anthropic). It is stored
+in the system Keychain (encrypted-file fallback on non-macOS) — never in `.env`
+or any env var.
 
 ### Install (macOS .app)
 
@@ -60,7 +64,6 @@ Environment variables (loaded from `.env`; legacy `YTP_*` names are honoured as 
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `ANTHROPIC_API_KEY` | — | Claude API key (also configurable from Settings) |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Default Claude model. Override per install via Settings → Anthropic → Model name (stored in DB). |
 | `DYS_HOST` | `127.0.0.1` | Bind address |
 | `DYS_PORT` | `8008` | Server port |

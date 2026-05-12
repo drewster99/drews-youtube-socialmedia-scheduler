@@ -1,8 +1,8 @@
 """Live integration tests for the template renderer.
 
 These hit the real Anthropic API via ``services.templates.render``. They
-auto-skip when no Anthropic API key is available (Keychain or
-``ANTHROPIC_API_KEY`` env var). Each test costs a few cents in tokens
+auto-skip when no Anthropic API key is configured in the Keychain
+(encrypted-file fallback elsewhere). Each test costs a few cents in tokens
 and a few seconds in latency, so they're segregated from the default
 suite via a module-level skip — run with ``pytest tests/test_template_render_live.py``
 to exercise them deliberately.
@@ -26,7 +26,7 @@ from yt_scheduler.services import templates
 
 pytestmark = pytest.mark.skipif(
     not get_anthropic_api_key(),
-    reason="No Anthropic API key in Keychain or env — skipping live API tests",
+    reason="No Anthropic API key configured in Keychain — skipping live API tests",
 )
 
 

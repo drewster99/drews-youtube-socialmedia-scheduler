@@ -12,7 +12,7 @@ Drew's Video + Socials Scheduler is a local web application for managing the You
 # Setup
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[social,dev]"
-cp .env.example .env  # then add ANTHROPIC_API_KEY
+cp .env.example .env  # optional; only non-secret settings. Set the Anthropic API key from the web UI (Settings → Anthropic) — it's stored in Keychain, never in .env.
 
 # Run (dev mode with auto-reload)
 yt-scheduler --reload
@@ -97,11 +97,10 @@ Native SwiftUI app that embeds a Python runtime and manages the server as a subp
 
 ## Configuration
 
-All via environment variables (loaded from `.env`):
+All via environment variables (loaded from `.env`). Secrets are **never** read from env/`.env` — the Anthropic API key and all OAuth tokens live only in the macOS Keychain (encrypted-JSON fallback elsewhere), set via the Settings page.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `ANTHROPIC_API_KEY` | — | Claude API key |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Model for AI generation |
 | `DYS_HOST` | `127.0.0.1` | Server bind address |
 | `DYS_PORT` | `8008` | Server port |

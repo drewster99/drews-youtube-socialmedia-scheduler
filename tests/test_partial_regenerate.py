@@ -25,7 +25,6 @@ import pytest
 async def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("DYS_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("DYS_HOST", "127.0.0.1")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-fake")
     (tmp_path / "uploads").mkdir(parents=True, exist_ok=True)
     (tmp_path / "templates").mkdir(parents=True, exist_ok=True)
     for mod in list(sys.modules.keys()):
@@ -33,6 +32,7 @@ async def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             sys.modules.pop(mod, None)
     keychain = importlib.import_module("yt_scheduler.services.keychain")
     monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    keychain.store_secret("anthropic", "api_key", "sk-ant-test-fake")
     app_module = importlib.import_module("yt_scheduler.app")
 
     from fastapi.testclient import TestClient

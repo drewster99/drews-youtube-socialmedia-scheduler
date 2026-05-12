@@ -19,9 +19,7 @@ def get_client() -> anthropic.Anthropic:
     """Get an Anthropic client."""
     api_key = get_anthropic_api_key()
     if not api_key:
-        raise RuntimeError(
-            "ANTHROPIC_API_KEY not configured. Set it in Settings or in your .env file."
-        )
+        raise RuntimeError("Anthropic API key not configured. Set it in Settings.")
     return anthropic.Anthropic(api_key=api_key)
 
 

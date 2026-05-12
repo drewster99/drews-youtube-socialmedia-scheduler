@@ -20,13 +20,13 @@ import pytest
 @pytest.fixture
 async def app_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("DYS_DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-fake")
     for mod in list(sys.modules.keys()):
         if mod.startswith("yt_scheduler"):
             sys.modules.pop(mod, None)
     importlib.import_module("yt_scheduler.config")
     keychain = importlib.import_module("yt_scheduler.services.keychain")
     monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    keychain.store_secret("anthropic", "api_key", "sk-ant-test-fake")
     database = importlib.import_module("yt_scheduler.database")
     projects = importlib.import_module("yt_scheduler.services.projects")
 
@@ -124,7 +124,6 @@ async def test_generate_description_falls_back_to_frames(
 ) -> None:
     monkeypatch.setenv("DYS_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("DYS_HOST", "127.0.0.1")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-fake")
     (tmp_path / "uploads").mkdir(parents=True, exist_ok=True)
     (tmp_path / "templates").mkdir(parents=True, exist_ok=True)
     for mod in list(sys.modules.keys()):
@@ -133,6 +132,7 @@ async def test_generate_description_falls_back_to_frames(
 
     keychain = importlib.import_module("yt_scheduler.services.keychain")
     monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    keychain.store_secret("anthropic", "api_key", "sk-ant-test-fake")
     app_module = importlib.import_module("yt_scheduler.app")
     media = importlib.import_module("yt_scheduler.services.media")
     ai = importlib.import_module("yt_scheduler.services.ai")
@@ -175,7 +175,6 @@ async def test_generate_description_400s_when_no_transcript_and_no_file(
 ) -> None:
     monkeypatch.setenv("DYS_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("DYS_HOST", "127.0.0.1")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-fake")
     (tmp_path / "uploads").mkdir(parents=True, exist_ok=True)
     (tmp_path / "templates").mkdir(parents=True, exist_ok=True)
     for mod in list(sys.modules.keys()):
@@ -184,6 +183,7 @@ async def test_generate_description_400s_when_no_transcript_and_no_file(
 
     keychain = importlib.import_module("yt_scheduler.services.keychain")
     monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    keychain.store_secret("anthropic", "api_key", "sk-ant-test-fake")
     app_module = importlib.import_module("yt_scheduler.app")
 
     from fastapi.testclient import TestClient

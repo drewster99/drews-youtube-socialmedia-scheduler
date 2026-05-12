@@ -89,8 +89,8 @@ YOUTUBE_SCOPES = [
     "https://www.googleapis.com/auth/youtube.force-ssl",
 ]
 
-# Claude API — env var as fallback; Keychain is checked at runtime via get_anthropic_api_key()
-_ANTHROPIC_API_KEY_ENV = os.getenv("ANTHROPIC_API_KEY", "")
+# Claude API key lives only in secure storage (Keychain / encrypted fallback) —
+# never an env var or .env file, so it can't end up in plaintext on disk.
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 ANTHROPIC_NAMESPACE = "anthropic"
@@ -98,13 +98,10 @@ ANTHROPIC_API_KEY_FIELD = "api_key"
 
 
 def get_anthropic_api_key() -> str:
-    """Load the Anthropic API key, preferring Keychain over env var."""
+    """Load the Anthropic API key from secure storage (Keychain / encrypted fallback)."""
     from yt_scheduler.services.keychain import load_secret
 
-    value = load_secret(ANTHROPIC_NAMESPACE, ANTHROPIC_API_KEY_FIELD)
-    if value:
-        return value
-    return _ANTHROPIC_API_KEY_ENV
+    return load_secret(ANTHROPIC_NAMESPACE, ANTHROPIC_API_KEY_FIELD) or ""
 
 
 # Server
