@@ -1233,10 +1233,16 @@ async function loadSocialPosts() {
 
             const content = p.content || '';
             const effLen = platformContentLength(p.platform, content);
-            let limit, xCred = null;
+            let limit, xCred = null, xVT = null, xTierKnown = false;
             if (p.platform === 'twitter') {
                 xCred = resolveXCred(p);
-                limit = xPostLimit(xCred ? xCred.verified_type : null);
+                xVT = xCred ? xCred.verified_type : null;   // 'none' | 'blue' | ... | null(unknown)
+                xTierKnown = !!xVT;
+                // For the hard "over the limit" check use the known limit; if
+                // we don't know the tier yet (account predates this feature /
+                // not reconnected), be lenient — assume it *might* be Premium —
+                // so we don't false-alarm. The soft note below still nudges.
+                limit = xTierKnown ? xPostLimit(xVT) : X_PREMIUM_POST_LIMIT;
             } else {
                 limit = p.max_chars || PLATFORM_LIMITS[p.platform] || 0;
             }
@@ -1279,19 +1285,23 @@ async function loadSocialPosts() {
                                       data-id="${p.id}"
                                       ${bodyClickable ? `onclick="openSocialPostEditor(${p.id})" title="Click to edit"` : ''}
                                  >${highlightUnresolvedTags(escapeHtml(content))}</div>`;
-            // Length note. Over the limit → red (the platform will reject it).
-            // For X, when the post is over the 280 free cap but under the
-            // account's actual limit because it's X Premium, show a neutral
-            // note so it's clear *why* there's no warning.
+            // Length note. Over the hard limit → red (the platform rejects it).
+            // For X over the 280 free cap: a known-Premium account gets a calm
+            // info note; an account whose tier we don't know yet gets an amber
+            // "might be fine, reconnect to confirm" note instead of a red error.
             let lenNote = '';
             if (overLimit) {
                 const extra = (p.platform === 'twitter')
-                    ? ` — X ${xCred && xIsPremium(xCred.verified_type) ? 'Premium' : 'free'} accounts cap at ${limit.toLocaleString()} chars.`
+                    ? ` — X ${xIsPremium(xVT) ? 'Premium' : 'free'} accounts cap at ${limit.toLocaleString()} chars.`
                     : '';
                 lenNote = `<div class="post-warn">${effLen.toLocaleString()} exceeds max characters of ${limit.toLocaleString()}${extra}</div>`;
             } else if (p.platform === 'twitter' && effLen > X_FREE_POST_LIMIT) {
                 const who = xCred ? `@${escapeHtml(xCred.username || '')}` : 'this account';
-                lenNote = `<div class="form-hint" style="margin-top:0.3rem;">X Premium (${who}) · ${effLen.toLocaleString()} / ${limit.toLocaleString()} chars</div>`;
+                if (xIsPremium(xVT)) {
+                    lenNote = `<div class="form-hint" style="margin-top:0.3rem;">X Premium (${who}) · ${effLen.toLocaleString()} / ${X_PREMIUM_POST_LIMIT.toLocaleString()} chars</div>`;
+                } else {
+                    lenNote = `<div class="post-warn" style="opacity:0.9;">${effLen.toLocaleString()} chars — over the 280 free-tier limit. If ${who} is on X Premium this is fine (25,000); otherwise X will reject it. Reconnect the X account in Settings to detect.</div>`;
+                }
             }
             return `
                 <div class="social-post-card ${overLimit ? 'social-post-over-limit' : ''}" data-post-card="${p.id}" style="${opacity}">

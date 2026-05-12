@@ -551,7 +551,11 @@ function renderCredentialRow(cred) {
                 <div style="font-weight:600;">${escapeHtml(cred.label)}${reauthBadge}${premiumBadge}</div>
                 <div style="font-size:0.8rem; color:var(--text-muted);">
                     ${cred.is_nickname ? '<em>nickname</em> · ' : ''}Connected ${escapeHtml(created)}
-                    ${cred.platform === 'twitter' && !xPremium ? ' · free tier (280-char posts)' : ''}
+                    ${cred.platform === 'twitter' && !xPremium
+                        ? (cred.verified_type === 'none'
+                            ? ' · free tier (280-char posts)'
+                            : ' · tier unknown — reconnect to detect X Premium')
+                        : ''}
                 </div>
             </div>
             <div style="display:flex; gap:0.25rem; align-items:center;">
