@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -21,6 +22,16 @@ def _tier_from_iso_duration(iso: str | None) -> str:
     return tiers.tier_for_duration(seconds) or ""
 
 router = APIRouter(prefix="/api/social", tags=["social"])
+
+# {{video}} on a Threads slot: the Threads API only accepts media by public URL,
+# which a localhost app can't provide, so we skip the slot instead of silently
+# posting text-only. (Future: host the file on R2 and use the VIDEO container.)
+_VIDEO_DIRECTIVE_RE = re.compile(r"\{\{\s*video\s*\}\}", re.IGNORECASE)
+# After media directives are stripped and AI blocks resolved, a leftover
+# {{name}} is an unresolved variable. (Required {{name!}} would have raised;
+# {{name??default}} would have substituted the default — so plain {{name}} is
+# the only thing that survives the renderer.)
+_UNRESOLVED_VAR_RE = re.compile(r"\{\{(\w+)\}\}")
 
 
 async def _build_render_context(db, video: dict) -> dict:
@@ -166,11 +177,21 @@ async def generate_posts(
         template_name: Template to use (default: "announce_video")
         platforms: List of platform names to generate for (default: all in template)
         user_message: Free-form text bound to the ``{{user_message}}`` variable.
+        unresolved: ``{name: "empty" | "literal"}`` — how to handle template
+            variables that have no value. ``"empty"`` substitutes an empty
+            string; ``"literal"`` (or omitting a name) leaves ``{{name}}`` in
+            the post. Passing this key (even ``{}``) acknowledges the
+            unresolved set so generation proceeds.
+        unresolved_ack: ``true`` to proceed even with unresolved variables
+            (treating them all as literal).
 
-    If any unsent post for this video is currently scheduled (has a pending
-    APScheduler job), the route returns 409 unless ``?confirm_overwrite_scheduled=true``
-    is passed. On confirm, scheduled posts are cancelled (APScheduler jobs torn
-    down) before the regenerate.
+    Returns ``{"posts": [...], "warnings": [...]}``.
+
+    409 responses (nothing is written/deleted before either gate):
+      * ``{"unresolved": ["name", ...]}`` — template has variables with no
+        value and ``unresolved`` / ``unresolved_ack`` was not provided.
+      * ``{"scheduled_overwrite": true, ...}`` — regenerating would cancel
+        pending scheduled posts; pass ``?confirm_overwrite_scheduled=true``.
     """
     db = await get_db()
     rows = await db.execute_fetchall("SELECT * FROM videos WHERE id = ?", (video_id,))
@@ -180,6 +201,9 @@ async def generate_posts(
     opts = data or {}
     template_name = opts.get("template_name", "announce_video")
     requested_platforms = opts.get("platforms")
+    unresolved_choices = opts.get("unresolved") or {}
+    forced_empty = {name: "" for name, choice in unresolved_choices.items() if choice == "empty"}
+    unresolved_ack = bool(opts.get("unresolved_ack")) or ("unresolved" in opts)
 
     video = dict(rows[0])
     project_id = int(video.get("project_id") or 1)
@@ -221,15 +245,13 @@ async def generate_posts(
                 continue
             platforms_to_regen.add(p)
         if not platforms_to_regen:
-            return []
+            return {"posts": [], "warnings": []}
         platform_placeholders = ",".join("?" * len(platforms_to_regen))
         platform_params = (video_id, *sorted(platforms_to_regen))
 
-        # Refuse to silently nuke scheduled posts on the platforms being
-        # regenerated. Posts on OTHER platforms with active jobs are not
-        # touched and never appear in the 409 detail. Without this scope,
-        # the UI dialog would warn the user about scheduled posts that
-        # aren't actually at risk.
+        # Scheduled-overwrite guard goes BEFORE the (potentially slow, AI-bearing)
+        # render pass so a "confirm and retry" round-trip doesn't re-run AI blocks.
+        # It's non-destructive (a SELECT + raise), so checking it early is safe.
         scheduled_rows = await db.execute_fetchall(
             f"SELECT id, platform, scheduled_at FROM social_posts "
             f"WHERE video_id = ? AND platform IN ({platform_placeholders}) "
@@ -252,6 +274,81 @@ async def generate_posts(
                     ],
                 },
             )
+
+        # Render every slot up-front (no DB writes yet) so we can surface
+        # unresolved-variable problems *before* deleting any existing posts.
+        warnings: list[str] = []
+        unresolved_names: set[str] = set()
+        prepared: list[dict] = []
+        for slot in template.get("slots", []):
+            if slot.get("is_disabled"):
+                continue
+            platform = slot["platform"]
+            if requested_platforms and platform not in requested_platforms:
+                continue
+
+            body = slot.get("body", "") or ""
+
+            # Threads can't attach media (text-only API), so a {{video}} slot
+            # is skipped rather than posted without the video.
+            if platform == "threads" and _VIDEO_DIRECTIVE_RE.search(body):
+                warnings.append(
+                    "Threads slot skipped — {{video}} attachments aren't supported "
+                    "on Threads yet (its API posts text only)."
+                )
+                continue
+
+            slot_max = slot.get("max_chars")
+            if not slot_max:
+                raise HTTPException(
+                    500, f"Slot {slot.get('id')} ({platform}) has no max_chars"
+                )
+
+            media_paths: list[str] = []
+            if body:
+                try:
+                    cleaned, media_paths, _alts = tmpl.extract_media_directives(
+                        body,
+                        video_path=ctx["video_path"],
+                        thumbnail_path=ctx["thumb_path"],
+                        images=ctx["images"],
+                    )
+                    slot_vars = {**ctx["variables"], **forced_empty, "max_chars": str(slot_max)}
+                    rendered = tmpl.render(cleaned, slot_vars)
+                except Exception as e:
+                    rendered = f"[Error generating: {e}]"
+                    media_paths = []
+            else:
+                rendered = ""
+
+            # Trim leading/trailing whitespace at the boundary — AI blocks
+            # frequently emit a stray leading space or trailing newline,
+            # which would render as whitespace on the destination
+            # platform and would also cause near-identical content to
+            # bypass the dedup check by accident.
+            rendered = rendered.strip()
+            unresolved_names.update(_UNRESOLVED_VAR_RE.findall(rendered))
+
+            # If the template body had NO media directives, fall back to
+            # the slot's legacy `media` setting (thumbnail / video / none)
+            # so existing templates without directives still attach media.
+            if not media_paths:
+                fallback = _legacy_media_for_slot(slot, ctx)
+                if fallback:
+                    media_paths = [fallback]
+
+            prepared.append({
+                "slot": slot,
+                "platform": platform,
+                "rendered": rendered,
+                "media_paths": media_paths,
+                "max_chars": int(slot_max),
+            })
+
+        # Unresolved-variable gate — bail before any destructive DB op.
+        if unresolved_names and not unresolved_ack:
+            raise HTTPException(409, {"unresolved": sorted(unresolved_names)})
+
         for r in scheduled_rows:
             await cancel_scheduled_post(int(r["id"]))
 
@@ -272,75 +369,39 @@ async def generate_posts(
         )
 
         generated: list[dict] = []
-        for slot in template.get("slots", []):
-            if slot.get("is_disabled"):
-                continue
-            platform = slot["platform"]
-            if requested_platforms and platform not in requested_platforms:
-                continue
-
-            template_text = slot.get("body", "") or ""
-            media_paths: list[str] = []
-            if template_text:
-                try:
-                    cleaned, media_paths, _alts = tmpl.extract_media_directives(
-                        template_text,
-                        video_path=ctx["video_path"],
-                        thumbnail_path=ctx["thumb_path"],
-                        images=ctx["images"],
-                    )
-                    rendered = tmpl.render(cleaned, ctx["variables"])
-                except Exception as e:
-                    rendered = f"[Error generating: {e}]"
-                    media_paths = []
-            else:
-                rendered = ""
-
-            # Trim leading/trailing whitespace at the boundary — AI blocks
-            # frequently emit a stray leading space or trailing newline,
-            # which would render as whitespace on the destination
-            # platform and would also cause near-identical content to
-            # bypass the dedup check by accident.
-            rendered = rendered.strip()
-
-            # If the template body had NO media directives, fall back to
-            # the slot's legacy `media` setting (thumbnail / video / none)
-            # so existing templates without directives still attach media.
-            if not media_paths:
-                fallback = _legacy_media_for_slot(slot, ctx)
-                if fallback:
-                    media_paths = [fallback]
-
+        for item in prepared:
+            slot = item["slot"]
+            platform = item["platform"]
             sa_id = slot.get("social_account_id") or defaults.get(platform)
             media = slot.get("media", "thumbnail")
-            max_chars = slot.get("max_chars", 500)
+            media_paths = item["media_paths"]
             media_paths_json = json.dumps(media_paths) if media_paths else None
             primary_media = media_paths[0] if media_paths else None
 
             await db.execute(
                 """INSERT INTO social_posts
                        (video_id, platform, content, media_path, media_paths,
-                        media_type, status, social_account_id)
-                VALUES (?, ?, ?, ?, ?, ?, 'draft', ?)""",
+                        media_type, status, social_account_id, max_chars)
+                VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?)""",
                 (
-                    video_id, platform, rendered,
+                    video_id, platform, item["rendered"],
                     primary_media, media_paths_json,
-                    media, sa_id,
+                    media, sa_id, item["max_chars"],
                 ),
             )
 
             generated.append({
                 "slot_id": slot.get("id"),
                 "platform": platform,
-                "content": rendered,
+                "content": item["rendered"],
                 "media": media,
                 "media_paths": media_paths,
-                "max_chars": max_chars,
+                "max_chars": item["max_chars"],
                 "social_account_id": sa_id,
             })
 
         await db.commit()
-        return generated
+        return {"posts": generated, "warnings": warnings}
 
 
 @router.get("/posts/{video_id}")
@@ -383,6 +444,64 @@ async def update_post(post_id: int, data: dict):
         await db.commit()
 
     return {"status": "ok"}
+
+
+@router.post("/posts/{post_id}/shorten")
+async def shorten_post(post_id: int, data: dict | None = None):
+    """Ask the model to shorten a generated post to at most ``target_chars``
+    (defaults to the post's ``max_chars``), preserving meaning and every URL.
+
+    Applies the result in place and returns
+    ``{"content": <new>, "previous": <old>, "char_count": <int>, "warning": <str|null>}``
+    so the caller can offer an Undo.
+    """
+    from yt_scheduler.services import ai
+
+    db = await get_db()
+    rows = await db.execute_fetchall("SELECT * FROM social_posts WHERE id = ?", (post_id,))
+    if not rows:
+        raise HTTPException(404, "Post not found")
+    post = dict(rows[0])
+    old = (post.get("content") or "").strip()
+    if not old:
+        raise HTTPException(400, "Nothing to shorten — the post is empty.")
+
+    opts = data or {}
+    target = opts.get("target_chars")
+    try:
+        target = int(target) if target is not None else (post.get("max_chars") or 280)
+    except (TypeError, ValueError):
+        target = post.get("max_chars") or 280
+    if target < 1:
+        raise HTTPException(400, "target_chars must be a positive number")
+
+    prompt = (
+        f"Shorten this social post to at most {target} characters without losing "
+        f"its meaning, and keep every URL/link in it exactly as written:\n\n{old}"
+    )
+    try:
+        new = ai.call_ai_block(
+            prompt,
+            system=(
+                "You rewrite social media posts to be shorter. Return ONLY the "
+                "shortened post text — no quotes, no preamble, no explanation. "
+                "Preserve every URL/link exactly. Keep the original meaning and tone."
+            ),
+            max_tokens=512,
+        ).strip()
+    except Exception as e:
+        raise HTTPException(502, f"Couldn't shorten the post: {e}")
+    if not new:
+        raise HTTPException(502, "The model returned an empty result.")
+
+    orig_urls = set(re.findall(r"https?://\S+", old))
+    warning = None
+    if orig_urls and not orig_urls.issubset(set(re.findall(r"https?://\S+", new))):
+        warning = "A link may have changed — double-check before posting."
+
+    await db.execute("UPDATE social_posts SET content = ? WHERE id = ?", (new, post_id))
+    await db.commit()
+    return {"content": new, "previous": old, "char_count": len(new), "warning": warning}
 
 
 async def _resolve_poster_for_post(post: dict) -> social.SocialPoster:

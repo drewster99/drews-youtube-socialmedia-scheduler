@@ -169,6 +169,7 @@ async function generatePreviews() {
             template_name: templateName,
             platforms: platforms,
             user_message: userMessage,
+            unresolved_ack: true,
         }),
     });
     document.getElementById('btn-generate').disabled = false;

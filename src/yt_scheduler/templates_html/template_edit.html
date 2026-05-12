@@ -43,6 +43,7 @@
             <li><code>{{url}}</code> — this item's URL (YouTube URL for YT-uploaded items, or whatever you set on a standalone item).</li>
             <li><code>{{episode_url}}</code> — the parent episode's URL when this item has a parent (e.g. a hook pointing at its primary episode).</li>
             <li><code>{{project_url}}</code> — the project's URL (auto-filled from the YouTube channel handle on YT projects, or set explicitly on GitHub / social-only projects).</li>
+            <li><code>{{max_chars}}</code> — this slot's "Max characters" value, as a number. Handy inside an <code>{{ai:}}</code> block so the model knows the limit, e.g. <code>{{ai: Write a post under {{max_chars}} chars about {{title}}}}</code>. (Resolves in real post generation and in the preview below; it stays literal in other render paths.)</li>
         </ul>
         <p><strong>Custom variables</strong> — define your own at three scopes; later wins on collision.</p>
         <ul>
@@ -156,6 +157,106 @@ function escapeHtml(s) {
         .replaceAll("'", '&#39;');
 }
 
+// A body that contains the video / thumbnail / image directives drives its own
+// attachments; the per-slot Media dropdown is ignored in that case (see
+// social_routes._legacy_media_for_slot), so we disable it to avoid implying both apply.
+const MEDIA_DIRECTIVE_RE = /\{\{\s*(video|thumbnail|image:[^}]+)\s*\}\}/i;
+function bodyHasMediaDirective(body) {
+    return MEDIA_DIRECTIVE_RE.test(String(body || ''));
+}
+function mediaSelectOptions(media) {
+    const m = media || 'thumbnail';
+    return `
+        <option value="thumbnail" ${m === 'thumbnail' ? 'selected' : ''}>Thumbnail</option>
+        <option value="full_video" ${m === 'full_video' ? 'selected' : ''}>Full video</option>
+        <option value="clip" ${m.startsWith('clip') ? 'selected' : ''}>Clip</option>
+        <option value="gif" ${m.startsWith('gif') ? 'selected' : ''}>GIF</option>
+        <option value="none" ${m === 'none' ? 'selected' : ''}>None</option>
+    `;
+}
+function syncMediaField(slotId) {
+    const bodyArea = document.querySelector(`[data-slot-body="${slotId}"]`);
+    const select = document.querySelector(`[data-slot-media="${slotId}"]`);
+    if (!bodyArea || !select) return;
+    if (bodyHasMediaDirective(bodyArea.value)) {
+        if (!select.disabled) select.dataset.savedMedia = select.value;
+        select.innerHTML = '<option>Media embedded — see directive in body ↑</option>';
+        select.disabled = true;
+    } else if (select.disabled) {
+        select.disabled = false;
+        select.innerHTML = mediaSelectOptions(select.dataset.savedMedia || 'thumbnail');
+    }
+}
+
+// --- Threads video-directive guard (Threads can't attach media — slot is skipped on generate) ---
+const VIDEO_DIRECTIVE_RE = /\{\{\s*video\s*\}\}/i;
+function syncThreadsWarn(slotId, platform) {
+    const warn = document.querySelector(`[data-slot-threads-warn="${slotId}"]`);
+    if (!warn) return;
+    const ta = document.querySelector(`[data-slot-body="${slotId}"]`);
+    warn.style.display = (platform === 'threads' && ta && VIDEO_DIRECTIVE_RE.test(ta.value)) ? '' : 'none';
+}
+
+// --- Live template-tag syntax highlighting (overlay backdrop behind a transparent textarea) ---
+const BUILTIN_VARS = new Set([
+    'title', 'description', 'description_short', 'description_medium', 'tags', 'hashtags',
+    'tier', 'transcript', 'user_message', 'thumbnail_path', 'url', 'episode_url',
+    'project_url', 'max_chars',
+]);
+let knownCustomVars = new Set();   // global + project custom-variable names
+
+function highlightUnresolved(escapedHtml) {
+    // Wrap any leftover template tag in a red span. Input must already be HTML-escaped.
+    return escapedHtml.replace(/\{\{[^{}]+\}\}/g, m => `<span class="tag-unresolved">${m}</span>`);
+}
+
+function renderHighlight(text) {
+    // Colorize variable tokens (name, name with a required-marker, name with a
+    // default) and media directives. AI-block wrappers are left at default
+    // color; any variable inside an AI block still gets colored.
+    return escapeHtml(text).replace(
+        /\{\{\s*([A-Za-z_]\w*|video|thumbnail|image:[^{}]*?)\s*(!|\?\?[^{}]*?)?\}\}/g,
+        (m, name, suffix) => {
+            const n = name.trim();
+            let cls;
+            if (n === 'video' || n === 'thumbnail' || n.startsWith('image:')) cls = 'tag-media';
+            else if (suffix && suffix.startsWith('??')) cls = 'tag-known';   // has a fallback — never unresolved
+            else if (BUILTIN_VARS.has(n) || knownCustomVars.has(n)) cls = 'tag-known';
+            else cls = 'tag-unknown';
+            return `<span class="${cls}">${m}</span>`;
+        }
+    );
+}
+
+function renderSlotHighlight(slotId) {
+    const ta = document.querySelector(`[data-slot-body="${slotId}"]`);
+    const bd = document.querySelector(`[data-slot-hl="${slotId}"]`);
+    if (!ta || !bd) return;
+    bd.innerHTML = renderHighlight(ta.value) + (ta.value.endsWith('\n') ? '​' : '');
+    syncHighlightScroll(slotId);
+}
+
+function syncHighlightScroll(slotId) {
+    const ta = document.querySelector(`[data-slot-body="${slotId}"]`);
+    const bd = document.querySelector(`[data-slot-hl="${slotId}"]`);
+    if (!ta || !bd) return;
+    bd.scrollTop = ta.scrollTop;
+    bd.scrollLeft = ta.scrollLeft;
+}
+
+async function loadKnownCustomVars() {
+    const names = new Set();
+    try {
+        const g = await fetch('/api/global-variables', {_silent: true});
+        if (g.ok) for (const row of await g.json()) if (row && row.key) names.add(row.key);
+    } catch (_) {}
+    try {
+        const p = await fetch(`/api/projects/${encodeURIComponent(projectSlug)}/variables`, {_silent: true});
+        if (p.ok) for (const row of await p.json()) if (row && row.key) names.add(row.key);
+    } catch (_) {}
+    knownCustomVars = names;
+}
+
 function renderSlots() {
     const container = document.getElementById('slots-editor');
     if (!slots.length) {
@@ -197,17 +298,17 @@ function renderSlotCard(slot) {
             </div>
             <div class="form-group" style="margin-top: 0.5rem;">
                 <label>Template body</label>
-                <textarea data-slot-body="${slot.id}" rows="6" class="code-editor">${escapeHtml(slot.body)}</textarea>
+                <div class="code-hl-wrap">
+                    <div class="code-hl-backdrop" data-slot-hl="${slot.id}" aria-hidden="true"></div>
+                    <textarea data-slot-body="${slot.id}" rows="6" class="code-editor" spellcheck="false">${escapeHtml(slot.body)}</textarea>
+                </div>
+                <div data-slot-threads-warn="${slot.id}" class="form-hint slot-threads-warn" style="display: none;">⚠ This slot uses a video directive — Threads can't attach media, so this slot is skipped when you generate posts.</div>
             </div>
             <div class="form-row">
                 <div class="form-group">
                     <label>Media</label>
-                    <select data-slot-media="${slot.id}">
-                        <option value="thumbnail" ${slot.media === 'thumbnail' ? 'selected' : ''}>Thumbnail</option>
-                        <option value="full_video" ${slot.media === 'full_video' ? 'selected' : ''}>Full video</option>
-                        <option value="clip" ${(slot.media || '').startsWith('clip') ? 'selected' : ''}>Clip</option>
-                        <option value="gif" ${(slot.media || '').startsWith('gif') ? 'selected' : ''}>GIF</option>
-                        <option value="none" ${slot.media === 'none' ? 'selected' : ''}>None</option>
+                    <select data-slot-media="${slot.id}" data-saved-media="${escapeHtml(slot.media || 'thumbnail')}">
+                        ${mediaSelectOptions(slot.media)}
                     </select>
                 </div>
                 <div class="form-group">
@@ -234,21 +335,47 @@ function attachSlotHandlers(slot) {
     const disabledBox = document.querySelector(`[data-slot-disabled="${slot.id}"]`);
     if (disabledBox) {
         disabledBox.addEventListener('change', async () => {
-            await patchSlot(slot.id, { is_disabled: disabledBox.checked });
+            await patchSlot(slot.id, { is_disabled: disabledBox.checked }, { reload: false });
+            const badge = document.querySelector(`[data-slot-id="${slot.id}"] .platform-badge`);
+            if (badge) {
+                badge.textContent = (PLATFORM_LABELS[slot.platform] || slot.platform)
+                    + (disabledBox.checked ? ' (disabled)' : '');
+            }
         });
     }
+    const bodyArea = document.querySelector(`[data-slot-body="${slot.id}"]`);
+    if (bodyArea) {
+        bodyArea.addEventListener('input', () => {
+            syncMediaField(slot.id);
+            syncThreadsWarn(slot.id, slot.platform);
+            renderSlotHighlight(slot.id);
+        });
+        bodyArea.addEventListener('scroll', () => syncHighlightScroll(slot.id));
+    }
+    syncMediaField(slot.id);
+    syncThreadsWarn(slot.id, slot.platform);
+    renderSlotHighlight(slot.id);
 }
 
 async function saveSlot(slotId) {
     const body = document.querySelector(`[data-slot-body="${slotId}"]`).value;
-    const media = document.querySelector(`[data-slot-media="${slotId}"]`).value;
-    const max_chars = parseInt(document.querySelector(`[data-slot-max="${slotId}"]`).value || '500', 10);
+    const mediaSel = document.querySelector(`[data-slot-media="${slotId}"]`);
+    const media = mediaSel.disabled ? (mediaSel.dataset.savedMedia || 'none') : mediaSel.value;
+    const maxEl = document.querySelector(`[data-slot-max="${slotId}"]`);
+    const max_chars = parseInt(maxEl.value, 10);
+    if (!Number.isInteger(max_chars) || max_chars < 1) {
+        showToast('Max characters must be a positive number', 'error');
+        maxEl.focus();
+        return;
+    }
     const accountSel = document.querySelector(`[data-slot-account="${slotId}"]`);
     const social_account_id = accountSel.value === '' ? null : Number(accountSel.value);
-    await patchSlot(slotId, { body, media, max_chars, social_account_id });
+    // reload:false — re-rendering the whole slot list here would discard
+    // unsaved edits in *other* slot textareas.
+    await patchSlot(slotId, { body, media, max_chars, social_account_id }, { reload: false });
 }
 
-async function patchSlot(slotId, payload) {
+async function patchSlot(slotId, payload, { reload = true } = {}) {
     const resp = await fetch(`/api/templates/${templateName}/slots/${slotId}?project_slug=${encodeURIComponent(projectSlug)}`, {
         method: 'PATCH',
         headers: {'Content-Type': 'application/json'},
@@ -256,7 +383,9 @@ async function patchSlot(slotId, payload) {
     });
     if (resp.ok) {
         showToast('Slot saved', 'success');
-        await loadTemplate();
+        const slot = slots.find(s => s.id === slotId);
+        if (slot) Object.assign(slot, payload);
+        if (reload) await loadTemplate();
     }
 }
 
@@ -376,11 +505,12 @@ async function previewAll() {
         if (slot.is_disabled) continue;
         const bodyEl = document.querySelector(`[data-slot-body="${slot.id}"]`);
         const body = bodyEl ? bodyEl.value : slot.body;
+        const slotVars = {...variables, max_chars: String(slot.max_chars)};
         try {
             const resp = await fetch('/api/expand_text', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({template: body, variables}),
+                body: JSON.stringify({template: body, variables: slotVars}),
             });
             const result = await resp.json();
             results.push({slot, rendered: result.rendered || result.error || 'Error'});
@@ -389,14 +519,18 @@ async function previewAll() {
         }
     }
 
-    container.innerHTML = results.map(r => `
+    container.innerHTML = results.map(r => {
+        const len = r.rendered.length;
+        const limit = r.slot.max_chars;
+        const over = limit && len > limit;
+        return `
         <div class="preview-card">
             <span class="platform-badge platform-${r.slot.platform}">${escapeHtml(PLATFORM_LABELS[r.slot.platform] || r.slot.platform)}</span>
             ${r.slot.is_builtin ? '<span class="badge badge-published" style="margin-left: 0.5rem;">Built-in</span>' : ''}
-            <pre>${escapeHtml(r.rendered)}</pre>
-            <small>${r.rendered.length} characters</small>
-        </div>
-    `).join('');
+            <pre>${highlightUnresolved(escapeHtml(r.rendered))}</pre>
+            <small class="${over ? 'tag-unresolved' : ''}">${len} characters${over ? ` — exceeds max characters of ${limit}` : ''}</small>
+        </div>`;
+    }).join('');
 }
 
 async function loadCredentialsForVisiblePlatforms() {
@@ -456,6 +590,7 @@ async function loadTemplate() {
         box.checked = appliesTo.includes(box.value);
     });
     await loadCredentialsForVisiblePlatforms();
+    await loadKnownCustomVars();
     renderSlots();
 }
 

@@ -227,7 +227,7 @@
             </form>
         </div>
 
-        <div class="card">
+        <div class="card" id="item-vars-card">
             <h3>Item variables</h3>
             <p class="form-hint" style="margin: 0 0 0.5rem;">
                 Per-item custom variables. Highest priority of the four-level inheritance
@@ -310,6 +310,20 @@
     <div class="modal-actions" style="margin-top: 0.75rem;">
         <button type="button" class="btn" id="spe-cancel">Cancel</button>
         <button type="button" class="btn btn-primary" id="spe-save">Save</button>
+    </div>
+</dialog>
+
+<dialog id="unresolved-vars-dialog" class="modal modal-wide">
+    <h3>Some variable tags have no value</h3>
+    <p class="form-hint" style="margin: 0 0 0.75rem;">
+        These template variables aren't set for this item. Pick what to do with each,
+        or choose "Set values…" to enter them in <em>Item variables</em> first.
+    </p>
+    <div id="unresolved-vars-list"></div>
+    <div class="modal-actions" style="margin-top: 1rem;">
+        <button type="button" class="btn" id="uvd-cancel">Cancel</button>
+        <button type="button" class="btn" id="uvd-setvalue">Set values…</button>
+        <button type="button" class="btn btn-primary" id="uvd-generate">Generate</button>
     </div>
 </dialog>
 {% endblock %}
@@ -782,6 +796,20 @@ function escapeHtml(s) {
         .replaceAll('"','&quot;');
 }
 
+// Per-platform character ceilings — used as the fallback when a post row has no
+// max_chars (rows generated before that column existed).
+const PLATFORM_LIMITS = { twitter: 280, bluesky: 300, mastodon: 500, linkedin: 3000, threads: 500 };
+
+// Wrap any leftover template tag in the rendered post text with a red span so a
+// stray unresolved variable is obvious. Input must already be HTML-escaped.
+function highlightUnresolvedTags(escapedHtml) {
+    return escapedHtml.replace(/\{\{[^{}]+\}\}/g, m => `<span class="tag-unresolved">${m}</span>`);
+}
+
+// Tracks the last "Make it shorter" so the user can Undo it. Cleared on any
+// other edit/regenerate/reload of posts.
+let lastShorten = null;   // { postId, previous }
+
 function renderEvent(ev) {
     const ts = `<time class="event-ts">${fmtEventDate(ev.created_at)}</time>`;
     const tier = ev.payload?.tier ? ` (${escapeHtml(ev.payload.tier)})` : '';
@@ -1178,6 +1206,10 @@ async function loadSocialPosts() {
                 statusBadge = `<button class="badge badge-failed" onclick="showPostError(${p.id})" title="Click to show the error" style="border:0; cursor:pointer;">failed</button>`;
             }
 
+            const content = p.content || '';
+            const limit = p.max_chars || PLATFORM_LIMITS[p.platform] || 0;
+            const overLimit = limit && content.length > limit;
+
             let actions = '';
             if (isPosted) {
                 if (p.post_url) {
@@ -1189,8 +1221,13 @@ async function loadSocialPosts() {
                 // already-approved so the user can just hit Send to retry
                 // instead of having to re-Approve every time.
                 const wasApproved = p.status === 'approved' || p.status === 'failed';
+                const undoLink = (lastShorten && lastShorten.postId === p.id && lastShorten.after === content)
+                    ? `<button class="btn btn-sm" onclick="undoShorten(${p.id})">Undo shorten</button>`
+                    : '';
                 actions = `
                     <button class="btn btn-sm btn-primary" onclick="openSocialPostEditor(${p.id})" title="Open editor (also: click the post body)">Edit</button>
+                    <button class="btn btn-sm" onclick="shortenPost(${p.id})" title="Ask the AI to shorten this post">Make it shorter</button>
+                    ${undoLink}
                     ${!wasApproved ? `<button class="btn btn-sm" onclick="approvePost(${p.id})">Approve</button>` : ''}
                     <button class="btn btn-sm btn-success" onclick="sendPost(${p.id})"
                         ${!isConfigured ? 'disabled title="Configure this platform in Settings first"' : ''}>
@@ -1209,14 +1246,18 @@ async function loadSocialPosts() {
             const displayBody = `<div class="social-post-display ${bodyClickable ? 'social-post-display-clickable' : ''}"
                                       data-id="${p.id}"
                                       ${bodyClickable ? `onclick="openSocialPostEditor(${p.id})" title="Click to edit"` : ''}
-                                 >${escapeHtml(p.content || '')}</div>`;
+                                 >${highlightUnresolvedTags(escapeHtml(content))}</div>`;
+            const overWarn = overLimit
+                ? `<div class="post-warn">${content.length} exceeds max characters of ${limit}</div>`
+                : '';
             return `
-                <div class="social-post-card" data-post-card="${p.id}" style="${opacity}">
+                <div class="social-post-card ${overLimit ? 'social-post-over-limit' : ''}" data-post-card="${p.id}" style="${opacity}">
                     <div class="social-post-header">
                         <span class="platform-badge platform-${p.platform}">${p.platform}</span>
                         ${statusBadge}
                     </div>
                     ${displayBody}
+                    ${overWarn}
                     <div class="social-post-actions">${actions}</div>
                 </div>
             `;
@@ -1524,6 +1565,46 @@ async function regeneratePosts() {
     document.getElementById('social-posts-area').innerHTML = '<p class="empty-state">Select platforms and click "Generate for Selected" to regenerate.</p>';
 }
 
+function promptUnresolvedVars(names) {
+    return new Promise(resolve => {
+        const dlg = document.getElementById('unresolved-vars-dialog');
+        const list = document.getElementById('unresolved-vars-list');
+        list.innerHTML = names.map(n => `
+            <div class="form-row" style="align-items: center; gap: 0.75rem; margin-bottom: 0.4rem;">
+                <code style="min-width: 9rem; display: inline-block;">${escapeHtml(n)}</code>
+                <select data-uv="${escapeHtml(n)}">
+                    <option value="literal">leave the tag in the post</option>
+                    <option value="empty">substitute an empty string</option>
+                </select>
+            </div>`).join('');
+        let settled = false;
+        const onGenerate = () => finish('generate');
+        const onCancel = () => finish('cancel');
+        const onSetValue = () => finish('setvalue');
+        const onClose = () => finish('cancel');
+        function cleanup() {
+            document.getElementById('uvd-generate').removeEventListener('click', onGenerate);
+            document.getElementById('uvd-cancel').removeEventListener('click', onCancel);
+            document.getElementById('uvd-setvalue').removeEventListener('click', onSetValue);
+            dlg.removeEventListener('close', onClose);
+        }
+        function finish(action) {
+            if (settled) return;
+            settled = true;
+            const choices = {};
+            list.querySelectorAll('select[data-uv]').forEach(s => { choices[s.dataset.uv] = s.value; });
+            cleanup();
+            try { dlg.close(); } catch (_) {}
+            resolve({ action, choices });
+        }
+        document.getElementById('uvd-generate').addEventListener('click', onGenerate);
+        document.getElementById('uvd-cancel').addEventListener('click', onCancel);
+        document.getElementById('uvd-setvalue').addEventListener('click', onSetValue);
+        dlg.addEventListener('close', onClose);
+        dlg.showModal();
+    });
+}
+
 async function doGeneratePosts(platforms) {
     const btn = document.getElementById('btn-generate-posts');
     const area = document.getElementById('social-posts-area');
@@ -1537,57 +1618,90 @@ async function doGeneratePosts(platforms) {
     const platformsLabel = (platforms && platforms.length)
         ? platforms.join(', ')
         : 'all platforms';
-    area.innerHTML = `
+    const showSpinner = () => {
+        area.innerHTML = `
         <div style="text-align: center; padding: 2rem;">
             <div class="spinner" style="display:inline-block; width:24px; height:24px; border:3px solid var(--border); border-top-color: var(--accent); border-radius:50%; animation: spin 1s linear infinite;"></div>
             <p style="margin-top: 0.5rem; color: var(--text-muted);">Generating posts for ${escapeHtml(platformsLabel)}…</p>
             <style>@keyframes spin { to { transform: rotate(360deg); } }</style>
         </div>`;
+    };
+    showSpinner();
+    lastShorten = null;
     try {
+        const url = `/api/social/generate-posts/${videoId}`;
         const body = {};
         if (platforms) body.platforms = platforms;
-        const url = `/api/social/generate-posts/${videoId}`;
-        const init = {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(body),
-            _silent: true,
-        };
-        let resp = await fetch(url, init);
-        if (resp.status === 409) {
-            const payload = await resp.json().catch(() => ({}));
-            const detail = payload && payload.detail;
-            if (detail && detail.scheduled_overwrite && Array.isArray(detail.scheduled)) {
-                const lines = detail.scheduled
-                    .map(s => `• ${s.platform}${s.scheduled_at ? ` — ${s.scheduled_at}` : ''}`)
-                    .join('\n');
-                const ok = confirm(
-                    `Regenerating will cancel ${detail.scheduled.length} scheduled post${detail.scheduled.length === 1 ? '' : 's'}:\n\n${lines}\n\nCancel and regenerate?`
-                );
-                if (!ok) {
-                    showToast('Regenerate cancelled — scheduled posts kept.', 'info');
-                    await loadSocialPosts();
-                    return;
+        let confirmScheduled = false;
+
+        // A 409 (scheduled-overwrite or unresolved-vars) gathers a user
+        // decision and re-issues the request with the extra params.
+        for (let attempt = 0; attempt < 4; attempt++) {
+            const resp = await fetch(url + (confirmScheduled ? '?confirm_overwrite_scheduled=true' : ''), {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(body),
+                _silent: true,
+            });
+
+            if (resp.status === 409) {
+                const detail = ((await resp.json().catch(() => ({}))) || {}).detail || {};
+                if (detail.scheduled_overwrite && Array.isArray(detail.scheduled)) {
+                    const lines = detail.scheduled
+                        .map(s => `• ${s.platform}${s.scheduled_at ? ` — ${s.scheduled_at}` : ''}`)
+                        .join('\n');
+                    const ok = confirm(
+                        `Regenerating will cancel ${detail.scheduled.length} scheduled post${detail.scheduled.length === 1 ? '' : 's'}:\n\n${lines}\n\nCancel and regenerate?`
+                    );
+                    if (!ok) { showToast('Regenerate cancelled — scheduled posts kept.', 'info'); await loadSocialPosts(); return; }
+                    confirmScheduled = true;
+                    showSpinner();
+                    continue;
                 }
-                resp = await fetch(`${url}?confirm_overwrite_scheduled=true`, init);
+                if (Array.isArray(detail.unresolved) && detail.unresolved.length) {
+                    const choice = await promptUnresolvedVars(detail.unresolved);
+                    if (choice.action === 'cancel') { showToast('Generate cancelled.', 'info'); await loadSocialPosts(); return; }
+                    if (choice.action === 'setvalue') {
+                        showToast('Add values in "Item variables" below, then click Generate again.', 'info');
+                        await loadSocialPosts();
+                        const card = document.getElementById('item-vars-card');
+                        if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        const keyInput = document.getElementById('new-item-var-key');
+                        if (keyInput) { keyInput.value = detail.unresolved[0]; keyInput.focus(); }
+                        return;
+                    }
+                    body.unresolved = choice.choices;   // action === 'generate'
+                    showSpinner();
+                    continue;
+                }
+                showToast('Could not generate posts.', 'error');
+                await loadSocialPosts();
+                return;
             }
-        }
-        if (resp.ok) {
-            const generated = await resp.json();
-            const count = Array.isArray(generated) ? generated.length : 0;
+
+            if (!resp.ok) {
+                let d = 'Failed to generate posts';
+                try { d = (await resp.json()).detail || d; } catch (_) {}
+                showToast(typeof d === 'string' ? d : 'Failed to generate posts', 'error');
+                await loadSocialPosts();
+                return;
+            }
+
+            const result = await resp.json();
+            const posts = Array.isArray(result) ? result : (result.posts || []);
+            const warnings = Array.isArray(result) ? [] : (result.warnings || []);
             showToast(
-                count
-                    ? `Generated ${count} post${count === 1 ? '' : 's'} for ${platformsLabel}.`
+                posts.length
+                    ? `Generated ${posts.length} post${posts.length === 1 ? '' : 's'} for ${platformsLabel}.`
                     : `No posts generated — the template has no slots for ${platformsLabel}.`,
-                count ? 'success' : 'error',
+                posts.length ? 'success' : 'error',
             );
+            for (const w of warnings) showToast(w, 'error');
             await loadSocialPosts();
-        } else {
-            let detail = 'Failed to generate posts';
-            try { detail = (await resp.json()).detail || detail; } catch {}
-            showToast(typeof detail === 'string' ? detail : 'Failed to generate posts', 'error');
-            await loadSocialPosts();
+            return;
         }
+        showToast('Gave up generating after too many retries.', 'error');
+        await loadSocialPosts();
     } finally {
         btn.disabled = false;
         btn.textContent = 'Generate Social Posts';
@@ -1600,6 +1714,53 @@ function setPostCardBusy(postId, busy) {
     card.querySelectorAll('button').forEach(b => { b.disabled = !!busy; });
     card.style.pointerEvents = busy ? 'none' : '';
     card.style.opacity = busy ? '0.6' : '';
+}
+
+async function shortenPost(postId) {
+    const post = (socialPostsCache || []).find(p => p.id === postId);
+    if (!post) return;
+    const target = post.max_chars || PLATFORM_LIMITS[post.platform] || 280;
+    const oldLen = (post.content || '').length;
+    setPostCardBusy(postId, true);
+    try {
+        const resp = await fetch(`/api/social/posts/${postId}/shorten`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ target_chars: target }),
+            _silent: true,
+        });
+        if (!resp.ok) {
+            let msg = 'Could not shorten the post.';
+            try { msg = (await resp.json()).detail || msg; } catch (_) {}
+            showToast(typeof msg === 'string' ? msg : 'Could not shorten the post.', 'error');
+            return;
+        }
+        const data = await resp.json();
+        lastShorten = { postId, previous: data.previous, after: data.content };
+        showToast(`Shortened ${oldLen} → ${data.char_count} chars`, 'success');
+        if (data.warning) showToast(data.warning, 'error');
+        await loadSocialPosts();
+    } finally {
+        setPostCardBusy(postId, false);
+    }
+}
+
+async function undoShorten(postId) {
+    if (!lastShorten || lastShorten.postId !== postId) return;
+    const previous = lastShorten.previous;
+    const resp = await fetch(`/api/social/posts/${postId}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ content: previous }),
+        _silent: true,
+    });
+    if (resp.ok) {
+        lastShorten = null;   // leave it set on failure so the Undo button comes back
+        showToast('Reverted to the longer version.', 'info');
+    } else {
+        showToast('Could not undo.', 'error');
+    }
+    await loadSocialPosts();
 }
 
 // saveSocialPost was the in-card "Save" handler. The in-card textarea
@@ -1668,6 +1829,7 @@ async function _speSave() {
         if (display) display.textContent = newValue;
         const cached = (socialPostsCache || []).find(p => p.id === postId);
         if (cached) cached.content = newValue;
+        if (lastShorten && lastShorten.postId === postId) lastShorten = null;
         showToast('Saved', 'success');
         document.getElementById('social-post-editor-dialog').close();
         _spePostId = null;

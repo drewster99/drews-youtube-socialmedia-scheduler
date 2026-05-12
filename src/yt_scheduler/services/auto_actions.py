@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -357,6 +358,8 @@ async def _maybe_generate_socials(
 
     ctx = await _build_render_context(db, video)
 
+    video_directive_re = re.compile(r"\{\{\s*video\s*\}\}", re.IGNORECASE)
+
     for slot in template.get("slots", []):
         if slot.get("is_disabled"):
             continue
@@ -366,6 +369,15 @@ async def _maybe_generate_socials(
         body = slot.get("body") or ""
         if not body:
             continue
+        # Threads can't attach media (text-only API) — skip a {{video}} slot
+        # rather than auto-post it without the video.
+        if platform == "threads" and video_directive_re.search(body):
+            logger.info("auto-social: skipping Threads slot for %s — uses {{video}}", video_id)
+            continue
+        slot_max = slot.get("max_chars")
+        if not slot_max:
+            logger.warning("auto-social: slot %s (%s) has no max_chars; skipping", slot.get("id"), platform)
+            continue
         try:
             cleaned, media_paths, _alts = tmpl.extract_media_directives(
                 body,
@@ -373,7 +385,8 @@ async def _maybe_generate_socials(
                 thumbnail_path=ctx["thumb_path"],
                 images=ctx["images"],
             )
-            rendered = tmpl.render(cleaned, ctx["variables"]).strip()
+            slot_vars = {**ctx["variables"], "max_chars": str(slot_max)}
+            rendered = tmpl.render(cleaned, slot_vars).strip()
         except Exception as exc:
             logger.warning("auto-social render failed for %s: %s", platform, exc)
             continue
@@ -391,12 +404,12 @@ async def _maybe_generate_socials(
         await db.execute(
             """INSERT INTO social_posts
                    (video_id, platform, content, media_path, media_paths,
-                    media_type, status, social_account_id)
-            VALUES (?, ?, ?, ?, ?, ?, 'draft', ?)""",
+                    media_type, status, social_account_id, max_chars)
+            VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?)""",
             (
                 video_id, platform, rendered,
                 primary_media, media_paths_json,
-                media_type, sa_id,
+                media_type, sa_id, int(slot_max),
             ),
         )
     await db.commit()

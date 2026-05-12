@@ -90,3 +90,67 @@ def test_url_and_hashtag_together() -> None:
     assert _slice(text, link) == "https://x.com/p/1"
     assert _slice(text, tag) == "#launch"
     assert tag["features"][0]["tag"] == "launch"
+
+
+# --- bare domains (no scheme) -------------------------------------------------
+
+def test_bare_domain_gets_synthesized_https_uri() -> None:
+    text = "code at github.com/me/repo today"
+    facets = _build_bluesky_facets(text)
+    assert len(facets) == 1
+    assert _slice(text, facets[0]) == "github.com/me/repo"
+    assert facets[0]["features"] == [
+        {"$type": "app.bsky.richtext.facet#link", "uri": "https://github.com/me/repo"}
+    ]
+
+
+def test_bare_domain_with_www_and_no_path() -> None:
+    text = "visit www.example.com please"
+    facets = _build_bluesky_facets(text)
+    assert len(facets) == 1
+    assert _slice(text, facets[0]) == "www.example.com"
+    assert facets[0]["features"][0]["uri"] == "https://www.example.com"
+
+
+def test_bare_domain_trailing_period_excluded() -> None:
+    text = "see example.org."
+    facets = _build_bluesky_facets(text)
+    assert len(facets) == 1
+    assert _slice(text, facets[0]) == "example.org"
+    assert facets[0]["features"][0]["uri"] == "https://example.org"
+
+
+def test_email_is_not_a_bare_domain_link() -> None:
+    assert _build_bluesky_facets("ping me@example.com anytime") == []
+
+
+def test_scheme_url_not_double_matched_as_bare_domain() -> None:
+    text = "go to https://example.com/x now"
+    facets = _build_bluesky_facets(text)
+    assert len(facets) == 1
+    assert facets[0]["features"][0]["uri"] == "https://example.com/x"
+
+
+def test_filename_with_unlisted_extension_not_linked() -> None:
+    # .py / .md / .go aren't in the curated TLD list, so prose mentioning a
+    # filename doesn't accidentally become a link.
+    assert _build_bluesky_facets("open main.py and notes.md") == []
+
+
+def test_bare_domain_and_hashtag_together() -> None:
+    text = "repo at github.io/x #opensource"
+    facets = _build_bluesky_facets(text)
+    assert len(facets) == 2
+    by_type = {f["features"][0]["$type"]: f for f in facets}
+    assert by_type["app.bsky.richtext.facet#link"]["features"][0]["uri"] == "https://github.io/x"
+    assert _slice(text, by_type["app.bsky.richtext.facet#tag"]) == "#opensource"
+
+
+def test_hashtag_with_dot_domain_suffix_is_only_a_tag() -> None:
+    # `#foo.com` — the `#` lookbehind keeps the bare-domain matcher from
+    # producing a link facet that overlaps the `#foo` hashtag facet.
+    text = "check #foo.com today"
+    facets = _build_bluesky_facets(text)
+    assert len(facets) == 1
+    assert facets[0]["features"][0]["$type"] == "app.bsky.richtext.facet#tag"
+    assert facets[0]["features"][0]["tag"] == "foo"

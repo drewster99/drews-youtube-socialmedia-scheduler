@@ -466,6 +466,20 @@ _BSKY_URL_PAIRED_CLOSERS = {b")": b"(", b"]": b"[", b"}": b"{"}
 # bytes to keep `index.byteStart`/`byteEnd` aligned with what the server sees.
 _BSKY_URL_RE = re.compile(rb"https?://[^\s<>]+")
 
+# Bare-domain detector — `example.com`, `www.foo.io/bar`, etc. with NO scheme.
+# Bluesky won't auto-link these (it doesn't even auto-link scheme'd URLs), so we
+# synthesize an `https://` URI for the facet. The negative lookbehind keeps it
+# from firing inside an already-matched http(s) URL (preceding `/`), inside an
+# email address (`@`), or mid-label. `dev` precedes `de` and `com` precedes `co`
+# so the longer TLD wins the alternation; the trailing `(?![a-z0-9-])` stops a
+# TLD from matching the head of a longer label (e.g. `co` in `community`).
+_BSKY_BARE_DOMAIN_RE = re.compile(
+    rb"(?<![\w./@#-])(?:[a-z0-9][a-z0-9-]*\.)+"
+    rb"(?:com|org|net|edu|gov|info|dev|app|io|ai|me|tv|xyz|co|us|uk|ca|de|fr|nl|so)"
+    rb"(?![a-z0-9-])(?:/[^\s<>]*)?",
+    re.IGNORECASE,
+)
+
 # Hashtag detector — `#` followed by at least one letter, then word chars.
 # A leading letter avoids matching things like "#1" (numeric) which Bluesky
 # also rejects as a tag. Tag value sent to the server omits the leading `#`.
@@ -504,6 +518,22 @@ def _build_bluesky_facets(text: str) -> list[dict]:
         if end <= start:
             continue
         uri = trimmed.decode("utf-8", errors="ignore")
+        facets.append({
+            "index": {"byteStart": start, "byteEnd": end},
+            "features": [{"$type": "app.bsky.richtext.facet#link", "uri": uri}],
+        })
+
+    # Bare domains (no scheme) — link with a synthesized https:// URI. The
+    # byte offsets index the original text; only the `uri` string gets the
+    # prefix. The lookbehind in the pattern already prevents overlap with the
+    # scheme'd-URL matches above.
+    for match in _BSKY_BARE_DOMAIN_RE.finditer(encoded):
+        start = match.start()
+        trimmed = _trim_trailing_url_punct(match.group(0))
+        end = start + len(trimmed)
+        if end <= start:
+            continue
+        uri = "https://" + trimmed.decode("utf-8", errors="ignore")
         facets.append({
             "index": {"byteStart": start, "byteEnd": end},
             "features": [{"$type": "app.bsky.richtext.facet#link", "uri": uri}],

@@ -687,6 +687,52 @@ body {
     line-height: 1.5;
 }
 
+/* Live {{tag}} syntax highlighting: a colored backdrop div sits behind a
+   transparent textarea. Both must share the exact same box model + text metrics
+   so the rendered text lines up pixel-for-pixel with what the user types. */
+.code-hl-wrap { position: relative; }
+.code-hl-wrap > textarea,
+.code-hl-wrap > .code-hl-backdrop {
+    width: 100%;
+    padding: 0.6rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 0.85rem;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    word-break: break-word;
+    scrollbar-gutter: stable;
+}
+.code-hl-wrap > textarea {
+    display: block;
+    position: relative;
+    z-index: 1;
+    background: transparent;
+    color: transparent;
+    caret-color: var(--text-primary);
+    resize: vertical;
+}
+.code-hl-wrap > .code-hl-backdrop {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    overflow: hidden;
+    pointer-events: none;
+    color: var(--text-primary);
+    border-color: transparent;
+}
+.tag-known { color: var(--success); }
+.tag-media { color: var(--accent); }
+.tag-unknown { color: var(--warning); }
+.tag-unresolved { color: var(--danger); font-weight: 600; }
+.slot-threads-warn { color: var(--danger); }
+
+/* Over-limit / leftover-tag flags on generated social-post cards */
+.social-post-over-limit { border-color: var(--danger); }
+.post-warn { color: var(--danger); font-size: 0.8rem; margin-top: 0.3rem; }
+
 .template-help {
     background: var(--bg-input);
     margin-bottom: 1rem;
