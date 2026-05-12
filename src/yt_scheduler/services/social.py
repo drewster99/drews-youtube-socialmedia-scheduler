@@ -28,8 +28,12 @@ _TWITTER_TOKEN_URL = "https://api.twitter.com/2/oauth2/token"
 
 async def _twitter_refresh_bearer(creds: dict[str, str]) -> str | None:
     """Mint a fresh access_token using the stored refresh_token, persist it
-    back into Keychain, and return the new bearer. Returns None if refresh
-    isn't possible (no refresh_token or client_id, or the API rejects it)."""
+    back into Keychain, and return the new bearer.
+
+    Returns ``None`` only when there's no refresh path (no refresh_token /
+    no client_id). Raises :class:`RuntimeError` when the API *rejects* the
+    refresh (terminal — re-auth needed). Network/transport errors propagate
+    as ``httpx`` exceptions (transient — caller should not flag re-auth)."""
     refresh = creds.get("refresh_token")
     client_id = creds.get("client_id")
     if not refresh or not client_id:
@@ -43,21 +47,16 @@ async def _twitter_refresh_bearer(creds: dict[str, str]) -> str | None:
     auth = None
     if creds.get("client_secret"):
         auth = (client_id, creds["client_secret"])
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(_TWITTER_TOKEN_URL, data=body, auth=auth)
-    except Exception as exc:
-        logger.warning("Twitter token refresh network error: %s", exc)
-        return None
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(_TWITTER_TOKEN_URL, data=body, auth=auth)
     if resp.status_code != 200:
-        logger.warning(
-            "Twitter token refresh rejected (%s): %s", resp.status_code, resp.text
+        raise RuntimeError(
+            f"X token refresh rejected ({resp.status_code}): {resp.text}"
         )
-        return None
     payload = resp.json() or {}
     new_bearer = payload.get("access_token")
     if not new_bearer:
-        return None
+        raise RuntimeError(f"X token refresh response missing access_token: {payload}")
     new_refresh = payload.get("refresh_token")
 
     creds["bearer_token"] = new_bearer
@@ -353,7 +352,11 @@ class TwitterPoster(SocialPoster):
         expires_at = int(creds.get("expires_at") or 0)
         if not expires_at or expires_at - window_secs > int(time.time()):
             return False
-        from yt_scheduler.services.social_credentials import get_credential_lock, load_bundle
+        from yt_scheduler.services.social_credentials import (
+            clear_needs_reauth,
+            get_credential_lock,
+            load_bundle,
+        )
         async with get_credential_lock(uuid):
             fresh = load_bundle("twitter", uuid)
             if fresh:
@@ -361,11 +364,13 @@ class TwitterPoster(SocialPoster):
             expires_at = int(creds.get("expires_at") or 0)
             if expires_at and expires_at - window_secs > int(time.time()):
                 return False
-            new_bearer = await _twitter_refresh_bearer(creds)
-            if new_bearer is None:
-                raise CredentialAuthError(
-                    uuid, "X token refresh was rejected — re-authenticate from Settings."
-                )
+            try:
+                new_bearer = await _twitter_refresh_bearer(creds)
+            except RuntimeError as exc:
+                raise CredentialAuthError(uuid, str(exc)) from exc
+            if not new_bearer:
+                return False  # no refresh token in the bundle — nothing to do
+            await clear_needs_reauth(uuid)
             return True
 
     async def post(
@@ -445,11 +450,20 @@ class TwitterPoster(SocialPoster):
                 )
             except tweepy.errors.Unauthorized as exc:
                 # Bearer expired (~2h lifetime). Try once with refresh_token.
-                new_bearer = await _twitter_refresh_bearer(creds)
+                # A *rejected* refresh is terminal (re-OAuth); a network blip
+                # propagates and is reported as a generic post failure, not a
+                # re-auth prompt.
+                try:
+                    new_bearer = await _twitter_refresh_bearer(creds)
+                except RuntimeError as rexc:
+                    raise CredentialAuthError(
+                        creds.get("uuid"),
+                        "X bearer expired and the refresh was rejected — re-OAuth.",
+                    ) from rexc
                 if not new_bearer:
                     raise CredentialAuthError(
                         creds.get("uuid"),
-                        "X bearer expired and refresh failed — re-OAuth.",
+                        "X bearer expired and there's no refresh token — re-OAuth.",
                     ) from exc
                 logger.info("Twitter bearer refreshed; retrying tweet.")
                 # Re-upload media against the fresh token — old media_ids
@@ -826,6 +840,7 @@ class BlueskyPoster(SocialPoster):
         fresh / not possible. RuntimeError from the AS propagates."""
         from yt_scheduler.services import bluesky_oauth
         from yt_scheduler.services.social_credentials import (
+            clear_needs_reauth,
             get_credential_lock,
             load_bundle,
             save_bundle,
@@ -847,6 +862,10 @@ class BlueskyPoster(SocialPoster):
             else:
                 async with httpx.AsyncClient(follow_redirects=True) as c:
                     await self._refresh_access_token(creds, c, bluesky_oauth, save_bundle)
+            if uuid:
+                # A successful refresh means the session is alive — clear any
+                # stale needs-reauth flag (e.g. one set by a transient blip).
+                await clear_needs_reauth(uuid)
             return True
 
         if uuid:

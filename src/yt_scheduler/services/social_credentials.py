@@ -229,11 +229,24 @@ async def mark_needs_reauth(uuid: str) -> None:
 
     Called by send paths after a terminal authentication failure. The
     flag is cleared on the next successful :func:`upsert_credential`
-    (which runs as part of the OAuth callback).
+    (re-OAuth) or :func:`clear_needs_reauth` (a successful token refresh).
     """
     db = await get_db()
     await db.execute(
         "UPDATE social_accounts SET needs_reauth = 1 WHERE uuid = ?", (uuid,)
+    )
+    await db.commit()
+
+
+async def clear_needs_reauth(uuid: str) -> None:
+    """Clear a credential's needs-reauth flag — called after a successful
+    token refresh, so a credential flagged by a transient blip self-heals
+    without forcing the user through the OAuth flow again. No-op if the
+    flag wasn't set."""
+    db = await get_db()
+    await db.execute(
+        "UPDATE social_accounts SET needs_reauth = 0 WHERE uuid = ? AND needs_reauth = 1",
+        (uuid,),
     )
     await db.commit()
 
