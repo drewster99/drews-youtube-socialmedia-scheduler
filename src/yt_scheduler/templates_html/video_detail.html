@@ -1750,14 +1750,18 @@ function openSocialsComposer() {
 }
 
 async function generatePosts() {
-    // If we have platform checkboxes, use the picker flow
+    // If we have platform checkboxes from the in-place Regenerate flow,
+    // route through that picker. Otherwise hand off to the unified
+    // compose page with ``auto=1`` so it auto-runs Generate using the
+    // project's default template for this video's tier. The detail
+    // page no longer has its own generate code path — same engine,
+    // same UI, one place to debug.
     const checkboxes = document.querySelectorAll('#platform-checkboxes input[name="platform"]');
     if (checkboxes.length > 0) {
         generatePostsForSelected();
         return;
     }
-    // Fallback: generate for all
-    await doGeneratePosts();
+    window.location.href = `/projects/${projectSlug}/socials-compose?video_id=${videoId}&auto=1`;
 }
 
 async function generatePostsForSelected() {

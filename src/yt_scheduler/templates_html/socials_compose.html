@@ -144,6 +144,15 @@ async function loadInitial() {
     populateTemplatePicker();
     document.getElementById('template-picker').addEventListener('change', onTemplateChange);
     await loadSlotsForCurrentTemplate();
+
+    // When the detail page hands off via ?auto=1 — the unified entry
+    // point that replaced its own "Generate social posts" code path —
+    // immediately fire Generate with the just-selected template and
+    // every slot checked. The picker card hides itself after a
+    // successful generate, so the user lands on the previews directly.
+    if (params.get('auto') === '1' && currentTemplateSlots.length) {
+        await generatePreviews();
+    }
 }
 
 function populateTemplatePicker() {
@@ -167,6 +176,19 @@ function populateTemplatePicker() {
     sel.innerHTML = visible.map(t =>
         `<option value="${t.name}">${t.name}${t.description ? ' — ' + t.description : ''}</option>`
     ).join('');
+
+    // Pre-select the project's per-tier default template when it's in
+    // the filtered list. This is what makes the unified detail-page
+    // "Generate social posts" hand-off (?auto=1) actually do the
+    // right thing — it auto-fires Generate against the same template
+    // a user would have hand-picked.
+    const defaultName = videoTier
+        ? postingSettings?.[`default_template_${videoTier}`]
+        : null;
+    if (defaultName && visible.some(t => t.name === defaultName)) {
+        sel.value = defaultName;
+    }
+
     if (visible.length === 1) {
         hintEl.textContent = `Only one template applies to "${videoTier || 'any tier'}" — auto-selected.`;
     } else {
