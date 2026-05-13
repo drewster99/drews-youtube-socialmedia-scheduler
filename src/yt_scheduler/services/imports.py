@@ -166,15 +166,22 @@ async def import_video(video_id: str, *, project_id: int) -> dict:
         except Exception as exc:
             logger.warning("Could not download thumbnail for %s: %s", video_id, exc)
 
+    # videos.url is the canonical link used by {{url}} in templates. Every
+    # imported row IS a YouTube video, so we know the URL deterministically;
+    # leaving it NULL would silently break any {{url}} reference at render
+    # time. (Migration 010 backfilled existing rows; this keeps new ones
+    # consistent.)
+    youtube_url = f"https://youtu.be/{video_id}"
+
     await db.execute(
         """INSERT INTO videos (
             id, project_id, title, description, tags, privacy_status,
             thumbnail_path, status, imported_from_youtube,
-            duration_seconds, tier, youtube_kind
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'uploaded', 1, ?, ?, ?)""",
+            duration_seconds, tier, youtube_kind, url
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'uploaded', 1, ?, ?, ?, ?)""",
         (
             video_id, project_id, title, description, json.dumps(tags_list),
-            privacy, thumbnail_path, duration, tier, youtube_kind,
+            privacy, thumbnail_path, duration, tier, youtube_kind, youtube_url,
         ),
     )
     await db.commit()

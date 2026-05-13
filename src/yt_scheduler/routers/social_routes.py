@@ -33,6 +33,12 @@ _VIDEO_DIRECTIVE_RE = re.compile(r"\{\{\s*video\s*\}\}", re.IGNORECASE)
 # {{name??default}} would have substituted the default — so plain {{name}} is
 # the only thing that survives the renderer.)
 _UNRESOLVED_VAR_RE = re.compile(r"\{\{(\w+)\}\}")
+# Body-side scan for the URL family (url / episode_url / project_url) so we
+# can warn when a slot referenced one of them but the resolved value was
+# empty. Matches the three placeholder forms: {{name}}, {{name!}},
+# {{name??default}} — all three render to the empty string when the
+# variable is present in the dict with an empty value.
+_URL_VAR_REF_RE = re.compile(r"\{\{(url|episode_url|project_url)(?:!|\?\?[^}]*)?\}\}")
 
 
 async def _build_render_context(db, video: dict) -> dict:
@@ -114,6 +120,15 @@ async def _build_render_context(db, video: dict) -> dict:
 
     description = video.get("description") or ""
 
+    # URL family — read directly from columns; resolution is just
+    # "self.url -> empty" / "parent.url -> empty" / "project.project_url
+    # -> empty". Migration 010 backfilled videos.url for pre-existing rows
+    # and migration 015 covers any imports that were created in the window
+    # before services/imports.py started setting it on INSERT.
+    url_value = video.get("url") or ""
+    episode_url_value = (parent or {}).get("url") or ""
+    project_url_value = project_row.get("project_url") or ""
+
     self_builtins: dict[str, object] = {
         "title": video.get("title") or "",
         "description": description,
@@ -124,13 +139,23 @@ async def _build_render_context(db, video: dict) -> dict:
         "thumbnail_path": video.get("thumbnail_path") or "",
         "tier": tier,
         "transcript": srt_to_plain_text(video.get("transcript") or ""),
-        # URL family — read directly from columns; resolution is just
-        # "self.url -> empty" / "parent.url -> empty" / "project.project_url
-        # -> empty". The migration backfilled videos.url for existing rows.
-        "url": video.get("url") or "",
-        "episode_url": (parent or {}).get("url") or "",
-        "project_url": project_row.get("project_url") or "",
+        "url": url_value,
+        "episode_url": episode_url_value,
+        "project_url": project_url_value,
     }
+
+    # Names that resolved to empty string. The renderer treats these as
+    # ordinary {{name}} hits and silently substitutes "", which means a
+    # template body that referenced {{url}} would render with no URL and
+    # the user would never know. generate_posts uses this set to emit a
+    # warning when a slot body actually mentioned one of these names.
+    empty_url_keys: set[str] = set()
+    if not url_value:
+        empty_url_keys.add("url")
+    if not episode_url_value:
+        empty_url_keys.add("episode_url")
+    if not project_url_value:
+        empty_url_keys.add("project_url")
 
     variables = tmpl.merge_variables(
         global_vars=global_vars,
@@ -145,6 +170,7 @@ async def _build_render_context(db, video: dict) -> dict:
         "video_path": video.get("video_file_path") or "",
         "thumb_path": video.get("thumbnail_path") or "",
         "images": images,
+        "empty_url_keys": empty_url_keys,
     }
 
 
@@ -304,6 +330,11 @@ async def generate_posts(
         # unresolved-variable problems *before* deleting any existing posts.
         warnings: list[str] = []
         unresolved_names: set[str] = set()
+        # URL-family names that were referenced in a slot body but resolved
+        # to empty. We collect, dedupe, and warn once at the end so the
+        # user sees "{{url}} resolved to empty" without ten copies of the
+        # same warning for five slots.
+        empty_url_refs: set[str] = set()
         prepared: list[dict] = []
         for slot in template.get("slots", []):
             if slot.get("is_disabled"):
@@ -313,6 +344,13 @@ async def generate_posts(
                 continue
 
             body = slot.get("body", "") or ""
+
+            # Scan the body for url-family references before rendering so we
+            # know which ones got referenced even if they substitute to "".
+            # The set is intersected with ctx["empty_url_keys"] below.
+            url_refs_in_body = {m.group(1) for m in _URL_VAR_REF_RE.finditer(body)}
+            for name in url_refs_in_body & ctx.get("empty_url_keys", set()):
+                empty_url_refs.add(name)
 
             # Threads can't attach media (text-only API), so a {{video}} slot
             # is skipped rather than posted without the video.
@@ -387,6 +425,29 @@ async def generate_posts(
         # Unresolved-variable gate — bail before any destructive DB op.
         if unresolved_names and not unresolved_ack:
             raise HTTPException(409, {"unresolved": sorted(unresolved_names)})
+
+        # URL-family soft warnings. These are not gating (the post still
+        # renders fine, just with no link) — they exist so the user sees
+        # WHY their post came out without the URL they expected. One
+        # message per offending name, regardless of how many slots tripped.
+        _EMPTY_URL_HINTS = {
+            "url": (
+                "{{url}} resolved to empty for this item — set the URL on "
+                "the item or, for an imported YouTube video, the import "
+                "should have populated it automatically (file a bug if "
+                "this is one)."
+            ),
+            "episode_url": (
+                "{{episode_url}} resolved to empty — this item has no "
+                "parent episode, or the parent has no URL set."
+            ),
+            "project_url": (
+                "{{project_url}} resolved to empty — set the project URL "
+                "in Project settings."
+            ),
+        }
+        for name in sorted(empty_url_refs):
+            warnings.append(_EMPTY_URL_HINTS[name])
 
         for r in scheduled_rows:
             await cancel_scheduled_post(int(r["id"]))
