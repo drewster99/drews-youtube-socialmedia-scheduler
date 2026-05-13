@@ -89,11 +89,16 @@
     <div class="card-header"><h2>Posting to social media</h2></div>
     <div class="card-body">
         <div class="form-row">
-            <label>Default template — video<input type="text" id="dt-video"></label>
-            <label>Default template — segment<input type="text" id="dt-segment"></label>
-            <label>Default template — short<input type="text" id="dt-short"></label>
-            <label>Default template — hook<input type="text" id="dt-hook"></label>
+            <label>Default template — video<select id="dt-video"></select></label>
+            <label>Default template — segment<select id="dt-segment"></select></label>
+            <label>Default template — short<select id="dt-short"></select></label>
+            <label>Default template — hook<select id="dt-hook"></select></label>
         </div>
+        <small class="form-hint" style="margin: -0.5rem 0 0.75rem; display: block;">
+            Lists only templates whose <code>applies_to</code> includes the
+            corresponding tier — edit a template's tier checkboxes on its
+            Templates page to add or remove it from these dropdowns.
+        </small>
         <div class="form-row">
             <label>Minutes after video posting before socials fire<input type="number" id="post-delay" min="0" value="15"></label>
             <label>Minutes between social postings<input type="number" id="post-spacing" min="0" value="5"></label>
@@ -135,6 +140,13 @@
             <div class="form-group">
                 <label>Extra instructions <span class="form-hint" style="font-weight: normal;">(optional)</span></label>
                 <textarea id="pv-extra" rows="2"></textarea>
+            </div>
+            <div class="form-row">
+                <label>Target chars <span class="form-hint" style="font-weight: normal;">(for shorten_post_prompt)</span><input type="number" id="pv-target-chars" value="280" min="1"></label>
+            </div>
+            <div class="form-group">
+                <label>Post text <span class="form-hint" style="font-weight: normal;">(for shorten_post_prompt)</span></label>
+                <textarea id="pv-post-text" rows="2">Check out my new video on testing prompt templates: https://example.com/video</textarea>
             </div>
         </details>
 
@@ -342,14 +354,37 @@ function updatePostingButtonState() {
     btn.disabled = jsonStable(buildPostingPayload()) === postingBaseline;
 }
 
+// Per-tier default-template selectors are dropdowns populated from the
+// project's templates filtered by each template's applies_to. The user's
+// currently-saved value is included even if its template was deleted —
+// otherwise switching saves would silently downgrade their choice.
+async function populateDefaultTemplateDropdowns(saved) {
+    const tplResp = await fetch(`/api/templates?project_slug=${encodeURIComponent(slug)}`);
+    const allTemplates = tplResp.ok ? await tplResp.json() : [];
+    const tiers = ['video', 'segment', 'short', 'hook'];
+    for (const tier of tiers) {
+        const sel = document.getElementById(`dt-${tier}`);
+        if (!sel) continue;
+        const eligible = allTemplates.filter(t =>
+            Array.isArray(t.applies_to) && t.applies_to.includes(tier)
+        );
+        const savedValue = saved[`default_template_${tier}`] || 'announce_video';
+        const names = eligible.map(t => t.name);
+        // Preserve the saved value even if its template no longer exists
+        // or no longer applies to this tier; surfacing that mismatch is
+        // more useful than silently renaming the user's choice.
+        if (!names.includes(savedValue)) names.unshift(savedValue);
+        sel.innerHTML = names.map(name =>
+            `<option value="${name}"${name === savedValue ? ' selected' : ''}>${name}</option>`
+        ).join('');
+    }
+}
+
 async function loadPostingSettings() {
     const resp = await fetch(`/api/projects/${slug}/posting-settings`);
     if (resp.ok) {
         postingSettings = await resp.json();
-        document.getElementById('dt-video').value = postingSettings.default_template_video || 'announce_video';
-        document.getElementById('dt-segment').value = postingSettings.default_template_segment || 'announce_video';
-        document.getElementById('dt-short').value = postingSettings.default_template_short || 'announce_video';
-        document.getElementById('dt-hook').value = postingSettings.default_template_hook || 'announce_video';
+        await populateDefaultTemplateDropdowns(postingSettings);
         document.getElementById('post-delay').value = postingSettings.post_video_delay_minutes ?? 15;
         document.getElementById('post-spacing').value = postingSettings.inter_post_spacing_minutes ?? 5;
         postingBaseline = jsonStable(buildPostingPayload());
@@ -358,7 +393,11 @@ async function loadPostingSettings() {
 }
 
 ['dt-video', 'dt-segment', 'dt-short', 'dt-hook', 'post-delay', 'post-spacing'].forEach(id => {
-    document.getElementById(id).addEventListener('input', updatePostingButtonState);
+    const el = document.getElementById(id);
+    // <select> fires change; <input> fires input. Listen for both so we
+    // don't miss either, and so the dropdown switch flips the Save state.
+    el.addEventListener('input', updatePostingButtonState);
+    el.addEventListener('change', updatePostingButtonState);
 });
 
 document.getElementById('save-auto-actions').addEventListener('click', async () => {
@@ -627,25 +666,49 @@ async function loadPromptTemplates() {
     // page. Without this, the page returns 500.
     const TPL_OPEN = String.fromCharCode(123, 123);
     const TPL_CLOSE = String.fromCharCode(125, 125);
+    const chipRow = (names) => names.length
+        ? `<p class="form-hint" style="margin: 0.25rem 0;">
+            Available variables — referencing any other name renders literally:
+            ${names.map(v => `<code style="margin-right: 0.25rem;">${TPL_OPEN}${v}${TPL_CLOSE}</code>`).join('')}
+          </p>`
+        : '';
     container.innerHTML = prompts.map(p => {
-        const vars = (p.variables || []);
-        const varsBlock = vars.length
-            ? `<p class="form-hint" style="margin: 0.25rem 0;">
-                Available variables — referencing any other name renders literally:
-                ${vars.map(v => `<code style="margin-right: 0.25rem;">${TPL_OPEN}${v}${TPL_CLOSE}</code>`).join('')}
-              </p>`
-            : '';
+        const vars = p.variables || [];
+        const sysVars = p.system_variables || [];
+        // A seed with no system declared (body-only) hides the system
+        // textarea entirely. The two description seeds fall under this.
+        const showSystem = p.default_system !== null && p.default_system !== undefined;
+        // The system-only seed (ai_block_default_system_prompt) sets
+        // body_required=false. Hide the body textarea for that one.
+        const showBody = p.body_required !== false;
+        const systemValue = p.system === null || p.system === undefined ? '' : p.system;
+        const sysBlock = showSystem ? `
+            <h4 style="margin: 0.75rem 0 0.25rem; font-size: 0.9rem; color: var(--text-muted);">System prompt</h4>
+            ${chipRow(sysVars)}
+            <textarea class="prompt-system" rows="4" style="width: 100%; font-family: var(--font-mono, monospace); font-size: 0.85rem;">${escapeHtml(systemValue)}</textarea>
+        ` : '';
+        const bodyBlock = showBody ? `
+            ${chipRow(vars)}
+            <textarea class="prompt-body" rows="10" style="width: 100%; font-family: var(--font-mono, monospace); font-size: 0.85rem;">${escapeHtml(p.body)}</textarea>
+        ` : '';
+        const defaultSystemAttr = p.default_system === null || p.default_system === undefined
+            ? ''
+            : `data-default-system="${escapeHtml(p.default_system)}"`;
         return `
-        <div class="prompt-row" data-key="${p.key}" style="margin-bottom: 1.25rem;">
+        <div class="prompt-row" data-key="${p.key}"
+             data-show-body="${showBody ? '1' : '0'}"
+             data-show-system="${showSystem ? '1' : '0'}"
+             ${defaultSystemAttr}
+             style="margin-bottom: 1.25rem;">
             <h3 style="margin: 0 0 0.25rem; font-size: 1rem;">${p.name}
                 <span class="form-hint" style="font-weight: normal;">(<code>${p.key}</code>)</span>
                 ${p.is_default ? '<span class="badge badge-draft" style="margin-left: 0.5rem;">Default</span>' : ''}
             </h3>
-            ${varsBlock}
-            <textarea class="prompt-body" rows="10" style="width: 100%; font-family: var(--font-mono, monospace); font-size: 0.85rem;">${escapeHtml(p.body)}</textarea>
+            ${bodyBlock}
+            ${sysBlock}
             <div class="modal-actions" style="justify-content: flex-end; margin-top: 0.25rem;">
                 <button type="button" class="btn btn-sm" data-action="reset" data-default="${escapeHtml(p.default_body)}">Reset to default</button>
-                <button type="button" class="btn btn-sm" data-action="preview" title="Render this prompt with the test variables above">Preview</button>
+                ${showBody ? '<button type="button" class="btn btn-sm" data-action="preview" title="Render the user prompt body with the test variables above">Preview</button>' : ''}
                 <button type="button" class="btn btn-sm btn-primary" data-action="save" disabled>Save</button>
             </div>
             <pre class="prompt-preview" data-preview-for="${p.key}"
@@ -660,29 +723,54 @@ async function loadPromptTemplates() {
     }).join('');
     container.querySelectorAll('.prompt-row').forEach(row => {
         const key = row.dataset.key;
-        const ta = row.querySelector('.prompt-body');
+        const bodyTa = row.querySelector('.prompt-body');     // may be null (system-only seed)
+        const sysTa = row.querySelector('.prompt-system');    // may be null (no system seed)
         const saveBtn = row.querySelector('[data-action="save"]');
         const resetBtn = row.querySelector('[data-action="reset"]');
         const previewBtn = row.querySelector('[data-action="preview"]');
         const previewBox = row.querySelector('.prompt-preview');
-        const original = ta.value;
-        promptDirty.set(key, original);
-        ta.addEventListener('input', () => {
-            saveBtn.disabled = ta.value === promptDirty.get(key);
-        });
+
+        const originalBody = bodyTa ? bodyTa.value : '';
+        const originalSys = sysTa ? sysTa.value : '';
+        promptDirty.set(key, {body: originalBody, system: originalSys});
+
+        const isDirty = () => {
+            const snapshot = promptDirty.get(key);
+            const curBody = bodyTa ? bodyTa.value : '';
+            const curSys = sysTa ? sysTa.value : '';
+            return curBody !== snapshot.body || curSys !== snapshot.system;
+        };
+        const refresh = () => { saveBtn.disabled = !isDirty(); };
+
+        if (bodyTa) bodyTa.addEventListener('input', refresh);
+        if (sysTa) sysTa.addEventListener('input', refresh);
+
         resetBtn.addEventListener('click', () => {
-            ta.value = resetBtn.dataset.default;
-            saveBtn.disabled = ta.value === promptDirty.get(key);
+            if (bodyTa) bodyTa.value = resetBtn.dataset.default;
+            if (sysTa) sysTa.value = row.dataset.defaultSystem ?? '';
+            refresh();
         });
+
         saveBtn.addEventListener('click', async () => {
             saveBtn.disabled = true;
+            // Three-state for system: null → use seed; "" → explicit
+            // "send no system"; other string → exact override. The UI
+            // sends what's currently in the textarea verbatim. To "reset
+            // to seed default" the user hits Reset, which fills the seed
+            // text — same value the server would have used implicitly.
+            const payload = {};
+            if (bodyTa) payload.body = bodyTa.value;
+            if (sysTa) payload.system = sysTa.value;
             const resp = await fetch(`/api/projects/${slug}/prompts/${key}`, {
                 method: 'PUT',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({body: ta.value}),
+                body: JSON.stringify(payload),
             });
             if (resp.ok) {
-                promptDirty.set(key, ta.value);
+                promptDirty.set(key, {
+                    body: bodyTa ? bodyTa.value : '',
+                    system: sysTa ? sysTa.value : '',
+                });
                 showToast('Prompt saved', 'success');
                 row.querySelector('.badge')?.remove();
             } else {
@@ -690,12 +778,23 @@ async function loadPromptTemplates() {
                 showToast('Save failed', 'error');
             }
         });
-        previewBtn.addEventListener('click', async () => {
-            await renderPromptPreview(ta.value, previewBox);
-            // Keep the test-variables panel open so the user can iterate.
-            const det = document.getElementById('prompt-test-vars');
-            if (det && !det.open) det.open = true;
-        });
+
+        if (previewBtn && bodyTa) {
+            previewBtn.addEventListener('click', async () => {
+                // Preview always uses the body field; the system prompt
+                // is sent to Claude at generation time, not rendered as
+                // visible output. Pass the current system text as
+                // default_system_prompt so any inline AI blocks inside
+                // the body honor the user's edits.
+                await renderPromptPreview(
+                    bodyTa.value,
+                    previewBox,
+                    {default_system_prompt: sysTa ? sysTa.value : undefined},
+                );
+                const det = document.getElementById('prompt-test-vars');
+                if (det && !det.open) det.open = true;
+            });
+        }
     });
 }
 
@@ -708,6 +807,8 @@ function buildPromptTestVariables() {
     const description = document.getElementById('pv-description')?.value || '';
     const transcript = document.getElementById('pv-transcript')?.value || '';
     const extra = document.getElementById('pv-extra')?.value || '';
+    const targetChars = document.getElementById('pv-target-chars')?.value || '280';
+    const postText = document.getElementById('pv-post-text')?.value || '';
     return {
         title,
         channel_name: channelName,
@@ -726,20 +827,27 @@ function buildPromptTestVariables() {
         extra_instructions_block: extra
             ? `\n\nAdditional instructions:\n${extra}\n`
             : '',
+        // shorten_post_prompt variables — see services/prompts.SEED_SHORTEN_POST_PROMPT.
+        target_chars: targetChars,
+        post_text: postText,
     };
 }
 
-async function renderPromptPreview(body, outputBox) {
+async function renderPromptPreview(body, outputBox, opts) {
     outputBox.style.display = 'block';
     outputBox.textContent = 'Rendering…';
     try {
+        const payload = {
+            template: body,
+            variables: buildPromptTestVariables(),
+        };
+        if (opts && opts.default_system_prompt !== undefined) {
+            payload.default_system_prompt = opts.default_system_prompt;
+        }
         const resp = await fetch('/api/expand_text', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-                template: body,
-                variables: buildPromptTestVariables(),
-            }),
+            body: JSON.stringify(payload),
         });
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok) {

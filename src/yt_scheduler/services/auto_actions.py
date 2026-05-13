@@ -358,6 +358,13 @@ async def _maybe_generate_socials(
 
     ctx = await _build_render_context(db, video)
 
+    # Same per-project default for ``{{ai: …}}`` blocks as the on-demand
+    # generate flow — see social_routes.py for the rationale.
+    from yt_scheduler.services import prompts as prompt_service
+    default_ai_system = (await prompt_service.get_prompt_with_fallback(
+        "ai_block_default_system_prompt", project_id=project_id,
+    ))["system"]
+
     video_directive_re = re.compile(r"\{\{\s*video\s*\}\}", re.IGNORECASE)
 
     for slot in template.get("slots", []):
@@ -386,7 +393,9 @@ async def _maybe_generate_socials(
                 images=ctx["images"],
             )
             slot_vars = {**ctx["variables"], "max_chars": str(slot_max)}
-            rendered = tmpl.render(cleaned, slot_vars).strip()
+            rendered = tmpl.render(
+                cleaned, slot_vars, default_system_prompt=default_ai_system,
+            ).strip()
         except Exception as exc:
             logger.warning("auto-social render failed for %s: %s", platform, exc)
             continue

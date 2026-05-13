@@ -24,9 +24,9 @@ def get_client() -> anthropic.Anthropic:
 
 
 # Module-level cache for the Anthropic model name. Both async (description /
-# tags) and sync (template ``{{ai: ...}}`` blocks, social_post generation)
-# code paths read through this so the user's Settings → Model selection
-# applies everywhere. Settings save handler calls ``invalidate_model_cache()``.
+# tags) and sync (template ``{{ai: ...}}`` blocks) code paths read through
+# this so the user's Settings → Model selection applies everywhere. Settings
+# save handler calls ``invalidate_model_cache()``.
 _active_model_cache: str | None = None
 
 
@@ -91,8 +91,9 @@ async def generate_seo_description(
 ) -> str:
     """Generate an SEO-friendly video description from a transcript.
 
-    Prompt body comes from the ``description_from_transcript`` row in
-    ``prompt_templates``; the seed default kicks in when the row is missing.
+    Prompt body comes from the ``description_from_transcript_prompt`` row
+    in ``prompt_templates``; the seed default kicks in when the row is
+    missing. No system prompt — instructions live in the user message.
     """
     from yt_scheduler.services import prompts as prompt_service
     from yt_scheduler.services.transcripts import srt_to_plain_text
@@ -102,11 +103,11 @@ async def generate_seo_description(
     # and timestamp lines don't eat the context budget.
     plain = srt_to_plain_text(transcript) if transcript else ""
 
-    body = await prompt_service.get_prompt_body_with_fallback(
-        "description_from_transcript", project_id=project_id
+    prompt = await prompt_service.get_prompt_with_fallback(
+        "description_from_transcript_prompt", project_id=project_id
     )
     rendered = _render_template_body(
-        body,
+        prompt["body"],
         {
             "title": title,
             "channel_name": channel_name,
@@ -117,13 +118,16 @@ async def generate_seo_description(
         },
     )
 
+    kwargs: dict[str, object] = {
+        "model": await _resolve_model(),
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": rendered}],
+    }
+    if prompt["system"]:
+        kwargs["system"] = prompt["system"]
+
     client = get_client()
-    message = await asyncio.to_thread(
-        client.messages.create,
-        model=await _resolve_model(),
-        max_tokens=1024,
-        messages=[{"role": "user", "content": rendered}],
-    )
+    message = await asyncio.to_thread(client.messages.create, **kwargs)
     return message.content[0].text.strip()
 
 
@@ -137,7 +141,7 @@ async def generate_seo_description_from_frames(
 ) -> str:
     """Generate an SEO description from a list of JPEG keyframes.
 
-    Prompt body comes from the ``description_from_frames`` row in
+    Prompt body comes from the ``description_from_frames_prompt`` row in
     ``prompt_templates``; the seed default kicks in when the row is missing.
     Frames are attached after the rendered prompt text in the same user turn.
     """
@@ -147,15 +151,15 @@ async def generate_seo_description_from_frames(
     if not frames:
         raise ValueError("generate_seo_description_from_frames called with no frames")
 
-    body = await prompt_service.get_prompt_body_with_fallback(
-        "description_from_frames", project_id=project_id
+    prompt = await prompt_service.get_prompt_with_fallback(
+        "description_from_frames_prompt", project_id=project_id
     )
     extra_block = (
         f"\n\nAdditional instructions:\n{extra_instructions}\n"
         if extra_instructions else ""
     )
     instructions = _render_template_body(
-        body,
+        prompt["body"],
         {
             "title": title,
             "channel_name": channel_name,
@@ -176,13 +180,16 @@ async def generate_seo_description_from_frames(
             },
         })
 
+    kwargs: dict[str, object] = {
+        "model": await _resolve_model(),
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": content}],
+    }
+    if prompt["system"]:
+        kwargs["system"] = prompt["system"]
+
     client = get_client()
-    message = await asyncio.to_thread(
-        client.messages.create,
-        model=await _resolve_model(),
-        max_tokens=1024,
-        messages=[{"role": "user", "content": content}],
-    )
+    message = await asyncio.to_thread(client.messages.create, **kwargs)
     return message.content[0].text.strip()
 
 
@@ -197,8 +204,9 @@ async def generate_tags_from_frames(
     description + the keyframes, when there's no transcript to feed
     ``generate_tags_from_metadata``.
 
-    Prompt body comes from the ``tags_from_frames`` row in
-    ``prompt_templates``; the seed default kicks in when the row is missing.
+    Prompt body and system come from the ``tags_from_frames_prompt`` row
+    in ``prompt_templates``; the seed defaults kick in when fields are
+    missing.
     """
     import base64
     from yt_scheduler.services import prompts as prompt_service
@@ -206,11 +214,11 @@ async def generate_tags_from_frames(
     if not frames:
         raise ValueError("generate_tags_from_frames called with no frames")
 
-    body = await prompt_service.get_prompt_body_with_fallback(
-        "tags_from_frames", project_id=project_id
+    prompt = await prompt_service.get_prompt_with_fallback(
+        "tags_from_frames_prompt", project_id=project_id
     )
     instructions = _render_template_body(
-        body,
+        prompt["body"],
         {
             "title": title,
             "description": description,
@@ -229,14 +237,16 @@ async def generate_tags_from_frames(
             },
         })
 
+    kwargs: dict[str, object] = {
+        "model": await _resolve_model(),
+        "max_tokens": 256,
+        "messages": [{"role": "user", "content": content}],
+    }
+    if prompt["system"]:
+        kwargs["system"] = prompt["system"]
+
     client = get_client()
-    message = await asyncio.to_thread(
-        client.messages.create,
-        model=await _resolve_model(),
-        max_tokens=256,
-        messages=[{"role": "user", "content": content}],
-        system="You return ONLY a comma-separated list of tags, no preamble.",
-    )
+    message = await asyncio.to_thread(client.messages.create, **kwargs)
     raw = message.content[0].text.strip()
     return [t.strip().strip('"\'').lower() for t in raw.split(",") if t.strip()]
 
@@ -255,11 +265,11 @@ async def generate_tags_from_metadata(
 
     plain = srt_to_plain_text(transcript) if transcript else ""
 
-    body = await prompt_service.get_prompt_body_with_fallback(
-        "tags_from_metadata", project_id=project_id
+    prompt = await prompt_service.get_prompt_with_fallback(
+        "tags_from_metadata_prompt", project_id=project_id
     )
     rendered = _render_template_body(
-        body,
+        prompt["body"],
         {
             "title": title,
             "description": description,
@@ -268,19 +278,26 @@ async def generate_tags_from_metadata(
         },
     )
 
+    kwargs: dict[str, object] = {
+        "model": await _resolve_model(),
+        "max_tokens": 256,
+        "messages": [{"role": "user", "content": rendered}],
+    }
+    if prompt["system"]:
+        kwargs["system"] = prompt["system"]
+
     client = get_client()
-    message = await asyncio.to_thread(
-        client.messages.create,
-        model=await _resolve_model(),
-        max_tokens=256,
-        messages=[{"role": "user", "content": rendered}],
-        system="You return ONLY a comma-separated list of tags, no preamble.",
-    )
+    message = await asyncio.to_thread(client.messages.create, **kwargs)
     raw = message.content[0].text.strip()
     return [t.strip().strip('"\'').lower() for t in raw.split(",") if t.strip()]
 
 
-DEFAULT_AI_SYSTEM = (
+# Seed fallback for ``ai_block_default_system_prompt`` — kept here so an
+# install whose migrations haven't run yet still has a sensible default for
+# bare ``{{ai: …}}`` blocks. The user-editable copy lives in
+# ``services/prompts.SEED_AI_BLOCK_DEFAULT_SYSTEM_PROMPT`` and is mirrored
+# from there to keep this constant in lockstep.
+DEFAULT_AI_SYSTEM_PROMPT = (
     "You are a social media copywriter. Return ONLY the requested text, "
     "no preamble, no quotes, no explanation."
 )
@@ -289,15 +306,15 @@ DEFAULT_AI_SYSTEM = (
 def call_ai_block(
     prompt: str,
     *,
-    system: str | None = DEFAULT_AI_SYSTEM,
+    system: str | None,
     model: str | None = None,
     max_tokens: int = 512,
 ) -> str:
     """One Claude round-trip for a single template ``{{ai: ...}}`` block.
 
-    ``system=None`` (or empty string) sends no system prompt; the renderer
-    passes a per-block override when the template uses
-    ``{{ai[system text]: ...}}`` syntax. ``model=None`` falls back to
+    ``system`` is keyword-only and required — callers must be explicit
+    about what system message (if any) to send. ``None`` or empty string
+    sends no system prompt. ``model=None`` falls back to
     ``settings.anthropic_model`` (or env). Used as the unified leaf call;
     the walker in `services/templates.py` handles nesting itself.
     """
@@ -310,55 +327,4 @@ def call_ai_block(
     if system:
         kwargs["system"] = system
     message = client.messages.create(**kwargs)
-    return message.content[0].text.strip()
-
-
-def generate_social_post(
-    platform: str,
-    title: str,
-    url: str,
-    description: str = "",
-    tags: list[str] | None = None,
-    max_chars: int = 280,
-    custom_prompt: str = "",
-    tier: str | None = None,
-) -> str:
-    """Generate a social media post for a specific platform."""
-    client = get_client()
-
-    platform_guidance = {
-        "twitter": "Keep it punchy and under 280 chars. Include the URL. Use 2-3 hashtags.",
-        "bluesky": "Conversational tone. Under 300 chars. Include the URL.",
-        "mastodon": "Friendly, community-oriented. Under 500 chars. Use CamelCase hashtags.",
-        "linkedin": "Professional but approachable. 2-3 short paragraphs. End with a question.",
-        "threads": "Casual, engaging. Under 500 chars.",
-    }
-
-    tier_guidance = {
-        "hook":    "Tier: Hook (teaser clip under 50s) — tease, don't spoil.",
-        "short":   "Tier: Short (50s–3 min) — punchy, self-contained highlight.",
-        "segment": "Tier: Segment (3–12 min) — deeper dive, invite viewers to explore.",
-        "video":   "Tier: Video (12+ min) — the main piece, full context.",
-    }
-
-    prompt = custom_prompt or f"""Write a {platform} post announcing a new YouTube video.
-
-Title: {title}
-Description: {description}
-URL: {url}
-Tags: {', '.join(tags or [])}
-{tier_guidance.get((tier or '').lower(), '')}
-
-Platform guidance: {platform_guidance.get(platform, '')}
-Max characters: {max_chars}
-
-Return ONLY the post text."""
-
-    message = client.messages.create(
-        model=_resolve_model_sync(),
-        max_tokens=512,
-        messages=[{"role": "user", "content": prompt}],
-        system="You are a social media copywriter. Return ONLY the post text, no preamble.",
-    )
-
     return message.content[0].text.strip()

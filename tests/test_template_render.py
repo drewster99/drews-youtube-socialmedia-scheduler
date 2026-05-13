@@ -163,7 +163,7 @@ def test_per_block_system_override():
     # First block uses the override; second falls back to the default.
     assert seen[0]["system"] == "Be terse"
     assert seen[0]["prompt"] == "write a haiku about rain"
-    assert seen[1]["system"] == templates.DEFAULT_AI_SYSTEM
+    assert seen[1]["system"] == templates.DEFAULT_AI_SYSTEM_PROMPT
     assert seen[1]["prompt"] == "standard"
     assert out == "<write a haiku about rain> -- <standard>"
 

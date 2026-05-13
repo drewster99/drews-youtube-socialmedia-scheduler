@@ -89,6 +89,7 @@ let posts = [];     // the just-generated, still-actionable posts (drafts etc.)
 let postingSettings = null;
 let composedPlatforms = [];          // platforms the user checked for this generate
 let priorPostsByPlatform = {};       // platform -> most recent already-posted row (for the note)
+let videoTier = null;                // current video's tier; filters the picker
 
 // Split a full /api/social/posts list into: (a) the actionable cards for the
 // platforms we just generated for — drafts / failed / approved, but never the
@@ -114,17 +115,30 @@ function projectSlugFromBody() {
 const projectSlug = projectSlugFromBody();
 
 async function loadInitial() {
-    const [tplResp, socResp, postingResp] = await Promise.all([
+    // Fetch the video alongside templates so we can filter the picker by
+    // the video's tier — a "video"-only template shouldn't show up when
+    // composing posts for a Short, etc.
+    const fetches = [
         fetch(`/api/templates?project_slug=${encodeURIComponent(projectSlug)}`),
         fetch('/api/settings/social'),
         fetch(`/api/projects/${projectSlug}/posting-settings`),
-    ]);
+    ];
+    if (videoId) {
+        fetches.push(fetch(`/api/videos/${encodeURIComponent(videoId)}`));
+    }
+    const responses = await Promise.all(fetches);
+    const [tplResp, socResp, postingResp, videoResp] = responses;
+
     templates = tplResp.ok ? await tplResp.json() : [];
     const socData = socResp.ok ? await socResp.json() : {};
     accounts = Object.entries(socData)
         .filter(([_, v]) => v.configured)
         .map(([name]) => name);
     postingSettings = postingResp.ok ? await postingResp.json() : null;
+    if (videoResp && videoResp.ok) {
+        const video = await videoResp.json();
+        videoTier = video.tier || null;
+    }
 
     populateTemplatePicker();
     populateAccountCheckboxes();
@@ -132,16 +146,31 @@ async function loadInitial() {
 
 function populateTemplatePicker() {
     const sel = document.getElementById('template-picker');
-    if (!templates.length) {
+    const hintEl = document.getElementById('template-hint');
+    // Filter by tier when we know it. A template with all four tiers
+    // checked (the default for new templates) is effectively global and
+    // shows up for every video — no special sentinel needed.
+    const visible = videoTier
+        ? templates.filter(t =>
+            Array.isArray(t.applies_to) && t.applies_to.includes(videoTier))
+        : templates.slice();
+
+    if (!visible.length) {
         sel.innerHTML = '<option value="">No templates available</option>';
+        hintEl.textContent = videoTier && templates.length
+            ? `No templates apply to "${videoTier}" — edit a template's Applies to checkboxes to include it.`
+            : '';
         return;
     }
-    sel.innerHTML = templates.map(t =>
+    sel.innerHTML = visible.map(t =>
         `<option value="${t.name}">${t.name}${t.description ? ' — ' + t.description : ''}</option>`
     ).join('');
-    if (templates.length === 1) {
-        document.getElementById('template-hint').textContent =
-            `Only one template available — auto-selected.`;
+    if (visible.length === 1) {
+        hintEl.textContent = `Only one template applies to "${videoTier || 'any tier'}" — auto-selected.`;
+    } else {
+        hintEl.textContent = videoTier
+            ? `Showing templates that apply to "${videoTier}".`
+            : '';
     }
 }
 

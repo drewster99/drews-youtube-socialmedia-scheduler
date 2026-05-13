@@ -44,9 +44,10 @@ def test_template_default_applies_to_all_tiers() -> None:
 
 def test_prompt_template_round_trip() -> None:
     pt = PromptTemplate(
-        key="description_from_transcript",
+        key="description_from_transcript_prompt",
         name="Description from transcript",
         body="Make a description from {{transcript}}",
+        system_body="Return ONLY the description.",
     )
     assert PromptTemplate.model_validate(pt.model_dump()) == pt
 

@@ -143,14 +143,14 @@
             </div>
             <div id="schedule-expanded" style="display:none;">
                 <div class="form-group" style="margin-bottom: 0.5rem;">
-                    <label>Publish Date & Time</label>
+                    <label>Publish date & time</label>
                     <input type="datetime-local" id="schedule-datetime">
                 </div>
                 <div id="schedule-post-preview" style="margin-bottom: 0.5rem;"></div>
                 <div class="form-actions">
                     <button class="btn btn-sm btn-primary" id="btn-schedule" onclick="schedulePublish()">Schedule</button>
                     <button class="btn btn-sm btn-secondary" onclick="scheduleCollapse()">Cancel</button>
-                    <button class="btn btn-sm btn-danger" id="btn-cancel-schedule" onclick="cancelSchedule()" style="display:none;">Cancel Schedule</button>
+                    <button class="btn btn-sm btn-danger" id="btn-cancel-schedule" onclick="cancelSchedule()" style="display:none;">Cancel schedule</button>
                 </div>
             </div>
             <small style="color: var(--text-muted); display: block; margin-top: 0.5rem;">
@@ -1207,8 +1207,8 @@ async function loadSocialPosts() {
         const hasDraft = posts.some(p => p.status === 'draft');
         if (hasUnsent) {
             html += `<div style="margin-bottom: 0.75rem; display: flex; gap: 0.5rem;">
-                ${hasDraft ? '<button class="btn btn-sm btn-primary" onclick="approveAllPosts()">Approve All</button>' : ''}
-                ${hasApproved ? '<button class="btn btn-sm btn-success" onclick="sendAllPosts()">Send All Approved</button>' : ''}
+                ${hasDraft ? '<button class="btn btn-sm btn-primary" onclick="approveAllPosts()">Approve all</button>' : ''}
+                ${hasApproved ? '<button class="btn btn-sm btn-success" onclick="sendAllPosts()">Send all approved</button>' : ''}
                 <button class="btn btn-sm" onclick="regeneratePosts()">Regenerate</button>
             </div>`;
         }

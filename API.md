@@ -341,6 +341,71 @@ Stored values are merged on top of the defaults from `services/project_settings.
 
 **Errors** — `404` (unknown slug), `400` (body not an object).
 
+### `GET /api/projects/{slug}/prompts`
+
+**Purpose** — Return the project's LLM prompt templates, merged with built-in seed defaults so the UI can always show every editable prompt — even before the user has saved any custom row.
+
+**Response 200** — Array of prompt records:
+
+```json
+[
+  {
+    "key": "description_from_transcript_prompt",
+    "name": "Description from transcript",
+    "body": "Generate an SEO-friendly YouTube video description...",
+    "system": null,
+    "is_default": true,
+    "default_body": "Generate an SEO-friendly YouTube video description...",
+    "default_system": null,
+    "variables": ["title", "channel_name", "channel_name_block", "transcript", "transcript_truncated", "extra_instructions"],
+    "system_variables": [],
+    "body_required": true
+  }
+]
+```
+
+**Fields:**
+
+- `key` — opaque identifier used in the `PUT` URL. Stable across renames.
+- `name` — display label.
+- `body` — current user prompt (saved row's body, falling back to seed).
+- `system` — current system prompt; `null` when the seed has none and the user hasn't saved one.
+- `is_default` — `true` when no row has been saved (UI shows a "Default" badge).
+- `default_body`, `default_system` — the seed values, for "Reset to default".
+- `variables`, `system_variables` — variable names available in each field, for the editor's chip hints.
+- `body_required` — `false` for system-only seeds (e.g. `ai_block_default_system_prompt`); the UI hides the body textarea in that case.
+
+**Errors** — `404` (unknown slug).
+
+### `PUT /api/projects/{slug}/prompts/{key}`
+
+**Purpose** — Save a customised prompt for the project. Body and system are independently overridable; either can fall back to the seed.
+
+**Path params** — `key` must be one of the seed keys returned by `GET /prompts`.
+
+**Request body**:
+
+```json
+{
+  "body": "Generate an SEO-friendly YouTube video description...",
+  "system": "Return ONLY the description.",
+  "name": "Description from transcript"
+}
+```
+
+- `body` — required when the seed declares a non-empty body. Empty string is rejected for those keys.
+- `system` — three-state:
+  - **Field omitted** → preserve whatever's currently saved (no clobber on partial updates).
+  - **`null`** → fall back to the seed default at read time.
+  - **String (any, including `""`)** → exact override; `""` explicitly suppresses the system prompt.
+- `name` — optional display label; defaults to the seed's name.
+
+**Response 200** — `{"ok": true}`.
+
+**Errors** — `400` (missing body for a seed that requires it), `404` (unknown slug, unknown `key`).
+
+**Side effects** — Upserts into `prompt_templates` keyed on `(project_id, key)`.
+
 ### `GET /api/projects/{slug}/social-defaults`
 
 **Purpose** — Return the project's chosen default credential per platform. Used to wire up which X / Bluesky / etc. account a generated post fires from.
@@ -668,7 +733,7 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 
 **Side effects** — Calls Anthropic API; for frames mode also calls `ffmpeg` to extract keyframes; writes `videos.generated_description`. The applied description includes `pinned_links` appended after the AI text.
 
-**Renderer** — `mode=transcript` (and the transcript leg of `auto`) substitutes the prompt body from `prompt_templates.description_from_transcript` through the same engine as [`POST /api/expand_text`](#post-apiexpand_text), then sends the substituted prompt to Claude in a single call. Any `{{ai: ...}}`, `{{var!}}`, or `{{var??default}}` syntax in the prompt-template body is honoured. `mode=frames` skips substitution entirely — it sends the keyframes with a hardcoded vision instruction.
+**Renderer** — `mode=transcript` (and the transcript leg of `auto`) substitutes the prompt body from `prompt_templates.description_from_transcript_prompt` through the same engine as [`POST /api/expand_text`](#post-apiexpand_text), then sends the substituted prompt to Claude in a single call. Any `{{ai: ...}}`, `{{var!}}`, or `{{var??default}}` syntax in the prompt-template body is honoured. `mode=frames` substitutes `prompt_templates.description_from_frames_prompt` and attaches the keyframes to the same user turn. Both modes also send the saved `system_body` (if any) to Claude — edit it in Project Settings → LLM prompt templates.
 
 ### `POST /api/videos/{video_id}/generate-tags`
 
@@ -692,7 +757,7 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 
 **Side effects** — Calls Anthropic API; for frames mode also calls `ffmpeg` to extract keyframes. No DB write.
 
-**Renderer** — `mode=metadata` substitutes the prompt body from `prompt_templates.tags_from_metadata` through the same engine as [`POST /api/expand_text`](#post-apiexpand_text). `mode=frames` substitutes `prompt_templates.tags_from_frames` and sends it alongside the keyframes. Both calls force a "comma-separated list only" system prompt.
+**Renderer** — `mode=metadata` substitutes the prompt body from `prompt_templates.tags_from_metadata_prompt` through the same engine as [`POST /api/expand_text`](#post-apiexpand_text). `mode=frames` substitutes `prompt_templates.tags_from_frames_prompt` and sends it alongside the keyframes. Each row's saved `system_body` (or the seed's default — "You return ONLY a comma-separated list of tags, no preamble.") is sent as the system message; edit either in Project Settings → LLM prompt templates.
 
 ### `POST /api/videos/{video_id}/apply-description`
 

@@ -226,6 +226,16 @@ async def generate_posts(
     if not template:
         raise HTTPException(404, f"Template '{template_name}' not found")
 
+    # Resolve the project's editable default for ``{{ai: …}}`` blocks once
+    # per (re)generate. Each ``tmpl.render`` call below uses this so user
+    # edits in Project Settings → LLM prompt templates take effect on the
+    # next generate. Atomic per generate — a mid-flight edit is picked up
+    # on the next call, not partway through this one.
+    from yt_scheduler.services import prompts as prompt_service
+    default_ai_system = (await prompt_service.get_prompt_with_fallback(
+        "ai_block_default_system_prompt", project_id=project_id,
+    ))["system"]
+
     cursor = await db.execute(
         "SELECT platform, social_account_id FROM project_social_defaults "
         "WHERE project_id = ?",
@@ -329,7 +339,9 @@ async def generate_posts(
                         images=ctx["images"],
                     )
                     slot_vars = {**ctx["variables"], **forced_empty, "max_chars": str(slot_max)}
-                    rendered = tmpl.render(cleaned, slot_vars)
+                    rendered = tmpl.render(
+                        cleaned, slot_vars, default_system_prompt=default_ai_system,
+                    )
                 except Exception as e:
                     rendered = f"[Error generating: {e}]"
                     media_paths = []
@@ -494,6 +506,7 @@ async def shorten_post(post_id: int, data: dict | None = None):
     so the caller can offer an Undo.
     """
     from yt_scheduler.services import ai
+    from yt_scheduler.services import prompts as prompt_service
 
     db = await get_db()
     rows = await db.execute_fetchall("SELECT * FROM social_posts WHERE id = ?", (post_id,))
@@ -513,18 +526,37 @@ async def shorten_post(post_id: int, data: dict | None = None):
     if target < 1:
         raise HTTPException(400, "target_chars must be a positive number")
 
-    prompt = (
-        f"Shorten this social post to at most {target} characters without losing "
-        f"its meaning, and keep every URL/link in it exactly as written:\n\n{old}"
+    # Resolve the project the post belongs to (via its video) so we read the
+    # right per-project prompt customisation. Posts that predate the
+    # project layer fall back to the default project.
+    project_id = 1
+    video_id = post.get("video_id")
+    if video_id:
+        v_rows = await db.execute_fetchall(
+            "SELECT project_id FROM videos WHERE id = ?", (video_id,),
+        )
+        if v_rows and v_rows[0]["project_id"]:
+            project_id = int(v_rows[0]["project_id"])
+
+    seed = await prompt_service.get_prompt_with_fallback(
+        "shorten_post_prompt", project_id=project_id,
+    )
+    # Render through the same engine the rest of the app uses so the user
+    # can edit the prompt and rely on the same {{variable}} semantics. The
+    # body and system both go through render() — system prompts may also
+    # want {{target_chars}} or future variables baked in.
+    variables: dict[str, object] = {
+        "target_chars": str(target),
+        "post_text": old,
+    }
+    user_prompt = tmpl.render(seed["body"], variables)
+    system_prompt = (
+        tmpl.render(seed["system"], variables) if seed["system"] else None
     )
     try:
         new = ai.call_ai_block(
-            prompt,
-            system=(
-                "You rewrite social media posts to be shorter. Return ONLY the "
-                "shortened post text — no quotes, no preamble, no explanation. "
-                "Preserve every URL/link exactly. Keep the original meaning and tone."
-            ),
+            user_prompt,
+            system=system_prompt,
             max_tokens=512,
         ).strip()
     except Exception as e:

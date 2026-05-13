@@ -16,7 +16,7 @@ import re
 import aiosqlite
 
 from yt_scheduler.database import get_db
-from yt_scheduler.services.ai import DEFAULT_AI_SYSTEM, call_ai_block
+from yt_scheduler.services.ai import DEFAULT_AI_SYSTEM_PROMPT, call_ai_block
 from yt_scheduler.services.social import ALL_PLATFORMS
 
 # Default templates shipped with the app
@@ -205,7 +205,7 @@ def render(
     template_text: str,
     variables: dict[str, object] | None = None,
     *,
-    default_system_prompt: str | None = DEFAULT_AI_SYSTEM,
+    default_system_prompt: str | None = DEFAULT_AI_SYSTEM_PROMPT,
     model: str | None = None,
     max_tokens: int = 512,
 ) -> str:

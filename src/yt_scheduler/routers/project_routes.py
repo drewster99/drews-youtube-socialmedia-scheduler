@@ -191,52 +191,97 @@ async def list_project_prompts(slug: str) -> list[dict]:
     """Return all LLM prompt templates for the project, merged with seed
     fallbacks so the UI can always show every editable prompt — even before
     the user has saved any changes.
+
+    Each entry includes both ``body`` and ``system`` (the system prompt).
+    ``system`` is null when neither the row nor the seed declares one (the
+    UI hides the system textarea in that case). ``default_body`` and
+    ``default_system`` echo the seed values so the UI can offer
+    "Reset to default" for either field independently.
     """
     project = await project_service.get_project_by_slug(slug)
     if project is None:
         raise HTTPException(404, f"Project '{slug}' not found")
 
-    saved = {row["key"]: row for row in await prompts_service.list_prompt_templates(project["id"])}
+    saved = {
+        row["key"]: row
+        for row in await prompts_service.list_prompt_templates(project["id"])
+    }
     merged: list[dict] = []
     for key, seed in prompts_service._SEEDS_BY_KEY.items():
-        if key in saved:
-            row = saved[key]
-            merged.append({
-                "key": key,
-                "name": row.get("name") or seed.name,
-                "body": row["body"],
-                "is_default": False,
-                "default_body": seed.body,
-                "variables": list(seed.variables),
-            })
+        row = saved.get(key)
+        if row is not None:
+            body = row["body"]
+            system_value = row.get("system_body")
+            is_default = False
         else:
-            merged.append({
-                "key": key,
-                "name": seed.name,
-                "body": seed.body,
-                "is_default": True,
-                "default_body": seed.body,
-                "variables": list(seed.variables),
-            })
+            body = seed.body
+            system_value = seed.system
+            is_default = True
+        merged.append({
+            "key": key,
+            "name": (row.get("name") if row else None) or seed.name,
+            "body": body,
+            "system": system_value if system_value is not None else seed.system,
+            "is_default": is_default,
+            "default_body": seed.body,
+            "default_system": seed.system,
+            "variables": list(seed.variables),
+            "system_variables": list(seed.system_variables),
+            # body_required is False for the system-only seed
+            # (ai_block_default_system_prompt) so the UI knows to hide the
+            # body textarea. Everything else has a meaningful body.
+            "body_required": bool(seed.body),
+        })
     return merged
 
 
 @router.put("/{slug}/prompts/{key}")
 async def upsert_project_prompt(slug: str, key: str, payload: dict) -> dict:
+    """Save a project's customised prompt body and/or system prompt.
+
+    Payload keys (all optional unless the seed marks them required):
+
+    - ``body`` (str) — user prompt. Required when the seed's ``body`` is
+      non-empty (which is every seed except ``ai_block_default_system_prompt``).
+    - ``system`` (str | null) — system prompt. ``null`` means "use the
+      seed's system" (or "no system" when the seed has none); an empty
+      string explicitly suppresses the system prompt; any non-empty string
+      overrides it.
+    - ``name`` (str, optional) — display name.
+    """
     project = await project_service.get_project_by_slug(slug)
     if project is None:
         raise HTTPException(404, f"Project '{slug}' not found")
     if key not in prompts_service._SEEDS_BY_KEY:
         raise HTTPException(404, f"Unknown prompt key '{key}'")
-    body = (payload.get("body") or "").strip()
-    if not body:
-        raise HTTPException(400, "body is required")
     seed = prompts_service._SEEDS_BY_KEY[key]
+
+    body = (payload.get("body") or "")
+    if seed.body and not body.strip():
+        raise HTTPException(400, "body is required")
+
+    # ``system`` is intentionally three-state:
+    #   - missing key                → keep current row's system_body
+    #     (UPDATE preserves it via the COALESCE-style fallback in upsert)
+    #   - explicit null              → fall back to seed default
+    #     (stored as NULL; resolver reads from seed)
+    #   - explicit string (any "")   → exact override
+    system_value: str | None
+    if "system" in payload:
+        raw = payload.get("system")
+        system_value = None if raw is None else str(raw)
+    else:
+        # Caller didn't send system; preserve whatever's in DB by reading
+        # it first. Avoids accidentally clearing on a partial update.
+        existing = await prompts_service.get_prompt_template(key, project_id=project["id"])
+        system_value = existing.get("system_body") if existing else None
+
     name = payload.get("name") or seed.name
     await prompts_service.upsert_prompt_template(
         key=key,
         name=name,
         body=body,
+        system=system_value,
         project_id=project["id"],
     )
     return {"ok": True}
