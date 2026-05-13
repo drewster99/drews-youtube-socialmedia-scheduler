@@ -1076,9 +1076,12 @@ All template endpoints implicitly scope to `project_id=1` (the Default project) 
       "resolved_account": { "uuid": "...", "username": "alice", "platform": "twitter", "deleted": false } | null
     }
   ],
-  "platforms": { "twitter": { "template": "...", "media": "thumbnail", "max_chars": 280 }, ... }
+  "platforms": { "twitter": { "template": "...", "media": "thumbnail", "max_chars": 280 }, ... },
+  "test_variables": { "title": "Saved title", "url": "https://...", "region": "US" }
 }
 ```
+
+`test_variables` is the persisted Preview-pane fixtures for the template-edit page (migration 016). Keys are template-variable names (the five seeded ones — `title`, `url`, `tags`, `description`, `user_message` — plus any custom keys the user added). Values are strings. An empty dict means "no override; the page falls back to its seeded defaults."
 
 **Errors** — `404` (unknown name).
 
@@ -1123,6 +1126,28 @@ All template endpoints implicitly scope to `project_id=1` (the Default project) 
 
 **Cascades** — Deleting a template cascades to all of its `template_slots` rows via `ON DELETE CASCADE` (`migrations/008_per_project_credentials.sql:77`). Already-generated `social_posts` rows are unaffected — they're denormalized snapshots of the rendered text at generation time and don't carry a slot FK.
 
+### `PUT /api/templates/{name}/test-variables`
+
+**Purpose** — Persist the Preview-pane test fixtures shown on the template-edit page (`templates.test_variables`, migration 016).
+
+**Request body**:
+
+```json
+{
+  "test_variables": {
+    "title": "Saved title",
+    "url": "https://example.com/x",
+    "region": "US"
+  }
+}
+```
+
+Values are coerced to strings server-side (numbers → str, booleans → str, `null` → `""`) so the render engine never sees a non-string variable later. Keys must be strings; non-string keys return `400`. Sending `{"test_variables": {}}` clears the column back to NULL — the front-end then falls back to its seeded defaults.
+
+**Response 200** — `{"status": "ok"}`.
+
+**Errors** — `404` (unknown template), `400` (`test_variables` is not an object, or any key is not a string).
+
 ### `POST /api/templates/{name}/duplicate`
 
 **Purpose** — Create a new template as a deep copy of `{name}` within the same project.
@@ -1131,7 +1156,7 @@ All template endpoints implicitly scope to `project_id=1` (the Default project) 
 
 **Response 200** — The newly created template (same shape as `GET /api/templates/{name}`).
 
-**Behaviour** — Copies the description, `applies_to`, and **every** slot verbatim (built-in slots stay built-in, disabled stays disabled, account bindings and order preserved). The new *template* row is never flagged `is_builtin` — only the two protected names carry that — so the copy is freely deletable.
+**Behaviour** — Copies the description, `applies_to`, `test_variables` (the Preview-pane fixtures, migration 016), and **every** slot verbatim (built-in slots stay built-in, disabled stays disabled, account bindings and order preserved). The new *template* row is never flagged `is_builtin` — only the two protected names carry that — so the copy is freely deletable.
 
 **Errors** — `400` (missing `new_name`, or name not matching `^[A-Za-z0-9][A-Za-z0-9_-]*$`), `404` (source `{name}` not found), `409` (`new_name` already exists, or collides with a reserved built-in name).
 

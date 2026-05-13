@@ -107,6 +107,36 @@ async def delete_template(name: str, project_slug: str | None = None):
     return {"status": "ok"}
 
 
+@router.put("/{name}/test-variables")
+async def update_template_test_variables(
+    name: str, data: dict, project_slug: str | None = None,
+):
+    """Persist the Preview-pane test fixtures for a template. Body is a
+    JSON object whose keys are template-variable names ({{title}},
+    {{url}}, ..., plus any user-added custom keys) and whose values are
+    the strings to substitute. Passing ``{}`` clears the column back to
+    NULL so the front-end falls back to its seeded defaults.
+    """
+    project_id = await _resolve_project_id(project_slug)
+    raw = data.get("test_variables")
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise HTTPException(400, "test_variables must be an object")
+    # Coerce to ``{str: str}`` here so a misbehaving client can't poison
+    # the DB with non-string values that the renderer chokes on later.
+    cleaned: dict[str, str] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str):
+            raise HTTPException(400, "test_variables keys must be strings")
+        cleaned[k] = "" if v is None else str(v)
+    try:
+        await tmpl.set_template_test_variables(name, cleaned, project_id=project_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return {"status": "ok"}
+
+
 @router.post("/{name}/duplicate")
 async def duplicate_template(name: str, data: dict, project_slug: str | None = None):
     """Create a new template as a deep copy of ``name``.

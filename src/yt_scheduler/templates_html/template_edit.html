@@ -103,29 +103,44 @@
 
 <div class="card" style="margin-top: 1rem;">
     <h3>Preview</h3>
+    <p class="form-hint" style="margin-top: -0.25rem;">These test values
+    are saved with the template, so each time you open it the Preview
+    starts from the same fixtures. Add custom variables for any
+    <code>{{ '{{' }}name{{ '}}' }}</code> your template references.</p>
     <div class="form-row">
         <div class="form-group">
             <label>Test title</label>
-            <input type="text" id="preview-title" value="How to build a YouTube app" placeholder="Test title">
+            <input type="text" data-test-var="title" value="How to build a YouTube app" placeholder="Test title">
         </div>
         <div class="form-group">
             <label>Test URL</label>
-            <input type="text" id="preview-url" value="https://youtu.be/abc123" placeholder="Test URL">
+            <input type="text" data-test-var="url" value="https://youtu.be/abc123" placeholder="Test URL">
         </div>
         <div class="form-group">
             <label>Test tags</label>
-            <input type="text" id="preview-tags" value="python, tutorial, coding" placeholder="Test tags">
+            <input type="text" data-test-var="tags" value="python, tutorial, coding" placeholder="Test tags">
         </div>
     </div>
     <div class="form-group">
         <label>Test description</label>
-        <textarea id="preview-description" rows="3" placeholder="Test description">A great tutorial about building apps with Python and FastAPI.</textarea>
+        <textarea data-test-var="description" rows="3" placeholder="Test description">A great tutorial about building apps with Python and FastAPI.</textarea>
     </div>
     <div class="form-group">
         <label>Test user_message</label>
-        <input type="text" id="preview-user-message" value="Just shipped this!" placeholder="Test user message">
+        <input type="text" data-test-var="user_message" value="Just shipped this!" placeholder="Test user message">
     </div>
-    <button class="btn btn-secondary" onclick="previewAll()">Preview all slots</button>
+
+    <h4 style="margin: 1rem 0 0.25rem; font-size: 0.95rem;">Custom test variables</h4>
+    <p class="form-hint" style="margin: 0;">For variables not listed
+    above. The key must be alphanumeric / underscores; reference it in
+    a slot body as <code>{{ '{{' }}your_key{{ '}}' }}</code>.</p>
+    <div id="custom-test-vars" style="margin-top: 0.5rem;"></div>
+    <button type="button" class="btn btn-sm btn-secondary" id="add-test-var-btn" style="margin-top: 0.25rem;">+ Add test variable</button>
+
+    <div style="margin-top: 1rem;">
+        <button class="btn btn-secondary" onclick="previewAll()">Preview all slots</button>
+        <span id="test-vars-save-state" class="form-hint" style="margin-left: 0.75rem;"></span>
+    </div>
     <div id="preview-results"></div>
 </div>
 {% endblock %}
@@ -503,21 +518,45 @@ async function duplicateTemplate() {
     window.location.href = `/projects/${projectSlug}/templates/${encodeURIComponent(newName)}`;
 }
 
+// Per-template Preview-pane fixtures live on the template row
+// (templates.test_variables, migration 016). Hydrated in loadTemplate();
+// autosaved on blur of any test field via debouncedSaveTestVars(). Keys
+// are constrained to /^[A-Za-z_][A-Za-z0-9_]*$/ so the page never sends
+// keys the render engine wouldn't accept as a {{name}} reference.
+const _TEST_VAR_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function collectTestVariables() {
+    /** Read every data-test-var input + every custom row into a flat
+     * {key: value} dict. Used both for the AI preview substitution and
+     * for the autosave payload. */
+    const out = {};
+    document.querySelectorAll('[data-test-var]').forEach(el => {
+        const k = el.dataset.testVar;
+        if (k) out[k] = el.value;
+    });
+    document.querySelectorAll('.custom-test-var-row').forEach(row => {
+        const k = (row.querySelector('.cv-key')?.value || '').trim();
+        const v = row.querySelector('.cv-value')?.value || '';
+        if (k && _TEST_VAR_KEY_RE.test(k)) out[k] = v;
+    });
+    return out;
+}
+
 async function previewAll() {
     const container = document.getElementById('preview-results');
-    const description = document.getElementById('preview-description').value;
-    const userMessage = document.getElementById('preview-user-message').value;
+    const baseVars = collectTestVariables();
+    const description = baseVars.description || '';
+    const tags = baseVars.tags || '';
+    // Derived values match the render-context derivations in
+    // social_routes._build_render_context — same shapes the AI service
+    // sees at real generation time.
     const variables = {
-        title: document.getElementById('preview-title').value,
-        url: document.getElementById('preview-url').value,
-        tags: document.getElementById('preview-tags').value,
-        hashtags: document.getElementById('preview-tags').value.split(',').map(t => `#${t.trim()}`).join(' '),
-        description: description,
+        ...baseVars,
+        hashtags: tags.split(',').map(t => `#${t.trim()}`).filter(t => t !== '#').join(' '),
         description_short: description.slice(0, 150),
         description_medium: description.slice(0, 500),
-        user_message: userMessage,
-        transcript: 'Test transcript content.',
-        tier: 'video',
+        transcript: baseVars.transcript || 'Test transcript content.',
+        tier: baseVars.tier || 'video',
     };
 
     container.innerHTML = '<p class="loading">Generating previews (AI blocks may take a moment)…</p>';
@@ -610,6 +649,7 @@ async function loadTemplate() {
                 deleteBtn.disabled = true;
                 deleteBtn.title = 'Built-in templates cannot be deleted';
             }
+            hydrateTestVariables(template.test_variables || {});
         } else {
             slots = [];
             showToast(`Couldn't load template "${templateName}".`, 'error');
@@ -624,6 +664,115 @@ async function loadTemplate() {
     await loadCredentialsForVisiblePlatforms();
     await loadKnownCustomVars();
     renderSlots();
+    initTestVarsAutosave();
+}
+
+// --- Persisted Preview-pane test variables ---------------------------
+
+const _SEEDED_TEST_VARS = new Set(['title', 'url', 'tags', 'description', 'user_message']);
+
+function hydrateTestVariables(saved) {
+    /** Replace the page's seeded defaults with whatever was last saved.
+     * Keys not in our five seeded inputs become custom rows. An empty
+     * `saved` (or missing key) leaves the seeded defaults in place. */
+    const customsContainer = document.getElementById('custom-test-vars');
+    customsContainer.innerHTML = '';  // wipe any prior render
+    for (const [k, v] of Object.entries(saved || {})) {
+        if (_SEEDED_TEST_VARS.has(k)) {
+            const el = document.querySelector(`[data-test-var="${k}"]`);
+            if (el) el.value = v;
+        } else {
+            customsContainer.appendChild(buildCustomTestVarRow(k, v));
+        }
+    }
+}
+
+function buildCustomTestVarRow(key, value) {
+    const row = document.createElement('div');
+    row.className = 'custom-test-var-row form-row';
+    row.style.alignItems = 'flex-end';
+    row.innerHTML = `
+        <div class="form-group" style="flex: 0 0 30%;">
+            <label>Key</label>
+            <input type="text" class="cv-key" value="${escapeHtml(key)}" placeholder="my_var" pattern="[A-Za-z_][A-Za-z0-9_]*">
+        </div>
+        <div class="form-group" style="flex: 1;">
+            <label>Value</label>
+            <input type="text" class="cv-value" value="${escapeHtml(value)}">
+        </div>
+        <div class="form-group" style="flex: 0 0 auto;">
+            <button type="button" class="btn btn-sm btn-danger cv-remove">Remove</button>
+        </div>
+    `;
+    return row;
+}
+
+let _saveTestVarsTimer = null;
+function debouncedSaveTestVars() {
+    /** Coalesce keypresses while typing — write to the server ~500ms
+     * after the last edit. Cheap (one column on one row) so this is
+     * fine even when the user is hammering an input. */
+    const status = document.getElementById('test-vars-save-state');
+    status.textContent = 'Editing…';
+    clearTimeout(_saveTestVarsTimer);
+    _saveTestVarsTimer = setTimeout(saveTestVarsNow, 500);
+}
+
+async function saveTestVarsNow() {
+    const status = document.getElementById('test-vars-save-state');
+    const vars = collectTestVariables();
+    status.textContent = 'Saving…';
+    try {
+        const resp = await fetch(
+            `/api/templates/${encodeURIComponent(templateName)}/test-variables`
+            + `?project_slug=${encodeURIComponent(projectSlug)}`,
+            {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                _silent: true,
+                body: JSON.stringify({test_variables: vars}),
+            },
+        );
+        if (resp.ok) {
+            status.textContent = 'Saved';
+            setTimeout(() => { if (status.textContent === 'Saved') status.textContent = ''; }, 1500);
+        } else {
+            status.textContent = 'Save failed';
+        }
+    } catch (e) {
+        status.textContent = 'Save failed';
+    }
+}
+
+function initTestVarsAutosave() {
+    /** Wire up listeners once per page load — loadTemplate() may be
+     * called multiple times (e.g. after Add slot), but the inputs in
+     * the Preview card are static, so we attach listeners only on the
+     * first call. The custom-row buttons are wired via event delegation
+     * so dynamically added rows pick up the same behavior. */
+    if (window._testVarsWired) return;
+    window._testVarsWired = true;
+
+    document.querySelectorAll('[data-test-var]').forEach(el => {
+        el.addEventListener('input', debouncedSaveTestVars);
+    });
+
+    const customsContainer = document.getElementById('custom-test-vars');
+    customsContainer.addEventListener('input', (e) => {
+        if (e.target.classList.contains('cv-key') || e.target.classList.contains('cv-value')) {
+            debouncedSaveTestVars();
+        }
+    });
+    customsContainer.addEventListener('click', (e) => {
+        if (e.target.classList.contains('cv-remove')) {
+            e.target.closest('.custom-test-var-row')?.remove();
+            debouncedSaveTestVars();
+        }
+    });
+
+    document.getElementById('add-test-var-btn').addEventListener('click', () => {
+        customsContainer.appendChild(buildCustomTestVarRow('', ''));
+    });
 }
 
 loadTemplate();

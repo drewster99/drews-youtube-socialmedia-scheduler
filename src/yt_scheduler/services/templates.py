@@ -468,6 +468,24 @@ def _platforms_view_from_slots(slots: list[dict]) -> dict:
 # --- Public API ------------------------------------------------------------
 
 
+def _decode_test_variables(raw: str | None) -> dict[str, str]:
+    """Parse the JSON-encoded test_variables column. Returns {} when the
+    column is NULL, empty, or malformed — never raises. Templates
+    created before migration 016 will have NULL; the front-end falls
+    back to its seeded defaults in that case."""
+    if not raw:
+        return {}
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    # Coerce values to strings so the template engine doesn't receive a
+    # numeric/bool/list it doesn't know how to substitute.
+    return {str(k): "" if v is None else str(v) for k, v in decoded.items()}
+
+
 async def get_template(name: str, *, project_id: int) -> dict | None:
     """Get a template by name within a project."""
     db = await get_db()
@@ -490,7 +508,35 @@ async def get_template(name: str, *, project_id: int) -> dict | None:
         "updated_at": row["updated_at"],
         "slots": slots,
         "platforms": _platforms_view_from_slots(slots),
+        # Preview-pane fixtures so editing the template re-opens with
+        # the same test inputs the user last saved. Empty dict = "use
+        # the page's seeded defaults" (pre-016 rows, or never saved).
+        "test_variables": _decode_test_variables(row["test_variables"]),
     }
+
+
+async def set_template_test_variables(
+    name: str, variables: dict[str, str], *, project_id: int
+) -> None:
+    """Persist the preview-pane test fixtures for a template. Stored as
+    a JSON object on ``templates.test_variables``. Passing an empty
+    dict clears the column back to NULL so the front-end falls back to
+    its seeded defaults."""
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT id FROM templates WHERE project_id = ? AND name = ?",
+        (project_id, name),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        raise ValueError(f"Template '{name}' not found")
+    encoded = json.dumps(variables) if variables else None
+    await db.execute(
+        "UPDATE templates SET test_variables = ?, updated_at = datetime('now') "
+        "WHERE id = ?",
+        (encoded, int(row["id"])),
+    )
+    await db.commit()
 
 
 async def list_templates(project_id: int) -> list[dict]:
@@ -654,11 +700,20 @@ async def duplicate_template(
     if await cursor.fetchone() is not None:
         raise ValueError(f"A template named '{new_name}' already exists")
 
+    # Copy test_variables along with the rest of the template so the
+    # duplicate opens in the editor with the same Preview fixtures the
+    # source had. An empty dict from the source stays NULL on the copy.
+    source_test_vars = source.get("test_variables") or {}
+    test_vars_json = json.dumps(source_test_vars) if source_test_vars else None
     try:
         cursor = await db.execute(
-            "INSERT INTO templates (project_id, name, description, applies_to, is_builtin) "
-            "VALUES (?, ?, ?, ?, 0)",
-            (project_id, new_name, source["description"], json.dumps(source["applies_to"])),
+            "INSERT INTO templates "
+            "(project_id, name, description, applies_to, is_builtin, test_variables) "
+            "VALUES (?, ?, ?, ?, 0, ?)",
+            (
+                project_id, new_name, source["description"],
+                json.dumps(source["applies_to"]), test_vars_json,
+            ),
         )
     except aiosqlite.IntegrityError as exc:
         raise ValueError(str(exc)) from exc
