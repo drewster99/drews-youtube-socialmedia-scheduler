@@ -512,15 +512,25 @@ async function loadVideo() {
                   + `<span class="video-duration">${formatDuration(durSec)}</span>`;
     }
     // Whether there's a local video file is what {{video}} attaches; surface it
-    // so it's obvious before generating socials.
+    // so it's obvious before generating socials. The "downloading" pill comes
+    // from videos.video_file_download_state — auto_actions sets it on import,
+    // the maybePollWhileBusy() loop below picks up the change and re-renders.
+    const dlState = video.video_file_download_state || null;
     if (video.video_file_url) {
         const name = video.video_file_name || '';
         metaHtml += ` <span class="badge badge-published" title="${escapeHtml(name)}">🎬 local file: ${escapeHtml(name)}</span>`;
+    } else if (dlState === 'in_progress') {
+        metaHtml += ` <span class="badge badge-draft">⬇︎ downloading video from YouTube…</span>`;
+    } else if (dlState === 'unavailable') {
+        metaHtml += ` <span class="badge badge-error" title="Private or age-gated on YouTube">⚠ download blocked — video is private on YouTube</span>`;
+    } else if (dlState === 'failed') {
+        metaHtml += ` <span class="badge badge-error">⚠ video download failed — try Transcribe to retry</span>`;
     } else {
         metaHtml += ` <span class="form-hint" style="margin-left:0.25rem;">no local video file — {{ '{{video}}' }} won't attach</span>`;
     }
     metaLeft.innerHTML = metaHtml;
     metaRow.style.display = 'flex';
+    maybePollWhileBusy(video);
 
     // Player
     document.getElementById('video-player').innerHTML = `
@@ -923,6 +933,28 @@ function _logPollTick() {
 function startLogPolling() {
     if (_logPollTimer) return;
     _logPollTimer = setInterval(_logPollTick, 15_000);
+}
+
+// While the server is mid-download of the YouTube mp4 (an import path
+// kicks off in auto_actions._maybe_download_video_file), poll
+// /api/videos/{id} every 3s until video_file_url shows up (or the
+// state flips to 'failed' / 'unavailable'). loadVideo() is the same
+// function we use for first-paint, so a successful download re-renders
+// the player + local-file pill in place — no reload needed.
+let _busyPollTimer = null;
+function maybePollWhileBusy(video) {
+    const state = video?.video_file_download_state || null;
+    const stillBusy = state === 'in_progress';
+    if (stillBusy) {
+        if (_busyPollTimer) return;
+        _busyPollTimer = setInterval(() => {
+            if (document.visibilityState !== 'visible') return;
+            loadVideo();
+        }, 3000);
+    } else if (_busyPollTimer) {
+        clearInterval(_busyPollTimer);
+        _busyPollTimer = null;
+    }
 }
 document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') _logPollTick();

@@ -76,6 +76,19 @@ async def _run_chain(video_id: str, project_id: int, source: Source) -> None:
         return
     video = dict(rows[0])
 
+    # 0. Always-download (import path only). The mp4 unlocks the rest of
+    # the auto-action chain (keyframe thumbnail, on-device transcribe,
+    # frames-driven description/tags), and a YouTube-imported row that
+    # never downloaded its file leaves every later gate as a silent
+    # no-op. We surface progress via videos.video_file_download_state
+    # so the detail page can show a "Downloading…" indicator and poll
+    # for completion without the user reloading.
+    if source == "import" and not video.get("video_file_path"):
+        await _maybe_download_video_file(video_id)
+        rows = await db.execute_fetchall("SELECT * FROM videos WHERE id = ?", (video_id,))
+        if rows:
+            video = dict(rows[0])
+
     # 1. Auto-thumbnail — only if no thumbnail is already attached.
     # On upload that means the user didn't provide one; on import it means
     # the YouTube thumbnail download didn't succeed (or YouTube had none).
@@ -120,6 +133,52 @@ async def _run_chain(video_id: str, project_id: int, source: Source) -> None:
 
 
 # --- individual side effects ----------------------------------------------
+
+
+async def _set_download_state(video_id: str, state: str | None) -> None:
+    db = await get_db()
+    await db.execute(
+        "UPDATE videos SET video_file_download_state = ?, updated_at = datetime('now') "
+        "WHERE id = ?",
+        (state, video_id),
+    )
+    await db.commit()
+
+
+async def _maybe_download_video_file(video_id: str) -> None:
+    """Fetch the mp4 from YouTube into UPLOAD_DIR. Updates videos.
+    video_file_path on success; videos.video_file_download_state tracks
+    progress for the detail-page polling loop.
+
+    PrivateVideoError surfaces as 'unavailable' (retrying won't help
+    without the user flipping privacy on YouTube); anything else
+    surfaces as 'failed' and gets logged so a manual Transcribe-button
+    retry will pick up the same code path."""
+    await _set_download_state(video_id, "in_progress")
+    try:
+        downloaded = await asyncio.to_thread(
+            youtube.download_video_file, video_id, UPLOAD_DIR
+        )
+    except youtube.PrivateVideoError:
+        logger.info(
+            "Skipping video-file download for %s — YouTube reports it as private; "
+            "the user can flip it to unlisted and retry from the detail page.",
+            video_id,
+        )
+        await _set_download_state(video_id, "unavailable")
+        return
+    except Exception as exc:
+        logger.warning("Video-file download failed for %s: %s", video_id, exc)
+        await _set_download_state(video_id, "failed")
+        return
+
+    db = await get_db()
+    await db.execute(
+        "UPDATE videos SET video_file_path = ?, video_file_download_state = NULL, "
+        "updated_at = datetime('now') WHERE id = ?",
+        (str(downloaded), video_id),
+    )
+    await db.commit()
 
 
 async def _maybe_extract_thumbnail(video_id: str, video_file_path: str | None) -> None:
