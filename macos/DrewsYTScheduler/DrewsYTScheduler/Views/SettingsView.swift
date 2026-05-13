@@ -6,6 +6,7 @@ import AppKit
 /// toggle here controls whether a menu-bar item appears at login.
 struct SettingsView: View {
     @ObservedObject var state: ServerStateModel
+    @StateObject private var backup = BackupController()
     @State private var menubarAtLogin = false
     @State private var probeTask: Task<Void, Never>?
 
@@ -58,8 +59,24 @@ struct SettingsView: View {
             }
 
             GroupBox(label: Text("Data files").font(.headline)) {
-                PathRow(label: "Application data", url: AppPaths.dataDirectory)
-                    .padding(8)
+                VStack(alignment: .leading, spacing: 10) {
+                    PathRow(label: "Application data", url: AppPaths.dataDirectory)
+                    HStack {
+                        Button("Export Data…") { backup.beginExport() }
+                            .disabled(backup.busy)
+                        Button("Import Data…") { backup.beginImport() }
+                            .disabled(backup.busy)
+                        if backup.busy {
+                            ProgressView().controlSize(.small)
+                        }
+                        Spacer()
+                    }
+                    Text("Export bundles the database, templates, uploaded media, and all stored credentials into one passphrase-encrypted file you can move to another Mac. Import replaces this Mac's data with a backup (the server is briefly stopped, and your current data is kept as a copy).")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(8)
             }
 
             GroupBox(label: Text("Logs").font(.headline)) {

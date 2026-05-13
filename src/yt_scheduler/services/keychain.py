@@ -285,3 +285,51 @@ def delete_all_secrets(namespace: str) -> None:
 def get_storage_type() -> str:
     """Return the active storage backend name."""
     return "keychain" if _is_macos() else "file"
+
+
+def _namespace_from_service(service: str) -> str | None:
+    """Recover the namespace from a full Keychain service name, or ``None``."""
+    for prefix in (KEYCHAIN_SERVICE_PREFIX, LEGACY_KEYCHAIN_SERVICE_PREFIX):
+        if service.startswith(prefix + "."):
+            return service[len(prefix) + 1 :]
+    return None
+
+
+def export_all_secrets() -> dict[str, dict[str, str]]:
+    """Resolve every stored secret as ``{namespace: {key: value}}``.
+
+    Namespaces and keys are enumerated from the local index file; each real
+    value is read via :func:`load_secret` (which transparently reads the
+    Keychain and migrates the legacy namespace forward). Entries that no longer
+    resolve are skipped. Both the current and legacy service prefixes are
+    considered, de-duplicated by namespace.
+    """
+    index = _load_secrets_file()
+    keys_by_namespace: dict[str, set[str]] = {}
+    for service, accounts in index.items():
+        namespace = _namespace_from_service(service)
+        if namespace is None:
+            continue
+        keys_by_namespace.setdefault(namespace, set()).update(accounts.keys())
+
+    result: dict[str, dict[str, str]] = {}
+    for namespace, keys in keys_by_namespace.items():
+        for key in sorted(keys):
+            value = load_secret(namespace, key)
+            if value is None:
+                continue
+            result.setdefault(namespace, {})[key] = value
+    return result
+
+
+def import_all_secrets(data: dict[str, dict[str, str]]) -> int:
+    """Write every ``{namespace: {key: value}}`` entry via :func:`store_secret`.
+
+    Returns the number of individual secrets written.
+    """
+    count = 0
+    for namespace, entries in data.items():
+        for key, value in entries.items():
+            store_secret(namespace, key, value)
+            count += 1
+    return count

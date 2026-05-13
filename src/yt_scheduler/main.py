@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 
 import uvicorn
 
@@ -32,6 +33,38 @@ def _redirect_stdio_to_log() -> None:
     os.close(fd)
     sys.stdout = os.fdopen(1, "w", buffering=1)
     sys.stderr = os.fdopen(2, "w", buffering=1)
+
+
+def _bundle_passphrase(*, confirm: bool) -> str:
+    """Get the backup passphrase from ``DYS_BUNDLE_PASSPHRASE`` or an interactive prompt."""
+    env = os.getenv("DYS_BUNDLE_PASSPHRASE")
+    if env:
+        return env
+    import getpass
+
+    passphrase = getpass.getpass("Backup passphrase: ")
+    if not passphrase:
+        print("A passphrase is required.", file=sys.stderr)
+        sys.exit(2)
+    if confirm:
+        again = getpass.getpass("Confirm passphrase: ")
+        if again != passphrase:
+            print("Passphrases did not match.", file=sys.stderr)
+            sys.exit(2)
+    return passphrase
+
+
+def _server_is_running() -> bool:
+    """True if something is already bound to the scheduler's host:port."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((HOST, PORT))
+        except OSError:
+            return True
+    return False
 
 
 def main():
@@ -122,6 +155,50 @@ def main():
         run_oauth_flow(client_secret_path=client_secrets)
         print("Authentication successful!")
 
+    elif args[0] == "export-all":
+        if len(args) < 2:
+            print("Usage: yt-scheduler export-all <output-file.dysbak>", file=sys.stderr)
+            sys.exit(2)
+        ensure_dirs()
+        from yt_scheduler.services import backup
+        passphrase = _bundle_passphrase(confirm=True)
+        try:
+            summary = backup.export_bundle(Path(args[1]), passphrase)
+        except backup.BackupError as exc:
+            print(f"Export failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        db_note = "" if summary["includes_db"] else ", no database found"
+        print(
+            f"Wrote {summary['path']} ({summary['bytes']:,} bytes) — "
+            f"{summary['data_files']} data file(s), {summary['secret_count']} secret(s){db_note}"
+        )
+        print("This file contains all your credentials — delete it after transferring it.")
+
+    elif args[0] == "import-all":
+        if len(args) < 2:
+            print("Usage: yt-scheduler import-all <input-file.dysbak>", file=sys.stderr)
+            sys.exit(2)
+        if _server_is_running():
+            print(
+                "The scheduler server appears to be running. Quit the app (or stop the "
+                f"launch agent) so nothing is using port {PORT}, then run this again.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        from yt_scheduler.services import backup
+        passphrase = _bundle_passphrase(confirm=False)
+        try:
+            result = backup.import_bundle(Path(args[1]), passphrase)
+        except backup.BackupError as exc:
+            print(f"Import failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(
+            f"Restored data to {result['data_dir']} and "
+            f"{result['secret_count']} secret(s) to secure storage."
+        )
+        if result["pre_import_path"]:
+            print(f"Your previous data was kept at: {result['pre_import_path']}")
+
     else:
         print("Drew's Video + Socials Scheduler")
         print()
@@ -132,6 +209,8 @@ def main():
         print("  yt-scheduler uninstall     Remove background service")
         print("  yt-scheduler status        Check service status")
         print("  yt-scheduler auth [path]   Run YouTube OAuth flow")
+        print("  yt-scheduler export-all <file>   Export all data + secrets to an encrypted backup")
+        print("  yt-scheduler import-all <file>   Restore from an encrypted backup (replaces current data)")
         print()
         print(f"Web UI: http://{HOST}:{PORT}")
 

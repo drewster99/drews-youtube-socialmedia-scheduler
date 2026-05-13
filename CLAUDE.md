@@ -33,7 +33,11 @@ yt-scheduler auth [client_secret.json]  # YouTube OAuth flow
 yt-scheduler install                     # Install as background service (launchd/systemd)
 yt-scheduler uninstall
 yt-scheduler status
+yt-scheduler export-all backup.dysbak    # Passphrase-encrypted bundle of the data dir + all Keychain secrets
+yt-scheduler import-all backup.dysbak    # Restore a bundle (server must be stopped; replaces data, keeps a .pre-import-* copy)
 ```
+
+`export-all`/`import-all` read the passphrase from `DYS_BUNDLE_PASSPHRASE` if set (used by the macOS app), otherwise prompt interactively. Bundle logic is in `services/backup.py`; secret enumeration is `keychain.export_all_secrets()`/`import_all_secrets()`.
 
 Web UI runs at `http://127.0.0.1:8008` by default.
 
