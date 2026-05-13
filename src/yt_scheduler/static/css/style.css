@@ -98,8 +98,35 @@ body {
     margin-top: 0.5rem;
 }
 
+/* When the section label is the currently-active project, give it
+ * extra weight and the brand accent so it visually anchors the
+ * sidebar's project sub-nav. data-project is set on the <li> in
+ * base.html only when current_project is bound. */
+.sidebar .nav-section-label[data-project] {
+    color: var(--accent);
+    font-size: 0.85rem;
+    font-weight: 700;
+    text-transform: none;
+    letter-spacing: 0;
+}
+
 .sidebar .nav-sub {
     padding-left: 2rem !important;
+}
+
+/* Third-level nav entry for "the video the user is currently
+ * looking at" — sits underneath Dashboard when current_video is
+ * bound. Truncates with ellipsis so a long title doesn't blow out
+ * the sidebar width. */
+.sidebar .nav-current-video {
+    padding: 0.35rem 1.25rem 0.35rem 3rem;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    border-left: 2px solid var(--accent);
+    margin-left: 1.5rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .sidebar .nav-divider {
