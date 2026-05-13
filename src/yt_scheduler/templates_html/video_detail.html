@@ -805,7 +805,9 @@ function escapeHtml(s) {
 }
 
 // Per-platform character ceilings — used as the fallback when a post row has no
-// max_chars (rows generated before that column existed).
+// max_chars (rows generated before that column existed). Mirrors
+// services/templates.DEFAULT_MAX_CHARS_BY_PLATFORM and the parallel
+// PLATFORM_DEFAULT_MAX_CHARS in template_edit.html; keep all three aligned.
 const PLATFORM_LIMITS = { twitter: 280, bluesky: 300, mastodon: 500, linkedin: 3000, threads: 500 };
 
 // Wrap any leftover template tag in the rendered post text with a red span so a

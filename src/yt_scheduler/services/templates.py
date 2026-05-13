@@ -19,16 +19,49 @@ from yt_scheduler.database import get_db
 from yt_scheduler.services.ai import DEFAULT_AI_SYSTEM_PROMPT, call_ai_block
 from yt_scheduler.services.social import ALL_PLATFORMS
 
+# Per-platform default character limits — the single source of truth used
+# by the API (default for a new slot), the template-edit page (initial
+# max_chars on "+ Add slot"), the default-template seeds below, and the
+# preview UI on the video-detail page. The numbers come from each
+# platform's stated post-length cap for a non-premium account; X-Premium
+# accounts get the 25,000-char limit applied dynamically based on the
+# connected account's tier (see social_routes / settings_routes).
+DEFAULT_MAX_CHARS_BY_PLATFORM: dict[str, int] = {
+    "twitter":  280,
+    "bluesky":  300,
+    "mastodon": 500,
+    "linkedin": 3000,
+    "threads":  500,
+}
+# Generic fallback when a platform name doesn't match any known key.
+# Picked to be conservative enough to fit X/Bluesky and most niche
+# Mastodon instances; callers should pass an explicit platform when one
+# is available.
+GENERIC_MAX_CHARS_FALLBACK = 500
+
+
+def default_max_chars(platform: str | None) -> int:
+    """Return the default max_chars for a platform, or the generic
+    fallback when the platform isn't one of the five we ship support
+    for. Used by the API, the seed templates, and any callsite that
+    needs to seed a slot's character limit."""
+    if platform is None:
+        return GENERIC_MAX_CHARS_FALLBACK
+    return DEFAULT_MAX_CHARS_BY_PLATFORM.get(
+        platform.lower(), GENERIC_MAX_CHARS_FALLBACK
+    )
+
+
 # Default templates shipped with the app
 DEFAULT_NEW_MESSAGE_TEMPLATE = {
     "name": "send_message",
     "description": "Plain user-message template — useful for one-off posts",
     "platforms": {
-        "twitter":  {"template": "{{user_message}}", "media": "none", "max_chars": 280},
-        "bluesky":  {"template": "{{user_message}}", "media": "none", "max_chars": 300},
-        "mastodon": {"template": "{{user_message}}", "media": "none", "max_chars": 500},
-        "linkedin": {"template": "{{user_message}}", "media": "none", "max_chars": 3000},
-        "threads":  {"template": "{{user_message}}", "media": "none", "max_chars": 500},
+        "twitter":  {"template": "{{user_message}}", "media": "none", "max_chars": DEFAULT_MAX_CHARS_BY_PLATFORM["twitter"]},
+        "bluesky":  {"template": "{{user_message}}", "media": "none", "max_chars": DEFAULT_MAX_CHARS_BY_PLATFORM["bluesky"]},
+        "mastodon": {"template": "{{user_message}}", "media": "none", "max_chars": DEFAULT_MAX_CHARS_BY_PLATFORM["mastodon"]},
+        "linkedin": {"template": "{{user_message}}", "media": "none", "max_chars": DEFAULT_MAX_CHARS_BY_PLATFORM["linkedin"]},
+        "threads":  {"template": "{{user_message}}", "media": "none", "max_chars": DEFAULT_MAX_CHARS_BY_PLATFORM["threads"]},
     },
 }
 
@@ -40,27 +73,27 @@ DEFAULT_TEMPLATE = {
         "twitter": {
             "template": '{{ai: Write a punchy tweet announcing a YouTube video titled "{{title}}" about {{tags}}. Include the URL {{url}}. Under 280 chars. 2-3 hashtags.}}',
             "media": "thumbnail",
-            "max_chars": 280,
+            "max_chars": DEFAULT_MAX_CHARS_BY_PLATFORM["twitter"],
         },
         "bluesky": {
             "template": '{{ai: Write a Bluesky post announcing my new video "{{title}}". Conversational tone, under 300 chars.}}\n\n{{url}}',
             "media": "thumbnail",
-            "max_chars": 300,
+            "max_chars": DEFAULT_MAX_CHARS_BY_PLATFORM["bluesky"],
         },
         "mastodon": {
             "template": 'New video is live!\n\n"{{title}}"\n\n{{url}}\n\n{{ai: Generate 3-5 CamelCase hashtags for: {{tags}}}}',
             "media": "thumbnail",
-            "max_chars": 500,
+            "max_chars": DEFAULT_MAX_CHARS_BY_PLATFORM["mastodon"],
         },
         "linkedin": {
             "template": '{{ai: Write a LinkedIn post (2-3 paragraphs, professional but approachable) about my new video "{{title}}". Description: {{description_short}}. End with a question.}}\n\nWatch here: {{url}}',
             "media": "thumbnail",
-            "max_chars": 3000,
+            "max_chars": DEFAULT_MAX_CHARS_BY_PLATFORM["linkedin"],
         },
         "threads": {
             "template": '{{ai: Write a casual Threads post announcing "{{title}}". Keep it engaging, under 500 chars.}}\n\n{{url}}',
             "media": "thumbnail",
-            "max_chars": 500,
+            "max_chars": DEFAULT_MAX_CHARS_BY_PLATFORM["threads"],
         },
     },
 }

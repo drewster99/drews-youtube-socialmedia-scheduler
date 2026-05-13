@@ -164,13 +164,27 @@ async def add_template_slot(name: str, data: dict, project_slug: str | None = No
             sa_id = int(sa_raw)
         except (TypeError, ValueError) as exc:
             raise HTTPException(400, "social_account_id must be an integer or null") from exc
+    # The default char limit must match the platform — handing every slot
+    # the same 500 fallback meant LinkedIn slots opened at 280 (because
+    # the front-end was sending 280 in its add-slot payload) and
+    # everything else at 280 too, never getting the platform-appropriate
+    # value. Pull from the canonical table when the caller doesn't pin a
+    # value.
+    max_chars_value: int
+    if "max_chars" in data and data["max_chars"] is not None:
+        try:
+            max_chars_value = int(data["max_chars"])
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "max_chars must be an integer") from exc
+    else:
+        max_chars_value = tmpl.default_max_chars(platform)
     try:
         return await tmpl.add_slot(
             template_id,
             platform,
             body=str(data.get("body", "")),
             media=str(data.get("media", "thumbnail")),
-            max_chars=int(data.get("max_chars", 500)),
+            max_chars=max_chars_value,
             social_account_id=sa_id,
             is_disabled=bool(data.get("is_disabled", False)),
             order_index=(

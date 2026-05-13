@@ -197,6 +197,23 @@ function syncThreadsWarn(slotId, platform) {
     warn.style.display = (platform === 'threads' && ta && VIDEO_DIRECTIVE_RE.test(ta.value)) ? '' : 'none';
 }
 
+// Per-platform default character limits, mirrored from
+// services/templates.DEFAULT_MAX_CHARS_BY_PLATFORM. Used by addSlot()
+// below so a new LinkedIn slot opens at 3000, not 280, etc. If you
+// touch one side, touch the other.
+const PLATFORM_DEFAULT_MAX_CHARS = {
+    twitter:  280,
+    bluesky:  300,
+    mastodon: 500,
+    linkedin: 3000,
+    threads:  500,
+};
+const GENERIC_MAX_CHARS_FALLBACK = 500;
+function defaultMaxCharsForPlatform(platform) {
+    if (!platform) return GENERIC_MAX_CHARS_FALLBACK;
+    return PLATFORM_DEFAULT_MAX_CHARS[platform.toLowerCase()] ?? GENERIC_MAX_CHARS_FALLBACK;
+}
+
 // --- Live template-tag syntax highlighting (overlay backdrop behind a transparent textarea) ---
 const BUILTIN_VARS = new Set([
     'title', 'description', 'description_short', 'description_medium', 'tags', 'hashtags',
@@ -407,7 +424,12 @@ async function addSlot() {
     const resp = await fetch(`/api/templates/${templateName}/slots?project_slug=${encodeURIComponent(projectSlug)}`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({platform, body: '', media: 'thumbnail', max_chars: 280}),
+        body: JSON.stringify({
+            platform,
+            body: '',
+            media: 'thumbnail',
+            max_chars: defaultMaxCharsForPlatform(platform),
+        }),
     });
     if (resp.ok) {
         document.getElementById('add-slot-platform').value = '';
