@@ -21,7 +21,7 @@ deploy: ## Sync cloudflare/ callbacks to the site repo, commit, push
 deploy-dry: ## Show what `make deploy` would change without writing or pushing
 	@./scripts/deploy-cloudflare.sh --dry-run
 
-build: ## Build the macOS .app (debug — fast, local, unsigned-if-no-cert)
+build: ## Build the macOS .app (debug — fast, local; requires a Developer ID Application cert)
 	@./macos/build.sh --debug
 
 release: ## Build + sign + notarize + DMG (release)

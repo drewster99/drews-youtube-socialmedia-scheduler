@@ -94,18 +94,26 @@ if [ -z "$DEVELOPER_ID" ]; then
         || true)
 fi
 
+# Signing requires a "Developer ID Application" cert in the login Keychain.
+# Ad-hoc (`codesign -s -`) is intentionally NOT a fallback: launchd's checks
+# for SMAppService.agent reject ad-hoc-signed apps with "Codesigning failure
+# loading plist", so the background service can't be installed — which makes
+# an "ad-hoc debug build" worse than a build error, because it looks like it
+# worked until the moment you try to install the agent. `--no-sign` is still
+# available if you explicitly want an unsigned bundle for some non-SMAppService
+# purpose; the resulting .app cannot install the launch agent.
 if [ "$FORCE_NO_SIGN" = true ]; then
     SIGN=false
     DEVELOPER_ID=""
 elif [ -n "$DEVELOPER_ID" ]; then
     SIGN=true
 else
-    SIGN=false
-fi
-
-if [ "$BUILD_KIND" = "release" ] && [ "$SIGN" != true ]; then
-    echo "ERROR: --release requires a Developer ID Application cert in Keychain."
+    echo "ERROR: no \"Developer ID Application\" cert found in the login Keychain."
     echo "       Run: security find-identity -v -p codesigning"
+    echo "       Install one (export .p12 from another Mac, or get one from"
+    echo "       developer.apple.com → Certificates), then re-run this build."
+    echo "       To intentionally build an unsigned bundle (cannot install the"
+    echo "       launch agent), pass --no-sign."
     exit 1
 fi
 
@@ -119,7 +127,7 @@ echo "Kind:       $BUILD_KIND"
 echo "Version:    $VERSION (#$BUILD_NUMBER)"
 echo "Build ID:   $BUILD_ID"
 echo "Build dir:  $BUILD_DIR"
-echo "Sign:       $([ "$SIGN" = true ] && echo "$DEVELOPER_ID" || echo "no")"
+echo "Sign:       $([ "$SIGN" = true ] && echo "$DEVELOPER_ID" || echo "no (--no-sign — agent will NOT install)")"
 echo "Notarize:   $NOTARIZE"
 echo
 
