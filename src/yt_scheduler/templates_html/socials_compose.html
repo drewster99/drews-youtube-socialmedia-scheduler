@@ -23,8 +23,8 @@
             </div>
         </div>
         <div class="form-group">
-            <label>Configured accounts</label>
-            <div id="account-checkboxes" class="account-checkboxes">
+            <label>Template slots <small class="form-hint" style="font-weight: normal;">(uncheck a slot to skip it for this run)</small></label>
+            <div id="slot-checkboxes" class="account-checkboxes">
                 <p class="empty-state">Loading…</p>
             </div>
         </div>
@@ -84,10 +84,16 @@ if (!videoId) {
 }
 
 let templates = [];
-let accounts = [];
+// Indexed view of the currently-selected template's enabled slots — the
+// picker shows one row per slot (not per platform), so a template with
+// two Mastodon slots renders two rows.
+let currentTemplateSlots = [];       // [{id, platform, account_username, is_disabled}, ...]
 let posts = [];     // the just-generated, still-actionable posts (drafts etc.)
 let postingSettings = null;
-let composedPlatforms = [];          // platforms the user checked for this generate
+// The set of platforms the just-generated batch covers. Derived from
+// the checked slot rows at Generate-time — used to filter out stale
+// drafts on platforms not present in the current template.
+let composedPlatforms = [];
 let priorPostsByPlatform = {};       // platform -> most recent already-posted row (for the note)
 let videoTier = null;                // current video's tier; filters the picker
 
@@ -120,20 +126,15 @@ async function loadInitial() {
     // composing posts for a Short, etc.
     const fetches = [
         fetch(`/api/templates?project_slug=${encodeURIComponent(projectSlug)}`),
-        fetch('/api/settings/social'),
         fetch(`/api/projects/${projectSlug}/posting-settings`),
     ];
     if (videoId) {
         fetches.push(fetch(`/api/videos/${encodeURIComponent(videoId)}`));
     }
     const responses = await Promise.all(fetches);
-    const [tplResp, socResp, postingResp, videoResp] = responses;
+    const [tplResp, postingResp, videoResp] = responses;
 
     templates = tplResp.ok ? await tplResp.json() : [];
-    const socData = socResp.ok ? await socResp.json() : {};
-    accounts = Object.entries(socData)
-        .filter(([_, v]) => v.configured)
-        .map(([name]) => name);
     postingSettings = postingResp.ok ? await postingResp.json() : null;
     if (videoResp && videoResp.ok) {
         const video = await videoResp.json();
@@ -141,7 +142,8 @@ async function loadInitial() {
     }
 
     populateTemplatePicker();
-    populateAccountCheckboxes();
+    document.getElementById('template-picker').addEventListener('change', onTemplateChange);
+    await loadSlotsForCurrentTemplate();
 }
 
 function populateTemplatePicker() {
@@ -174,29 +176,90 @@ function populateTemplatePicker() {
     }
 }
 
-function populateAccountCheckboxes() {
-    const wrap = document.getElementById('account-checkboxes');
-    if (!accounts.length) {
-        wrap.innerHTML = '<p class="empty-state">No social accounts configured. Configure them in <a href="/settings">General settings</a>.</p>';
-        return;
-    }
-    wrap.innerHTML = accounts.map(name => `
-        <label class="account-row">
-            <input type="checkbox" name="account" value="${name}" checked>
-            <span class="platform-badge platform-${name}">${name}</span>
-        </label>
-    `).join('');
+async function onTemplateChange() {
+    await loadSlotsForCurrentTemplate();
 }
 
-function selectedAccounts() {
-    return Array.from(document.querySelectorAll('input[name="account"]:checked'))
-        .map(box => box.value);
+async function loadSlotsForCurrentTemplate() {
+    /** Repopulate the slot picker from the currently-selected
+     * template. One row per enabled slot — a template with two
+     * Mastodon slots (different accounts) renders two rows, and a
+     * template with no LinkedIn slot has no LinkedIn row. */
+    const name = document.getElementById('template-picker').value;
+    if (!name) {
+        currentTemplateSlots = [];
+        renderSlotPicker();
+        return;
+    }
+    try {
+        const resp = await fetch(
+            `/api/templates/${encodeURIComponent(name)}?project_slug=${encodeURIComponent(projectSlug)}`
+        );
+        if (!resp.ok) {
+            currentTemplateSlots = [];
+            renderSlotPicker();
+            return;
+        }
+        const tpl = await resp.json();
+        currentTemplateSlots = (tpl.slots || [])
+            .filter(s => !s.is_disabled)
+            .map(s => ({
+                id: s.id,
+                platform: s.platform,
+                is_disabled: !!s.is_disabled,
+                // resolved_account: {username, ...} or null when the
+                // slot defers to the project's default account.
+                account_username: s.resolved_account ? s.resolved_account.username : null,
+            }));
+        renderSlotPicker();
+    } catch (e) {
+        currentTemplateSlots = [];
+        renderSlotPicker();
+    }
+}
+
+function renderSlotPicker() {
+    const wrap = document.getElementById('slot-checkboxes');
+    if (!currentTemplateSlots.length) {
+        wrap.innerHTML = '<p class="empty-state">No active slots in this template. Edit it in <a href="/projects/' + projectSlug + '/templates">Templates</a> to add platforms.</p>';
+        return;
+    }
+    // ``data-slot-id`` is the canonical identity per row even when two
+    // rows share the same platform (different accounts). ``data-platform``
+    // doubles as the value sent to the generate endpoint via the
+    // platforms[] list — backend filtering is still per-platform, so
+    // unchecking one of two same-platform rows currently excludes both
+    // (logged as a known limitation).
+    wrap.innerHTML = currentTemplateSlots.map(slot => {
+        const accountLabel = slot.account_username
+            ? `@${slot.account_username}`
+            : '<span class="form-hint" style="font-weight: normal;">(project default)</span>';
+        return `
+        <label class="account-row" data-slot-id="${slot.id}">
+            <input type="checkbox" name="slot" value="${slot.id}"
+                data-platform="${slot.platform}" checked>
+            <span class="platform-badge platform-${slot.platform}">${slot.platform}</span>
+            <span style="margin-left: 0.5rem;">${accountLabel}</span>
+        </label>
+        `;
+    }).join('');
+}
+
+function selectedPlatforms() {
+    /** Distinct platforms from the checked slot rows. Used as both the
+     * filter sent to the generate endpoint and the basis for the
+     * stale-draft intersection in applyPostFilter. */
+    const seen = new Set();
+    for (const cb of document.querySelectorAll('input[name="slot"]:checked')) {
+        seen.add(cb.dataset.platform);
+    }
+    return [...seen];
 }
 
 async function generatePreviews() {
-    const platforms = selectedAccounts();
+    const platforms = selectedPlatforms();
     if (!platforms.length) {
-        showToast('Pick at least one account.', 'error');
+        showToast('Pick at least one slot.', 'error');
         return;
     }
     const templateName = document.getElementById('template-picker').value;
