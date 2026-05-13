@@ -368,6 +368,11 @@ async def generate_posts(
                 )
 
             media_paths: list[str] = []
+            # Per-slot trace collector — populated by templates.render and
+            # ai.call_ai_block via the F1 plumbing. We persist it after
+            # the post row lands so the F3 ⓘ-modal can display it. None
+            # when the slot has no body to render (nothing to trace).
+            slot_trace: list[dict] | None = [] if body else None
             if body:
                 try:
                     cleaned, media_paths, _alts = tmpl.extract_media_directives(
@@ -379,10 +384,13 @@ async def generate_posts(
                     slot_vars = {**ctx["variables"], **forced_empty, "max_chars": str(slot_max)}
                     rendered = tmpl.render(
                         cleaned, slot_vars, default_system_prompt=default_ai_system,
+                        trace=slot_trace,
                     )
                 except Exception as e:
                     rendered = f"[Error generating: {e}]"
                     media_paths = []
+                    if slot_trace is not None:
+                        slot_trace.append({"kind": "error", "message": str(e)})
             else:
                 rendered = ""
 
@@ -420,6 +428,7 @@ async def generate_posts(
                 "rendered": rendered,
                 "media_paths": media_paths,
                 "max_chars": int(slot_max),
+                "trace": slot_trace,
             })
 
         # Unresolved-variable gate — bail before any destructive DB op.
@@ -478,7 +487,7 @@ async def generate_posts(
             media_paths_json = json.dumps(media_paths) if media_paths else None
             primary_media = media_paths[0] if media_paths else None
 
-            await db.execute(
+            cur = await db.execute(
                 """INSERT INTO social_posts
                        (video_id, platform, content, media_path, media_paths,
                         media_type, status, social_account_id, max_chars)
@@ -489,6 +498,17 @@ async def generate_posts(
                     media, sa_id, item["max_chars"],
                 ),
             )
+            post_id = cur.lastrowid
+
+            # Persist the per-slot debug trace (F2). Cascade-deleted with
+            # the post; pruned by the scheduler job to keep ~24h worth.
+            slot_trace = item.get("trace")
+            if slot_trace and post_id is not None:
+                await db.execute(
+                    "INSERT INTO social_post_traces (post_id, trace_json) "
+                    "VALUES (?, ?)",
+                    (int(post_id), json.dumps(slot_trace)),
+                )
 
             generated.append({
                 "slot_id": slot.get("id"),
@@ -503,6 +523,33 @@ async def generate_posts(
 
         await db.commit()
         return {"posts": generated, "warnings": warnings}
+
+
+@router.get("/posts/{post_id}/trace")
+async def get_post_trace(post_id: int):
+    """Return the debug-log trace for a generated social post (F3).
+
+    Pruned hourly to ~24h by services.scheduler. 404 when the row has
+    been pruned, cascade-deleted, or never had a trace recorded (e.g.
+    a post created before F2 landed).
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT trace_json, created_at FROM social_post_traces WHERE post_id = ?",
+        (post_id,),
+    )
+    if not rows:
+        raise HTTPException(404, "No trace for this post (may have expired).")
+    row = dict(rows[0])
+    try:
+        trace = json.loads(row["trace_json"])
+    except json.JSONDecodeError:
+        trace = []
+    return {
+        "post_id": post_id,
+        "created_at": row["created_at"],
+        "trace": trace,
+    }
 
 
 @router.get("/posts/{video_id}")

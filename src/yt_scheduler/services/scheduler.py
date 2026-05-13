@@ -1007,6 +1007,28 @@ async def refresh_social_tokens_job() -> None:
         logger.info("Token refresh sweep: renewed %d credential(s)", renewed)
 
 
+# F2: per-social-post debug traces (templates.render output) are kept
+# only as long as they're useful for the user to inspect from the ⓘ
+# button on the detail page. 24h is the spec'd retention; this job
+# evicts anything older. Cascade-delete from social_posts also handles
+# the case where a post is deleted before the trace expires.
+_TRACE_TTL_HOURS = 24
+
+
+async def prune_social_post_traces_job() -> None:
+    db = await get_db()
+    cur = await db.execute(
+        f"DELETE FROM social_post_traces "
+        f"WHERE created_at < datetime('now', '-{_TRACE_TTL_HOURS} hours')"
+    )
+    await db.commit()
+    if getattr(cur, "rowcount", 0):
+        logger.info(
+            "Trace pruning: removed %d social_post_traces older than %dh",
+            cur.rowcount, _TRACE_TTL_HOURS,
+        )
+
+
 def start_scheduler(
     caption_interval: int | None = None,
     comment_interval: int | None = None,
@@ -1039,10 +1061,18 @@ def start_scheduler(
         id="refresh_social_tokens",
         replace_existing=True,
     )
+    scheduler.add_job(
+        prune_social_post_traces_job,
+        "interval",
+        hours=1,
+        id="prune_social_post_traces",
+        replace_existing=True,
+    )
     scheduler.start()
     logger.info(
         f"Scheduler started (captions every {cap_mins}m, moderation every {mod_mins}m, "
-        f"social-token refresh every {_TOKEN_REFRESH_INTERVAL_MINUTES}m)"
+        f"social-token refresh every {_TOKEN_REFRESH_INTERVAL_MINUTES}m, "
+        "trace pruning hourly)"
     )
 
 

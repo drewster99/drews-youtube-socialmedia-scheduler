@@ -329,6 +329,15 @@
     </div>
 </dialog>
 
+<dialog id="trace-modal" class="modal modal-wide modal-tall">
+    <h3>How this post was generated</h3>
+    <div id="trace-modal-body" style="max-height: 60vh; overflow: auto;"></div>
+    <div class="modal-actions" style="margin-top: 1rem;">
+        <button type="button" class="btn btn-primary"
+                onclick="document.getElementById('trace-modal').close()">Close</button>
+    </div>
+</dialog>
+
 <dialog id="unresolved-vars-dialog" class="modal modal-wide">
     <h3>Some variable tags have no value</h3>
     <p class="form-hint" style="margin: 0 0 0.75rem;">
@@ -975,6 +984,68 @@ function startLogPolling() {
     _logPollTimer = setInterval(_logPollTick, 15_000);
 }
 
+// Debug-log modal for a generated social post (F3). Pulls the
+// per-post trace persisted by F2 and renders each step in order —
+// template body, the variables that were substituted, the rendered
+// prompt, and every AI sub-call (prompt + system + response +
+// elapsed). Pruned to ~24h server-side, so older posts surface a
+// "trace expired" notice instead of crashing.
+async function showPostTrace(postId) {
+    let body;
+    try {
+        const resp = await fetch(`/api/social/posts/${postId}/trace`);
+        if (resp.status === 404) {
+            body = '<p class="empty-state">No trace for this post — older than 24h or generated before debug logging was added.</p>';
+        } else if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            body = `<p class="empty-state">Couldn't load trace: ${escapeHtml(err.detail || resp.status)}</p>`;
+        } else {
+            const data = await resp.json();
+            body = renderTraceHtml(data);
+        }
+    } catch (e) {
+        body = `<p class="empty-state">Couldn't load trace: ${escapeHtml(e.message || String(e))}</p>`;
+    }
+    const dlg = document.getElementById('trace-modal');
+    document.getElementById('trace-modal-body').innerHTML = body;
+    dlg.showModal();
+}
+
+function renderTraceHtml(data) {
+    const entries = data.trace || [];
+    if (!entries.length) return '<p class="empty-state">Trace is empty.</p>';
+    const lines = [
+        `<p class="form-hint" style="margin-bottom: 0.5rem;">Captured at ${escapeHtml(data.created_at || '')}.</p>`,
+    ];
+    let aiIdx = 0;
+    for (const e of entries) {
+        if (e.kind === 'template_body') {
+            lines.push(`<details open><summary><strong>Template body</strong></summary>
+                <pre class="trace-block">${escapeHtml(e.text || '')}</pre></details>`);
+        } else if (e.kind === 'variables') {
+            const rows = Object.entries(e.values || {})
+                .map(([k, v]) => `<tr><td><code>${escapeHtml(k)}</code></td><td><pre class="trace-inline">${escapeHtml(v)}</pre></td></tr>`)
+                .join('');
+            lines.push(`<details><summary><strong>Variable substitutions</strong> (${Object.keys(e.values || {}).length})</summary>
+                <table class="trace-vars"><tbody>${rows}</tbody></table></details>`);
+        } else if (e.kind === 'substituted') {
+            lines.push(`<details><summary><strong>After variable substitution</strong></summary>
+                <pre class="trace-block">${escapeHtml(e.text || '')}</pre></details>`);
+        } else if (e.kind === 'ai_call') {
+            aiIdx += 1;
+            lines.push(`<details open><summary><strong>AI call ${aiIdx}</strong> &middot; ${escapeHtml(e.model || '')} &middot; ${e.elapsed_ms ?? '?'} ms</summary>
+                ${e.system ? `<p class="form-hint" style="margin: 0.25rem 0;">System:</p><pre class="trace-block">${escapeHtml(e.system)}</pre>` : ''}
+                <p class="form-hint" style="margin: 0.25rem 0;">Prompt:</p><pre class="trace-block">${escapeHtml(e.prompt || '')}</pre>
+                <p class="form-hint" style="margin: 0.25rem 0;">Response:</p><pre class="trace-block">${escapeHtml(e.response || '')}</pre>
+            </details>`);
+        } else if (e.kind === 'error') {
+            lines.push(`<details open><summary><strong>Error during render</strong></summary>
+                <pre class="trace-block">${escapeHtml(e.message || '')}</pre></details>`);
+        }
+    }
+    return lines.join('');
+}
+
 // Per-field fetch-state pill for the Transcript section. Reads
 // videos.youtube_transcript_state (migration 019) so the user can see
 // at a glance whether YouTube has no captions for this video (the
@@ -1472,6 +1543,9 @@ async function loadSocialPosts() {
                 <div class="social-post-card ${overLimit ? 'social-post-over-limit' : ''}" data-post-card="${p.id}" style="${opacity}">
                     <div class="social-post-header">
                         <span class="platform-badge platform-${p.platform}">${p.platform}</span>
+                        <button class="trace-info-btn" title="Show how this post was generated"
+                                onclick="showPostTrace(${p.id})"
+                                style="border: none; background: transparent; color: var(--text-muted); cursor: pointer; padding: 0 0.25rem; font-size: 0.9rem;">ⓘ</button>
                         ${statusBadge}
                     </div>
                     ${displayBody}

@@ -98,6 +98,47 @@ body {
     margin-top: 0.5rem;
 }
 
+/* Debug-trace modal (F3 — the ⓘ next to each social post chip).
+ * trace-block is a monospace, scrollable pre that wraps long lines —
+ * AI prompts and responses are often hundreds of chars. trace-inline
+ * is the compact form used inside the variables table. */
+.trace-block {
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 0.5rem;
+    font-family: var(--font-mono, monospace);
+    font-size: 0.8rem;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    max-height: 240px;
+    overflow-y: auto;
+    margin: 0 0 0.5rem;
+}
+.trace-inline {
+    background: var(--bg-input);
+    padding: 0.15rem 0.35rem;
+    font-family: var(--font-mono, monospace);
+    font-size: 0.8rem;
+    margin: 0;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+.trace-vars {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 0.5rem;
+}
+.trace-vars td {
+    padding: 0.25rem 0.5rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+}
+.trace-vars td:first-child {
+    width: 25%;
+}
+
 /* Page-header breadcrumb. Used on dashboard + video detail. The
  * project-name segment is brand-accented and linked; the page-name
  * segment is white and also linked (clicking goes back to the
