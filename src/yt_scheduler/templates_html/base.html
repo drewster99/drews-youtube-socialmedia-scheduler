@@ -19,6 +19,9 @@
             {% if current_project %}
             <li class="nav-section-label" data-project="{{ current_project.slug }}">{{ current_project.name }}</li>
             <li><a href="/projects/{{ current_project.slug }}" class="nav-link nav-sub">Dashboard</a></li>
+            {% if current_video %}
+            <li class="nav-current-video" title="{{ current_video.title }}">{{ current_video.title }}</li>
+            {% endif %}
             <li><a href="/projects/{{ current_project.slug }}/moderation" class="nav-link nav-sub">Moderation</a></li>
             <li><a href="/projects/{{ current_project.slug }}/templates" class="nav-link nav-sub">Templates</a></li>
             <li><a href="/projects/{{ current_project.slug }}/settings" class="nav-link nav-sub">Project settings</a></li>

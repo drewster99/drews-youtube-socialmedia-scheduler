@@ -220,10 +220,24 @@ async def project_dashboard(request: Request, slug: str):
 @app.get("/projects/{slug}/videos/{video_id}", response_class=HTMLResponse)
 async def project_video_detail_page(request: Request, slug: str, video_id: str):
     project = await _project_context(slug)
+    # Pull the video title for the sidebar's "current video" entry so
+    # the user has a "you are here" marker without having to read the
+    # page header. Missing row → no sidebar entry; the page itself
+    # surfaces the 404 once the JS fetch fails.
+    from yt_scheduler.database import get_db
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id, title FROM videos WHERE id = ?", (video_id,)
+    )
+    current_video = dict(rows[0]) if rows else None
     return html_templates.TemplateResponse(
         request,
         "video_detail.html",
-        context={"current_project": project, "video_id": video_id},
+        context={
+            "current_project": project,
+            "video_id": video_id,
+            "current_video": current_video,
+        },
     )
 
 
