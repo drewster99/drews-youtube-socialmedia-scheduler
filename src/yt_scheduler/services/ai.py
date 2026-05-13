@@ -81,6 +81,44 @@ def _render_template_body(body: str, variables: dict[str, str]) -> str:
     return templates.render(body, variables)
 
 
+# Tag cleaning shared by generate_tags_from_metadata and
+# generate_tags_from_frames. The LLM is told (in both seed body + system)
+# that tags must be 1–2 words and ≤24 characters, but the model
+# occasionally slips out a longer phrase ("a hands-on tutorial about X")
+# or repeats an existing tag with a synonym; we enforce both invariants
+# server-side so a misbehaving model can't push garbage into YouTube's
+# tag field. ``max_tags`` caps the final list (seed says 8–15, so 15 is
+# generous).
+_TAG_MAX_LEN = 24
+_TAG_MAX_WORDS = 2
+_TAG_MAX_COUNT = 15
+
+
+def _clean_tags(raw: str) -> list[str]:
+    """Parse the LLM's comma-separated tag list, lowercasing, stripping
+    quotes/whitespace, then enforcing length and word-count caps. Drops
+    anything that violates the rules (rather than truncating — a
+    truncated tag is usually a worse search term than the next-best
+    short one)."""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for piece in raw.split(","):
+        t = piece.strip().strip('"\'').lower()
+        if not t:
+            continue
+        if len(t) > _TAG_MAX_LEN:
+            continue
+        if len(t.split()) > _TAG_MAX_WORDS:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        cleaned.append(t)
+        if len(cleaned) >= _TAG_MAX_COUNT:
+            break
+    return cleaned
+
+
 async def generate_seo_description(
     title: str,
     transcript: str,
@@ -247,8 +285,7 @@ async def generate_tags_from_frames(
 
     client = get_client()
     message = await asyncio.to_thread(client.messages.create, **kwargs)
-    raw = message.content[0].text.strip()
-    return [t.strip().strip('"\'').lower() for t in raw.split(",") if t.strip()]
+    return _clean_tags(message.content[0].text.strip())
 
 
 async def generate_tags_from_metadata(
@@ -288,8 +325,7 @@ async def generate_tags_from_metadata(
 
     client = get_client()
     message = await asyncio.to_thread(client.messages.create, **kwargs)
-    raw = message.content[0].text.strip()
-    return [t.strip().strip('"\'').lower() for t in raw.split(",") if t.strip()]
+    return _clean_tags(message.content[0].text.strip())
 
 
 # Seed fallback for ``ai_block_default_system_prompt`` — kept here so an

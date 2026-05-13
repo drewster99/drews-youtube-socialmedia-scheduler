@@ -83,13 +83,18 @@ SEED_TAGS_FROM_METADATA_PROMPT = SeedPrompt(
         "Transcript (first 4000 chars): {{transcript_truncated}}\n\n"
         "Instructions:\n"
         "- Output a comma-separated list, no numbering, no quotes.\n"
+        "- Each tag must be 1–2 words. NEVER a sentence or a phrase.\n"
+        "- Each tag must be at most 24 characters long.\n"
         "- Use lowercase except for proper nouns.\n"
         "- Include both broad terms and specific phrases.\n"
         "- Avoid duplicates and near-duplicates.\n\n"
         "Return ONLY the comma-separated list."
     ),
     variables=("title", "description", "transcript", "transcript_truncated"),
-    system="You return ONLY a comma-separated list of tags, no preamble.",
+    system=(
+        "You return ONLY a comma-separated list of tags, no preamble. "
+        "Each tag is 1–2 words and at most 24 characters."
+    ),
 )
 
 SEED_DESCRIPTION_FROM_FRAMES_PROMPT = SeedPrompt(
@@ -122,11 +127,15 @@ SEED_TAGS_FROM_FRAMES_PROMPT = SeedPrompt(
         "Title: {{title}}\n"
         "Description: {{description_or_none}}\n\n"
         "Below are keyframes from the video. Generate 8-12 YouTube search "
-        "tags as a comma-separated list. Each tag 1-3 words, lowercase, "
+        "tags as a comma-separated list. Each tag MUST be 1–2 words and at "
+        "most 24 characters long — never a sentence or phrase. Lowercase, "
         "no quotes, no '#'. Return ONLY the comma-separated tags."
     ),
     variables=("title", "description", "description_or_none"),
-    system="You return ONLY a comma-separated list of tags, no preamble.",
+    system=(
+        "You return ONLY a comma-separated list of tags, no preamble. "
+        "Each tag is 1–2 words and at most 24 characters."
+    ),
 )
 
 SEED_SHORTEN_POST_PROMPT = SeedPrompt(
