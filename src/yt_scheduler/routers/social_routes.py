@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 
@@ -328,14 +329,24 @@ async def generate_posts(
 
         # Render every slot up-front (no DB writes yet) so we can surface
         # unresolved-variable problems *before* deleting any existing posts.
+        #
+        # F4: across-slot parallelism. ``tmpl.render`` is synchronous and
+        # internally fires one Claude round-trip per ``{{ai: ...}}`` block —
+        # so a 5-slot template with one inner+outer block per slot was
+        # serializing 10 sequential round-trips. We now collect the
+        # per-slot "needs rendering" closures up-front, fire them
+        # concurrently with asyncio.gather (each in a worker thread so
+        # the anthropic SDK's blocking IO doesn't stall the loop), then
+        # post-process results back in the request task. Within a single
+        # slot the nested-{{ai:}} walker stays sequential — that's a
+        # data dependency we can't parallelize.
         warnings: list[str] = []
         unresolved_names: set[str] = set()
-        # URL-family names that were referenced in a slot body but resolved
-        # to empty. We collect, dedupe, and warn once at the end so the
-        # user sees "{{url}} resolved to empty" without ten copies of the
-        # same warning for five slots.
         empty_url_refs: set[str] = set()
-        prepared: list[dict] = []
+
+        # Pre-render pass — early skips, URL-ref scan, build the list of
+        # slots we'll actually render. No AI calls, no DB writes here.
+        render_targets: list[dict] = []
         for slot in template.get("slots", []):
             if slot.get("is_disabled"):
                 continue
@@ -347,13 +358,10 @@ async def generate_posts(
 
             # Scan the body for url-family references before rendering so we
             # know which ones got referenced even if they substitute to "".
-            # The set is intersected with ctx["empty_url_keys"] below.
             url_refs_in_body = {m.group(1) for m in _URL_VAR_REF_RE.finditer(body)}
             for name in url_refs_in_body & ctx.get("empty_url_keys", set()):
                 empty_url_refs.add(name)
 
-            # Threads can't attach media (text-only API), so a {{video}} slot
-            # is skipped rather than posted without the video.
             if platform == "threads" and _VIDEO_DIRECTIVE_RE.search(body):
                 warnings.append(
                     "Threads slot skipped — {{video}} attachments aren't supported "
@@ -367,54 +375,93 @@ async def generate_posts(
                     500, f"Slot {slot.get('id')} ({platform}) has no max_chars"
                 )
 
+            cleaned_body = ""
             media_paths: list[str] = []
-            # Per-slot trace collector — populated by templates.render and
-            # ai.call_ai_block via the F1 plumbing. We persist it after
-            # the post row lands so the F3 ⓘ-modal can display it. None
-            # when the slot has no body to render (nothing to trace).
-            slot_trace: list[dict] | None = [] if body else None
             if body:
                 try:
-                    cleaned, media_paths, _alts = tmpl.extract_media_directives(
+                    cleaned_body, media_paths, _alts = tmpl.extract_media_directives(
                         body,
                         video_path=ctx["video_path"],
                         thumbnail_path=ctx["thumb_path"],
                         images=ctx["images"],
                     )
-                    slot_vars = {**ctx["variables"], **forced_empty, "max_chars": str(slot_max)}
-                    rendered = tmpl.render(
-                        cleaned, slot_vars, default_system_prompt=default_ai_system,
-                        trace=slot_trace,
-                    )
                 except Exception as e:
-                    rendered = f"[Error generating: {e}]"
-                    media_paths = []
-                    if slot_trace is not None:
-                        slot_trace.append({"kind": "error", "message": str(e)})
-            else:
-                rendered = ""
+                    # Media-directive extraction failed before any AI
+                    # call would have run — record an error trace and
+                    # carry on with an empty render. Same shape the old
+                    # exception path produced.
+                    error_trace: list[dict] = [{"kind": "error", "message": str(e)}]
+                    render_targets.append({
+                        "slot": slot,
+                        "platform": platform,
+                        "slot_max": int(slot_max),
+                        "cleaned_body": "",
+                        "media_paths": [],
+                        "rendered": f"[Error generating: {e}]",
+                        "trace": error_trace,
+                        "skip_render": True,
+                    })
+                    continue
 
-            # Trim leading/trailing whitespace at the boundary — AI blocks
-            # frequently emit a stray leading space or trailing newline,
-            # which would render as whitespace on the destination
-            # platform and would also cause near-identical content to
-            # bypass the dedup check by accident.
-            rendered = rendered.strip()
+            render_targets.append({
+                "slot": slot,
+                "platform": platform,
+                "slot_max": int(slot_max),
+                "cleaned_body": cleaned_body,
+                "media_paths": media_paths,
+                "rendered": None,  # filled in by the parallel render
+                "trace": [] if body else None,
+                "skip_render": not body,
+            })
+
+        # Parallel render across slots — each tmpl.render runs in its own
+        # worker thread so anthropic's sync client doesn't block the
+        # event loop. Slots already filled (early-skip / extract error
+        # path) are passed through untouched.
+        async def _render_target(target: dict) -> dict:
+            if target.get("skip_render"):
+                if target.get("rendered") is None:
+                    target["rendered"] = ""
+                return target
+            slot_vars = {
+                **ctx["variables"], **forced_empty,
+                "max_chars": str(target["slot_max"]),
+            }
+            try:
+                rendered = await asyncio.to_thread(
+                    tmpl.render,
+                    target["cleaned_body"],
+                    slot_vars,
+                    default_system_prompt=default_ai_system,
+                    trace=target["trace"],
+                )
+            except Exception as e:
+                rendered = f"[Error generating: {e}]"
+                target["media_paths"] = []
+                if target["trace"] is not None:
+                    target["trace"].append({"kind": "error", "message": str(e)})
+            target["rendered"] = rendered
+            return target
+
+        await asyncio.gather(*(_render_target(t) for t in render_targets))
+
+        # Post-render pass — strip whitespace, scan for unresolved
+        # variables, apply per-slot media fallback, and assemble the
+        # ``prepared`` list the INSERT loop below consumes. Synchronous
+        # again because nothing here hits Claude.
+        prepared: list[dict] = []
+        for target in render_targets:
+            slot = target["slot"]
+            platform = target["platform"]
+            rendered = (target.get("rendered") or "").strip()
             unresolved_names.update(_UNRESOLVED_VAR_RE.findall(rendered))
 
-            # If the template body had NO media directives, fall back to
-            # the slot's legacy `media` setting (thumbnail / video / none)
-            # so existing templates without directives still attach media.
+            media_paths = target.get("media_paths") or []
             if not media_paths:
                 fallback = _legacy_media_for_slot(slot, ctx)
                 if fallback:
                     media_paths = [fallback]
 
-            # Threads' API posts text only — it can't attach any media. Drop
-            # whatever was resolved (a {{thumbnail}}/{{image:...}} directive or
-            # the slot's media fallback) and warn, rather than silently
-            # discarding it at send time. ({{video}} slots were already
-            # skipped above.)
             if platform == "threads" and media_paths:
                 warnings.append(
                     "Threads slot will post text-only — Threads can't attach media yet, "
@@ -427,8 +474,8 @@ async def generate_posts(
                 "platform": platform,
                 "rendered": rendered,
                 "media_paths": media_paths,
-                "max_chars": int(slot_max),
-                "trace": slot_trace,
+                "max_chars": int(target["slot_max"]),
+                "trace": target.get("trace"),
             })
 
         # Unresolved-variable gate — bail before any destructive DB op.
