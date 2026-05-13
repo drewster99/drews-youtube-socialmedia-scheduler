@@ -164,7 +164,11 @@ SEED_AI_BLOCK_DEFAULT_SYSTEM_PROMPT = SeedPrompt(
     variables=(),
     system=(
         "You are a social media copywriter. Return ONLY the requested text, "
-        "no preamble, no quotes, no explanation."
+        "no preamble, no quotes, no explanation. "
+        "All URLs and links must include 'https://' at the beginning. "
+        "Do not use markdown link syntax — write URLs as plain text. "
+        "None of the supported platforms (X, Bluesky, Mastodon, LinkedIn, "
+        "Threads) reliably render markdown."
     ),
 )
 
