@@ -405,6 +405,7 @@ def call_ai_block(
     system: str | None,
     model: str | None = None,
     max_tokens: int = 512,
+    trace: list[dict] | None = None,
 ) -> str:
     """One Claude round-trip for a single template ``{{ai: ...}}`` block.
 
@@ -413,14 +414,34 @@ def call_ai_block(
     sends no system prompt. ``model=None`` falls back to
     ``settings.anthropic_model`` (or env). Used as the unified leaf call;
     the walker in `services/templates.py` handles nesting itself.
+
+    When ``trace`` is a list, one entry per call is appended with the
+    prompt, system text, resolved model, response text, and elapsed
+    ms. The collector is the F-series debug-log machinery — leave it
+    None for callers that don't care (no overhead either way).
     """
+    import time
+
     client = get_client()
+    resolved_model = model or _resolve_model_sync()
     kwargs: dict[str, object] = {
-        "model": model or _resolve_model_sync(),
+        "model": resolved_model,
         "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": prompt}],
     }
     if system:
         kwargs["system"] = system
+    start = time.monotonic()
     message = client.messages.create(**kwargs)
-    return message.content[0].text.strip()
+    elapsed_ms = int((time.monotonic() - start) * 1000)
+    result = message.content[0].text.strip()
+    if trace is not None:
+        trace.append({
+            "kind": "ai_call",
+            "prompt": prompt,
+            "system": system,
+            "model": resolved_model,
+            "response": result,
+            "elapsed_ms": elapsed_ms,
+        })
+    return result

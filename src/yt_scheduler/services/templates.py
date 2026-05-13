@@ -241,6 +241,7 @@ def render(
     default_system_prompt: str | None = DEFAULT_AI_SYSTEM_PROMPT,
     model: str | None = None,
     max_tokens: int = 512,
+    trace: list[dict] | None = None,
 ) -> str:
     """Single rendering primitive. Two passes:
 
@@ -272,12 +273,30 @@ def render(
     silently shipping a half-template to Claude.
     """
     variables = variables or {}
+    if trace is not None:
+        # Record the raw template, the variables we're about to
+        # substitute, and the result of the substitution pass — the
+        # F3 debug modal renders these in order so the user can see
+        # exactly how their template body became the prompt(s) sent
+        # to Claude. Variable values are coerced to strings for
+        # JSON-stable serialization.
+        trace.append({
+            "kind": "template_body",
+            "text": template_text,
+        })
+        trace.append({
+            "kind": "variables",
+            "values": {k: ("" if v is None else str(v)) for k, v in variables.items()},
+        })
     text = _substitute_variables(template_text, variables)
+    if trace is not None:
+        trace.append({"kind": "substituted", "text": text})
     return _resolve_ai_blocks(
         text,
         default_system_prompt=default_system_prompt,
         model=model,
         max_tokens=max_tokens,
+        trace=trace,
     )
 
 
@@ -315,6 +334,7 @@ def _resolve_ai_blocks(
     default_system_prompt: str | None,
     model: str | None,
     max_tokens: int,
+    trace: list[dict] | None = None,
 ) -> str:
     out: list[str] = []
     i = 0
@@ -369,6 +389,7 @@ def _resolve_ai_blocks(
             default_system_prompt=default_system_prompt,
             model=model,
             max_tokens=max_tokens,
+            trace=trace,
         )
         effective_system = (
             system_override if system_override is not None else default_system_prompt
@@ -378,6 +399,7 @@ def _resolve_ai_blocks(
             system=effective_system,
             model=model,
             max_tokens=max_tokens,
+            trace=trace,
         ))
         i = j
 

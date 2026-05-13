@@ -20,7 +20,9 @@ from unittest.mock import patch
 from yt_scheduler.services import templates
 
 
-def _fake_ai(prompt, *, system=None, model=None, max_tokens=512):
+def _fake_ai(prompt, *, system=None, model=None, max_tokens=512, trace=None):
+    # ``trace`` was added in F1 as the debug-log collector; tests that
+    # only care about the final rendered output accept it and ignore.
     return f"[AI({prompt})]"
 
 
@@ -99,7 +101,7 @@ def test_ai_block_with_variable_inside():
 def test_sibling_ai_blocks_independent():
     seen: list[str] = []
 
-    def fake(prompt, *, system=None, model=None, max_tokens=512):
+    def fake(prompt, *, system=None, model=None, max_tokens=512, trace=None):
         seen.append(prompt)
         return f"<{prompt}>"
 
@@ -112,7 +114,7 @@ def test_sibling_ai_blocks_independent():
 def test_nested_ai_blocks_resolve_inside_out():
     seen: list[str] = []
 
-    def fake(prompt, *, system=None, model=None, max_tokens=512):
+    def fake(prompt, *, system=None, model=None, max_tokens=512, trace=None):
         seen.append(prompt)
         return prompt.upper().replace(" ", "_")
 
@@ -125,7 +127,7 @@ def test_nested_ai_blocks_resolve_inside_out():
 def test_nested_with_variables_at_each_level():
     seen: list[str] = []
 
-    def fake(prompt, *, system=None, model=None, max_tokens=512):
+    def fake(prompt, *, system=None, model=None, max_tokens=512, trace=None):
         seen.append(prompt)
         return f"<{prompt}>"
 
@@ -151,7 +153,7 @@ def test_unbalanced_opener_emitted_literal():
 def test_per_block_system_override():
     seen: list[dict] = []
 
-    def fake(prompt, *, system=None, model=None, max_tokens=512):
+    def fake(prompt, *, system=None, model=None, max_tokens=512, trace=None):
         seen.append({"prompt": prompt, "system": system})
         return f"<{prompt}>"
 
@@ -171,7 +173,7 @@ def test_per_block_system_override():
 def test_default_system_override_at_render_call():
     seen: list[dict] = []
 
-    def fake(prompt, *, system=None, model=None, max_tokens=512):
+    def fake(prompt, *, system=None, model=None, max_tokens=512, trace=None):
         seen.append({"prompt": prompt, "system": system})
         return ""
 
@@ -187,7 +189,7 @@ def test_default_system_override_at_render_call():
 def test_nested_inner_inherits_outer_system_override():
     seen: list[dict] = []
 
-    def fake(prompt, *, system=None, model=None, max_tokens=512):
+    def fake(prompt, *, system=None, model=None, max_tokens=512, trace=None):
         seen.append({"prompt": prompt, "system": system})
         return prompt
 
