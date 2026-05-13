@@ -149,18 +149,85 @@ async def get_video(video_id: str):
     rows = await db.execute_fetchall("SELECT * FROM videos WHERE id = ?", (video_id,))
     if not rows:
         raise HTTPException(404, "Video not found")
-    result = _video_public(dict(rows[0]))
+    row = dict(rows[0])
 
     await _bind_project_for_video(video_id)
     # Also fetch live YouTube data
+    yt_data = None
+    yt_error: str | None = None
     try:
         yt_data = youtube.get_video(video_id)
-        if yt_data:
-            result["youtube_data"] = yt_data
     except Exception as e:
-        result["youtube_data_error"] = str(e)
+        yt_error = str(e)
+
+    # Auto-sync local DB from YouTube. Whenever the canonical fields
+    # (title, description, tags, privacy_status) drift on YouTube — the
+    # user edited them in Studio, another tool updated them, etc. — we
+    # take YouTube's value as truth and overwrite the local row. The
+    # user's in-progress unsaved form edits are protected client-side
+    # (loadVideo() preserves dirty fields), so this can't clobber typed
+    # but unsent text. Only runs when we actually got a yt_data response
+    # — a 404 from YouTube (standalone item, deleted video) leaves the
+    # local row untouched.
+    if yt_data:
+        updates = _diff_youtube_metadata(row, yt_data)
+        if updates:
+            sets = ", ".join(f"{col} = ?" for col in updates)
+            params = list(updates.values()) + [video_id]
+            await db.execute(
+                f"UPDATE videos SET {sets}, updated_at = datetime('now') WHERE id = ?",
+                params,
+            )
+            await db.commit()
+            rows = await db.execute_fetchall(
+                "SELECT * FROM videos WHERE id = ?", (video_id,)
+            )
+            if rows:
+                row = dict(rows[0])
+
+    result = _video_public(row)
+    if yt_data:
+        result["youtube_data"] = yt_data
+    if yt_error is not None:
+        result["youtube_data_error"] = yt_error
 
     return result
+
+
+def _diff_youtube_metadata(local_row: dict, yt_data: dict) -> dict[str, object]:
+    """Return the subset of (title, description, tags, privacy_status)
+    where YouTube's value differs from what we have locally — the
+    caller turns this dict into a single UPDATE.
+
+    Only compares the four canonical fields the user can edit. Returns
+    {} when everything matches so the caller can skip the DB write."""
+    snippet = (yt_data or {}).get("snippet", {}) or {}
+    status = (yt_data or {}).get("status", {}) or {}
+
+    yt_title = snippet.get("title")
+    yt_description = snippet.get("description")
+    yt_tags = snippet.get("tags") or []
+    yt_privacy = status.get("privacyStatus")
+
+    out: dict[str, object] = {}
+    if yt_title is not None and yt_title != (local_row.get("title") or ""):
+        out["title"] = yt_title
+    if yt_description is not None and yt_description != (local_row.get("description") or ""):
+        out["description"] = yt_description
+    # Tags are stored as JSON-encoded array in the DB; compare against
+    # the decoded list so a no-op re-serialization doesn't trip the diff.
+    local_tags_raw = local_row.get("tags") or "[]"
+    try:
+        local_tags = json.loads(local_tags_raw) if local_tags_raw else []
+        if not isinstance(local_tags, list):
+            local_tags = []
+    except json.JSONDecodeError:
+        local_tags = []
+    if list(yt_tags) != list(local_tags):
+        out["tags"] = json.dumps(list(yt_tags))
+    if yt_privacy and yt_privacy != (local_row.get("privacy_status") or ""):
+        out["privacy_status"] = yt_privacy
+    return out
 
 
 _YT_BACKED_ITEM_TYPES = {"episode", "short", "segment", "hook"}

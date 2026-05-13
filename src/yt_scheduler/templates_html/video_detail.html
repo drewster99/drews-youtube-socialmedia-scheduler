@@ -538,19 +538,38 @@ async function loadVideo() {
             frameborder="0" allowfullscreen></iframe>
     `;
 
-    // Metadata form
-    document.getElementById('meta-title').value = video.title;
-    document.getElementById('meta-description').value = video.description || '';
+    // Metadata form. Server-side auto-syncs from YouTube each fetch
+    // (video_routes.get_video), so the row we're rendering can change
+    // between the first load and a polling tick. Preserve any field the
+    // user has typed into but not yet saved — compare the live form
+    // value against the prior metaSnapshot to detect dirtiness, then
+    // only overwrite fields that are pristine. metaSnapshot always
+    // tracks the latest server value so a Save (or Revert) compares
+    // against current truth.
     const tags = video.tags ? JSON.parse(video.tags) : [];
-    document.getElementById('meta-tags').value = tags.join(', ');
-    document.getElementById('meta-privacy').value = video.privacy_status;
-
-    metaSnapshot = {
+    const newSnap = {
         title: video.title || '',
         description: video.description || '',
         tags: tags.join(', '),
         privacy_status: video.privacy_status || 'unlisted',
     };
+    const prevForm = {
+        title: document.getElementById('meta-title').value,
+        description: document.getElementById('meta-description').value,
+        tags: document.getElementById('meta-tags').value,
+        privacy_status: document.getElementById('meta-privacy').value,
+    };
+    // First-load case: every form field is empty default (or untouched
+    // initial value). Apply server values unconditionally. After that,
+    // a field is "dirty" iff its current value differs from the prior
+    // snapshot — that's the only thing we treat as user-typed.
+    const wasDirty = (k) => prevForm[k] !== metaSnapshot[k];
+    if (!wasDirty('title'))          document.getElementById('meta-title').value = newSnap.title;
+    if (!wasDirty('description'))    document.getElementById('meta-description').value = newSnap.description;
+    if (!wasDirty('tags'))           document.getElementById('meta-tags').value = newSnap.tags;
+    if (!wasDirty('privacy_status')) document.getElementById('meta-privacy').value = newSnap.privacy_status;
+
+    metaSnapshot = newSnap;
     refreshDirtyState();
     updateRegenerateVisibility();
     updateTagGenVisibility();
