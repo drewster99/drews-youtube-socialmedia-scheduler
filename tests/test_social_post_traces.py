@@ -92,8 +92,8 @@ async def test_cascade_delete_with_post(client: TestClient) -> None:
     from yt_scheduler.database import get_db
     db = await get_db()
     # The schema declares ON DELETE CASCADE; SQLite honors it only when
-    # foreign_keys are enabled per-connection. The DB initializer turns
-    # them on (database._enable_fk), so this delete should cascade.
+    # ``PRAGMA foreign_keys = ON`` was set on this connection, which
+    # ``database.get_db()`` does on first acquire.
     await db.execute("DELETE FROM social_posts WHERE id = ?", (post_id,))
     await db.commit()
 

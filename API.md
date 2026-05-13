@@ -580,7 +580,12 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 
 **Purpose** — Full details for a single video, plus a live YouTube readback.
 
-**Response 200** — The local row (all `videos` columns, with the same `thumbnail_path`/`video_file_path` → `thumbnail_url`/`video_file_url`/`video_file_name` transformation as `GET /api/videos`) plus either `youtube_data` (the full `videos.list()` response) or `youtube_data_error` (string) if the readback failed.
+**Response 200** — The local row (all `videos` columns, with `thumbnail_path` / `video_file_path` / `youtube_thumbnail_path` rewritten to `/media/...` URLs as `thumbnail_url` / `video_file_url` / `video_file_name` / `youtube_thumbnail_media_url`) plus either `youtube_data` (the full `videos.list()` response) or `youtube_data_error` (string) if the readback failed.
+
+**Side effects** —
+
+- **Auto-sync from YouTube (C2, migration 010)**: when a `youtube_data` readback succeeded, the four canonical user-editable fields (`title`, `description`, `tags`, `privacy_status`) are diffed against the local row and any drifted field is `UPDATE`d in place so the response always reflects current YouTube state.
+- **Dual-thumbnail refresh (C3, migration 018)**: schedules a fire-and-forget background task (`services.thumbnail_sync.schedule_refresh`) that re-downloads the YouTube-side thumbnail when its URL changed and runs a Claude-vision compare against the user's local copy. Verdict lands on `thumbnail_compare_verdict` / `thumbnail_compared_at` for the next GET to pick up. Idempotent per video — overlapping requests share the same in-flight task.
 
 **Errors** — `404` (no local row).
 
@@ -852,7 +857,27 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 
 **Errors** — `500` (YouTube rejected the thumbnail).
 
-**Side effects** — Saves file under `UPLOAD_DIR`; calls `youtube.set_thumbnail`; updates `videos.thumbnail_path`.
+**Side effects** — Saves file under `UPLOAD_DIR`; calls `youtube.set_thumbnail`; updates `videos.thumbnail_path`. Marks `videos.thumbnail_source='user'` and clears `thumbnail_compare_verdict` so the next `GET /api/videos/{id}` re-asks Claude whether the local copy matches what YouTube has.
+
+### `POST /api/videos/{video_id}/thumbnail/use-youtube`
+
+**Purpose** — Promote the cached YouTube-side thumbnail (`videos.youtube_thumbnail_path`, populated by the C3 background refresh) to be the active local thumbnail. Used from the Thumbnail-compare panel on the detail page when Claude flagged the user's copy and the live YouTube copy as different and the user prefers the live one.
+
+**Response 200** — `{"status": "ok"}`.
+
+**Errors** — `404` (no video row), `400` (no cached YouTube thumbnail yet — open the video so the background refresh has a chance to fetch one).
+
+**Side effects** — Copies `youtube_thumbnail_path` over `thumbnail_path`, sets `thumbnail_source='youtube'`, marks `thumbnail_compare_verdict='same'` and stamps `thumbnail_compared_at`.
+
+### `POST /api/videos/{video_id}/thumbnail/push-to-youtube`
+
+**Purpose** — Upload the current local thumbnail back to YouTube via `youtube.set_thumbnail`. Used from the same compare panel when the user wants to keep what they uploaded and overwrite what YouTube currently shows.
+
+**Response 200** — `{"status": "ok"}`.
+
+**Errors** — `404` (no video row), `400` (no local thumbnail to push), `500` (YouTube rejected the upload).
+
+**Side effects** — Marks `thumbnail_compare_verdict='same'` and stamps `thumbnail_compared_at` (best-effort — the next GET re-runs the compare if YouTube re-encoded the upload into something visually distinct).
 
 ---
 
@@ -951,6 +976,22 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 **Purpose** — All social posts for a video.
 
 **Response 200** — Array of `social_posts` rows ordered by platform, with one transformation: the absolute-path columns `media_path` and `media_paths` are **removed** and replaced by `media_urls` (array of `/media/<name>` strings) and `media_filenames` (array of bare filenames). Both arrays are empty when the post has no attachment.
+
+### `GET /api/social/posts/{post_id}/trace`
+
+**Purpose** — Return the F-series debug-log trace for a generated social post (templates.render's per-step capture: template body, variable substitutions, rendered prompt, and every Claude round-trip with prompt/system/model/response/elapsed_ms). Powers the ⓘ-button modal on the video-detail page.
+
+**Response 200** — `{"post_id": int, "created_at": "<ISO>", "trace": [...]}`. Each entry in `trace` is one of:
+
+- `{"kind": "template_body", "text": str}`
+- `{"kind": "variables", "values": {str: str}}`
+- `{"kind": "substituted", "text": str}`
+- `{"kind": "ai_call", "prompt": str, "system": str | null, "model": str, "response": str, "elapsed_ms": int}`
+- `{"kind": "error", "message": str}` — render-time failures (media-directive parse, AI exception).
+
+**Errors** — `404` (no trace for that `post_id` — either the trace was pruned by the 24h retention job, or the post was created before F2 landed).
+
+**Retention** — Rows persist for 24h (`prune_social_post_traces_job` runs hourly, evicts anything older than 24 hours). FK cascade-deletes the trace when the parent `social_posts` row is removed.
 
 ### `PUT /api/social/posts/{post_id}`
 

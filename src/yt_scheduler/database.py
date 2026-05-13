@@ -24,6 +24,13 @@ async def get_db() -> aiosqlite.Connection:
         ensure_dirs()
         _db = await aiosqlite.connect(str(DB_PATH))
         _db.row_factory = aiosqlite.Row
+        # SQLite default is foreign_keys = OFF per connection. We DEPEND
+        # on ON DELETE CASCADE for several FKs (template_slots → templates,
+        # social_post_traces → social_posts, project-scoped tables, etc.) —
+        # without this, an existing DB whose migration 002 already ran
+        # would silently lose cascading deletes on the next process start
+        # (the per-connection pragma doesn't survive close()).
+        await _db.execute("PRAGMA foreign_keys = ON")
         await apply_migrations(_db)
     return _db
 
