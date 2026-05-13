@@ -81,6 +81,62 @@ def _render_template_body(body: str, variables: dict[str, str]) -> str:
     return templates.render(body, variables)
 
 
+async def compare_thumbnails(a_bytes: bytes, b_bytes: bytes) -> str:
+    """Ask Claude whether two thumbnail images are visually the same.
+
+    Returns ``"same"`` when the model judges them equivalent up to
+    encoding/resolution/compression (i.e. the same picture YouTube
+    re-encoded), ``"different"`` when content has actually changed. Any
+    other response also counts as ``"different"`` — false positives
+    just mean we surface a "may have changed" callout the user can
+    dismiss, which is far less harmful than missing a real change.
+    """
+    import base64
+
+    instructions = (
+        "I will show you two thumbnail images. The first is the one we "
+        "uploaded; the second is what's currently on YouTube. Answer with "
+        "exactly one word: 'same' if they appear to be the same image "
+        "(differences in encoding, compression, resolution, or color "
+        "profile are fine — those happen automatically when YouTube "
+        "re-encodes an uploaded thumbnail), or 'different' if the actual "
+        "subject of the image has changed. No explanation."
+    )
+    content: list[dict] = [
+        {"type": "text", "text": instructions},
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": base64.b64encode(a_bytes).decode("ascii"),
+            },
+        },
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": base64.b64encode(b_bytes).decode("ascii"),
+            },
+        },
+    ]
+
+    client = get_client()
+    message = await asyncio.to_thread(
+        client.messages.create,
+        model=await _resolve_model(),
+        max_tokens=8,
+        messages=[{"role": "user", "content": content}],
+        system=(
+            "You answer with exactly one word — 'same' or 'different' — "
+            "and nothing else."
+        ),
+    )
+    raw = message.content[0].text.strip().lower()
+    return "same" if raw.startswith("same") else "different"
+
+
 # Tag cleaning shared by generate_tags_from_metadata and
 # generate_tags_from_frames. The LLM is told (in both seed body + system)
 # that tags must be 1–2 words and ≤24 characters, but the model

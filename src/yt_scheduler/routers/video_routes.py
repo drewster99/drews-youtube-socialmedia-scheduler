@@ -77,8 +77,13 @@ def _video_public(row: dict) -> dict:
     out["thumbnail_url"] = media_url(out.get("thumbnail_path"))
     out["video_file_url"] = media_url(out.get("video_file_path"))
     out["video_file_name"] = media_filename(out.get("video_file_path"))
+    # Dual-thumbnail (migration 018): the YouTube-side copy lives on a
+    # separate column so the detail page can render both side-by-side
+    # when the Claude-vision compare flagged them as different.
+    out["youtube_thumbnail_media_url"] = media_url(out.get("youtube_thumbnail_path"))
     out.pop("thumbnail_path", None)
     out.pop("video_file_path", None)
+    out.pop("youtube_thumbnail_path", None)
     return out
 
 
@@ -184,6 +189,14 @@ async def get_video(video_id: str):
             )
             if rows:
                 row = dict(rows[0])
+
+    # Schedule the dual-thumbnail refresh + Claude compare in the
+    # background. The next loadVideo() poll on the detail page picks
+    # up thumbnail_compare_verdict / youtube_thumbnail_media_url once
+    # the background task lands its UPDATE.
+    if yt_data:
+        from yt_scheduler.services import thumbnail_sync
+        thumbnail_sync.schedule_refresh(video_id, yt_data)
 
     result = _video_public(row)
     if yt_data:
@@ -1064,11 +1077,81 @@ async def set_thumbnail(video_id: str, file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(500, f"Failed to set thumbnail: {e}")
 
+    # The user just made our local thumbnail the truth, so it's a
+    # 'user' source again, and any stored compare verdict is stale —
+    # the next get_video will refresh youtube_thumbnail_url and ask
+    # Claude again.
     db = await get_db()
     await db.execute(
-        "UPDATE videos SET thumbnail_path = ?, updated_at = datetime('now') WHERE id = ?",
+        "UPDATE videos SET thumbnail_path = ?, thumbnail_source = 'user', "
+        "thumbnail_compare_verdict = NULL, thumbnail_compared_at = NULL, "
+        "updated_at = datetime('now') WHERE id = ?",
         (str(path), video_id),
     )
     await db.commit()
 
+    return {"status": "ok"}
+
+
+@router.post("/{video_id}/thumbnail/use-youtube")
+async def use_youtube_thumbnail(video_id: str):
+    """Promote the cached YouTube-side thumbnail to be the active local
+    thumbnail. Used when the Claude-vision compare flagged the two as
+    different and the user prefers what's currently on YouTube. The
+    YouTube-side file is left in place (still in UPLOAD_DIR) so future
+    fetches have something to diff against."""
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT youtube_thumbnail_path FROM videos WHERE id = ?", (video_id,)
+    )
+    if not rows:
+        raise HTTPException(404, "Video not found")
+    yt_local = rows[0]["youtube_thumbnail_path"]
+    if not yt_local or not Path(yt_local).exists():
+        raise HTTPException(
+            400,
+            "No cached YouTube thumbnail to promote. Open the video so the "
+            "thumbnail-sync background task can fetch one.",
+        )
+    await db.execute(
+        "UPDATE videos SET thumbnail_path = ?, thumbnail_source = 'youtube', "
+        "thumbnail_compare_verdict = 'same', thumbnail_compared_at = datetime('now'), "
+        "updated_at = datetime('now') WHERE id = ?",
+        (yt_local, video_id),
+    )
+    await db.commit()
+    return {"status": "ok"}
+
+
+@router.post("/{video_id}/thumbnail/push-to-youtube")
+async def push_thumbnail_to_youtube(video_id: str):
+    """Upload the current local thumbnail back to YouTube. Used when
+    Claude flagged the two as different and the user wants to keep
+    what they uploaded. After a successful push, YouTube should match
+    the local copy so we mark the verdict 'same' (best-effort — the
+    next compare on a fresh open will catch any re-encode that flips
+    Claude's mind)."""
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT thumbnail_path FROM videos WHERE id = ?", (video_id,)
+    )
+    if not rows:
+        raise HTTPException(404, "Video not found")
+    local = rows[0]["thumbnail_path"]
+    if not local or not Path(local).exists():
+        raise HTTPException(400, "No local thumbnail to push.")
+
+    await _bind_project_for_video(video_id)
+    try:
+        youtube.set_thumbnail(video_id, Path(local))
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to push thumbnail: {exc}") from exc
+
+    await db.execute(
+        "UPDATE videos SET thumbnail_compare_verdict = 'same', "
+        "thumbnail_compared_at = datetime('now'), "
+        "updated_at = datetime('now') WHERE id = ?",
+        (video_id,),
+    )
+    await db.commit()
     return {"status": "ok"}

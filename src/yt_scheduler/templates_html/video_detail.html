@@ -167,9 +167,14 @@
             <form id="thumb-form" style="margin-top: 0.5rem;">
                 <input type="file" id="thumb-file" accept="image/*" style="display:none;">
                 <button type="button" class="btn btn-sm" onclick="document.getElementById('thumb-file').click()">
-                    Change Thumbnail
+                    Change thumbnail
                 </button>
             </form>
+            <!-- Dual-thumbnail compare panel — populated by renderThumbnailCompare()
+                 only when the Claude-vision verdict is 'different' AND we have
+                 the user-side thumbnail (otherwise there's nothing to choose
+                 between). -->
+            <div id="thumbnail-compare" style="display: none; margin-top: 0.75rem;"></div>
         </div>
 
         <div class="card">
@@ -644,6 +649,7 @@ async function loadVideo() {
             <img src="${video.thumbnail_url}" alt="Thumbnail">
         `;
     }
+    renderThumbnailCompare(video);
 
     // Transcript
     if (video.transcript) {
@@ -954,6 +960,65 @@ function startLogPolling() {
     _logPollTimer = setInterval(_logPollTick, 15_000);
 }
 
+// Dual-thumbnail compare panel. Hidden whenever the verdict is anything
+// but 'different', or when we don't have a user-side thumbnail to choose
+// instead of the YouTube one. The two buttons hit dedicated endpoints
+// that update the row, after which the next poll tick (or a manual
+// refresh) re-renders this panel hidden again because verdict == 'same'.
+function renderThumbnailCompare(video) {
+    const panel = document.getElementById('thumbnail-compare');
+    if (!panel) return;
+    const verdict = video.thumbnail_compare_verdict || null;
+    const source = video.thumbnail_source || null;
+    const ytUrl = video.youtube_thumbnail_media_url || null;
+    if (verdict !== 'different' || source !== 'user' || !ytUrl || !video.thumbnail_url) {
+        panel.style.display = 'none';
+        panel.innerHTML = '';
+        return;
+    }
+    panel.style.display = 'block';
+    panel.innerHTML = `
+        <p class="form-hint" style="margin: 0 0 0.5rem;"><strong>Thumbnail may have changed on YouTube.</strong>
+        Claude flagged these as different. Pick whichever should be the source of truth.</p>
+        <div style="display: flex; gap: 0.75rem;">
+            <div style="flex: 1; text-align: center;">
+                <img src="${escapeHtml(video.thumbnail_url)}" alt="Yours"
+                     style="width: 100%; max-height: 100px; object-fit: contain; border: 1px solid var(--border); border-radius: var(--radius-sm);">
+                <p class="form-hint" style="margin: 0.25rem 0;">Yours (local)</p>
+                <button class="btn btn-sm" type="button" onclick="pushThumbnailToYouTube()">Push mine to YouTube</button>
+            </div>
+            <div style="flex: 1; text-align: center;">
+                <img src="${escapeHtml(ytUrl)}" alt="YouTube"
+                     style="width: 100%; max-height: 100px; object-fit: contain; border: 1px solid var(--border); border-radius: var(--radius-sm);">
+                <p class="form-hint" style="margin: 0.25rem 0;">YouTube (current)</p>
+                <button class="btn btn-sm" type="button" onclick="useYouTubeThumbnail()">Use the YouTube one</button>
+            </div>
+        </div>
+    `;
+}
+
+async function useYouTubeThumbnail() {
+    const resp = await fetch(`/api/videos/${videoId}/thumbnail/use-youtube`, {method: 'POST'});
+    if (resp.ok) {
+        showToast('Using YouTube thumbnail', 'success');
+        await loadVideo();
+    } else {
+        const body = await resp.json().catch(() => ({}));
+        showToast(`Could not switch: ${body.detail || resp.status}`, 'error');
+    }
+}
+
+async function pushThumbnailToYouTube() {
+    const resp = await fetch(`/api/videos/${videoId}/thumbnail/push-to-youtube`, {method: 'POST'});
+    if (resp.ok) {
+        showToast('Pushed your thumbnail back to YouTube', 'success');
+        await loadVideo();
+    } else {
+        const body = await resp.json().catch(() => ({}));
+        showToast(`Push failed: ${body.detail || resp.status}`, 'error');
+    }
+}
+
 // While the server is mid-download of the YouTube mp4 (an import path
 // kicks off in auto_actions._maybe_download_video_file), poll
 // /api/videos/{id} every 3s until video_file_url shows up (or the
@@ -962,8 +1027,23 @@ function startLogPolling() {
 // the player + local-file pill in place — no reload needed.
 let _busyPollTimer = null;
 function maybePollWhileBusy(video) {
-    const state = video?.video_file_download_state || null;
-    const stillBusy = state === 'in_progress';
+    // Two signals keep the 3s tick alive:
+    //   1. mp4 download in progress (auto_actions._maybe_download_video_file)
+    //   2. thumbnail compare pending — the YouTube-side thumbnail just
+    //      changed and we kicked off a background fetch + Claude
+    //      compare. NULL verdict + user-side thumbnail = "still
+    //      waiting", so poll until either verdict lands or the user
+    //      navigates away.
+    const dlState = video?.video_file_download_state || null;
+    const compareSource = video?.thumbnail_source || null;
+    const compareVerdict = video?.thumbnail_compare_verdict || null;
+    const ytThumbUrl = video?.youtube_thumbnail_url || null;
+    const ytLocal = video?.youtube_thumbnail_media_url || null;
+    const compareInFlight = compareSource === 'user'
+        && !!ytThumbUrl
+        && compareVerdict === null
+        && !!ytLocal;
+    const stillBusy = dlState === 'in_progress' || compareInFlight;
     if (stillBusy) {
         if (_busyPollTimer) return;
         _busyPollTimer = setInterval(() => {

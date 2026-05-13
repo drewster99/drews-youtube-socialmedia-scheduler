@@ -173,15 +173,27 @@ async def import_video(video_id: str, *, project_id: int) -> dict:
     # consistent.)
     youtube_url = f"https://youtu.be/{video_id}"
 
+    # Seed the dual-thumbnail columns (migration 018): a freshly-imported
+    # row's local copy IS the YouTube thumbnail we just downloaded, so
+    # thumbnail_source='youtube', youtube_thumbnail_path mirrors
+    # thumbnail_path, and youtube_thumbnail_url records the source URL
+    # so the next GET /api/videos/{id} doesn't re-download an identical
+    # image just to find nothing changed.
+    thumbnail_source_value = "youtube" if thumbnail_path else None
+    youtube_thumbnail_path_value = thumbnail_path
+    youtube_thumbnail_url_value = thumb_url if thumbnail_path else None
+
     await db.execute(
         """INSERT INTO videos (
             id, project_id, title, description, tags, privacy_status,
             thumbnail_path, status, imported_from_youtube,
-            duration_seconds, tier, youtube_kind, url
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'uploaded', 1, ?, ?, ?, ?)""",
+            duration_seconds, tier, youtube_kind, url,
+            thumbnail_source, youtube_thumbnail_path, youtube_thumbnail_url
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'uploaded', 1, ?, ?, ?, ?, ?, ?, ?)""",
         (
             video_id, project_id, title, description, json.dumps(tags_list),
             privacy, thumbnail_path, duration, tier, youtube_kind, youtube_url,
+            thumbnail_source_value, youtube_thumbnail_path_value, youtube_thumbnail_url_value,
         ),
     )
     await db.commit()
