@@ -3,7 +3,15 @@
 
 {% block content %}
 <div class="page-header">
-    <h1>{{ current_project.name }} / Dashboard</h1>
+    <!-- Two-segment breadcrumb. Project name is brand-accented + linked
+         back to its dashboard so the user always has a "back to the
+         project root" path. "Dashboard" segment is white because it
+         IS this page — clicking it scrolls to top. -->
+    <h1 class="page-breadcrumb">
+        <a href="/projects/{{ current_project.slug }}" class="crumb crumb-project">{{ current_project.name }}</a>
+        <span class="crumb-sep">/</span>
+        <a href="/projects/{{ current_project.slug }}" class="crumb crumb-page">Dashboard</a>
+    </h1>
     <div style="display:flex; gap:0.5rem;">
         <button class="btn" id="compose-standalone-btn">Compose standalone post</button>
         <button class="btn btn-primary" id="upload-btn">Upload new video</button>

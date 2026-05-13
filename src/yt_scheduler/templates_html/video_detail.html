@@ -2,13 +2,24 @@
 {% block title %}Video Detail — Drew's Video + Socials Scheduler{% endblock %}
 
 {% block content %}
-<div class="page-header">
-    <h1 id="video-title">Loading...</h1>
-    <div class="header-actions">
-        <a class="btn btn-secondary" href="javascript:void(0)" onclick="openSocialsComposer()">Socials from template</a>
-        <button class="btn btn-secondary" id="btn-generate-posts" onclick="generatePosts()">Generate social posts</button>
-        <button class="btn btn-primary" id="btn-publish" onclick="publishVideo()">Publish + post now</button>
+<div class="page-header" style="flex-direction: column; align-items: flex-start;">
+    <!-- Breadcrumb row matches dashboard.html — same brand-accent
+         project segment, same "/" separator, then "Dashboard" linked
+         back to the project root. Video title goes below as its own
+         line so it remains the largest visual element on the page. -->
+    <div class="header-row" style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
+        <h2 class="page-breadcrumb" style="margin: 0;">
+            <a href="/projects/{{ current_project.slug }}" class="crumb crumb-project">{{ current_project.name }}</a>
+            <span class="crumb-sep">/</span>
+            <a href="/projects/{{ current_project.slug }}" class="crumb crumb-page">Dashboard</a>
+        </h2>
+        <div class="header-actions">
+            <a class="btn btn-secondary" href="javascript:void(0)" onclick="openSocialsComposer()">Socials from template</a>
+            <button class="btn btn-secondary" id="btn-generate-posts" onclick="generatePosts()">Generate social posts</button>
+            <button class="btn btn-primary" id="btn-publish" onclick="publishVideo()">Publish + post now</button>
+        </div>
     </div>
+    <h1 id="video-title" style="margin-top: 0.5rem;">Loading...</h1>
 </div>
 
 <div class="detail-grid">
