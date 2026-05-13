@@ -86,7 +86,7 @@
         </div>
 
         <div class="card">
-            <h2>Transcript</h2>
+            <h2>Transcript <span id="transcript-state-pill" style="font-size: 0.75rem; vertical-align: middle; margin-left: 0.4rem;"></span></h2>
             <div class="transcribe-controls">
                 <span>Transcribe with</span>
                 <select id="transcribe-backend" class="btn btn-sm" style="background: var(--bg-input); padding: 0.3rem 0.5rem;"></select>
@@ -651,12 +651,16 @@ async function loadVideo() {
     }
     renderThumbnailCompare(video);
 
-    // Transcript
+    // Transcript + the per-field fetch-state pill that disambiguates
+    // "we tried YouTube and they have no captions" from "haven't tried
+    // yet" — without this pill an empty transcript area looks like
+    // the latter even when we just confirmed the former.
     if (video.transcript) {
         document.getElementById('transcript-area').innerHTML = `
             <textarea id="transcript-text" rows="12" class="transcript-editor">${video.transcript}</textarea>
         `;
     }
+    renderTranscriptStatePill(video);
 
     // Community post
     const communityText = `NEW UPLOAD: ${video.title}\nhttps://youtu.be/${videoId}`;
@@ -958,6 +962,23 @@ function _logPollTick() {
 function startLogPolling() {
     if (_logPollTimer) return;
     _logPollTimer = setInterval(_logPollTick, 15_000);
+}
+
+// Per-field fetch-state pill for the Transcript section. Reads
+// videos.youtube_transcript_state (migration 019) so the user can see
+// at a glance whether YouTube has no captions for this video (the
+// caption fetch ran and came back empty) vs. nothing-tried-yet.
+function renderTranscriptStatePill(video) {
+    const pill = document.getElementById('transcript-state-pill');
+    if (!pill) return;
+    const state = video?.youtube_transcript_state || null;
+    if (state === 'fetched') {
+        pill.innerHTML = '<span class="badge badge-published">from YouTube</span>';
+    } else if (state === 'unavailable') {
+        pill.innerHTML = '<span class="badge badge-draft" title="YouTube has no captions for this video">no YouTube captions</span>';
+    } else {
+        pill.innerHTML = '';
+    }
 }
 
 // Dual-thumbnail compare panel. Hidden whenever the verdict is anything

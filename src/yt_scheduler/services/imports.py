@@ -205,6 +205,11 @@ async def import_video(video_id: str, *, project_id: int) -> dict:
     # Try to grab the YouTube transcript on import if one exists. Stored as
     # SRT (the canonical format with timestamps); plain-text consumers strip
     # on read via ``transcripts.srt_to_plain_text``.
+    #
+    # youtube_transcript_state (migration 019) records the outcome so the
+    # detail page can show "Transcript from YouTube" vs. "No YouTube
+    # captions for this video" vs. nothing (haven't checked) — without
+    # this column the empty `transcript` field is ambiguous.
     try:
         captions = youtube.list_captions(video_id)
         if captions:
@@ -219,13 +224,27 @@ async def import_video(video_id: str, *, project_id: int) -> dict:
                     transcript_source = 'youtube',
                     transcript_created_at = datetime('now'),
                     transcript_updated_at = datetime('now'),
-                    status = 'captioned'
+                    status = 'captioned',
+                    youtube_transcript_state = 'fetched'
                 WHERE id = ?""",
                 (text, transcript_id, video_id),
             )
             await db.commit()
+        else:
+            await db.execute(
+                "UPDATE videos SET youtube_transcript_state = 'unavailable' "
+                "WHERE id = ?",
+                (video_id,),
+            )
+            await db.commit()
     except Exception as exc:
         logger.info("No YouTube transcript available for %s: %s", video_id, exc)
+        await db.execute(
+            "UPDATE videos SET youtube_transcript_state = 'unavailable' "
+            "WHERE id = ?",
+            (video_id,),
+        )
+        await db.commit()
 
     # Run the import-column auto-actions in the background.
     await auto_actions.run_post_create_actions(
