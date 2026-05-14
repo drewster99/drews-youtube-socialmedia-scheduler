@@ -12,12 +12,18 @@ The flow:
   1. ``maybe_refresh_youtube_thumbnail`` runs as a background task off
      GET /api/videos/{id}. Skips fast when ``youtube_data`` has the
      same thumbnail URL we last fetched.
-  2. New URL → download the JPEG into ``UPLOAD_DIR`` and update
-     ``youtube_thumbnail_path`` / ``youtube_thumbnail_url``. Clear
-     ``thumbnail_compare_verdict`` so we know to re-ask Claude.
-  3. If ``thumbnail_source='user'`` and we have both bytes,
-     ``ai.compare_thumbnails`` adjudicates; the verdict lands on the
-     row and the detail page picks it up on the next poll tick.
+  2. New URL → optional HEAD precheck (G3): i.ytimg.com sends ``etag``
+     on HEAD, so we can short-circuit the GET when the ETag matches
+     what we recorded last fetch. Otherwise download the JPEG into
+     ``UPLOAD_DIR`` and update ``youtube_thumbnail_path`` /
+     ``youtube_thumbnail_url``.
+  3. (sha cache, G3) Compute sha256 of both local and youtube bytes.
+     If they match the stored ``thumbnail_compare_local_sha`` /
+     ``thumbnail_compare_youtube_sha`` AND a non-NULL verdict is on
+     file, that verdict still applies — skip the AI call entirely.
+  4. Otherwise ``ai.compare_thumbnails`` adjudicates; the verdict +
+     both shas land on the row and the detail page picks it up on
+     the next poll tick.
 
 A row with ``thumbnail_source='youtube'`` (the user never overrode)
 skips the vision compare entirely — the local copy IS the YouTube
@@ -27,6 +33,7 @@ copy, so a "different" verdict would be meaningless.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from pathlib import Path
 
@@ -86,6 +93,43 @@ async def _run(video_id: str, yt_data: dict | None) -> None:
         )
 
 
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+async def _youtube_thumbnail_unchanged(
+    url: str, etag: str | None,
+) -> bool | None:
+    """G3 — HEAD precheck against i.ytimg.com.
+
+    Returns ``True`` when the server confirms the bytes haven't
+    changed since the recorded ``etag``, ``False`` when they've
+    changed (or no etag was stored), and ``None`` when the HEAD
+    failed for any reason (treat as "I don't know — go fetch
+    normally" rather than holding up the user's polling tick).
+
+    YouTube's thumbnail CDN returns ``etag: "<unix-ish>"`` on every
+    response, so an ETag match is a strong signal — same URL, same
+    ETag means same bytes (modulo a rare regen with identical
+    content, which would only cost us one extra Claude call to
+    re-confirm).
+    """
+    if not etag:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.head(url, follow_redirects=True)
+        if resp.status_code != 200:
+            return None
+        new_etag = resp.headers.get("etag") or resp.headers.get("ETag")
+        if new_etag is None:
+            return None
+        return new_etag == etag
+    except Exception as exc:
+        logger.debug("HEAD precheck failed for %s: %s", url, exc)
+        return None
+
+
 async def maybe_refresh_youtube_thumbnail(
     video_id: str, yt_data: dict | None,
 ) -> None:
@@ -98,7 +142,9 @@ async def maybe_refresh_youtube_thumbnail(
     db = await get_db()
     rows = await db.execute_fetchall(
         "SELECT thumbnail_path, thumbnail_source, youtube_thumbnail_path, "
-        "youtube_thumbnail_url, thumbnail_compare_verdict "
+        "youtube_thumbnail_url, youtube_thumbnail_etag, "
+        "thumbnail_compare_verdict, thumbnail_compare_local_sha, "
+        "thumbnail_compare_youtube_sha "
         "FROM videos WHERE id = ?",
         (video_id,),
     )
@@ -111,25 +157,37 @@ async def maybe_refresh_youtube_thumbnail(
         row["youtube_thumbnail_path"]
     ).exists()
 
-    if not url_changed and not yt_path_missing:
-        # Nothing to refresh. If we never asked Claude (verdict=NULL)
-        # AND the user has their own thumbnail, fall through to the
-        # compare step so the verdict gets computed eventually.
-        if row.get("thumbnail_compare_verdict") is not None:
-            return
-        if row.get("thumbnail_source") != "user":
-            return
-    else:
+    # Decide whether to (re)fetch the YouTube-side thumbnail. Three
+    # cases produce a GET:
+    #   1) URL changed (new image on the server)
+    #   2) We never downloaded one / the file is gone
+    #   3) URL is unchanged but the HEAD precheck couldn't confirm
+    #      "still the same bytes" via the cached ETag
+    # When the URL is unchanged AND HEAD confirms the ETag still
+    # matches, the cached file is current and we skip the GET — but
+    # we still fall through to the SHA cache below so a CHANGE on
+    # the LOCAL side (user uploaded a new thumb) re-triggers Claude.
+    must_fetch = url_changed or yt_path_missing
+    if not must_fetch:
+        unchanged = await _youtube_thumbnail_unchanged(
+            new_url, row.get("youtube_thumbnail_etag"),
+        )
+        if unchanged is False or unchanged is None:
+            must_fetch = True
+
+    if must_fetch:
         # Fetch the new YouTube thumbnail to disk. The filename folds in
         # video id so multiple fetches don't collide with each other or
         # with the user's own upload (which uses its own filename).
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         target = UPLOAD_DIR / f"{video_id}_yt_thumb.jpg"
+        new_etag: str | None = None
         try:
             async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(new_url)
+                resp = await client.get(new_url, follow_redirects=True)
                 resp.raise_for_status()
                 target.write_bytes(resp.content)
+                new_etag = resp.headers.get("etag") or resp.headers.get("ETag")
         except Exception as exc:
             logger.warning(
                 "Could not download YouTube thumbnail for %s from %s: %s",
@@ -137,14 +195,19 @@ async def maybe_refresh_youtube_thumbnail(
             )
             return
         await db.execute(
-            "UPDATE videos SET youtube_thumbnail_path = ?, youtube_thumbnail_url = ?, "
-            "thumbnail_compare_verdict = NULL, thumbnail_compared_at = NULL, "
+            "UPDATE videos SET youtube_thumbnail_path = ?, "
+            "youtube_thumbnail_url = ?, youtube_thumbnail_etag = ?, "
+            "thumbnail_compare_verdict = NULL, "
+            "thumbnail_compared_at = NULL, "
             "updated_at = datetime('now') WHERE id = ?",
-            (str(target), new_url, video_id),
+            (str(target), new_url, new_etag, video_id),
         )
         await db.commit()
         row["youtube_thumbnail_path"] = str(target)
         row["youtube_thumbnail_url"] = new_url
+        row["youtube_thumbnail_etag"] = new_etag
+        # New bytes → previously-cached verdict is stale.
+        row["thumbnail_compare_verdict"] = None
 
     # Compare step — only meaningful when the user has their own
     # thumbnail AND we have both files on disk. A 'youtube' source
@@ -161,16 +224,35 @@ async def maybe_refresh_youtube_thumbnail(
     if not local.exists() or not yt_local.exists():
         return
 
+    local_bytes = local.read_bytes()
+    yt_bytes = yt_local.read_bytes()
+    local_sha = _sha256_bytes(local_bytes)
+    yt_sha = _sha256_bytes(yt_bytes)
+
+    # G3 — SHA-pair cache. Same bytes on both sides as last time AND
+    # we already have a verdict on file → no need to re-ask Claude.
+    cached_local_sha = row.get("thumbnail_compare_local_sha")
+    cached_yt_sha = row.get("thumbnail_compare_youtube_sha")
+    cached_verdict = row.get("thumbnail_compare_verdict")
+    if (
+        cached_verdict is not None
+        and cached_local_sha == local_sha
+        and cached_yt_sha == yt_sha
+    ):
+        return
+
     try:
-        verdict = await ai.compare_thumbnails(local.read_bytes(), yt_local.read_bytes())
+        verdict = await ai.compare_thumbnails(local_bytes, yt_bytes)
     except Exception as exc:
         logger.warning("Claude thumbnail compare failed for %s: %s", video_id, exc)
         return
 
     await db.execute(
         "UPDATE videos SET thumbnail_compare_verdict = ?, "
+        "thumbnail_compare_local_sha = ?, "
+        "thumbnail_compare_youtube_sha = ?, "
         "thumbnail_compared_at = datetime('now'), "
         "updated_at = datetime('now') WHERE id = ?",
-        (verdict, video_id),
+        (verdict, local_sha, yt_sha, video_id),
     )
     await db.commit()

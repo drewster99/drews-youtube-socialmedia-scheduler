@@ -103,15 +103,29 @@ async def test_refresh_downloads_new_thumbnail_and_runs_compare(
     # httpx client patch — never hit the network.
     class FakeResp:
         content = fake_yt_bytes
+        # G3: the GET branch now reads resp.headers for the ETag.
+        # Empty dict means "no ETag from this CDN response," which the
+        # code handles by storing NULL — fine for this test.
+        headers: dict = {}
         def raise_for_status(self):
             pass
     class FakeAsyncClient:
         def __init__(self, *a, **kw): pass
         async def __aenter__(self): return self
         async def __aexit__(self, *exc): return False
-        async def get(self, url):
+        async def get(self, url, **kwargs):
+            # G3: the production code now passes follow_redirects=True.
             assert url == fake_yt_url
             return FakeResp()
+        async def head(self, url, **kwargs):
+            # G3: HEAD precheck. This test seeds no etag and a brand-new
+            # row, so url_changed=True drives the GET branch directly —
+            # head() shouldn't actually be reached here, but we declare
+            # it so the mock class is a complete httpx.AsyncClient stand-in.
+            class _HeadResp:
+                status_code = 200
+                headers: dict = {}
+            return _HeadResp()
 
     from yt_scheduler.services import thumbnail_sync, ai as ai_service
     monkeypatch.setattr(thumbnail_sync.httpx, "AsyncClient", FakeAsyncClient)
