@@ -130,7 +130,14 @@ async def publish_video_job(video_id: str) -> dict:
         )
         if needs_youtube_publish:
             try:
-                youtube.update_video_metadata(video_id, privacy_status="public")
+                # APScheduler runs jobs on the asyncio loop; the sync
+                # google-api-python-client call below would block every
+                # other concurrent request for the round-trip. to_thread
+                # parks it on a worker.
+                await asyncio.to_thread(
+                    youtube.update_video_metadata,
+                    video_id, privacy_status="public",
+                )
                 await db.execute(
                     """UPDATE videos SET privacy_status = 'public', status = 'published',
                     updated_at = datetime('now') WHERE id = ?""",
@@ -867,7 +874,10 @@ async def check_captions_job() -> None:
         for row in rows:
             video_id = row["id"]
             try:
-                captions = youtube.list_captions(video_id)
+                # Same rationale as elsewhere — sync YouTube SDK calls
+                # inside an AsyncIOScheduler job block the loop until
+                # the round-trip returns.
+                captions = await asyncio.to_thread(youtube.list_captions, video_id)
                 auto_captions = [
                     c for c in captions
                     if c["snippet"].get("trackKind") == "ASR"
@@ -875,7 +885,9 @@ async def check_captions_job() -> None:
                 if auto_captions:
                     # Store SRT canonically — preserves segment timestamps for
                     # YouTube round-trip + chapter detection.
-                    caption_text = youtube.download_caption(auto_captions[0]["id"], fmt="srt")
+                    caption_text = await asyncio.to_thread(
+                        youtube.download_caption, auto_captions[0]["id"], fmt="srt",
+                    )
                     transcript_id = await transcript_service.upsert_transcript_for_source(
                         video_id, "youtube", caption_text
                     )

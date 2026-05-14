@@ -113,7 +113,9 @@ async def _build_render_context(db, video: dict) -> dict:
             project_for_yt = await get_project_by_id(project_id)
             if project_for_yt:
                 set_active_project(project_for_yt["slug"])
-            yt = youtube.get_video(video_id)
+            # Sync google-api-python-client call; offload off the loop
+            # to keep concurrent generate-posts requests responsive.
+            yt = await asyncio.to_thread(youtube.get_video, video_id)
             iso_dur = (yt or {}).get("contentDetails", {}).get("duration")
             tier = _tier_from_iso_duration(iso_dur)
         except Exception:
