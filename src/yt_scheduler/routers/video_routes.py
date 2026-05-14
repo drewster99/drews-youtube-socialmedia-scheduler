@@ -157,11 +157,15 @@ async def get_video(video_id: str):
     row = dict(rows[0])
 
     await _bind_project_for_video(video_id)
-    # Also fetch live YouTube data
+    # Also fetch live YouTube data. ``youtube.get_video`` is the
+    # google-api-python-client sync call — wrap it in to_thread so the
+    # event loop doesn't stall on the round-trip (the C1 polling tick
+    # hits this endpoint every 3s while a download is in progress;
+    # blocking inline meant every other concurrent request paused).
     yt_data = None
     yt_error: str | None = None
     try:
-        yt_data = youtube.get_video(video_id)
+        yt_data = await asyncio.to_thread(youtube.get_video, video_id)
     except Exception as e:
         yt_error = str(e)
 
@@ -320,7 +324,8 @@ async def upload_video(
 
     # Upload to YouTube
     try:
-        result = youtube.upload_video(
+        result = await asyncio.to_thread(
+            youtube.upload_video,
             file_path=video_path,
             title=title,
             description=description,
@@ -337,7 +342,7 @@ async def upload_video(
     thumbnail_error = None
     if thumbnail_path:
         try:
-            youtube.set_thumbnail(video_id, thumbnail_path)
+            await asyncio.to_thread(youtube.set_thumbnail, video_id, thumbnail_path)
         except Exception as e:
             thumbnail_error = str(e)
 
@@ -527,7 +532,8 @@ async def update_video(video_id: str, data: dict):
     # tags trimmed past length limits) so writing what-we-sent to the
     # DB drifts from reality. Always trust YouTube's response.
     try:
-        youtube.update_video_metadata(
+        await asyncio.to_thread(
+            youtube.update_video_metadata,
             video_id=video_id,
             title=data.get("title"),
             description=data.get("description"),
@@ -540,7 +546,7 @@ async def update_video(video_id: str, data: dict):
 
     confirmed = None
     try:
-        fresh = youtube.get_video(video_id)
+        fresh = await asyncio.to_thread(youtube.get_video, video_id)
         if fresh:
             snippet = fresh.get("snippet") or {}
             status = fresh.get("status") or {}
@@ -956,7 +962,7 @@ async def apply_description(video_id: str):
         raise HTTPException(400, "No generated description. Generate one first.")
 
     await _bind_project_for_video(video_id)
-    youtube.update_video_metadata(video_id, description=desc)
+    await asyncio.to_thread(youtube.update_video_metadata, video_id, description=desc)
 
     old_description = video.get("description") or ""
     await db.execute(
@@ -1045,7 +1051,7 @@ async def list_captions(video_id: str):
     """List available caption tracks."""
     await _bind_project_for_video(video_id)
     try:
-        return youtube.list_captions(video_id)
+        return await asyncio.to_thread(youtube.list_captions, video_id)
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -1055,7 +1061,9 @@ async def list_comments(video_id: str, max_results: int = 50):
     """List comments on a video."""
     await _bind_project_for_video(video_id)
     try:
-        return youtube.list_comment_threads(video_id, max_results=max_results)
+        return await asyncio.to_thread(
+            youtube.list_comment_threads, video_id, max_results=max_results
+        )
     except Exception as e:
         error_msg = str(e)
         if "disabled" in error_msg.lower() or "commentsDisabled" in error_msg:
@@ -1073,7 +1081,7 @@ async def set_thumbnail(video_id: str, file: UploadFile = File(...)):
 
     await _bind_project_for_video(video_id)
     try:
-        youtube.set_thumbnail(video_id, path)
+        await asyncio.to_thread(youtube.set_thumbnail, video_id, path)
     except Exception as e:
         raise HTTPException(500, f"Failed to set thumbnail: {e}")
 
@@ -1143,7 +1151,7 @@ async def push_thumbnail_to_youtube(video_id: str):
 
     await _bind_project_for_video(video_id)
     try:
-        youtube.set_thumbnail(video_id, Path(local))
+        await asyncio.to_thread(youtube.set_thumbnail, video_id, Path(local))
     except Exception as exc:
         raise HTTPException(500, f"Failed to push thumbnail: {exc}") from exc
 

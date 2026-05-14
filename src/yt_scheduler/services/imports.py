@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -53,7 +54,7 @@ async def list_available_imports(project_id: int, max_results: int = 50) -> list
     project = await get_project_by_id(project_id)
     if project:
         set_active_project(project["slug"])
-    items = youtube.list_channel_videos(max_results=max_results)
+    items = await asyncio.to_thread(youtube.list_channel_videos, max_results=max_results)
 
     deleted_known: list[str] = []
     out: list[dict] = []
@@ -104,7 +105,9 @@ async def list_available_imports(project_id: int, max_results: int = 50) -> list
     # set so each card can show duration + a coarse kind (video / short /
     # live). 1 API unit per chunk of 50 — cheap.
     if out:
-        meta = youtube.get_videos_kind_metadata([v["video_id"] for v in out])
+        meta = await asyncio.to_thread(
+            youtube.get_videos_kind_metadata, [v["video_id"] for v in out]
+        )
         for v in out:
             entry = meta.get(v["video_id"]) or {}
             cd = entry.get("contentDetails") or {}
@@ -127,7 +130,7 @@ async def import_video(video_id: str, *, project_id: int) -> dict:
     if project:
         set_active_project(project["slug"])
 
-    full = youtube.get_video(video_id)
+    full = await asyncio.to_thread(youtube.get_video, video_id)
     if not full:
         raise ValueError(f"Video {video_id} not found on YouTube")
     snippet = full.get("snippet", {})
@@ -211,9 +214,11 @@ async def import_video(video_id: str, *, project_id: int) -> dict:
     # captions for this video" vs. nothing (haven't checked) — without
     # this column the empty `transcript` field is ambiguous.
     try:
-        captions = youtube.list_captions(video_id)
+        captions = await asyncio.to_thread(youtube.list_captions, video_id)
         if captions:
-            text = youtube.download_caption(captions[0]["id"], fmt="srt")
+            text = await asyncio.to_thread(
+                youtube.download_caption, captions[0]["id"], fmt="srt"
+            )
             transcript_id = await transcript_service.upsert_transcript_for_source(
                 video_id, "youtube", text
             )
