@@ -474,16 +474,22 @@ async def _maybe_generate_socials(
         primary_media = media_paths[0] if media_paths else None
         media_type = slot.get("media", "thumbnail")
         sa_id = slot.get("social_account_id")
+        slot_id = slot.get("id")
 
+        # G1 — slot_id pins the post to the exact template_slots row
+        # that produced it so a later partial regenerate can target
+        # this one specifically (two same-platform multi-account slots
+        # are routed independently).
         await db.execute(
             """INSERT INTO social_posts
                    (video_id, platform, content, media_path, media_paths,
-                    media_type, status, social_account_id, max_chars)
-            VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?)""",
+                    media_type, status, social_account_id, max_chars, slot_id)
+            VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)""",
             (
                 video_id, platform, rendered,
                 primary_media, media_paths_json,
                 media_type, sa_id, int(slot_max),
+                int(slot_id) if slot_id is not None else None,
             ),
         )
     await db.commit()

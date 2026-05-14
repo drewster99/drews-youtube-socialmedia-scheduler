@@ -90,10 +90,14 @@ let templates = [];
 let currentTemplateSlots = [];       // [{id, platform, account_username, is_disabled}, ...]
 let posts = [];     // the just-generated, still-actionable posts (drafts etc.)
 let postingSettings = null;
-// The set of platforms the just-generated batch covers. Derived from
-// the checked slot rows at Generate-time — used to filter out stale
-// drafts on platforms not present in the current template.
+// The set of platforms + slot_ids the just-generated batch covers.
+// Derived from the checked slot rows at Generate-time — used to
+// filter out stale drafts not present in the current template.
+// composedSlotIds is the precise filter (G1); composedPlatforms is the
+// back-compat fallback for legacy social_posts rows whose slot_id is
+// NULL (pre-migration 021).
 let composedPlatforms = [];
+let composedSlotIds = [];
 let priorPostsByPlatform = {};       // platform -> most recent already-posted row (for the note)
 let videoTier = null;                // current video's tier; filters the picker
 
@@ -101,15 +105,30 @@ let videoTier = null;                // current video's tier; filters the picker
 // platforms we just generated for — drafts / failed / approved, but never the
 // already-posted or in-flight rows; and (b) the most-recent already-posted row
 // per platform, surfaced as a "you already posted this" note on the new card.
+function _postMatchesCompose(p) {
+    /** A post belongs in the current compose batch if either:
+     *   - its slot_id is one of the ones we just (re)generated (G1
+     *     precise match — used for fresh rows that carry slot_id), or
+     *   - it has no slot_id (legacy row) AND its platform is one we
+     *     just regenerated (back-compat fallback).
+     * Posts whose slot_id points at a DIFFERENT slot in the same
+     * template (e.g. the OTHER Mastodon-account slot) are correctly
+     * excluded. */
+    if (p.slot_id != null && composedSlotIds.length) {
+        return composedSlotIds.includes(p.slot_id);
+    }
+    return composedPlatforms.includes(p.platform);
+}
+
 function applyPostFilter(all) {
     const list = Array.isArray(all) ? all : [];
     posts = list.filter(p =>
-        composedPlatforms.includes(p.platform) && p.status !== 'posted' && p.status !== 'sending'
+        _postMatchesCompose(p) && p.status !== 'posted' && p.status !== 'sending'
     );
     priorPostsByPlatform = {};
     const tOf = (p) => new Date(_ensureUtc(p.posted_at || p.updated_at || p.created_at)).getTime() || 0;
     for (const p of list) {
-        if (!composedPlatforms.includes(p.platform) || p.status !== 'posted') continue;
+        if (!_postMatchesCompose(p) || p.status !== 'posted') continue;
         const cur = priorPostsByPlatform[p.platform];
         if (!cur || tOf(p) >= tOf(cur)) priorPostsByPlatform[p.platform] = p;
     }
@@ -268,14 +287,23 @@ function renderSlotPicker() {
 }
 
 function selectedPlatforms() {
-    /** Distinct platforms from the checked slot rows. Used as both the
-     * filter sent to the generate endpoint and the basis for the
-     * stale-draft intersection in applyPostFilter. */
+    /** Distinct platforms from the checked slot rows. Used as the
+     * platform-level back-compat filter sent to the generate endpoint
+     * (the backend also accepts ``slot_ids`` for slot-level routing
+     * via selectedSlotIds; both can coexist). */
     const seen = new Set();
     for (const cb of document.querySelectorAll('input[name="slot"]:checked')) {
         seen.add(cb.dataset.platform);
     }
     return [...seen];
+}
+
+function selectedSlotIds() {
+    /** Slot-level filter (G1) — sent alongside ``platforms`` so the
+     * backend can route a partial regenerate to the exact slot the
+     * user checked, even when two slots share a platform. */
+    return [...document.querySelectorAll('input[name="slot"]:checked')]
+        .map(cb => Number(cb.value));
 }
 
 async function generatePreviews() {
@@ -309,12 +337,14 @@ async function generatePreviews() {
             <style>@keyframes spin { to { transform: rotate(360deg); } }</style>
         </div>`;
     try {
+        const slotIds = selectedSlotIds();
         const resp = await fetch(`/api/social/generate-posts/${videoId}`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
                 template_name: templateName,
                 platforms: platforms,
+                slot_ids: slotIds,  // G1 — exact-slot routing
                 user_message: userMessage,
                 unresolved_ack: true,
             }),
@@ -333,6 +363,7 @@ async function generatePreviews() {
         document.getElementById('picker-card').style.display = 'none';
 
         composedPlatforms = platforms.slice();
+        composedSlotIds = slotIds.slice();
         const postsResp = await fetch(`/api/social/posts/${videoId}`);
         applyPostFilter(postsResp.ok ? await postsResp.json() : []);
         renderPreviews();
@@ -388,7 +419,17 @@ function renderPreviews() {
         container.innerHTML = '<p class="empty-state">No posts generated.</p>';
         return;
     }
+    // G1 — index by slot_id so each preview card can show which
+    // specific account it routes to. Falls back to "(project default)"
+    // when the slot defers to the project's per-platform default.
+    const slotById = new Map(currentTemplateSlots.map(s => [s.id, s]));
     container.innerHTML = posts.map(p => {
+        const slotInfo = slotById.get(p.slot_id);
+        const accountLabel = slotInfo
+            ? (slotInfo.account_username
+                ? `<span class="form-hint" style="font-weight: normal; margin-left: 0.4rem;">@${escapeHtmlBasic(slotInfo.account_username)}</span>`
+                : `<span class="form-hint" style="font-weight: normal; margin-left: 0.4rem;">(project default)</span>`)
+            : '';
         const isFailed = p.status === 'failed';
         const cls = isFailed ? 'compose-card error' : 'compose-card';
         const prior = priorPostsByPlatform[p.platform];
@@ -401,11 +442,11 @@ function renderPreviews() {
             priorNote = `<div class="form-hint" style="margin: 0.25rem 0; color: var(--warning, #d29922);">⚠ Already posted to ${escapeHtmlBasic(p.platform)} for this video on ${escapeHtmlBasic(when)}${link}</div>`;
         }
         return `
-        <div class="${cls}" data-post-id="${p.id}" data-platform="${p.platform}">
+        <div class="${cls}" data-post-id="${p.id}" data-platform="${p.platform}" data-slot-id="${p.slot_id ?? ''}">
             <div class="compose-header">
                 <label class="compose-include">
                     <input type="checkbox" name="include" data-id="${p.id}" checked>
-                    <span class="platform-badge platform-${p.platform}">${p.platform}</span>
+                    <span class="platform-badge platform-${p.platform}">${p.platform}</span>${accountLabel}
                 </label>
                 <span class="compose-status">${isFailed ? 'Error: ' + (p.error || 'unknown') : ''}</span>
             </div>

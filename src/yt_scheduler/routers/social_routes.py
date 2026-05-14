@@ -243,6 +243,22 @@ async def generate_posts(
     opts = data or {}
     template_name = opts.get("template_name", "announce_video")
     requested_platforms = opts.get("platforms")
+    # G1 — slot-level filtering. When the caller knows specific
+    # template_slot ids it wants to (re)generate (the E1 per-slot
+    # picker does), they're sent here. A template with two Mastodon
+    # slots routed to different accounts can now be partially
+    # regenerated (only one slot), where ``requested_platforms`` alone
+    # could only express "all Mastodon slots or none". Optional;
+    # callers passing only ``platforms`` keep working unchanged.
+    requested_slot_ids_raw = opts.get("slot_ids")
+    requested_slot_ids: set[int] | None
+    if requested_slot_ids_raw is None:
+        requested_slot_ids = None
+    else:
+        try:
+            requested_slot_ids = {int(x) for x in requested_slot_ids_raw}
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "slot_ids must be a list of integers") from exc
     unresolved_choices = opts.get("unresolved") or {}
     forced_empty = {name: "" for name, choice in unresolved_choices.items() if choice == "empty"}
     unresolved_ack = bool(opts.get("unresolved_ack")) or ("unresolved" in opts)
@@ -288,27 +304,57 @@ async def generate_posts(
         # losing prior approvals and confusing the user with a "will
         # cancel N scheduled posts" dialog about platforms they aren't
         # touching.
+        # G1: build the set of slot_ids we'll actually (re)generate.
+        # The scheduled-overwrite guard and the DELETE-before-regen
+        # below scope to these slot_ids when available, falling back
+        # to platform-based scoping only for legacy rows where
+        # social_posts.slot_id is NULL.
+        slot_ids_to_regen: set[int] = set()
         platforms_to_regen: set[str] = set()
         for slot in template.get("slots", []):
             if slot.get("is_disabled"):
                 continue
             p = slot["platform"]
+            sid = slot.get("id")
             if requested_platforms and p not in requested_platforms:
                 continue
+            if requested_slot_ids is not None and (sid is None or int(sid) not in requested_slot_ids):
+                continue
             platforms_to_regen.add(p)
+            if sid is not None:
+                slot_ids_to_regen.add(int(sid))
         if not platforms_to_regen:
             return {"posts": [], "warnings": []}
         platform_placeholders = ",".join("?" * len(platforms_to_regen))
-        platform_params = (video_id, *sorted(platforms_to_regen))
+        slot_placeholders = (
+            ",".join("?" * len(slot_ids_to_regen)) if slot_ids_to_regen else ""
+        )
+        slot_params = tuple(sorted(slot_ids_to_regen))
+
+        # Match clause shared between the scheduled-overwrite SELECT
+        # and the DELETE below. When we know slot_ids: a row matches
+        # if its slot_id is in the set OR (slot_id IS NULL AND its
+        # platform is in the set) — the second branch is the legacy-
+        # row fallback. When no slot_ids are known: match on platform
+        # alone (back-compat with callers that don't send slot_ids).
+        if slot_ids_to_regen:
+            match_clause = (
+                f"(slot_id IN ({slot_placeholders}) "
+                f" OR (slot_id IS NULL AND platform IN ({platform_placeholders})))"
+            )
+            match_params = (*slot_params, *sorted(platforms_to_regen))
+        else:
+            match_clause = f"platform IN ({platform_placeholders})"
+            match_params = tuple(sorted(platforms_to_regen))
 
         # Scheduled-overwrite guard goes BEFORE the (potentially slow, AI-bearing)
         # render pass so a "confirm and retry" round-trip doesn't re-run AI blocks.
         # It's non-destructive (a SELECT + raise), so checking it early is safe.
         scheduled_rows = await db.execute_fetchall(
             f"SELECT id, platform, scheduled_at FROM social_posts "
-            f"WHERE video_id = ? AND platform IN ({platform_placeholders}) "
+            f"WHERE video_id = ? AND {match_clause} "
             f"AND scheduler_job_id IS NOT NULL",
-            platform_params,
+            (video_id, *match_params),
         )
         if scheduled_rows and not confirm_overwrite_scheduled:
             raise HTTPException(
@@ -351,7 +397,13 @@ async def generate_posts(
             if slot.get("is_disabled"):
                 continue
             platform = slot["platform"]
+            sid_for_filter = slot.get("id")
             if requested_platforms and platform not in requested_platforms:
+                continue
+            if requested_slot_ids is not None and (
+                sid_for_filter is None
+                or int(sid_for_filter) not in requested_slot_ids
+            ):
                 continue
 
             body = slot.get("body", "") or ""
@@ -508,20 +560,19 @@ async def generate_posts(
         for r in scheduled_rows:
             await cancel_scheduled_post(int(r["id"]))
 
-        # Replace unsent posts on the platforms being regenerated. Posts
+        # Replace unsent posts on the slots being regenerated. Posts
         # that already went out ('posted') stay for the audit trail;
         # in-flight scheduled posts ('sending') stay because the per-post
         # scheduler holds its own per-post lock — not the per-video
         # publish lock — so deleting a 'sending' row here would race with
-        # an active send. Approved rows on OTHER platforms also stay,
-        # which is the bug fix: a Twitter-only regenerate must not delete
-        # the user's previously-approved LinkedIn / Mastodon / Bluesky
-        # rows.
+        # an active send. Approved rows on OTHER slots also stay, which
+        # is the bug fix: a single-slot regenerate must not delete the
+        # user's previously-approved rows on neighboring slots.
         await db.execute(
             f"DELETE FROM social_posts "
-            f"WHERE video_id = ? AND platform IN ({platform_placeholders}) "
+            f"WHERE video_id = ? AND {match_clause} "
             f"AND status NOT IN ('posted', 'sending')",
-            platform_params,
+            (video_id, *match_params),
         )
 
         generated: list[dict] = []
@@ -534,15 +585,18 @@ async def generate_posts(
             media_paths_json = json.dumps(media_paths) if media_paths else None
             primary_media = media_paths[0] if media_paths else None
 
+            slot_id_for_insert = slot.get("id")
             cur = await db.execute(
                 """INSERT INTO social_posts
                        (video_id, platform, content, media_path, media_paths,
-                        media_type, status, social_account_id, max_chars)
-                VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?)""",
+                        media_type, status, social_account_id, max_chars,
+                        slot_id)
+                VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)""",
                 (
                     video_id, platform, item["rendered"],
                     primary_media, media_paths_json,
                     media, sa_id, item["max_chars"],
+                    int(slot_id_for_insert) if slot_id_for_insert is not None else None,
                 ),
             )
             post_id = cur.lastrowid

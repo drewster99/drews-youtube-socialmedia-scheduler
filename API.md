@@ -936,12 +936,15 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 ```json
 {
   "template_name": "announce_video",  // default
-  "platforms": ["twitter", "bluesky"], // optional whitelist
+  "platforms": ["twitter", "bluesky"], // optional platform whitelist
+  "slot_ids": [12, 17],                // optional template_slots.id whitelist (G1)
   "user_message": "...",               // exposed to templates as {{user_message}}
   "unresolved": {"repo": "empty", "video": "literal"},  // see "Errors" below
   "unresolved_ack": true               // proceed even with unresolved vars (all left literal)
 }
 ```
+
+`platforms` and `slot_ids` are both whitelist filters; they intersect. The latter is the precise filter — a template with two Mastodon slots routed to different accounts can be partially regenerated (one slot only) where `platforms` alone could only express "all Mastodon slots or none." The DELETE-before-regenerate also scopes by `slot_id` when `slot_ids` is supplied, so a single-slot regenerate never touches its sibling's rows. Legacy `social_posts` rows with `slot_id IS NULL` (pre-migration 021) still match by `platform` as a back-compat fallback.
 
 `unresolved` maps each unresolved variable name to `"empty"` (substitute an empty string) or `"literal"` (leave `{{name}}` in the post). Passing the `unresolved` key — even `{}` — acknowledges the unresolved set so generation proceeds; `unresolved_ack: true` does the same without choosing per-name behavior.
 
@@ -965,6 +968,7 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 - `404` — Video or template not found.
 - `409` — One or more posts are scheduled. Body: `{"detail": {"scheduled_overwrite": true, "needs_confirm": true, "scheduled": [{"post_id": int, "platform": str, "scheduled_at": "<ISO>"}, ...]}}`. Re-issue with `?confirm_overwrite_scheduled=true` to proceed.
 - `409` — Template has variables with no value and neither `unresolved` nor `unresolved_ack` was provided. Body: `{"detail": {"unresolved": ["name", ...]}}`. Re-issue with `unresolved` (or `unresolved_ack: true`). Nothing is written or deleted before this gate.
+- `400` — `slot_ids` is present but not a list of integers.
 - `500` — A non-disabled slot has no `max_chars` (a data bug — every slot is created with a positive value).
 
 **Side effects** — Holds the per-video publish lock. Renders every slot up front (before any destructive op) so the unresolved-vars gate can fire harmlessly. When `confirm_overwrite_scheduled=true`, calls `cancel_scheduled_post()` on each scheduled row first (tearing down its APScheduler `DateTrigger`) so no orphan jobs remain. Then deletes existing `social_posts` for the video where `status NOT IN ('posted','sending')` and inserts one fresh `draft` row per non-disabled, matching slot (each carrying the slot's `max_chars`). Threads slots whose body contains `{{video}}` are skipped (and reported in `warnings`). Template variables exposed: `title`, `url`, `description`, `description_short` (≤150), `description_medium` (≤500), `tags`, `hashtags`, `thumbnail_path`, `tier`, `transcript` (plain text, SRT stripped), `user_message`, `max_chars` (the slot's "Max characters" value). Also calls `youtube.get_video` to read the duration tier.
