@@ -834,6 +834,15 @@ body {
 .social-post-over-limit { border-color: var(--danger); }
 .post-warn { color: var(--danger); font-size: 0.8rem; margin-top: 0.3rem; }
 
+/* Brief highlight when the Log "Find the post →" link scrolls a failed
+   post into view. Pure visual cue — the underlying card state (status
+   badge, Send button) is unchanged. */
+@keyframes social-post-flash-kf {
+    0%   { box-shadow: 0 0 0 3px var(--danger); }
+    100% { box-shadow: 0 0 0 0   transparent;  }
+}
+.social-post-flash { animation: social-post-flash-kf 2.4s ease-out; }
+
 .template-help {
     background: var(--bg-input);
     margin-bottom: 1rem;

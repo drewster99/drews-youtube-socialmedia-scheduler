@@ -927,9 +927,15 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
             post["content"],
             media_paths=_decode_media_paths(post),
         )
+        # Manual Send on a post that was scheduled (status='approved'
+        # with a pending APScheduler job) supersedes that job — clear
+        # the schedule columns so the future job-id can't reference a
+        # post that's already done, and so the UI doesn't show "still
+        # scheduled" alongside a posted_at timestamp.
         await db.execute(
             """UPDATE social_posts
-            SET status = 'posted', posted_at = datetime('now'), post_url = ?
+            SET status = 'posted', posted_at = datetime('now'), post_url = ?,
+                scheduler_job_id = NULL, scheduled_at = NULL
             WHERE id = ?""",
             (result.get("url", ""), post_id),
         )
@@ -950,7 +956,8 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
         if e.uuid:
             await mark_needs_reauth(e.uuid)
         await db.execute(
-            "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
+            "UPDATE social_posts SET status = 'failed', error = ?, "
+            "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
             (f"Credential needs re-auth: {e}", post_id),
         )
         await db.commit()
@@ -961,7 +968,8 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
         ) from e
     except Exception as e:
         await db.execute(
-            "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
+            "UPDATE social_posts SET status = 'failed', error = ?, "
+            "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
             (str(e), post_id),
         )
         await db.commit()
@@ -1089,9 +1097,11 @@ async def send_all_posts(
                 post["content"],
                 media_paths=_decode_media_paths(post),
             )
+            # Same supersede-the-schedule reasoning as send_post.
             await db.execute(
                 """UPDATE social_posts
-                SET status = 'posted', posted_at = datetime('now'), post_url = ?
+                SET status = 'posted', posted_at = datetime('now'), post_url = ?,
+                    scheduler_job_id = NULL, scheduled_at = NULL
                 WHERE id = ?""",
                 (result.get("url", ""), post["id"]),
             )
@@ -1113,7 +1123,8 @@ async def send_all_posts(
             if e.uuid:
                 await mark_needs_reauth(e.uuid)
             await db.execute(
-                "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
+                "UPDATE social_posts SET status = 'failed', error = ?, "
+                "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
                 (f"Credential needs re-auth: {e}", post["id"]),
             )
             results[post["platform"]] = {
@@ -1122,7 +1133,8 @@ async def send_all_posts(
             }
         except Exception as e:
             await db.execute(
-                "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
+                "UPDATE social_posts SET status = 'failed', error = ?, "
+                "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
                 (str(e), post["id"]),
             )
             results[post["platform"]] = {"status": "failed", "error": str(e)}

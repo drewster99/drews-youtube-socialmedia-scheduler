@@ -212,8 +212,15 @@ async def test_send_scheduled_post_blocks_when_video_not_public(app_db) -> None:
 async def test_send_scheduled_post_proceeds_when_video_public(app_db) -> None:
     scheduler_mod, db, _ = app_db
     video_id, pids = await _seed(db, [("twitter", "approved")])
+    # Real-world drift: the user toggled privacy via the metadata
+    # dropdown, which updates videos.privacy_status but leaves the
+    # lifecycle videos.status column on its previous value ('uploaded'
+    # from the seed). The gate must still pass — viewers can see the
+    # video on YouTube, so the social link is safe to post. Gating on
+    # the lifecycle column produced the user-reported "YouTube video is
+    # public, not public" contradiction.
     await db.execute(
-        "UPDATE videos SET privacy_status = 'public', status = 'published' WHERE id = ?",
+        "UPDATE videos SET privacy_status = 'public' WHERE id = ?",
         (video_id,),
     )
     await db.commit()

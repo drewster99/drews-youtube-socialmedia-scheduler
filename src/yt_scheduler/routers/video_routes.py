@@ -566,6 +566,7 @@ async def update_video(video_id: str, data: dict):
     # the user-supplied values if readback failed.
     updates = []
     params = []
+    new_privacy: str | None = None
     for field in ["title", "description", "tags", "privacy_status", "publish_at", "pinned_links", "status"]:
         if field in data:
             updates.append(f"{field} = ?")
@@ -575,7 +576,26 @@ async def update_video(video_id: str, data: dict):
                 val = data[field]
             if field == "tags" and isinstance(val, list):
                 val = json.dumps(val)
+            if field == "privacy_status":
+                new_privacy = val
             params.append(val)
+
+    # Keep the lifecycle ``status`` column in sync with privacy transitions
+    # when the caller did NOT explicitly set it. Without this, flipping the
+    # Privacy dropdown to "Public" via the metadata form leaves
+    # ``status`` on its pre-publish value, and downstream code that gates
+    # on "is this video published?" (project counts, the per-post send
+    # precheck) sees contradictory state. The publish_video_job path
+    # already moves both columns atomically — this just covers the manual-
+    # edit path that historically only touched privacy_status.
+    if new_privacy is not None and "status" not in data:
+        before_status = before.get("status")
+        if new_privacy == "public" and before_status != "published":
+            updates.append("status = ?")
+            params.append("published")
+        elif new_privacy != "public" and before_status == "published":
+            updates.append("status = ?")
+            params.append("ready")
 
     # Manual tier override (req: per-spec, user can override the inferred tier
     # on the detail screen). Tracked separately because YouTube doesn't store it.
@@ -652,11 +672,22 @@ async def transcribe_video(
                 raise HTTPException(
                     400, f"Could not flip {video_id} to unlisted: {exc}"
                 ) from exc
-            await db.execute(
-                "UPDATE videos SET privacy_status = 'unlisted', updated_at = datetime('now') "
-                "WHERE id = ?",
-                (video_id,),
-            )
+            # Match the metadata-edit path: when privacy drops away from
+            # public, the lifecycle ``status`` column must follow or the
+            # video lingers in 'published' with mismatched privacy.
+            if (video.get("status") or "") == "published":
+                await db.execute(
+                    "UPDATE videos SET privacy_status = 'unlisted', "
+                    "status = 'ready', updated_at = datetime('now') "
+                    "WHERE id = ?",
+                    (video_id,),
+                )
+            else:
+                await db.execute(
+                    "UPDATE videos SET privacy_status = 'unlisted', "
+                    "updated_at = datetime('now') WHERE id = ?",
+                    (video_id,),
+                )
             await db.commit()
 
         try:

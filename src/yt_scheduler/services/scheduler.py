@@ -362,11 +362,17 @@ async def _send_scheduled_post(post_id: int) -> None:
             "SELECT privacy_status, status FROM videos WHERE id = ?", (video_id,)
         )
         vrow = await cursor.fetchone()
-        if vrow and (vrow["privacy_status"] != "public" or vrow["status"] != "published"):
+        # Only privacy_status decides whether viewers can see the YouTube
+        # link. The lifecycle `status` column drifts off 'published'
+        # whenever the user flips privacy via the metadata dropdown
+        # (video_routes update_video updates privacy_status without
+        # bumping status), so gating on it produces false failures with
+        # the contradictory "video is public, not public" message.
+        if vrow and vrow["privacy_status"] != "public":
             err = (
-                f"YouTube video is still {vrow['privacy_status']!r} (status "
-                f"{vrow['status']!r}); refusing to post a link to a non-public "
-                "video. Re-publish the video and use Send to retry."
+                f"YouTube video is still {vrow['privacy_status']!r}; "
+                "refusing to post a link to a non-public video. "
+                "Re-publish the video and use Send to retry."
             )
             await db.execute(
                 "UPDATE social_posts SET status = 'failed', error = ?, "

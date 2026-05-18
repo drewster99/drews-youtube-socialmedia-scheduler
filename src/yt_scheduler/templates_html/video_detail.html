@@ -930,7 +930,10 @@ function renderEvent(ev) {
         case 'social_post_failed_video_not_public': {
             const platform = ev.payload?.platform || 'social';
             const priv = ev.payload?.video_privacy || '?';
-            return `${ts} <span style="color: var(--danger);">Social post failed — YouTube video is ${escapeHtml(priv)}, not public [${escapeHtml(platform)}] — use Send below to retry</span>`;
+            // Jump the user to the matching post card and flash it —
+            // "Send below to retry" is no help when the social posts
+            // section is scrolled off-screen on a long detail page.
+            return `${ts} <span style="color: var(--danger);">Social post failed — YouTube video is ${escapeHtml(priv)}, not public [${escapeHtml(platform)}] <a href="#" onclick="focusFailedPost(${JSON.stringify(platform)}); return false;" style="margin-left: 0.4rem;">Find the post →</a></span>`;
         }
         case 'credential_invalid': {
             const scope = ev.payload?.scope || 'account';
@@ -1373,6 +1376,28 @@ const postErrorsById = new Map();
 function showPostError(postId) {
     const msg = postErrorsById.get(postId);
     if (msg) showToast(msg, 'error');
+}
+
+// Scroll the failed post's card into view and flash it. Triggered from
+// the "Find the post →" link in the log entry — the social posts
+// section is usually below the fold on a long detail page, so just
+// telling the user to "use Send below" leaves them hunting.
+function focusFailedPost(platform) {
+    const target = (socialPostsCache || []).find(
+        p => p.platform === platform && p.status === 'failed'
+    );
+    if (!target) {
+        showToast(
+            `No failed ${platform} post to retry — it may have been re-sent or regenerated.`,
+            'info'
+        );
+        return;
+    }
+    const card = document.querySelector(`.social-post-card[data-post-card="${target.id}"]`);
+    if (!card) return;
+    card.scrollIntoView({behavior: 'smooth', block: 'center'});
+    card.classList.add('social-post-flash');
+    setTimeout(() => card.classList.remove('social-post-flash'), 2400);
 }
 
 let socialPostsCache = [];
