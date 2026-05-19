@@ -212,3 +212,46 @@ def test_retry_promo_step_updates_state(client: TestClient) -> None:
 def test_promo_routes_404_on_unknown_parent(client: TestClient) -> None:
     resp = client.get("/api/projects/default/videos/nope/promos")
     assert resp.status_code == 404
+
+
+def test_import_as_child_falls_back_to_short_when_tier_unknown(
+    client: TestClient, monkeypatch
+) -> None:
+    """When YouTube doesn't return duration info, ``tier`` ends up None.
+    Importing as a child still needs a non-NULL ``item_type`` or the
+    INSERT fails — fall back to 'short'."""
+    from yt_scheduler.services import youtube as youtube_mod
+
+    _insert_video(
+        client, video_id="parentid077", title="Parent",
+    )
+
+    # Mock youtube.get_video to return a result with no duration so
+    # tier_for_duration() returns None.
+    def fake_get_video(video_id):
+        return {
+            "id": video_id,
+            "snippet": {
+                "title": "Imported clip",
+                "description": "",
+                "tags": [],
+                "thumbnails": {},
+            },
+            "status": {"privacyStatus": "unlisted"},
+            "contentDetails": {},
+        }
+
+    monkeypatch.setattr(youtube_mod, "get_video", fake_get_video)
+    monkeypatch.setattr(
+        youtube_mod, "list_captions", lambda _vid: []
+    )
+
+    resp = client.post(
+        "/api/projects/default/imports/import",
+        json={"video_id": "noduration1", "parent_item_id": "parentid077"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["parent_item_id"] == "parentid077"
+    # Fallback: item_type = 'short' when tier is None on import-as-child.
+    assert body["item_type"] == "short"

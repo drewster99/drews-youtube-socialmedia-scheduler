@@ -24,6 +24,8 @@ Endpoints:
 
 from __future__ import annotations
 
+import os
+import secrets
 import shutil
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -126,10 +128,18 @@ async def upload_promos(
     for upload in files:
         if not upload.filename:
             continue
-        # Drop the file to UPLOAD_DIR; YT-upload reads from there. Keep
-        # the original filename so the title-from-filename prompt sees
-        # the user's actual filename (not a server-generated stub).
-        target = UPLOAD_DIR / upload.filename
+        # Append a random hex suffix to the disk filename so two
+        # concurrent uploads with the same filename can't overwrite
+        # each other on disk (which would leak one user's video content
+        # into another's YouTube upload). The ORIGINAL filename is
+        # still passed to ``start_promo_upload`` so the title-from-
+        # filename prompt sees the user's name, not the suffixed one.
+        stem, ext = os.path.splitext(os.path.basename(upload.filename))
+        # Strip path components for safety (defensive against
+        # filenames containing "../" or absolute paths).
+        suffix = secrets.token_hex(4)
+        disk_name = f"{stem}_{suffix}{ext}"
+        target = UPLOAD_DIR / disk_name
         with open(target, "wb") as f:
             shutil.copyfileobj(upload.file, f)
         job_id = await auto_actions.start_promo_upload(

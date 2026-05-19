@@ -223,7 +223,13 @@ async def import_video(
     # by the parent_item_id filter and surfaces on the parent's Promo
     # Videos screen instead. Standalone imports keep the legacy default
     # ('episode') so the existing Dashboard behaviour is preserved.
-    item_type_value = tier if parent_item_id else "episode"
+    # ``tier`` can be None when YouTube didn't return duration info;
+    # fall back to "short" rather than NULL (videos.item_type is NOT
+    # NULL — a None here would fail the constraint).
+    if parent_item_id:
+        item_type_value = tier or "short"
+    else:
+        item_type_value = "episode"
 
     await db.execute(
         """INSERT INTO videos (

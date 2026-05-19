@@ -461,7 +461,16 @@ scheduleAllCancel.addEventListener('click', () => scheduleAllModal.close());
 
 scheduleAllForm.addEventListener('submit', async (e) => {
     e.preventDefault();
-    if (needsParentPicker && !parentPickedAt) return;
+    // Belt-and-braces: also read directly from the picker in case the
+    // change event didn't fire (some keyboard paths set the value then
+    // immediately submit without blurring).
+    if (needsParentPicker) {
+        const inp = document.getElementById('parent-publish-input');
+        if (inp && inp.value) {
+            parentPickedAt = new Date(inp.value).toISOString();
+        }
+        if (!parentPickedAt) return;
+    }
     scheduleAllConfirm.disabled = true;
     scheduleAllConfirm.textContent = 'Scheduling…';
     try {

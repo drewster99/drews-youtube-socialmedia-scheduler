@@ -216,3 +216,40 @@ def test_promo_quota_helper() -> None:
     assert promo_quota_for(0) == 0
     assert promo_quota_for(1) == 150
     assert promo_quota_for(10) == 1500
+
+
+def test_preview_preserves_already_scheduled_children(client: TestClient) -> None:
+    """Schedule-all must be non-destructive: already-scheduled children
+    keep their existing publish_at, even when no unscheduled children
+    are added in this batch."""
+    parent_iso = "2026-04-01T17:30:00+00:00"
+    custom_short_time = "2026-04-15T09:00:00+00:00"
+    _insert_ready_video(
+        "parentid006", publish_at=parent_iso, status="scheduled",
+    )
+    _insert_ready_video(
+        "shortmanl1", parent_item_id="parentid006", item_type="short",
+        publish_at=custom_short_time, status="scheduled",
+    )
+    resp = client.get(
+        "/api/projects/default/videos/parentid006/promos/schedule-all/preview"
+    )
+    data = resp.json()
+    row = next(r for r in data["rows"] if r["video_id"] == "shortmanl1")
+    assert row["target_time"] == custom_short_time
+
+
+def test_readiness_accepts_user_edited_description_starting_with_placeholder(
+) -> None:
+    """A user-edited description that happens to begin with the same
+    phrase as the placeholder must still count as ready (it's a real
+    description now, just unfortunate phrasing)."""
+    from yt_scheduler.services.scheduler import is_ready_for_schedule
+
+    ready, _ = is_ready_for_schedule({
+        "transcript": "real transcript",
+        "description": "Description pending generation but here's more text",
+        "tags": '["one", "two", "three"]',
+        "thumbnail_path": "/tmp/x.jpg",
+    })
+    assert ready

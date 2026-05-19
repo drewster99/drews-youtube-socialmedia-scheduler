@@ -830,6 +830,7 @@ async def restore_pending_auto_actions() -> None:
         f"""SELECT id, project_id, imported_from_youtube FROM videos
         WHERE (transcript IS NULL OR transcript = ''
                OR description_generated_at IS NULL)
+        AND auto_action_state IS NULL
         AND COALESCE(updated_at, created_at) >=
             datetime('now', '-{_AUTO_ACTION_RESUME_WINDOW_HOURS} hours')
         """
@@ -853,6 +854,49 @@ async def restore_pending_auto_actions() -> None:
         logger.info(
             "Restored %d pending auto-action chain(s) from the last %dh",
             restored, _AUTO_ACTION_RESUME_WINDOW_HOURS,
+        )
+
+    # Resume Promo Videos chains that were mid-step at shutdown. Same
+    # window cap as the standard chain, so an idle box can't burn its
+    # OAuth tokens / quota replaying historic chains. Promo state lives
+    # in ``videos.auto_action_state``; we re-enter at whatever step the
+    # column held when the server stopped (the step's idempotency gate
+    # makes the resume cheap if the work is already done).
+    promo_rows = await db.execute_fetchall(
+        f"""SELECT id, project_id, auto_action_state FROM videos
+        WHERE auto_action_state IS NOT NULL
+        AND auto_action_state NOT LIKE 'failed:%'
+        AND auto_action_state != 'ready'
+        AND COALESCE(updated_at, created_at) >=
+            datetime('now', '-{_AUTO_ACTION_RESUME_WINDOW_HOURS} hours')
+        """
+    )
+    if not promo_rows:
+        return
+    from yt_scheduler.services.auto_actions import (
+        PROMO_STATE_TRANSCRIBING, retry_promo_step,
+    )
+    promo_restored = 0
+    for row in promo_rows:
+        state = row["auto_action_state"]
+        # ``probing`` / ``uploading`` / ``generating_title`` happen
+        # before or during the INSERT and shouldn't be reachable from
+        # the videos table (no row exists yet for pre-INSERT states).
+        # If we see one of those, treat it as "transcribing" so the
+        # row gets its chain finished.
+        if state in {"generating_title", "uploading", "probing"}:
+            state = PROMO_STATE_TRANSCRIBING
+        try:
+            await retry_promo_step(row["id"], state)
+            promo_restored += 1
+        except Exception as exc:
+            logger.warning(
+                "Could not resume Promo chain for %s: %s", row["id"], exc,
+            )
+    if promo_restored:
+        logger.info(
+            "Resumed %d in-flight Promo chain(s) from the last %dh",
+            promo_restored, _AUTO_ACTION_RESUME_WINDOW_HOURS,
         )
 
 
@@ -1153,8 +1197,12 @@ def is_ready_for_schedule(video: dict) -> tuple[bool, list[str]]:
     if not transcript:
         missing.append("transcript")
     description = (video.get("description") or "").strip()
-    placeholder = "description pending generation"
-    if not description or description.lower().startswith(placeholder):
+    # The Promo upload step inserts an exact placeholder string until
+    # _promo_step_description overwrites it. Match on equality so a
+    # user-edited description happening to mention "Description pending
+    # generation..." still counts as ready.
+    placeholder = "Description pending generation."
+    if not description or description == placeholder:
         missing.append("description")
     tags = _decode_tags(video.get("tags"))
     if len(tags) < 3:
@@ -1307,10 +1355,6 @@ async def compute_promo_batch_preview(
         if tier_name not in DEFAULT_PROMO_DELAYS:
             continue
         cfg = delays.get(tier_name, DEFAULT_PROMO_DELAYS[tier_name])
-        # Find already-scheduled children in this tier so a new addition
-        # appends at the chronologically-last scheduled time + subsequent
-        # (per spec). When nothing is scheduled yet, anchor on the
-        # parent + initial.
         scheduled_in_tier = [
             (c, _parse_iso_datetime(c.get("publish_at")))
             for c in group
@@ -1319,30 +1363,33 @@ async def compute_promo_batch_preview(
         scheduled_in_tier = [(c, t) for c, t in scheduled_in_tier if t]
         unscheduled = [c for c in group if not c.get("publish_at")]
 
-        if scheduled_in_tier and unscheduled:
-            for child, existing in scheduled_in_tier:
-                rows_out.append(_preview_row(child, existing))
-                if latest_target is None or existing > latest_target:
-                    latest_target = existing
-            anchor = max(t for _c, t in scheduled_in_tier)
-            current = anchor
+        # Always include already-scheduled children at their existing
+        # times — schedule-all is non-destructive to manually-set or
+        # previously-batched schedules. Newly-added (unscheduled)
+        # children chain off the latest existing time + subsequent.
+        for child, existing in scheduled_in_tier:
+            rows_out.append(_preview_row(child, existing))
+            if latest_target is None or existing > latest_target:
+                latest_target = existing
+
+        if not unscheduled:
+            continue
+
+        if scheduled_in_tier:
+            current = max(t for _c, t in scheduled_in_tier)
             for child in unscheduled:
                 current = current + cfg["subsequent"]
                 rows_out.append(_preview_row(child, current))
                 if latest_target is None or current > latest_target:
                     latest_target = current
         else:
-            # Full re-baseline of the tier chain from the parent: gives
-            # the user a clean schedule when none of the children are
-            # already scheduled (also the common new-promo-batch case).
-            chain_set = group
-            if not chain_set:
-                continue
+            # Fresh chain: first child anchors at parent + initial,
+            # the rest follow at +subsequent each.
             current = parent_publish + cfg["initial"]
-            rows_out.append(_preview_row(chain_set[0], current))
+            rows_out.append(_preview_row(unscheduled[0], current))
             if latest_target is None or current > latest_target:
                 latest_target = current
-            for child in chain_set[1:]:
+            for child in unscheduled[1:]:
                 current = current + cfg["subsequent"]
                 rows_out.append(_preview_row(child, current))
                 if latest_target is None or current > latest_target:
