@@ -1922,3 +1922,25 @@ Bulk-upload promo children under a primary video. Each upload runs through the m
 **Response 200** — `{"job_id": "...", "filename": "...", "parent_id": "...", "video_id": "..." | null, "state": "...", "last_error": "..." | null, "title": "..." | null}`. `video_id` is `null` until the YouTube upload step succeeds; once set, the UI should switch to polling `GET /api/videos/{video_id}/auto-actions` (the job dict is dropped from memory when the chain terminates, returning 404 on a stale poll).
 
 **Errors** — `404` (job not found / already completed).
+
+### `GET /api/projects/{slug}/videos/{parent_id}/promos/schedule-all/preview`
+
+**Purpose** — Dry-run for the review modal. Computes per-tier independent schedule chains anchored to the parent's `publish_at` (or the optional `parent_publish_at` query param when the parent isn't scheduled yet).
+
+**Query params** — `parent_publish_at` (optional ISO 8601 string; only honoured when the parent has no `publish_at` and isn't `published`).
+
+**Response 200** — `{"parent": {"id","title","publish_at","status","ready","missing"}, "rows": [{"video_id","title","item_type","tier","target_time","ready","missing"}, ...], "total_span": ISO|null, "warnings": [...], "anchor_publish_at": ISO|null}`. Rows sorted by `target_time`; each row's `ready` reflects the same readiness check used by the commit endpoint.
+
+**Errors** — `404` (project / parent missing), `400` (parent is itself a child).
+
+### `POST /api/projects/{slug}/videos/{parent_id}/promos/schedule-all`
+
+**Purpose** — Commit the batch from the preview modal. Calls `schedule_publish` for each eligible child (and for the parent when `parent_publish_at` is supplied and the parent isn't already published).
+
+**Request body** — `{"parent_publish_at": "ISO 8601" | null}`.
+
+**Response 200** — `{"scheduled": [{"video_id", "publish_at"}, ...], "warnings": [...]}`.
+
+**Errors** — `404` (project / parent missing), `400` (parent is itself a child / readiness gates fail / no eligible children).
+
+**Side effects** — For each scheduled video: writes `videos.publish_at`, sets `videos.status='scheduled'`, registers the APScheduler `publish_video_job` (which also re-stages per-post social jobs), and stamps `publish_at_manual = 0` so future cascade routines may sweep these rows.

@@ -162,3 +162,54 @@ async def get_upload_job(slug: str, parent_id: str, job_id: str) -> dict:
     return job
 
 
+@router.get("/schedule-all/preview")
+async def schedule_all_preview(
+    slug: str,
+    parent_id: str,
+    parent_publish_at: str | None = None,
+) -> dict:
+    """Dry-run for the review modal. Returns parent row at the top,
+    per-child rows grouped by tier with their projected publish times
+    and readiness chips, total batch span, and any warnings (quota +
+    parent-not-ready)."""
+    from yt_scheduler.services import scheduler as _scheduler
+    _project, _parent = await _ensure_primary(slug, parent_id)
+    parent_dt = _scheduler._parse_iso_datetime(parent_publish_at)
+    try:
+        preview = await _scheduler.compute_promo_batch_preview(
+            parent_id, parent_publish_at=parent_dt,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return preview
+
+
+@router.post("/schedule-all")
+async def schedule_all(
+    slug: str,
+    parent_id: str,
+    payload: dict,
+) -> dict:
+    """Commit the batch from the preview modal. Body:
+
+    ```
+    {"parent_publish_at": "2026-04-01T17:30:00Z"}     # optional
+    ```
+
+    When the parent already has a publish_at (or status='published'),
+    omit ``parent_publish_at`` — the chain anchors against the
+    existing time.
+    """
+    from yt_scheduler.services import scheduler as _scheduler
+    _project, _parent = await _ensure_primary(slug, parent_id)
+    payload = payload or {}
+    parent_dt = _scheduler._parse_iso_datetime(payload.get("parent_publish_at"))
+    try:
+        result = await _scheduler.schedule_promo_batch(
+            parent_id, parent_publish_at=parent_dt,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return result
+
+

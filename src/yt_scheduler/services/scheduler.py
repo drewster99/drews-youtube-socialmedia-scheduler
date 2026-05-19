@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -1098,3 +1098,355 @@ def stop_scheduler() -> None:
     """Stop the background scheduler."""
     if scheduler.running:
         scheduler.shutdown(wait=False)
+
+
+# --- Promo batch scheduling ----------------------------------------------
+
+# Hardcoded v1 defaults (TIER_WORKFLOW.md). Each tier has its own
+# independent chain anchored to the parent's publish time: ``initial``
+# is the gap between the parent and the chronologically-first child
+# of that tier; ``subsequent`` is the gap between consecutive children
+# in that tier.
+DEFAULT_PROMO_DELAYS: dict[str, dict[str, timedelta]] = {
+    "hook":    {"initial": timedelta(hours=4),  "subsequent": timedelta(hours=99)},
+    "short":   {"initial": timedelta(hours=18), "subsequent": timedelta(days=6)},
+    "segment": {"initial": timedelta(days=3),   "subsequent": timedelta(days=9)},
+}
+
+# Quota guard for the Promo screen. Each child upload chain costs
+# ≈ 100 (insert) + 50 (metadata update) = 150 YouTube quota units. The
+# daily allowance is 10,000 — this threshold (25%) is what we surface
+# as a "heads up" banner. Doesn't block scheduling — just warns.
+PROMO_BATCH_QUOTA_WARN_FRACTION = 0.25
+_YT_DAILY_QUOTA = 10_000
+_YT_PROMO_UNITS_PER_VIDEO = 150
+
+
+def promo_quota_for(child_count: int) -> int:
+    """Estimated YouTube quota units for a batch upload of N promos."""
+    return child_count * _YT_PROMO_UNITS_PER_VIDEO
+
+
+def _decode_tags(raw: str | None) -> list:
+    import json as _json
+    if not raw:
+        return []
+    try:
+        decoded = _json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if isinstance(decoded, list):
+        return list(decoded)
+    return []
+
+
+def is_ready_for_schedule(video: dict) -> tuple[bool, list[str]]:
+    """Per the spec: transcript present (any source, not whitespace),
+    description present, ≥3 tags, and a thumbnail (custom or YouTube
+    auto-generated).
+
+    Returns ``(ready, missing)`` — missing is a short list of human-
+    readable reasons used by the review modal's per-row readiness chip.
+    """
+    missing: list[str] = []
+    transcript = (video.get("transcript") or "").strip()
+    if not transcript:
+        missing.append("transcript")
+    description = (video.get("description") or "").strip()
+    placeholder = "description pending generation"
+    if not description or description.lower().startswith(placeholder):
+        missing.append("description")
+    tags = _decode_tags(video.get("tags"))
+    if len(tags) < 3:
+        missing.append("tags (need ≥ 3)")
+    has_custom_thumb = bool(video.get("thumbnail_path"))
+    has_youtube_thumb = (video.get("thumbnail_source") or "").lower() == "youtube"
+    if not (has_custom_thumb or has_youtube_thumb):
+        missing.append("thumbnail")
+    return (not missing, missing)
+
+
+def _parse_iso_datetime(value) -> datetime | None:
+    """Lenient ISO-8601 parser used to read ``videos.publish_at`` /
+    inbound ``parent_publish_at`` parameters. Returns ``None`` on any
+    parse failure so the caller can fall back to "not scheduled"
+    behaviour rather than crashing the batch."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    # ``datetime.fromisoformat`` accepts trailing ``Z`` only in 3.11+.
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+async def compute_promo_batch_preview(
+    parent_id: str,
+    *,
+    parent_publish_at: datetime | None = None,
+    delays: dict[str, dict[str, timedelta]] | None = None,
+) -> dict:
+    """Dry-run: compute what :func:`schedule_promo_batch` would write.
+
+    Returned shape:
+
+    ```
+    {
+        "parent": {
+            "id": ..., "title": ..., "publish_at": ..., "status": ...,
+        },
+        "rows": [
+            {"video_id", "title", "item_type", "tier",
+             "target_time": ISO,
+             "ready": bool, "missing": [...]}, ...
+        ],
+        "total_span": ISO | null,    # latest target_time or null
+        "warnings": [...],            # quota warning, parent readiness, etc.
+        "anchor_publish_at": ISO,    # the time chains anchored against
+    }
+    ```
+
+    Keeps the same per-tier independent-chain logic as the writing
+    path so the review modal renders an accurate preview.
+    """
+    delays = delays or DEFAULT_PROMO_DELAYS
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM videos WHERE id = ?", (parent_id,)
+    )
+    if not rows:
+        raise ValueError(f"Parent video {parent_id} not found")
+    parent = dict(rows[0])
+    if parent.get("parent_item_id"):
+        raise ValueError(
+            f"Video {parent_id} is itself a child; only one level of "
+            "parenting is supported"
+        )
+
+    parent_publish = (
+        parent_publish_at or _parse_iso_datetime(parent.get("publish_at"))
+    )
+    parent_already_published = (parent.get("status") or "") == "published"
+
+    warnings: list[str] = []
+    parent_ready, parent_missing = is_ready_for_schedule(parent)
+    if not parent_already_published and not parent_ready:
+        warnings.append(
+            "Parent video isn't ready: missing " + ", ".join(parent_missing)
+        )
+
+    children_rows = await db.execute_fetchall(
+        "SELECT * FROM videos WHERE parent_item_id = ? "
+        "ORDER BY created_at ASC",
+        (parent_id,),
+    )
+    children = [dict(r) for r in children_rows]
+    eligible = [c for c in children if (c.get("status") or "") != "published"]
+
+    quota_units = promo_quota_for(len(eligible))
+    if quota_units >= _YT_DAILY_QUOTA * PROMO_BATCH_QUOTA_WARN_FRACTION:
+        warnings.append(
+            f"This batch consumes ~{quota_units} YouTube quota units "
+            f"({(quota_units / _YT_DAILY_QUOTA) * 100:.0f}% of the daily "
+            f"10,000-unit allowance)."
+        )
+
+    rows_out: list[dict] = []
+    latest_target: datetime | None = None
+    if parent_publish is None:
+        # Parent hasn't been scheduled yet AND the caller didn't supply
+        # a tentative anchor; we can't compute per-child target times,
+        # so return the children as "ready check only" entries.
+        for child in eligible:
+            ready, missing = is_ready_for_schedule(child)
+            rows_out.append({
+                "video_id": child["id"],
+                "title": child.get("title") or "",
+                "item_type": child.get("item_type") or child.get("tier") or "short",
+                "tier": child.get("tier") or "",
+                "target_time": None,
+                "ready": ready,
+                "missing": missing,
+            })
+        return {
+            "parent": _public_parent(parent, parent_publish),
+            "rows": rows_out,
+            "total_span": None,
+            "warnings": warnings + [
+                "Parent has no publish time set; pick one above to "
+                "compute per-child target times."
+            ],
+            "anchor_publish_at": None,
+        }
+
+    # Group eligible children by item_type so each tier-chain anchors
+    # independently from the parent. ``item_type`` is the user-editable
+    # bucket; ``tier`` is the duration-derived one. We chain on
+    # ``item_type`` so manual overrides land in the picked bucket.
+    chains: dict[str, list[dict]] = {"segment": [], "short": [], "hook": []}
+    for child in eligible:
+        bucket = (child.get("item_type") or child.get("tier") or "short").lower()
+        if bucket in chains:
+            chains[bucket].append(child)
+        else:
+            chains.setdefault(bucket, []).append(child)
+
+    for tier_name, group in chains.items():
+        if tier_name not in DEFAULT_PROMO_DELAYS:
+            continue
+        cfg = delays.get(tier_name, DEFAULT_PROMO_DELAYS[tier_name])
+        # Find already-scheduled children in this tier so a new addition
+        # appends at the chronologically-last scheduled time + subsequent
+        # (per spec). When nothing is scheduled yet, anchor on the
+        # parent + initial.
+        scheduled_in_tier = [
+            (c, _parse_iso_datetime(c.get("publish_at")))
+            for c in group
+            if c.get("publish_at")
+        ]
+        scheduled_in_tier = [(c, t) for c, t in scheduled_in_tier if t]
+        unscheduled = [c for c in group if not c.get("publish_at")]
+
+        if scheduled_in_tier and unscheduled:
+            for child, existing in scheduled_in_tier:
+                rows_out.append(_preview_row(child, existing))
+                if latest_target is None or existing > latest_target:
+                    latest_target = existing
+            anchor = max(t for _c, t in scheduled_in_tier)
+            current = anchor
+            for child in unscheduled:
+                current = current + cfg["subsequent"]
+                rows_out.append(_preview_row(child, current))
+                if latest_target is None or current > latest_target:
+                    latest_target = current
+        else:
+            # Full re-baseline of the tier chain from the parent: gives
+            # the user a clean schedule when none of the children are
+            # already scheduled (also the common new-promo-batch case).
+            chain_set = group
+            if not chain_set:
+                continue
+            current = parent_publish + cfg["initial"]
+            rows_out.append(_preview_row(chain_set[0], current))
+            if latest_target is None or current > latest_target:
+                latest_target = current
+            for child in chain_set[1:]:
+                current = current + cfg["subsequent"]
+                rows_out.append(_preview_row(child, current))
+                if latest_target is None or current > latest_target:
+                    latest_target = current
+
+    rows_out.sort(key=lambda r: r["target_time"] or "")
+    return {
+        "parent": _public_parent(parent, parent_publish),
+        "rows": rows_out,
+        "total_span": latest_target.isoformat() if latest_target else None,
+        "warnings": warnings,
+        "anchor_publish_at": parent_publish.isoformat(),
+    }
+
+
+def _public_parent(parent: dict, parent_publish: datetime | None) -> dict:
+    return {
+        "id": parent.get("id"),
+        "title": parent.get("title") or "",
+        "publish_at": parent_publish.isoformat() if parent_publish else None,
+        "status": parent.get("status"),
+        "ready": is_ready_for_schedule(parent)[0],
+        "missing": is_ready_for_schedule(parent)[1],
+    }
+
+
+def _preview_row(child: dict, target: datetime) -> dict:
+    ready, missing = is_ready_for_schedule(child)
+    return {
+        "video_id": child["id"],
+        "title": child.get("title") or "",
+        "item_type": child.get("item_type") or child.get("tier") or "short",
+        "tier": child.get("tier") or "",
+        "target_time": target.isoformat(),
+        "ready": ready,
+        "missing": missing,
+    }
+
+
+async def schedule_promo_batch(
+    parent_id: str,
+    *,
+    parent_publish_at: datetime | None = None,
+    delays: dict[str, dict[str, timedelta]] | None = None,
+) -> dict:
+    """Schedule every eligible child of ``parent_id`` using
+    :func:`compute_promo_batch_preview` for the math, then writing
+    each child via :func:`schedule_publish` (which re-registers the
+    APScheduler job AND re-stages any per-post social jobs).
+
+    Optionally also schedules the parent when it isn't already
+    published and ``parent_publish_at`` is supplied.
+
+    Raises :class:`ValueError` when the parent is missing / itself a
+    child / has no readiness-OK children to schedule.
+    """
+    preview = await compute_promo_batch_preview(
+        parent_id, parent_publish_at=parent_publish_at, delays=delays,
+    )
+    if not preview["rows"] and parent_publish_at is None:
+        raise ValueError("No promo children eligible for scheduling")
+    if not all(r["ready"] for r in preview["rows"]):
+        not_ready = [r["video_id"] for r in preview["rows"] if not r["ready"]]
+        raise ValueError(
+            "Some children aren't ready to schedule: " + ", ".join(not_ready)
+        )
+    parent_info = preview["parent"]
+    if parent_publish_at and not parent_info.get("ready"):
+        raise ValueError(
+            "Parent isn't ready: missing "
+            + ", ".join(parent_info.get("missing") or [])
+        )
+
+    db = await get_db()
+
+    scheduled: list[dict] = []
+    if parent_publish_at is not None and parent_info.get("status") != "published":
+        await schedule_publish(parent_id, parent_publish_at)
+        # Schedule-all batches are auto-anchored; mark the parent so a
+        # future cascade still moves it.
+        await db.execute(
+            "UPDATE videos SET publish_at_manual = 0 WHERE id = ?",
+            (parent_id,),
+        )
+        await db.commit()
+        scheduled.append({
+            "video_id": parent_id, "publish_at": parent_publish_at.isoformat(),
+        })
+
+    for row in preview["rows"]:
+        target = _parse_iso_datetime(row["target_time"])
+        if not target:
+            continue
+        await schedule_publish(row["video_id"], target)
+        # Batch-scheduled children are "auto", not "manual"; the
+        # cascade routines will sweep them on the next parent move.
+        await db.execute(
+            "UPDATE videos SET publish_at_manual = 0 WHERE id = ?",
+            (row["video_id"],),
+        )
+        await db.commit()
+        scheduled.append({
+            "video_id": row["video_id"],
+            "publish_at": target.isoformat(),
+        })
+
+    return {"scheduled": scheduled, "warnings": preview["warnings"]}

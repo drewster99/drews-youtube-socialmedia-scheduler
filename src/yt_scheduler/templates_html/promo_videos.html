@@ -11,12 +11,27 @@
         <span class="crumb crumb-page">Promo videos</span>
     </h1>
     <div style="display:flex; gap:0.5rem;">
+        <button type="button" class="btn btn-secondary" id="schedule-all-btn">Schedule all…</button>
         <label for="add-files-all" class="btn btn-primary" id="add-files-all-label">
             + Add videos
             <input type="file" id="add-files-all" accept="video/*" multiple style="display:none;">
         </label>
     </div>
 </div>
+
+<dialog id="schedule-all-modal" class="modal modal-wide">
+    <h3>Schedule all promos</h3>
+    <div id="schedule-all-warnings"></div>
+    <div id="schedule-all-parent" style="margin: 0.5rem 0;"></div>
+    <div id="schedule-all-rows"></div>
+    <div id="schedule-all-span" class="form-hint" style="margin: 0.5rem 0;"></div>
+    <form id="schedule-all-form">
+        <div class="form-actions" style="display:flex; justify-content: space-between; margin-top: 0.5rem;">
+            <button type="button" class="btn btn-secondary" id="schedule-all-cancel">Cancel</button>
+            <button type="submit" class="btn btn-primary" id="schedule-all-confirm">Confirm schedule</button>
+        </div>
+    </form>
+</dialog>
 
 <div id="upload-error-banner" class="banner banner-error" style="display:none;"></div>
 
@@ -322,6 +337,156 @@ function scheduleNextPoll() {
 }
 
 loadPromos().then(scheduleNextPoll);
+
+// --- Schedule-all modal -------------------------------------------------
+
+const scheduleAllBtn = document.getElementById('schedule-all-btn');
+const scheduleAllModal = document.getElementById('schedule-all-modal');
+const scheduleAllForm = document.getElementById('schedule-all-form');
+const scheduleAllCancel = document.getElementById('schedule-all-cancel');
+const scheduleAllConfirm = document.getElementById('schedule-all-confirm');
+
+// Track the modal's "are we letting the user pick a parent time?" state.
+// Re-set every time the modal opens based on the preview's anchor.
+let needsParentPicker = false;
+let parentPickedAt = null;
+
+function fmtDateTime(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    return d.toLocaleString();
+}
+
+async function fetchPreview(parentPublishAt) {
+    const qs = parentPublishAt
+        ? `?parent_publish_at=${encodeURIComponent(parentPublishAt)}`
+        : '';
+    const resp = await fetch(
+        `/api/projects/${projectSlug}/videos/${parentId}/promos/schedule-all/preview${qs}`,
+    );
+    if (!resp.ok) {
+        const err = await resp.text();
+        throw new Error(err || 'Preview failed');
+    }
+    return await resp.json();
+}
+
+function renderReadinessChip(row) {
+    if (row.ready) return '<span class="badge badge-published">Ready</span>';
+    const missing = (row.missing || []).join(', ');
+    return `<span class="badge badge-error" title="${escapeHtml(missing)}">Not ready</span>`;
+}
+
+function renderPreview(preview) {
+    const parentEl = document.getElementById('schedule-all-parent');
+    const rowsEl = document.getElementById('schedule-all-rows');
+    const spanEl = document.getElementById('schedule-all-span');
+    const warnEl = document.getElementById('schedule-all-warnings');
+
+    const warnings = preview.warnings || [];
+    warnEl.innerHTML = warnings.length
+        ? warnings.map(w => `<div class="banner banner-error">${escapeHtml(w)}</div>`).join('')
+        : '';
+
+    const p = preview.parent;
+    needsParentPicker = !p.publish_at && p.status !== 'published';
+    parentEl.innerHTML = `
+        <div class="status-row" style="font-weight:600;">
+            Parent: ${escapeHtml(p.title || p.id)}
+            ${renderReadinessChip(p)}
+        </div>
+        ${p.status === 'published'
+            ? '<div class="form-hint">Already published — children anchor to its publish time.</div>'
+            : needsParentPicker
+                ? `<div class="form-group" style="margin-top:0.4rem;">
+                    <label>Parent publish time</label>
+                    <input type="datetime-local" id="parent-publish-input" required>
+                </div>`
+                : `<div class="form-hint">Scheduled for ${fmtDateTime(p.publish_at)}.</div>`}
+    `;
+
+    if (needsParentPicker) {
+        // Re-pull preview on parent-time change so children's targets
+        // update live as the user picks a time.
+        document.getElementById('parent-publish-input').addEventListener('change', async (e) => {
+            parentPickedAt = e.target.value
+                ? new Date(e.target.value).toISOString()
+                : null;
+            try {
+                const fresh = await fetchPreview(parentPickedAt);
+                renderPreview(fresh);
+            } catch (err) { /* swallow */ }
+        });
+    }
+
+    const rows = preview.rows || [];
+    if (!rows.length) {
+        rowsEl.innerHTML = '<p class="empty-state">No children to schedule.</p>';
+        spanEl.textContent = '';
+        scheduleAllConfirm.disabled = true;
+        return;
+    }
+    rowsEl.innerHTML = rows.map(r => `
+        <div class="status-row" style="padding:0.25rem 0;">
+            <span>${escapeHtml(r.title)}</span>
+            <span class="badge badge-type-${escapeHtml(r.item_type)}">${escapeHtml(r.item_type)}</span>
+            <span>${escapeHtml(fmtDateTime(r.target_time))}</span>
+            ${renderReadinessChip(r)}
+        </div>
+    `).join('');
+    spanEl.textContent = preview.total_span
+        ? `Ends ${fmtDateTime(preview.total_span)}.`
+        : '';
+
+    const anyMissing = rows.some(r => !r.ready) || !p.ready;
+    const anyMissingTime = rows.some(r => !r.target_time);
+    scheduleAllConfirm.disabled = anyMissing || anyMissingTime;
+}
+
+scheduleAllBtn.addEventListener('click', async () => {
+    parentPickedAt = null;
+    try {
+        const preview = await fetchPreview(null);
+        renderPreview(preview);
+        scheduleAllModal.showModal();
+    } catch (err) {
+        const banner = document.getElementById('upload-error-banner');
+        banner.textContent = `Couldn't load preview: ${err}`;
+        banner.style.display = '';
+    }
+});
+
+scheduleAllCancel.addEventListener('click', () => scheduleAllModal.close());
+
+scheduleAllForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (needsParentPicker && !parentPickedAt) return;
+    scheduleAllConfirm.disabled = true;
+    scheduleAllConfirm.textContent = 'Scheduling…';
+    try {
+        const resp = await fetch(
+            `/api/projects/${projectSlug}/videos/${parentId}/promos/schedule-all`,
+            {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({parent_publish_at: parentPickedAt}),
+            },
+        );
+        if (!resp.ok) {
+            const err = await resp.text();
+            const banner = document.getElementById('upload-error-banner');
+            banner.textContent = `Schedule failed: ${err}`;
+            banner.style.display = '';
+        } else {
+            scheduleAllModal.close();
+            await loadPromos();
+        }
+    } finally {
+        scheduleAllConfirm.disabled = false;
+        scheduleAllConfirm.textContent = 'Confirm schedule';
+    }
+});
 </script>
 
 <style>
