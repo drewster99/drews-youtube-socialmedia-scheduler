@@ -695,7 +695,7 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 
 **Errors** — `404` (no local row), `400` (invalid `tier` value — must be one of `hook`, `short`, `segment`, `video`, `null`, or `""`), `500` (YouTube update failed).
 
-**Side effects** — Calls `youtube.update_video_metadata` (50 quota), reads back via `youtube.get_video` to capture any silent coercion (privacy clamp, tag truncation), writes confirmed values to the DB, and records a `metadata_updated` event with a per-field `{old, new}` diff for changed tracked fields.
+**Side effects** — Calls `youtube.update_video_metadata` (50 quota), reads back via `youtube.get_video` to capture any silent coercion (privacy clamp, tag truncation), writes confirmed values to the DB, and records a `metadata_updated` event with a per-field `{old, new}` diff for changed tracked fields. When the body includes `publish_at`, that field is **not** written directly — it routes through `services/scheduler.apply_user_reschedule(...)` so the APScheduler `publish_<video_id>` job actually re-registers, `publish_at_manual` flips to `1`, and the promo cascade fires (children-of-parent when the row is a primary, same-tier siblings when the row is a child).
 
 ### `POST /api/videos/{video_id}/transcribe`
 
@@ -822,21 +822,25 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 
 ### `POST /api/videos/{video_id}/schedule`
 
-**Purpose** — Schedule a video to flip to public (and fire its social posts) at a specific future time.
+**Purpose** — Schedule a video to flip to public (and fire its social posts) at a specific future time. User-driven reschedule path — also fires the promo cascade.
 
 **Request body** — `{"publish_at": "2026-04-28T15:00:00-07:00"}` (ISO 8601).
 
 **Response 200**:
 
 ```json
-{ "status": "ok", "job_id": "publish_<video_id>", "publish_at": "...", "message": "..." }
+{ "status": "ok", "job_id": "publish_<video_id>", "publish_at": "...",
+  "cascaded_children": ["..."], "cascaded_siblings": ["..."], "message": "..." }
 ```
 
 **Errors** — `400` (missing `publish_at`, invalid format, time not in future).
 
-**Cascades** — **Re-baselines all per-post jobs.** Any pending scheduled posts for this video (rows with `scheduler_job_id IS NOT NULL`) are cancelled via `cancel_scheduled_post()` and re-scheduled at staggered offsets driven by the project's `post_video_delay_minutes` and `inter_post_spacing_minutes`. Hand-retimed per-post jobs from a prior `POST /api/social/posts/{post_id}/schedule` call are intentionally overwritten — re-scheduling the video is the explicit "reset everything" action.
+**Cascades** —
 
-**Side effects** — Registers an APScheduler `DateTrigger` job (`publish_<video_id>`); cancels and re-attaches per-post jobs (see Cascades above); sets `videos.status='scheduled'`, `videos.publish_at=<iso>`; records `publish_scheduled` and one `social_post_scheduled` event per re-attached post.
+* **Per-post jobs are re-baselined.** Any pending scheduled posts for this video (rows with `scheduler_job_id IS NOT NULL`) are cancelled via `cancel_scheduled_post()` and re-scheduled at staggered offsets driven by the project's `post_video_delay_minutes` and `inter_post_spacing_minutes`. Hand-retimed per-post jobs from a prior `POST /api/social/posts/{post_id}/schedule` call are intentionally overwritten — re-scheduling the video is the explicit "reset everything" action.
+* **Promo cascade.** When the target is a primary (`parent_item_id IS NULL`), every auto-anchored child (`publish_at_manual = 0`) shifts by the same delta the parent just moved; manually-overridden children stay put. When the target is a child, later same-`item_type` siblings whose `publish_at > old_publish_at` and `publish_at_manual = 0` shift by the same delta; manual siblings stay put. The IDs that were moved are returned in `cascaded_children` / `cascaded_siblings`.
+
+**Side effects** — Sets `videos.publish_at_manual = 1` on the target (user-initiated). Registers an APScheduler `DateTrigger` job (`publish_<video_id>`); cancels and re-attaches per-post jobs (see Cascades above); sets `videos.status='scheduled'`, `videos.publish_at=<iso>`; records `publish_scheduled` and one `social_post_scheduled` event per re-attached post.
 
 ### `DELETE /api/videos/{video_id}/schedule`
 

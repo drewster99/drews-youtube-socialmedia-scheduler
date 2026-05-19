@@ -638,11 +638,21 @@ async def update_video(video_id: str, data: dict):
     # that were touched in this request — that way a privacy clamp or
     # silent tag-trim shows up in the DB and event diff. Fall back to
     # the user-supplied values if readback failed.
+    #
+    # ``publish_at`` is special: writing it directly here would leave
+    # the APScheduler job stale (registered to the OLD time). Defer to
+    # ``apply_user_reschedule`` below so the job + cascade fire too.
     updates = []
     params = []
     new_privacy: str | None = None
+    publish_at_for_reschedule = None
     for field in ["title", "description", "tags", "privacy_status", "publish_at", "pinned_links", "status"]:
         if field in data:
+            if field == "publish_at":
+                # Capture for the post-update reschedule call; skip the
+                # direct write so schedule_publish owns the value.
+                publish_at_for_reschedule = data[field]
+                continue
             updates.append(f"{field} = ?")
             if confirmed is not None and field in confirmed and confirmed[field] is not None:
                 val = confirmed[field]
@@ -688,6 +698,36 @@ async def update_video(video_id: str, data: dict):
         )
         await db.commit()
 
+    # publish_at changes route through apply_user_reschedule so the
+    # APScheduler job actually re-registers, publish_at_manual flips
+    # to 1, and the cascade (children-of-parent or same-tier-siblings)
+    # fires. Without this dedicated path the metadata-form publish_at
+    # edit was a silent scheduler de-sync — a pre-C4 bug.
+    if publish_at_for_reschedule is not None:
+        from datetime import datetime as _dt, timezone
+        from yt_scheduler.services.scheduler import apply_user_reschedule
+
+        raw = publish_at_for_reschedule
+        if confirmed is not None and confirmed.get("publish_at"):
+            raw = confirmed["publish_at"]
+        if raw:
+            try:
+                normalised = (
+                    raw.replace("Z", "+00:00")
+                    if isinstance(raw, str) and raw.endswith("Z")
+                    else raw
+                )
+                target = _dt.fromisoformat(normalised)
+                if target.tzinfo is None:
+                    target = target.replace(tzinfo=timezone.utc)
+                await apply_user_reschedule(video_id, target)
+            except (ValueError, TypeError) as exc:
+                logger.warning(
+                    "Could not apply reschedule cascade for %s: %s",
+                    video_id, exc,
+                )
+
+    if updates or publish_at_for_reschedule is not None:
         # Record per-field diff. Compare against what the user actually sent so
         # tag-list normalisation lines up.
         after = {**before, **{k: data[k] for k in data if k in _TRACKED_FIELDS_FOR_DIFF}}
@@ -1104,9 +1144,15 @@ async def schedule_video(video_id: str, data: dict):
 
     At the scheduled time, the video flips to public and all
     approved social posts are sent simultaneously.
+
+    User-driven reschedule path: stamps ``publish_at_manual = 1`` on
+    the target row, then fires the appropriate cascade — primary
+    targets shift their auto-anchored children by the same delta;
+    child targets shift later same-tier siblings by the same delta.
+    Manually-overridden rows are left in place.
     """
     from datetime import datetime as dt, timezone
-    from yt_scheduler.services.scheduler import schedule_publish
+    from yt_scheduler.services.scheduler import apply_user_reschedule
 
     publish_at_str = data.get("publish_at")
     if not publish_at_str:
@@ -1123,7 +1169,7 @@ async def schedule_video(video_id: str, data: dict):
     if publish_at <= dt.now(timezone.utc):
         raise HTTPException(400, "publish_at must be in the future")
 
-    job_id = await schedule_publish(video_id, publish_at)
+    cascade = await apply_user_reschedule(video_id, publish_at)
     await events.record_event(
         video_id,
         "publish_scheduled",
@@ -1135,8 +1181,10 @@ async def schedule_video(video_id: str, data: dict):
     )
     return {
         "status": "ok",
-        "job_id": job_id,
+        "job_id": f"publish_{video_id}",
         "publish_at": publish_at.isoformat(),
+        "cascaded_children": cascade["cascaded_children"],
+        "cascaded_siblings": cascade["cascaded_siblings"],
         "message": f"Video will go public and social posts will fire at {publish_at.isoformat()}",
     }
 

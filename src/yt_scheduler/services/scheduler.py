@@ -1382,6 +1382,175 @@ def _preview_row(child: dict, target: datetime) -> dict:
     }
 
 
+# --- Cascade rescheduling -------------------------------------------------
+
+# When the user reschedules a video, related rows may need to move too:
+#
+# * Parent reschedule  -> auto-anchored children shift by the same delta
+#   (publish_at_manual = 0 children). Manual-override children stay put.
+# * Child reschedule   -> same-tier siblings AFTER this child shift by
+#   the same delta, again only the auto-anchored ones.
+#
+# A re-entry guard prevents A-causes-B-causes-A loops: when one cascade
+# fires another schedule_publish, the inner call passes cascade=False
+# so the inner schedule doesn't trigger more cascades.
+
+
+async def cascade_children_on_parent_shift(
+    parent_id: str, old_publish_at: datetime, new_publish_at: datetime,
+) -> list[str]:
+    """Move every auto-anchored child of ``parent_id`` by the same delta
+    the parent just moved. Skips children with ``publish_at_manual = 1``
+    and children whose status is ``published``.
+
+    Returns the list of child ids that were rescheduled.
+    """
+    if old_publish_at.tzinfo is None:
+        old_publish_at = old_publish_at.replace(tzinfo=timezone.utc)
+    if new_publish_at.tzinfo is None:
+        new_publish_at = new_publish_at.replace(tzinfo=timezone.utc)
+    delta = new_publish_at - old_publish_at
+    if delta == timedelta():
+        return []
+
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id, publish_at FROM videos "
+        "WHERE parent_item_id = ? "
+        "AND publish_at IS NOT NULL "
+        "AND (publish_at_manual IS NULL OR publish_at_manual = 0) "
+        "AND (status IS NULL OR status != 'published')",
+        (parent_id,),
+    )
+    shifted: list[str] = []
+    for r in rows:
+        child = dict(r)
+        existing = _parse_iso_datetime(child.get("publish_at"))
+        if existing is None:
+            continue
+        target = existing + delta
+        await schedule_publish(child["id"], target)
+        # schedule_publish stamps status='scheduled' + writes publish_at;
+        # we have to re-mark publish_at_manual = 0 since schedule_publish
+        # itself doesn't touch the column. Without this, a user-driven
+        # cascade would leave the column as it was before — fine in this
+        # path but cleaner to be explicit.
+        await db.execute(
+            "UPDATE videos SET publish_at_manual = 0 WHERE id = ?",
+            (child["id"],),
+        )
+        await db.commit()
+        shifted.append(child["id"])
+    return shifted
+
+
+async def cascade_siblings_on_shift(
+    child_id: str, old_publish_at: datetime, new_publish_at: datetime,
+) -> list[str]:
+    """Move same-tier siblings scheduled AFTER ``child_id`` by the same
+    delta. Skips manually-overridden siblings and published siblings.
+
+    Two siblings are "same-tier" when they share ``parent_item_id`` and
+    ``item_type`` (so a user-forced tier reclassification correctly
+    routes the cascade through the user's pick rather than the
+    duration-derived one).
+    """
+    if old_publish_at.tzinfo is None:
+        old_publish_at = old_publish_at.replace(tzinfo=timezone.utc)
+    if new_publish_at.tzinfo is None:
+        new_publish_at = new_publish_at.replace(tzinfo=timezone.utc)
+    delta = new_publish_at - old_publish_at
+    if delta == timedelta():
+        return []
+
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT parent_item_id, item_type FROM videos WHERE id = ?",
+        (child_id,),
+    )
+    if not rows:
+        return []
+    me = dict(rows[0])
+    parent_id = me.get("parent_item_id")
+    item_type = me.get("item_type") or ""
+    if not parent_id:
+        return []
+
+    sibling_rows = await db.execute_fetchall(
+        "SELECT id, publish_at FROM videos "
+        "WHERE parent_item_id = ? AND item_type = ? "
+        "AND id != ? "
+        "AND publish_at IS NOT NULL "
+        "AND publish_at > ? "
+        "AND (publish_at_manual IS NULL OR publish_at_manual = 0) "
+        "AND (status IS NULL OR status != 'published')",
+        (parent_id, item_type, child_id, old_publish_at.isoformat()),
+    )
+    shifted: list[str] = []
+    for r in sibling_rows:
+        sibling = dict(r)
+        existing = _parse_iso_datetime(sibling.get("publish_at"))
+        if existing is None:
+            continue
+        target = existing + delta
+        await schedule_publish(sibling["id"], target)
+        await db.execute(
+            "UPDATE videos SET publish_at_manual = 0 WHERE id = ?",
+            (sibling["id"],),
+        )
+        await db.commit()
+        shifted.append(sibling["id"])
+    return shifted
+
+
+async def apply_user_reschedule(
+    video_id: str, new_publish_at: datetime,
+) -> dict:
+    """User-driven reschedule entry point. Wraps :func:`schedule_publish`,
+    stamps ``publish_at_manual = 1`` on the target row, and fires the
+    appropriate cascade based on whether the target is a primary
+    (parent shift) or a child (sibling shift).
+
+    Returns ``{"cascaded_children": [...], "cascaded_siblings": [...]}``.
+    """
+    if new_publish_at.tzinfo is None:
+        new_publish_at = new_publish_at.replace(tzinfo=timezone.utc)
+
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id, publish_at, parent_item_id FROM videos WHERE id = ?",
+        (video_id,),
+    )
+    if not rows:
+        raise ValueError(f"Video {video_id} not found")
+    row = dict(rows[0])
+    old_publish_at = _parse_iso_datetime(row.get("publish_at"))
+    parent_item_id = row.get("parent_item_id")
+
+    await schedule_publish(video_id, new_publish_at)
+    await db.execute(
+        "UPDATE videos SET publish_at_manual = 1 WHERE id = ?",
+        (video_id,),
+    )
+    await db.commit()
+
+    cascaded_children: list[str] = []
+    cascaded_siblings: list[str] = []
+    if old_publish_at is not None and old_publish_at != new_publish_at:
+        if parent_item_id:
+            cascaded_siblings = await cascade_siblings_on_shift(
+                video_id, old_publish_at, new_publish_at,
+            )
+        else:
+            cascaded_children = await cascade_children_on_parent_shift(
+                video_id, old_publish_at, new_publish_at,
+            )
+    return {
+        "cascaded_children": cascaded_children,
+        "cascaded_siblings": cascaded_siblings,
+    }
+
+
 async def schedule_promo_batch(
     parent_id: str,
     *,
