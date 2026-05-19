@@ -678,100 +678,102 @@ class BlueskyPoster(SocialPoster):
             first_mime = mimetypes.guess_type(first_path.name)[0] or ""
             embed_kind = "video" if first_mime.startswith("video/") else "images"
 
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            try:
-                await self._ensure_fresh_token(creds, client)
-            except RuntimeError as exc:
-                # refresh_tokens raises RuntimeError on a non-200 from the
-                # AS — invalid_grant, expired_token, etc. all mean the
-                # user has to re-OAuth.
-                raise CredentialAuthError(creds.get("uuid"), str(exc)) from exc
+        from yt_scheduler.services import bluesky_http
 
-            embed = None
-            if embed_kind == "video":
-                first_path, first_alt = existing[0]
-                blob = await self._upload_blob(
-                    creds, first_path, client, bluesky_oauth, save_bundle
-                )
-                embed = {
-                    "$type": "app.bsky.embed.video",
-                    "video": blob,
-                    "alt": first_alt or "",
-                }
-            elif embed_kind == "images":
-                images_payload: list[dict] = []
-                for path_obj, alt in existing[:4]:
-                    mime = mimetypes.guess_type(path_obj.name)[0] or ""
-                    if mime.startswith("video/"):
-                        # Mixed batches aren't supported by the embed.images
-                        # lexicon; skip the video so the batch still posts.
-                        continue
-                    blob = await self._upload_blob(
-                        creds, path_obj, client, bluesky_oauth, save_bundle
-                    )
-                    images_payload.append({"image": blob, "alt": alt or ""})
-                if images_payload:
-                    embed = {
-                        "$type": "app.bsky.embed.images",
-                        "images": images_payload,
-                    }
+        try:
+            await self._ensure_fresh_token(creds)
+        except RuntimeError as exc:
+            # refresh_tokens raises RuntimeError on a non-200 from the
+            # AS — invalid_grant, expired_token, etc. all mean the
+            # user has to re-OAuth.
+            raise CredentialAuthError(creds.get("uuid"), str(exc)) from exc
 
-            record = {
-                "$type": "app.bsky.feed.post",
-                "text": text,
-                "createdAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        embed = None
+        if embed_kind == "video":
+            first_path, first_alt = existing[0]
+            blob = await self._upload_blob(
+                creds, first_path, bluesky_oauth, save_bundle
+            )
+            embed = {
+                "$type": "app.bsky.embed.video",
+                "video": blob,
+                "alt": first_alt or "",
             }
-            facets = _build_bluesky_facets(text)
-            if facets:
-                record["facets"] = facets
-            if embed is not None:
-                record["embed"] = embed
-
-            create_url = f"{creds['pds'].rstrip('/')}/xrpc/com.atproto.repo.createRecord"
-
-            async def _do() -> httpx.Response:
-                proof = bluesky_oauth.sign_dpop_proof(
-                    creds["private_key_pem"], "POST", create_url,
-                    nonce=creds.get("dpop_nonce_pds"),
-                    access_token=creds["access_token"],
+        elif embed_kind == "images":
+            images_payload: list[dict] = []
+            for path_obj, alt in existing[:4]:
+                mime = mimetypes.guess_type(path_obj.name)[0] or ""
+                if mime.startswith("video/"):
+                    # Mixed batches aren't supported by the embed.images
+                    # lexicon; skip the video so the batch still posts.
+                    continue
+                blob = await self._upload_blob(
+                    creds, path_obj, bluesky_oauth, save_bundle
                 )
-                return await client.post(
-                    create_url,
-                    headers={
-                        "Authorization": f"DPoP {creds['access_token']}",
-                        "DPoP": proof,
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "repo": creds["did"],
-                        "collection": "app.bsky.feed.post",
-                        "record": record,
-                    },
-                )
+                images_payload.append({"image": blob, "alt": alt or ""})
+            if images_payload:
+                embed = {
+                    "$type": "app.bsky.embed.images",
+                    "images": images_payload,
+                }
 
-            resp = await _do()
-            if resp.status_code in (400, 401):
-                try:
-                    retried = await self._handle_dpop_or_token_error(
-                        resp, creds, client, bluesky_oauth, save_bundle,
-                    )
-                except RuntimeError as exc:
-                    raise CredentialAuthError(creds.get("uuid"), str(exc)) from exc
-                if retried:
-                    resp = await _do()
+        record = {
+            "$type": "app.bsky.feed.post",
+            "text": text,
+            "createdAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        facets = _build_bluesky_facets(text)
+        if facets:
+            record["facets"] = facets
+        if embed is not None:
+            record["embed"] = embed
 
-            if resp.status_code == 401:
-                # Still 401 after refresh+retry — the credential is dead.
-                raise CredentialAuthError(
-                    creds.get("uuid"),
-                    f"Bluesky rejected the credential after refresh: {resp.text}",
-                )
-            if resp.status_code not in (200, 201):
-                raise RuntimeError(
-                    f"Bluesky createRecord failed: HTTP {resp.status_code} {resp.text}"
-                )
+        create_url = f"{creds['pds'].rstrip('/')}/xrpc/com.atproto.repo.createRecord"
 
-            self._stash_pds_nonce(creds, resp, save_bundle)
+        async def _do() -> bluesky_http.Response:
+            proof = bluesky_oauth.sign_dpop_proof(
+                creds["private_key_pem"], "POST", create_url,
+                nonce=creds.get("dpop_nonce_pds"),
+                access_token=creds["access_token"],
+            )
+            return await bluesky_http.post(
+                create_url,
+                headers={
+                    "Authorization": f"DPoP {creds['access_token']}",
+                    "DPoP": proof,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "repo": creds["did"],
+                    "collection": "app.bsky.feed.post",
+                    "record": record,
+                },
+                timeout=60,
+            )
+
+        resp = await _do()
+        if resp.status_code in (400, 401):
+            try:
+                retried = await self._handle_dpop_or_token_error(
+                    resp, creds, bluesky_oauth, save_bundle,
+                )
+            except RuntimeError as exc:
+                raise CredentialAuthError(creds.get("uuid"), str(exc)) from exc
+            if retried:
+                resp = await _do()
+
+        if resp.status_code == 401:
+            # Still 401 after refresh+retry — the credential is dead.
+            raise CredentialAuthError(
+                creds.get("uuid"),
+                f"Bluesky rejected the credential after refresh: {resp.text}",
+            )
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"Bluesky createRecord failed: HTTP {resp.status_code} {resp.text}"
+            )
+
+        self._stash_pds_nonce(creds, resp, save_bundle)
 
         body = resp.json() or {}
         uri = body.get("uri", "")
@@ -804,7 +806,7 @@ class BlueskyPoster(SocialPoster):
         return parts[-1]
 
     @staticmethod
-    def _stash_pds_nonce(creds: dict, resp: httpx.Response, save_bundle) -> None:
+    def _stash_pds_nonce(creds: dict, resp, save_bundle) -> None:
         new_nonce = resp.headers.get("DPoP-Nonce")
         if new_nonce and new_nonce != creds.get("dpop_nonce_pds"):
             creds["dpop_nonce_pds"] = new_nonce
@@ -812,9 +814,8 @@ class BlueskyPoster(SocialPoster):
 
     async def _handle_dpop_or_token_error(
         self,
-        resp: httpx.Response,
+        resp,
         creds: dict,
-        client: httpx.AsyncClient,
         bluesky_oauth,
         save_bundle,
     ) -> bool:
@@ -836,7 +837,7 @@ class BlueskyPoster(SocialPoster):
                 save_bundle("bluesky", creds["uuid"], creds)
                 return True
         if resp.status_code == 401 or err in ("invalid_token", "expired_token"):
-            await self._refresh_access_token(creds, client, bluesky_oauth, save_bundle)
+            await self._refresh_access_token(creds, bluesky_oauth, save_bundle)
             return True
         return False
 
@@ -848,7 +849,7 @@ class BlueskyPoster(SocialPoster):
     _PRE_REFRESH_WINDOW_SECS = 15 * 60
 
     async def _refresh_under_lock(
-        self, creds: dict, *, window_secs: int, client: httpx.AsyncClient | None = None,
+        self, creds: dict, *, window_secs: int,
     ) -> bool:
         """Refresh the access token, serialised per-credential via
         ``get_credential_lock``. Re-reads the stored bundle inside the lock so
@@ -875,11 +876,7 @@ class BlueskyPoster(SocialPoster):
                 return False
             if not creds.get("refresh_token"):
                 return False
-            if client is not None:
-                await self._refresh_access_token(creds, client, bluesky_oauth, save_bundle)
-            else:
-                async with httpx.AsyncClient(follow_redirects=True) as c:
-                    await self._refresh_access_token(creds, c, bluesky_oauth, save_bundle)
+            await self._refresh_access_token(creds, bluesky_oauth, save_bundle)
             if uuid:
                 # A successful refresh means the session is alive — clear any
                 # stale needs-reauth flag (e.g. one set by a transient blip).
@@ -891,7 +888,7 @@ class BlueskyPoster(SocialPoster):
                 return await _do()
         return await _do()
 
-    async def _ensure_fresh_token(self, creds: dict, client: httpx.AsyncClient) -> None:
+    async def _ensure_fresh_token(self, creds: dict) -> None:
         # Quick out before taking the lock; _refresh_under_lock re-checks inside it.
         expires_at = int(creds.get("expires_at") or 0)
         if expires_at and expires_at - self._PRE_REFRESH_WINDOW_SECS > int(time.time()):
@@ -899,7 +896,7 @@ class BlueskyPoster(SocialPoster):
         if not creds.get("refresh_token"):
             return
         await self._refresh_under_lock(
-            creds, window_secs=self._PRE_REFRESH_WINDOW_SECS, client=client
+            creds, window_secs=self._PRE_REFRESH_WINDOW_SECS,
         )
 
     async def refresh_if_stale(self, *, window_secs: int = 0) -> bool:
@@ -915,7 +912,7 @@ class BlueskyPoster(SocialPoster):
             raise CredentialAuthError(creds.get("uuid"), str(exc)) from exc
 
     async def _refresh_access_token(
-        self, creds: dict, client: httpx.AsyncClient, bluesky_oauth, save_bundle,
+        self, creds: dict, bluesky_oauth, save_bundle,
     ) -> None:
         result = await bluesky_oauth.refresh_tokens(
             refresh_token=creds["refresh_token"],
@@ -923,7 +920,6 @@ class BlueskyPoster(SocialPoster):
             token_endpoint=creds["token_endpoint"],
             redirect_uri=creds["redirect_uri"],
             nonce=creds.get("dpop_nonce_as"),
-            client=client,
         )
         creds["access_token"] = result["access_token"]
         if result.get("refresh_token"):
@@ -935,20 +931,22 @@ class BlueskyPoster(SocialPoster):
         save_bundle("bluesky", creds["uuid"], creds)
 
     async def _upload_blob(
-        self, creds: dict, path: Path, client: httpx.AsyncClient, bluesky_oauth, save_bundle,
+        self, creds: dict, path: Path, bluesky_oauth, save_bundle,
     ) -> dict:
+        from yt_scheduler.services import bluesky_http
+
         url = f"{creds['pds'].rstrip('/')}/xrpc/com.atproto.repo.uploadBlob"
         mime, _ = mimetypes.guess_type(path.name)
         mime = mime or "application/octet-stream"
         data = path.read_bytes()
 
-        async def _do() -> httpx.Response:
+        async def _do() -> bluesky_http.Response:
             proof = bluesky_oauth.sign_dpop_proof(
                 creds["private_key_pem"], "POST", url,
                 nonce=creds.get("dpop_nonce_pds"),
                 access_token=creds["access_token"],
             )
-            return await client.post(
+            return await bluesky_http.post(
                 url,
                 headers={
                     "Authorization": f"DPoP {creds['access_token']}",
@@ -956,13 +954,14 @@ class BlueskyPoster(SocialPoster):
                     "Content-Type": mime,
                 },
                 content=data,
+                timeout=120,
             )
 
         resp = await _do()
         if resp.status_code in (400, 401):
             try:
                 retried = await self._handle_dpop_or_token_error(
-                    resp, creds, client, bluesky_oauth, save_bundle,
+                    resp, creds, bluesky_oauth, save_bundle,
                 )
             except RuntimeError as exc:
                 raise CredentialAuthError(creds.get("uuid"), str(exc)) from exc

@@ -38,12 +38,12 @@ def _stub_resolution_and_par(monkeypatch) -> None:
     bo = importlib.import_module("yt_scheduler.services.bluesky_oauth")
     routes = importlib.import_module("yt_scheduler.routers.oauth_routes")
 
-    async def _fake_resolve(handle, _client):
+    async def _fake_resolve(handle):
         return bo.ResolvedIdentity(
             handle=handle, did="did:plc:fake", pds="https://pds.test"
         )
 
-    async def _fake_discover(_pds, _client):
+    async def _fake_discover(_pds):
         return bo.AuthServerMetadata(
             issuer="https://bsky.social",
             authorization_endpoint="https://bsky.social/oauth/authorize",
@@ -51,7 +51,7 @@ def _stub_resolution_and_par(monkeypatch) -> None:
             pushed_authorization_request_endpoint="https://bsky.social/oauth/par",
         )
 
-    async def _fake_par(_pending, _client):
+    async def _fake_par(_pending):
         return "urn:ietf:params:oauth:request_uri:fake-12345"
 
     monkeypatch.setattr(bo, "resolve_identity", _fake_resolve)
@@ -96,7 +96,7 @@ def test_resolution_failure_returns_400(client) -> None:
     bo = importlib.import_module("yt_scheduler.services.bluesky_oauth")
     routes = importlib.import_module("yt_scheduler.routers.oauth_routes")
 
-    async def _fail_resolve(handle, _client):
+    async def _fail_resolve(handle):
         raise ValueError(f"unknown handle {handle}")
 
     monkeypatch.setattr(bo, "resolve_identity", _fail_resolve)
@@ -116,7 +116,7 @@ def test_par_failure_returns_400(client) -> None:
     bo = importlib.import_module("yt_scheduler.services.bluesky_oauth")
     routes = importlib.import_module("yt_scheduler.routers.oauth_routes")
 
-    async def _fail_par(_pending, _client):
+    async def _fail_par(_pending):
         raise RuntimeError("PAR boom")
 
     monkeypatch.setattr(bo, "push_authorization_request", _fail_par)

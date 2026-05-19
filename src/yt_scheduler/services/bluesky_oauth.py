@@ -48,13 +48,14 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote, urlparse
 
-import httpx
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import (
     decode_dss_signature,
 )
 from cryptography.hazmat.primitives.hashes import SHA256
+
+from yt_scheduler.services import bluesky_http
 
 logger = logging.getLogger(__name__)
 
@@ -213,7 +214,7 @@ def normalise_handle(raw: str) -> str:
     return handle
 
 
-async def resolve_handle_to_did(handle: str, client: httpx.AsyncClient) -> str:
+async def resolve_handle_to_did(handle: str) -> str:
     """Resolve a Bluesky handle to a DID.
 
     Uses the AT-proto well-known endpoint first (much more reliable than
@@ -222,17 +223,17 @@ async def resolve_handle_to_did(handle: str, client: httpx.AsyncClient) -> str:
     """
     url = f"https://{handle}/.well-known/atproto-did"
     try:
-        resp = await client.get(url, timeout=8)
+        resp = await bluesky_http.get(url, timeout=8)
         if resp.status_code == 200:
             text = (resp.text or "").strip()
             if text.startswith("did:"):
                 return text
-    except httpx.HTTPError as exc:
+    except bluesky_http.BlueskyHTTPError as exc:
         logger.debug("well-known lookup for %s failed: %s", handle, exc)
 
     # Fallback to the public entryway's resolveHandle xrpc method.
     fallback = f"{BSKY_API_FALLBACK}/xrpc/com.atproto.identity.resolveHandle?handle={quote(handle)}"
-    resp = await client.get(fallback, timeout=8)
+    resp = await bluesky_http.get(fallback, timeout=8)
     if resp.status_code != 200:
         raise ValueError(f"Could not resolve handle {handle!r} (HTTP {resp.status_code})")
     data = resp.json() or {}
@@ -242,7 +243,7 @@ async def resolve_handle_to_did(handle: str, client: httpx.AsyncClient) -> str:
     return did
 
 
-async def fetch_did_document(did: str, client: httpx.AsyncClient) -> dict:
+async def fetch_did_document(did: str) -> dict:
     """Fetch the DID document for a ``did:plc:*`` or ``did:web:*`` DID."""
     if did.startswith("did:plc:"):
         url = f"https://plc.directory/{did}"
@@ -251,7 +252,7 @@ async def fetch_did_document(did: str, client: httpx.AsyncClient) -> dict:
         url = f"https://{host}/.well-known/did.json"
     else:
         raise ValueError(f"Unsupported DID method: {did}")
-    resp = await client.get(url, timeout=8)
+    resp = await bluesky_http.get(url, timeout=8)
     resp.raise_for_status()
     return resp.json() or {}
 
@@ -278,10 +279,10 @@ class ResolvedIdentity:
     pds: str
 
 
-async def resolve_identity(handle: str, client: httpx.AsyncClient) -> ResolvedIdentity:
+async def resolve_identity(handle: str) -> ResolvedIdentity:
     """Round-trip a handle to ``(handle, did, pds_url)``."""
-    did = await resolve_handle_to_did(handle, client)
-    doc = await fetch_did_document(did, client)
+    did = await resolve_handle_to_did(handle)
+    doc = await fetch_did_document(did)
     pds = pds_endpoint_from_did_document(doc)
     return ResolvedIdentity(handle=handle, did=did, pds=pds)
 
@@ -300,12 +301,10 @@ class AuthServerMetadata:
     dpop_signing_alg_values_supported: list[str] = field(default_factory=list)
 
 
-async def discover_auth_server_for_pds(
-    pds_url: str, client: httpx.AsyncClient
-) -> AuthServerMetadata:
+async def discover_auth_server_for_pds(pds_url: str) -> AuthServerMetadata:
     """Walk the PDS → protected-resource → authorization-server discovery chain."""
     pr_url = pds_url.rstrip("/") + "/.well-known/oauth-protected-resource"
-    pr_resp = await client.get(pr_url, timeout=8)
+    pr_resp = await bluesky_http.get(pr_url, timeout=8)
     pr_resp.raise_for_status()
     pr = pr_resp.json() or {}
     auth_servers = pr.get("authorization_servers") or []
@@ -314,7 +313,7 @@ async def discover_auth_server_for_pds(
     issuer = auth_servers[0]
 
     as_url = issuer.rstrip("/") + "/.well-known/oauth-authorization-server"
-    as_resp = await client.get(as_url, timeout=8)
+    as_resp = await bluesky_http.get(as_url, timeout=8)
     as_resp.raise_for_status()
     meta = as_resp.json() or {}
     par = meta.get("pushed_authorization_request_endpoint")
@@ -384,7 +383,7 @@ class PendingAuth:
     dpop_nonce_as: str | None = None
 
 
-def _is_dpop_nonce_error(resp: httpx.Response) -> bool:
+def _is_dpop_nonce_error(resp: bluesky_http.Response) -> bool:
     if resp.status_code not in (400, 401):
         return False
     try:
@@ -395,9 +394,7 @@ def _is_dpop_nonce_error(resp: httpx.Response) -> bool:
     return err == "use_dpop_nonce"
 
 
-async def push_authorization_request(
-    pending: PendingAuth, client: httpx.AsyncClient
-) -> str:
+async def push_authorization_request(pending: PendingAuth) -> str:
     """Send the PAR request, return the ``request_uri`` URN.
 
     Retries once if the AS demands a DPoP nonce. The ``DPoP-Nonce`` value
@@ -419,11 +416,11 @@ async def push_authorization_request(
         "login_hint": pending.handle,
     }
 
-    async def _do(nonce: str | None) -> httpx.Response:
+    async def _do(nonce: str | None) -> bluesky_http.Response:
         proof = sign_dpop_proof(
             pending.private_key_pem, "POST", par_url, nonce=nonce
         )
-        return await client.post(
+        return await bluesky_http.post(
             par_url, data=form, headers={"DPoP": proof}, timeout=15
         )
 
@@ -464,9 +461,7 @@ def authorization_redirect_url(pending: PendingAuth, request_uri: str) -> str:
 # --- Token exchange + refresh ---------------------------------------------
 
 
-async def exchange_code_for_tokens(
-    pending: PendingAuth, code: str, client: httpx.AsyncClient
-) -> dict:
+async def exchange_code_for_tokens(pending: PendingAuth, code: str) -> dict:
     """Trade the auth code for ``{access_token, refresh_token, sub, ...}``.
 
     Replays ``DPoP-Nonce`` once on ``use_dpop_nonce``. Updates
@@ -483,11 +478,11 @@ async def exchange_code_for_tokens(
         "code_verifier": pending.code_verifier,
     }
 
-    async def _do(nonce: str | None) -> httpx.Response:
+    async def _do(nonce: str | None) -> bluesky_http.Response:
         proof = sign_dpop_proof(
             pending.private_key_pem, "POST", token_url, nonce=nonce
         )
-        return await client.post(
+        return await bluesky_http.post(
             token_url, data=form, headers={"DPoP": proof}, timeout=15
         )
 
@@ -521,7 +516,6 @@ async def refresh_tokens(
     token_endpoint: str,
     redirect_uri: str,
     nonce: str | None,
-    client: httpx.AsyncClient,
 ) -> dict:
     """Use a refresh_token to mint a new access_token (and a rotated
     refresh_token). The ``nonce`` argument is the AS-side nonce (don't
@@ -536,9 +530,9 @@ async def refresh_tokens(
         "client_id": client_id,
     }
 
-    async def _do(n: str | None) -> httpx.Response:
+    async def _do(n: str | None) -> bluesky_http.Response:
         proof = sign_dpop_proof(private_key_pem, "POST", token_endpoint, nonce=n)
-        return await client.post(
+        return await bluesky_http.post(
             token_endpoint, data=form, headers={"DPoP": proof}, timeout=15
         )
 

@@ -29,7 +29,7 @@ from yt_scheduler.services.auth import (
     has_client_secret,
     store_credentials,
 )
-from yt_scheduler.services import bluesky_oauth, oauth_clients, youtube as _youtube
+from yt_scheduler.services import bluesky_http, bluesky_oauth, oauth_clients, youtube as _youtube
 from yt_scheduler.services.projects import slugify
 from yt_scheduler.services.social_credentials import (
     display_name_for,
@@ -1318,36 +1318,33 @@ async def bluesky_start(data: dict):
     state = secrets.token_urlsafe(24)
     private_key_pem = bluesky_oauth.generate_keypair_pem()
 
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        try:
-            identity = await bluesky_oauth.resolve_identity(handle, client)
-        except (ValueError, httpx.HTTPError) as exc:
-            raise HTTPException(400, f"Could not resolve {handle}: {exc}") from exc
-        try:
-            auth_meta = await bluesky_oauth.discover_auth_server_for_pds(
-                identity.pds, client
-            )
-        except (ValueError, httpx.HTTPError) as exc:
-            raise HTTPException(
-                400,
-                f"Could not discover authorization server for PDS {identity.pds}: {exc}",
-            ) from exc
+    try:
+        identity = await bluesky_oauth.resolve_identity(handle)
+    except (ValueError, bluesky_http.BlueskyHTTPError) as exc:
+        raise HTTPException(400, f"Could not resolve {handle}: {exc}") from exc
+    try:
+        auth_meta = await bluesky_oauth.discover_auth_server_for_pds(identity.pds)
+    except (ValueError, bluesky_http.BlueskyHTTPError) as exc:
+        raise HTTPException(
+            400,
+            f"Could not discover authorization server for PDS {identity.pds}: {exc}",
+        ) from exc
 
-        pending = bluesky_oauth.PendingAuth(
-            handle=identity.handle,
-            did=identity.did,
-            pds=identity.pds,
-            auth_server=auth_meta,
-            redirect_uri=redirect_uri,
-            code_verifier=code_verifier,
-            state=state,
-            private_key_pem=private_key_pem,
-            project_slug=project_slug,
-        )
-        try:
-            request_uri = await bluesky_oauth.push_authorization_request(pending, client)
-        except (RuntimeError, httpx.HTTPError) as exc:
-            raise HTTPException(400, f"PAR failed: {exc}") from exc
+    pending = bluesky_oauth.PendingAuth(
+        handle=identity.handle,
+        did=identity.did,
+        pds=identity.pds,
+        auth_server=auth_meta,
+        redirect_uri=redirect_uri,
+        code_verifier=code_verifier,
+        state=state,
+        private_key_pem=private_key_pem,
+        project_slug=project_slug,
+    )
+    try:
+        request_uri = await bluesky_oauth.push_authorization_request(pending)
+    except (RuntimeError, bluesky_http.BlueskyHTTPError) as exc:
+        raise HTTPException(400, f"PAR failed: {exc}") from exc
 
     _gc_pending()
     _bluesky_pending[state] = pending
@@ -1396,13 +1393,12 @@ async def bluesky_callback(
             platform="bluesky",
         )
 
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        try:
-            tokens = await bluesky_oauth.exchange_code_for_tokens(pending, code, client)
-        except (RuntimeError, httpx.HTTPError) as exc:
-            return _result_page(
-                False, f"Token exchange failed: {exc}", platform="bluesky"
-            )
+    try:
+        tokens = await bluesky_oauth.exchange_code_for_tokens(pending, code)
+    except (RuntimeError, bluesky_http.BlueskyHTTPError) as exc:
+        return _result_page(
+            False, f"Token exchange failed: {exc}", platform="bluesky"
+        )
 
     sub = tokens.get("sub") or pending.did
     if sub != pending.did:
