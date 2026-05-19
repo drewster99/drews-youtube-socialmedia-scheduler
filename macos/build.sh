@@ -69,7 +69,7 @@ PYTHON_VERSION="3.12"
 PYTHON_FULL_VERSION="3.12.8"
 BUNDLE_ID="com.nuclearcyborg.drews-socialmedia-scheduler"
 LAUNCH_AGENT_LABEL="$BUNDLE_ID"
-NOTARIZE_PROFILE="${NOTARIZE_PROFILE:-YTScheduler}"
+NOTARIZE_PROFILE="${NOTARY_PROFILE:-${NOTARIZE_PROFILE:-YTScheduler}}"
 
 # --- build identity ---------------------------------------------------------
 
@@ -128,7 +128,7 @@ echo "Version:    $VERSION (#$BUILD_NUMBER)"
 echo "Build ID:   $BUILD_ID"
 echo "Build dir:  $BUILD_DIR"
 echo "Sign:       $([ "$SIGN" = true ] && echo "$DEVELOPER_ID" || echo "no (--no-sign — agent will NOT install)")"
-echo "Notarize:   $NOTARIZE"
+echo "Notarize:   $NOTARIZE$([ "$NOTARIZE" = true ] && echo " (profile: $NOTARIZE_PROFILE)")"
 echo
 
 rm -rf "$BUILD_DIR"
