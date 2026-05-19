@@ -547,6 +547,7 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 | Name | Type | Required | Description |
 |---|---|---|---|
 | `project_slug` | string | optional | Filter to one project. When omitted, returns every video across every project (used by import / admin views). |
+| `include_children` | bool | optional, default `false` | When `false`, hides rows whose `parent_item_id` is set (promo children); the Dashboard listing relies on this. Set `true` to retrieve children too (used by the import-dedup branch and admin views). |
 
 **Response 200** — Array of video rows from `videos` (every column), ordered `created_at DESC`, with one transformation: the absolute-path columns `thumbnail_path` and `video_file_path` are **removed** and replaced by `thumbnail_url` (`/media/<name>` or `null`), `video_file_url` (`/media/<name>` or `null`), and `video_file_name` (the bare filename or `null`). `tags` is the raw JSON-encoded string from the column (the frontend `JSON.parse`s it).
 
@@ -575,6 +576,26 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 ```json
 [ { "id": 1, "video_id": "abc", "type": "uploaded", "payload": {"platform":"youtube","url":"..."}, "created_at": "..." } ]
 ```
+
+### `GET /api/videos/{video_id}/auto-actions`
+
+**Purpose** — Promo-flow per-video progress for the polling UI.
+
+**Response 200** — `{"state": "...", "last_error": "..." | null, "updated_at": "..."}`. `state` is one of the persisted `videos.auto_action_state` values (`generating_title`, `uploading`, `probing`, `transcribing`, `generating_desc`, `generating_tags`, `pushing_metadata`, `ready`) or `failed:<step>` after a failure; `null` means the chain has never touched this row.
+
+**Errors** — `404` (video not found).
+
+### `POST /api/videos/{video_id}/auto-actions/retry`
+
+**Purpose** — Re-run the Promo auto-action chain from a specific step onward. Used by the per-card "Retry <step>" button when state lands on `failed:<step>`.
+
+**Query params** — `step` (one of the `PROMO_STEP_ORDER` values).
+
+**Response 200** — `{"status": "ok", "video_id": "...", "step": "..."}`.
+
+**Errors** — `400` (unknown step name, video missing).
+
+**Side effects** — Sets `auto_action_state` back to `step`, kicks off `auto_actions._resume_promo_chain` in a background task. Steps are gated by idempotency (skip if the column they produce is already populated), so a retry that lands on a now-resolved failure walks straight through to `ready`.
 
 ### `GET /api/videos/{video_id}`
 
@@ -1856,12 +1877,48 @@ Source: `src/yt_scheduler/routers/import_routes.py`
 
 **Purpose** — Import a specific YouTube video by id into the project.
 
-**Request body** — `{"video_id": "abc"}`.
+**Request body** — `{"video_id": "abc", "parent_item_id": "optional_parent_id"}`.
+
+When `parent_item_id` is set, the imported video lands as a promo child of that primary (hidden from Dashboard, surfaces on the parent's Promo Videos screen). The parent must exist in the same project and itself be a primary (`parent_item_id IS NULL`); only one level of parenting is supported.
 
 **Response 200** — The newly inserted `videos` row.
 
-**Errors** — `404` (unknown slug), `400` (`video_id` missing, video not on YouTube, video already imported), `500` (any other failure).
+**Errors** — `404` (unknown slug), `400` (`video_id` missing, video not on YouTube, video already imported, parent_item_id not found / belongs to another project / is itself a child), `500` (any other failure).
 
 **Side effects** — Calls `youtube.get_video` (~1 quota); downloads the thumbnail to `UPLOAD_DIR`; inserts the row; records `imported`; tries to download the existing YouTube caption (50 quota) and store it as a transcript; runs `auto_actions.run_post_create_actions(... source="import")` in the background.
 
 **Renderer (background path)** — When auto-gen-socials is enabled for imports, the background job renders each platform's slot body through the same engine as [`POST /api/expand_text`](#post-apiexpand_text). Same variables and same syntax.
+
+## Promo Videos (`/api/projects/{slug}/videos/{parent_id}/promos`)
+
+Source: `src/yt_scheduler/routers/promo_routes.py`
+
+Bulk-upload promo children under a primary video. Each upload runs through the multi-step auto-action chain (title → upload → probe → transcribe → description → tags → push metadata); per-card progress is polled via either the upload-jobs endpoint (pre-INSERT) or `GET /api/videos/{id}/auto-actions` (post-INSERT).
+
+### `GET /api/projects/{slug}/videos/{parent_id}/promos`
+
+**Purpose** — List the parent's children, bucketed by `item_type`.
+
+**Response 200** — `{"summary": {"segment": N, "short": N, "hook": N}, "children": {"segment": [...], "short": [...], "hook": [...]}}`. Each child entry is the `_video_public` projection.
+
+**Errors** — `404` (project or parent video not found in project), `400` (parent is itself a child — only one level of parenting is supported).
+
+### `POST /api/projects/{slug}/videos/{parent_id}/promos/upload`
+
+**Purpose** — Queue one or more files into the promo auto-action chain.
+
+**Request body** — `multipart/form-data` with `files[]` (one or more video files) and optional `item_type` (one of `segment`, `short`, `hook`; when omitted, the chain derives `item_type` from the probed duration).
+
+**Response 200** — `{"jobs": [{"job_id": "job_<hex>", "filename": "..."}, ...]}`. Each `job_id` is the polling handle.
+
+**Errors** — `404` (project / parent missing), `400` (invalid `item_type`, no files, parent is itself a child).
+
+**Side effects** — Saves each file under `UPLOAD_DIR`; spawns one `auto_actions.start_promo_upload(...)` task per file. The chain runs sequentially per-task: the transcription step is serialised across all in-flight promo uploads via a module-level lock so concurrent Whisper instances don't thrash the box. Each finished chain spends ≈ 150 YouTube quota (100 upload + 50 metadata update).
+
+### `GET /api/projects/{slug}/videos/{parent_id}/promos/upload-jobs/{job_id}`
+
+**Purpose** — Poll a single in-flight upload job.
+
+**Response 200** — `{"job_id": "...", "filename": "...", "parent_id": "...", "video_id": "..." | null, "state": "...", "last_error": "..." | null, "title": "..." | null}`. `video_id` is `null` until the YouTube upload step succeeds; once set, the UI should switch to polling `GET /api/videos/{video_id}/auto-actions` (the job dict is dropped from memory when the chain terminates, returning 404 on a stale poll).
+
+**Errors** — `404` (job not found / already completed).

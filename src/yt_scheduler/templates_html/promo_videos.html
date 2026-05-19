@@ -1,0 +1,344 @@
+{% extends "base.html" %}
+{% block title %}{{ current_video.title or "Video" }} / Promo Videos — Drew's Video + Socials Scheduler{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1 class="page-breadcrumb">
+        <a href="/projects/{{ current_project.slug }}" class="crumb crumb-project">{{ current_project.name }}</a>
+        <span class="crumb-sep">/</span>
+        <a href="/projects/{{ current_project.slug }}/videos/{{ parent_id }}" class="crumb">{{ current_video.title or parent_id }}</a>
+        <span class="crumb-sep">/</span>
+        <span class="crumb crumb-page">Promo videos</span>
+    </h1>
+    <div style="display:flex; gap:0.5rem;">
+        <label for="add-files-all" class="btn btn-primary" id="add-files-all-label">
+            + Add videos
+            <input type="file" id="add-files-all" accept="video/*" multiple style="display:none;">
+        </label>
+    </div>
+</div>
+
+<div id="upload-error-banner" class="banner banner-error" style="display:none;"></div>
+
+<div class="section" id="promo-section-segment">
+    <div class="section-header">
+        <h2>Segments</h2>
+        <label for="add-files-segment" class="btn btn-sm">
+            + Add to Segments
+            <input type="file" id="add-files-segment" accept="video/*" multiple style="display:none;">
+        </label>
+    </div>
+    <div id="promo-list-segment" class="video-grid promo-grid"
+         data-drop-tier="segment"></div>
+</div>
+
+<div class="section" id="promo-section-short">
+    <div class="section-header">
+        <h2>Shorts</h2>
+        <label for="add-files-short" class="btn btn-sm">
+            + Add to Shorts
+            <input type="file" id="add-files-short" accept="video/*" multiple style="display:none;">
+        </label>
+    </div>
+    <div id="promo-list-short" class="video-grid promo-grid"
+         data-drop-tier="short"></div>
+</div>
+
+<div class="section" id="promo-section-hook">
+    <div class="section-header">
+        <h2>Hooks</h2>
+        <label for="add-files-hook" class="btn btn-sm">
+            + Add to Hooks
+            <input type="file" id="add-files-hook" accept="video/*" multiple style="display:none;">
+        </label>
+    </div>
+    <div id="promo-list-hook" class="video-grid promo-grid"
+         data-drop-tier="hook"></div>
+</div>
+
+<script>
+const projectSlug = "{{ current_project.slug }}";
+const parentId = "{{ parent_id }}";
+
+// Maps the promo chain's persisted state strings to a human-friendly
+// label for the per-card progress strip. Keeps the polling code dumb:
+// it just reads the state and looks up the label.
+const PROMO_STATE_LABELS = {
+    pending: 'Queued…',
+    generating_title: 'Generating title…',
+    uploading: 'Uploading to YouTube…',
+    probing: 'Probing duration…',
+    transcribing: 'Transcribing…',
+    generating_desc: 'Generating description…',
+    generating_tags: 'Generating tags…',
+    pushing_metadata: 'Pushing metadata to YouTube…',
+    ready: 'Ready',
+};
+
+// Step names in order — used for the Retry button (re-runs from the
+// failed step onward). Mirror of services.auto_actions.PROMO_STEP_ORDER.
+const PROMO_STEPS_IN_ORDER = [
+    'generating_title', 'uploading', 'probing',
+    'transcribing', 'generating_desc', 'generating_tags', 'pushing_metadata',
+];
+
+// In-memory map of job_id -> { video_id, last_state }. Drives the
+// upload-jobs polling lifecycle: while video_id is null we poll
+// /upload-jobs/{id}; once it lands we switch to polling the video
+// directly (state moves over to the videos.auto_action_state column).
+const activeJobs = new Map();
+
+function escapeHtml(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function progressStripFor(state, lastError) {
+    if (!state) return '';
+    if (state === 'ready') {
+        return '<div class="promo-progress promo-progress-ready">Ready</div>';
+    }
+    if (state.startsWith('failed:')) {
+        const failedStep = state.slice('failed:'.length);
+        const stepLabel = PROMO_STATE_LABELS[failedStep] || failedStep;
+        const errorMsg = lastError ? `<div class="promo-error-msg">${escapeHtml(lastError)}</div>` : '';
+        return `
+            <div class="promo-progress promo-progress-failed">
+                Failed at: ${escapeHtml(stepLabel)}
+                ${errorMsg}
+                <button class="btn btn-sm btn-secondary promo-retry-btn"
+                        data-retry-step="${escapeHtml(failedStep)}">
+                    Retry ${escapeHtml(stepLabel.toLowerCase())}
+                </button>
+            </div>`;
+    }
+    const label = PROMO_STATE_LABELS[state] || state;
+    return `<div class="promo-progress promo-progress-active"><span class="spinner-dot"></span> ${escapeHtml(label)}</div>`;
+}
+
+function renderChildCard(child) {
+    const state = child.auto_action_state;
+    const ready = state === 'ready' || state == null;
+    const editable = ready ? '' : ' promo-card-locked';
+    const thumb = child.thumbnail_url
+        ? `<img src="${escapeHtml(child.thumbnail_url)}" alt="${escapeHtml(child.title)}">`
+        : '<div class="thumb-placeholder">No thumbnail</div>';
+    return `
+        <div class="video-card promo-card${editable}" data-child-id="${escapeHtml(child.id)}">
+            <a href="/projects/${escapeHtml(projectSlug)}/videos/${escapeHtml(child.id)}" class="video-thumb">${thumb}</a>
+            <div class="video-info">
+                <h3>${escapeHtml(child.title)}</h3>
+                ${progressStripFor(state, child.auto_action_last_error || null)}
+                <div class="video-meta">
+                    <span class="badge badge-type-${escapeHtml(child.item_type || 'short')}">${escapeHtml(child.item_type || 'short')}</span>
+                    ${child.tier ? `<span class="badge badge-tier-${escapeHtml(child.tier)}">${escapeHtml(child.tier)}</span>` : ''}
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+function renderUploadJobCard(job) {
+    return `
+        <div class="video-card promo-card promo-card-locked" data-job-id="${escapeHtml(job.job_id)}">
+            <div class="video-thumb"><div class="thumb-placeholder">Uploading…</div></div>
+            <div class="video-info">
+                <h3>${escapeHtml(job.title || job.filename || 'New promo')}</h3>
+                ${progressStripFor(job.state, job.last_error || null)}
+            </div>
+        </div>
+    `;
+}
+
+async function loadPromos() {
+    const resp = await fetch(`/api/projects/${projectSlug}/videos/${parentId}/promos`);
+    if (!resp.ok) {
+        document.getElementById('upload-error-banner').style.display = '';
+        document.getElementById('upload-error-banner').textContent = 'Failed to load promo videos.';
+        return;
+    }
+    const data = await resp.json();
+    const buckets = data.children || {};
+    for (const tier of ['segment', 'short', 'hook']) {
+        const list = document.getElementById('promo-list-' + tier);
+        const children = (buckets[tier] || []);
+        // Upload jobs that have produced a video_id are already in the
+        // server response; ones that haven't are still in activeJobs
+        // and we render them as placeholder cards in the matching bucket.
+        const pendingJobsForTier = Array.from(activeJobs.values())
+            .filter(j => !j.video_id && j.expectedTier === tier)
+            .map(j => renderUploadJobCard(j));
+        const cards = children.map(renderChildCard).concat(pendingJobsForTier);
+        list.innerHTML = cards.length
+            ? cards.join('')
+            : '<p class="empty-state">No videos in this section yet.</p>';
+    }
+    bindRetryButtons();
+}
+
+function bindRetryButtons() {
+    for (const btn of document.querySelectorAll('[data-retry-step]')) {
+        btn.addEventListener('click', async () => {
+            const card = btn.closest('[data-child-id]');
+            if (!card) return;
+            const videoId = card.getAttribute('data-child-id');
+            const step = btn.getAttribute('data-retry-step');
+            btn.disabled = true;
+            btn.textContent = 'Retrying…';
+            await fetch(`/api/videos/${videoId}/auto-actions/retry?step=${encodeURIComponent(step)}`, {
+                method: 'POST',
+            });
+            setTimeout(loadPromos, 1500);
+        });
+    }
+}
+
+async function pollUploadJobs() {
+    if (activeJobs.size === 0) return;
+    const toDelete = [];
+    let anyStateChange = false;
+    for (const [jobId, job] of activeJobs) {
+        try {
+            const resp = await fetch(
+                `/api/projects/${projectSlug}/videos/${parentId}/promos/upload-jobs/${encodeURIComponent(jobId)}`,
+                {_silent: true},
+            );
+            if (resp.status === 404) {
+                toDelete.push(jobId);
+                anyStateChange = true;
+                continue;
+            }
+            if (!resp.ok) continue;
+            const data = await resp.json();
+            if (data.video_id && !job.video_id) {
+                job.video_id = data.video_id;
+                anyStateChange = true;
+            }
+            if (data.state !== job.state) {
+                job.state = data.state;
+                job.last_error = data.last_error || null;
+                job.title = data.title || job.title;
+                anyStateChange = true;
+            }
+            if (data.state && (data.state === 'ready' || data.state.startsWith('failed:'))) {
+                toDelete.push(jobId);
+            }
+        } catch (e) { /* swallow; we'll retry next tick */ }
+    }
+    for (const id of toDelete) activeJobs.delete(id);
+    if (anyStateChange) {
+        await loadPromos();
+    }
+}
+
+async function uploadFiles(files, forcedItemType) {
+    if (!files || !files.length) return;
+    const fd = new FormData();
+    for (const f of files) fd.append('files', f);
+    if (forcedItemType) fd.append('item_type', forcedItemType);
+
+    const banner = document.getElementById('upload-error-banner');
+    banner.style.display = 'none';
+    try {
+        const resp = await fetch(
+            `/api/projects/${projectSlug}/videos/${parentId}/promos/upload`,
+            {method: 'POST', body: fd},
+        );
+        if (!resp.ok) {
+            const err = await resp.text();
+            banner.textContent = `Upload failed: ${err}`;
+            banner.style.display = '';
+            return;
+        }
+        const out = await resp.json();
+        const expectedTier = forcedItemType || 'short';
+        for (const j of out.jobs || []) {
+            activeJobs.set(j.job_id, {
+                job_id: j.job_id,
+                filename: j.filename,
+                state: 'pending',
+                last_error: null,
+                video_id: null,
+                title: null,
+                expectedTier,
+            });
+        }
+        await loadPromos();
+    } catch (e) {
+        banner.textContent = `Upload failed: ${e}`;
+        banner.style.display = '';
+    }
+}
+
+// Per-section + global "Add" buttons. The per-section variant forces
+// item_type to that section's value; the global one leaves it blank so
+// the chain derives item_type from probed duration.
+function bindAdder(inputId, forcedItemType) {
+    const input = document.getElementById(inputId);
+    if (!input) return;
+    input.addEventListener('change', async () => {
+        await uploadFiles(input.files, forcedItemType);
+        input.value = '';
+    });
+}
+bindAdder('add-files-all', null);
+bindAdder('add-files-segment', 'segment');
+bindAdder('add-files-short', 'short');
+bindAdder('add-files-hook', 'hook');
+
+// Drag-and-drop on each section forces that section's tier; drag-and-
+// drop outside any section is a no-op (we'd have nowhere natural to
+// route the files). Drop on a section calls the same uploader as the
+// per-section button.
+for (const list of document.querySelectorAll('.promo-grid')) {
+    const tier = list.getAttribute('data-drop-tier');
+    list.addEventListener('dragover', e => { e.preventDefault(); list.classList.add('promo-drop-active'); });
+    list.addEventListener('dragleave', () => list.classList.remove('promo-drop-active'));
+    list.addEventListener('drop', async e => {
+        e.preventDefault();
+        list.classList.remove('promo-drop-active');
+        const files = Array.from(e.dataTransfer.files || []).filter(f => f.type.startsWith('video/'));
+        if (files.length) await uploadFiles(files, tier);
+    });
+}
+
+// Poll cadence: faster while any cards are non-terminal (3s), back off
+// to 15s once everything is ready. Cheap because the endpoint is a
+// single SELECT each call. The upload-job poller runs on the fast tick
+// since by definition those are non-terminal.
+let pollTimer = null;
+function scheduleNextPoll() {
+    if (pollTimer) clearTimeout(pollTimer);
+    const anyActive = document.querySelector(
+        '.promo-progress-active, [data-job-id]'
+    ) || activeJobs.size > 0;
+    const delay = anyActive ? 3000 : 15000;
+    pollTimer = setTimeout(async () => {
+        await pollUploadJobs();
+        await loadPromos();
+        scheduleNextPoll();
+    }, delay);
+}
+
+loadPromos().then(scheduleNextPoll);
+</script>
+
+<style>
+.section-header { display: flex; justify-content: space-between; align-items: center; }
+.promo-grid { min-height: 4rem; padding: 0.5rem; border: 1px dashed transparent; border-radius: 8px; transition: border-color 120ms ease; }
+.promo-drop-active { border-color: var(--accent, #4a90e2); background: rgba(74,144,226,0.05); }
+.promo-card-locked { opacity: 0.85; pointer-events: none; }
+.promo-card-locked .video-thumb { pointer-events: none; }
+.promo-progress { margin: 0.4rem 0; font-size: 0.85em; padding: 0.35rem 0.5rem; border-radius: 4px; }
+.promo-progress-active { background: rgba(74,144,226,0.12); color: var(--accent, #4a90e2); }
+.promo-progress-ready { background: rgba(60,180,75,0.12); color: var(--success, #3cb44b); }
+.promo-progress-failed { background: rgba(220,80,80,0.12); color: var(--error, #d44); }
+.promo-error-msg { margin: 0.3rem 0; font-size: 0.85em; opacity: 0.85; }
+.promo-retry-btn { margin-top: 0.3rem; }
+.spinner-dot { display: inline-block; width: 0.6em; height: 0.6em; background: currentColor; border-radius: 50%; animation: spin-dot 1s ease-in-out infinite; }
+@keyframes spin-dot { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
+.banner { padding: 0.6rem 0.9rem; margin: 0.6rem 0; border-radius: 4px; }
+.banner-error { background: rgba(220,80,80,0.12); color: var(--error, #d44); border: 1px solid rgba(220,80,80,0.25); }
+</style>
+{% endblock %}

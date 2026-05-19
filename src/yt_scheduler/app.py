@@ -26,6 +26,7 @@ from yt_scheduler.routers import (
     oauth_routes,
     project_routes,
     project_variable_routes,
+    promo_routes,
     settings_routes,
     social_credentials_routes,
     social_routes,
@@ -180,6 +181,7 @@ app.include_router(settings_routes.router)
 app.include_router(oauth_routes.router)
 app.include_router(social_credentials_routes.router)
 app.include_router(import_routes.router)
+app.include_router(promo_routes.router)
 app.include_router(global_variable_routes.router)
 app.include_router(project_variable_routes.router)
 app.include_router(item_variable_routes.router)
@@ -236,6 +238,27 @@ async def project_video_detail_page(request: Request, slug: str, video_id: str):
         context={
             "current_project": project,
             "video_id": video_id,
+            "current_video": current_video,
+        },
+    )
+
+
+@app.get("/projects/{slug}/videos/{parent_id}/promos", response_class=HTMLResponse)
+async def project_promo_videos_page(request: Request, slug: str, parent_id: str):
+    """Promo Videos screen — three tier sections + multi-file Add."""
+    project = await _project_context(slug)
+    from yt_scheduler.database import get_db
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id, title FROM videos WHERE id = ?", (parent_id,)
+    )
+    current_video = dict(rows[0]) if rows else None
+    return html_templates.TemplateResponse(
+        request,
+        "promo_videos.html",
+        context={
+            "current_project": project,
+            "parent_id": parent_id,
             "current_video": current_video,
         },
     )

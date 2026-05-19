@@ -384,6 +384,33 @@ async def generate_tags_from_metadata(
     return _clean_tags(message.content[0].text.strip())
 
 
+def _build_parent_context_block(
+    parent_title: str,
+    parent_url: str,
+    parent_description: str,
+    parent_tags: str,
+) -> str:
+    """Collapse the four parent fields into a one-paragraph block for
+    prompt bodies that reference ``{{parent_context_block??}}``. Empty
+    string when there's no parent (caller passes empty fields), which
+    lets the ??-default form in the prompt body swallow it cleanly."""
+    if not parent_title:
+        return ""
+    parts = ["This is a promo clip from a parent video:",
+             f"Parent title: {parent_title}"]
+    if parent_url:
+        parts.append(f"Parent URL: {parent_url}")
+    if parent_description:
+        parts.append(f"Parent description: {parent_description[:500]}")
+    if parent_tags:
+        parts.append(f"Parent tags: {parent_tags}")
+    parts.append(
+        "Where natural, reference or link back to the parent so the "
+        "promo helps viewers find it."
+    )
+    return "\n".join(parts)
+
+
 async def generate_title_from_filename(
     filename: str,
     *,
@@ -392,7 +419,6 @@ async def generate_title_from_filename(
     parent_title: str = "",
     parent_description: str = "",
     parent_tags: str = "",
-    parent_context_block: str = "",
 ) -> str:
     """Generate a YouTube title from a raw filename via the
     ``title_from_filename_prompt`` seed.
@@ -410,6 +436,9 @@ async def generate_title_from_filename(
 
     prompt = await prompt_service.get_prompt_with_fallback(
         "title_from_filename_prompt", project_id=project_id
+    )
+    parent_context_block = _build_parent_context_block(
+        parent_title, parent_url, parent_description, parent_tags
     )
     rendered = _render_template_body(
         prompt["body"],

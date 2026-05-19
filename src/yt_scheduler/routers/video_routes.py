@@ -88,13 +88,21 @@ def _video_public(row: dict) -> dict:
 
 
 @router.get("")
-async def list_videos(project_slug: str | None = None):
+async def list_videos(
+    project_slug: str | None = None,
+    include_children: bool = False,
+):
     """List tracked videos.
 
     Filters to a single project when ``?project_slug=`` is supplied. Per-
     project dashboards always pass it; the legacy unfiltered call (no
     query string) returns everything across every project so the import
     pages and admin views still work.
+
+    Children (rows where ``parent_item_id`` is set) are hidden by
+    default — the Dashboard "Your Videos" list shows only primaries.
+    Set ``include_children=true`` for callers that need to see every
+    row (e.g. the import-dedup branch, admin views).
     """
     db = await get_db()
     if project_slug:
@@ -104,14 +112,28 @@ async def list_videos(project_slug: str | None = None):
         row = await cursor.fetchone()
         if row is None:
             raise HTTPException(404, f"Project '{project_slug}' not found")
-        rows = await db.execute_fetchall(
-            "SELECT * FROM videos WHERE project_id = ? ORDER BY created_at DESC",
-            (int(row["id"]),),
-        )
+        if include_children:
+            rows = await db.execute_fetchall(
+                "SELECT * FROM videos WHERE project_id = ? "
+                "ORDER BY created_at DESC",
+                (int(row["id"]),),
+            )
+        else:
+            rows = await db.execute_fetchall(
+                "SELECT * FROM videos WHERE project_id = ? "
+                "AND parent_item_id IS NULL ORDER BY created_at DESC",
+                (int(row["id"]),),
+            )
     else:
-        rows = await db.execute_fetchall(
-            "SELECT * FROM videos ORDER BY created_at DESC"
-        )
+        if include_children:
+            rows = await db.execute_fetchall(
+                "SELECT * FROM videos ORDER BY created_at DESC"
+            )
+        else:
+            rows = await db.execute_fetchall(
+                "SELECT * FROM videos WHERE parent_item_id IS NULL "
+                "ORDER BY created_at DESC"
+            )
     return [_video_public(dict(r)) for r in rows]
 
 
@@ -145,6 +167,47 @@ async def list_scheduled():
 async def list_video_events(video_id: str, limit: int = 200):
     """Per-video activity log (newest first)."""
     return await events.list_events_for_video(video_id, limit=limit)
+
+
+@router.get("/{video_id}/auto-actions")
+async def get_auto_actions_state(video_id: str) -> dict:
+    """Per-video Promo-flow progress for the polling UI.
+
+    Returned shape:
+        ``{"state": str | None, "last_error": str | None, "updated_at": str}``
+
+    ``state`` is one of the ``PROMO_STATE_*`` strings or
+    ``"failed:<step>"``; ``None`` means the row has never been touched
+    by the Promo chain. Detail pages poll this every 3s while the state
+    is non-terminal and back off to 15s once it lands on ``ready`` or
+    ``failed:*``.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT auto_action_state, auto_action_last_error, updated_at "
+        "FROM videos WHERE id = ?",
+        (video_id,),
+    )
+    if not rows:
+        raise HTTPException(404, "Video not found")
+    row = dict(rows[0])
+    return {
+        "state": row.get("auto_action_state"),
+        "last_error": row.get("auto_action_last_error"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+@router.post("/{video_id}/auto-actions/retry")
+async def retry_auto_actions_step(video_id: str, step: str) -> dict:
+    """Re-run the Promo chain from ``step`` onward. Used by the per-card
+    "Retry <step>" button when a step has landed in ``failed:<step>``."""
+    from yt_scheduler.services import auto_actions
+    try:
+        await auto_actions.retry_promo_step(video_id, step)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"status": "ok", "video_id": video_id, "step": step}
 
 
 @router.get("/{video_id}")
@@ -207,6 +270,17 @@ async def get_video(video_id: str):
         result["youtube_data"] = yt_data
     if yt_error is not None:
         result["youtube_data_error"] = yt_error
+
+    # Surface the parent's title so the detail page can render the
+    # "Promo of: <parent title>" backlink without a second round-trip.
+    parent_item_id = row.get("parent_item_id")
+    if parent_item_id:
+        parent_rows = await db.execute_fetchall(
+            "SELECT title FROM videos WHERE id = ?", (parent_item_id,)
+        )
+        result["parent_title"] = (
+            dict(parent_rows[0]).get("title") if parent_rows else None
+        )
 
     return result
 

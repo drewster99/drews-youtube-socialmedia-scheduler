@@ -204,19 +204,36 @@ document.getElementById('upload-btn').addEventListener('click', () => {
     window.location.href = `/upload?project_slug=${encodeURIComponent(projectSlug)}`;
 });
 
+function escapeAttr(s) {
+    return String(s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 async function loadAvailableImports() {
     const container = document.getElementById('import-list');
     try {
-        const resp = await fetch(`/api/projects/${projectSlug}/imports/available?max_results=25`, {_silent: true});
-        if (!resp.ok) {
+        // Primaries in this project drive the "Parent" dropdown on each
+        // import card — picking one parents the imported child at
+        // import time (it lands hidden from Dashboard and appears on
+        // the parent's Promo Videos screen).
+        const [importsResp, primariesResp] = await Promise.all([
+            fetch(`/api/projects/${projectSlug}/imports/available?max_results=25`, {_silent: true}),
+            fetch(`/api/videos?project_slug=${encodeURIComponent(projectSlug)}`, {_silent: true}),
+        ]);
+        if (!importsResp.ok) {
             container.innerHTML = '<p class="empty-state">Connect a YouTube account in <a href="/settings">General settings</a> to see imports.</p>';
             return;
         }
-        const items = await resp.json();
+        const items = await importsResp.json();
         if (!items.length) {
             container.innerHTML = '<p class="empty-state">No new YouTube videos to import.</p>';
             return;
         }
+        const primaries = primariesResp.ok ? await primariesResp.json() : [];
+        const parentOptions = ['<option value="">(none / standalone)</option>']
+            .concat(primaries.map(p =>
+                `<option value="${escapeAttr(p.id)}">${escapeAttr(p.title)}</option>`
+            )).join('');
         container.innerHTML = items.map(v => {
             const embed = v.embeddable
                 ? `<iframe src="https://www.youtube.com/embed/${v.video_id}" frameborder="0" allowfullscreen></iframe>`
@@ -239,6 +256,12 @@ async function loadAvailableImports() {
                             ${durationBadge}
                             <time>${v.published_at ? new Date(_ensureUtc(v.published_at)).toLocaleDateString() : ''}</time>
                         </div>
+                        <div class="form-group" style="margin: 0.5rem 0;">
+                            <label style="display:block; font-size: 0.85em; opacity:0.7;">Parent (optional)</label>
+                            <select data-parent-for="${escapeAttr(v.video_id)}" class="parent-picker">
+                                ${parentOptions}
+                            </select>
+                        </div>
                         <button class="btn btn-sm btn-primary" data-import-id="${v.video_id}">+ Import</button>
                     </div>
                 </div>
@@ -247,12 +270,17 @@ async function loadAvailableImports() {
         for (const btn of container.querySelectorAll('[data-import-id]')) {
             btn.addEventListener('click', async () => {
                 const id = btn.dataset.importId;
+                const parentSel = container.querySelector(`[data-parent-for="${id}"]`);
+                const parentItemId = parentSel ? parentSel.value : '';
                 btn.disabled = true;
                 btn.textContent = 'Importing...';
                 const resp = await fetch(`/api/projects/${projectSlug}/imports/import`, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({video_id: id}),
+                    body: JSON.stringify({
+                        video_id: id,
+                        parent_item_id: parentItemId || undefined,
+                    }),
                 });
                 if (resp.ok) {
                     showToast('Imported', 'success');

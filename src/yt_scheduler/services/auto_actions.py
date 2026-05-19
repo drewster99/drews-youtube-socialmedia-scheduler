@@ -12,6 +12,13 @@ the spec:
 
 All work is dispatched via ``asyncio.create_task`` so the HTTP handler can
 return promptly and side effects continue in the background.
+
+Promo Videos (migration 023) uses a separate orchestrator —
+``run_promo_chain`` / ``_run_promo_chain`` — that always runs the full
+sequence (title → upload → probe → transcribe → desc → tags →
+metadata push) and persists per-step progress in
+``videos.auto_action_state``. The Promo flow short-circuits work that's
+already done so a Retry resumes from the failing step.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import asyncio
 import json
 import logging
 import re
+import secrets
 import shutil
 import subprocess
 from pathlib import Path
@@ -32,6 +40,7 @@ from yt_scheduler.services import (
     events,
     project_settings,
     templates as tmpl,
+    tiers,
     transcripts as transcript_service,
     youtube,
 )
@@ -493,3 +502,478 @@ async def _maybe_generate_socials(
             ),
         )
     await db.commit()
+
+
+# --- Promo Videos auto-action chain --------------------------------------
+
+# The Promo flow ALWAYS runs the full chain so the user can drop files and
+# walk away. The chain skips any step whose output already exists, which
+# also makes retry idempotent: a "Retry transcribing" after a real
+# transcription failure re-tries; a "Retry transcribing" on a row that
+# already has a transcript jumps straight to the next step.
+
+# Step state strings persisted to ``videos.auto_action_state``.
+PROMO_STATE_PENDING = "pending"
+PROMO_STATE_GENERATING_TITLE = "generating_title"
+PROMO_STATE_UPLOADING = "uploading"
+PROMO_STATE_PROBING = "probing"
+PROMO_STATE_TRANSCRIBING = "transcribing"
+PROMO_STATE_GENERATING_DESC = "generating_desc"
+PROMO_STATE_GENERATING_TAGS = "generating_tags"
+PROMO_STATE_PUSHING_METADATA = "pushing_metadata"
+PROMO_STATE_READY = "ready"
+
+# Ordered. ``_resume_from`` walks this list to determine which steps to
+# (re-)run on a Retry. Names match the persisted state column.
+PROMO_STEP_ORDER: tuple[str, ...] = (
+    PROMO_STATE_GENERATING_TITLE,
+    PROMO_STATE_UPLOADING,
+    PROMO_STATE_PROBING,
+    PROMO_STATE_TRANSCRIBING,
+    PROMO_STATE_GENERATING_DESC,
+    PROMO_STATE_GENERATING_TAGS,
+    PROMO_STATE_PUSHING_METADATA,
+)
+
+# Whisper transcription is CPU-bound (and a model load is ~RAM-bound); a
+# serial lock keeps concurrent promo uploads from thrashing the box. YT
+# upload and Claude calls don't need the lock — they're I/O bound.
+_PROMO_WHISPER_LOCK: asyncio.Lock = asyncio.Lock()
+
+# In-flight upload jobs that don't yet have a videos row. The Promo screen
+# polls upload-jobs/<id> until ``video_id`` flips to a real id, then
+# switches to polling /api/videos/{id}/auto-actions.
+_UPLOAD_JOBS: dict[str, dict] = {}
+
+
+def get_upload_job(job_id: str) -> dict | None:
+    """Public read of an upload-job's current state."""
+    job = _UPLOAD_JOBS.get(job_id)
+    if job is None:
+        return None
+    # Drop internal-only fields before exposing.
+    public_keys = {"job_id", "filename", "parent_id", "video_id",
+                   "state", "last_error", "title"}
+    return {k: v for k, v in job.items() if k in public_keys}
+
+
+async def start_promo_upload(
+    *,
+    local_path: Path,
+    original_filename: str,
+    parent_id: str,
+    project_id: int,
+    forced_item_type: str | None = None,
+) -> str:
+    """Queue a Promo upload chain. Returns a job_id the UI can poll."""
+    job_id = "job_" + secrets.token_hex(8)
+    _UPLOAD_JOBS[job_id] = {
+        "job_id": job_id,
+        "filename": original_filename,
+        "local_path": str(local_path),
+        "parent_id": parent_id,
+        "project_id": project_id,
+        "forced_item_type": forced_item_type,
+        "video_id": None,
+        "state": PROMO_STATE_PENDING,
+        "last_error": None,
+        "title": None,
+    }
+    task = asyncio.create_task(_run_promo_chain(job_id))
+    _pending_tasks.add(task)
+    task.add_done_callback(_pending_tasks.discard)
+    return job_id
+
+
+async def retry_promo_step(video_id: str, step: str) -> None:
+    """Re-run the chain starting at ``step``. The chain's idempotency
+    gates handle "skip steps we already have" for steps after the failed
+    one, so this is the right hook for a per-card retry button."""
+    if step not in PROMO_STEP_ORDER:
+        raise ValueError(f"Unknown promo step: {step!r}")
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM videos WHERE id = ?", (video_id,)
+    )
+    if not rows:
+        raise ValueError(f"Video {video_id} not found")
+    video = dict(rows[0])
+    project_id = int(video.get("project_id") or 1)
+    await _set_promo_state(video_id, step, error=None)
+    task = asyncio.create_task(
+        _resume_promo_chain(video_id, project_id, start_step=step)
+    )
+    _pending_tasks.add(task)
+    task.add_done_callback(_pending_tasks.discard)
+
+
+async def _set_promo_state(
+    video_id: str, state: str | None, *, error: str | None = None
+) -> None:
+    db = await get_db()
+    await db.execute(
+        "UPDATE videos SET auto_action_state = ?, auto_action_last_error = ?, "
+        "updated_at = datetime('now') WHERE id = ?",
+        (state, error, video_id),
+    )
+    await db.commit()
+
+
+async def _load_parent_context(parent_id: str | None) -> dict:
+    """Fetch parent fields for the title-from-filename prompt. Returns an
+    empty dict when there's no parent (caller passes empty strings)."""
+    if not parent_id:
+        return {}
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT title, description, url, tags FROM videos WHERE id = ?",
+        (parent_id,),
+    )
+    if not rows:
+        return {}
+    parent = dict(rows[0])
+    try:
+        parent_tags = ", ".join(json.loads(parent.get("tags") or "[]"))
+    except json.JSONDecodeError:
+        parent_tags = ""
+    return {
+        "title": parent.get("title") or "",
+        "description": parent.get("description") or "",
+        "url": parent.get("url") or "",
+        "tags": parent_tags,
+    }
+
+
+async def _run_promo_chain(job_id: str) -> None:
+    """Drive a new promo upload from start to finish.
+
+    The first two steps (title generation + YT upload) run before any DB
+    row exists; their state lives in ``_UPLOAD_JOBS[job_id]``. Once
+    YouTube returns an id we INSERT the row, the upload job hands off to
+    the videos row's ``auto_action_state``, and remaining steps update
+    that column.
+    """
+    job = _UPLOAD_JOBS.get(job_id)
+    if job is None:
+        return
+    project_id = int(job["project_id"])
+
+    project_row = await get_project_by_id(project_id)
+    if project_row:
+        set_active_project(project_row["slug"])
+
+    parent_ctx = await _load_parent_context(job.get("parent_id"))
+
+    # Step 1 — generate title
+    job["state"] = PROMO_STATE_GENERATING_TITLE
+    try:
+        title = await ai.generate_title_from_filename(
+            filename=job["filename"],
+            project_id=project_id,
+            parent_url=parent_ctx.get("url", ""),
+            parent_title=parent_ctx.get("title", ""),
+            parent_description=parent_ctx.get("description", ""),
+            parent_tags=parent_ctx.get("tags", ""),
+        )
+    except Exception as exc:
+        logger.info(
+            "AI title failed for %s, using deterministic fallback: %s",
+            job["filename"], exc,
+        )
+        title = ai.fallback_title_from_filename(job["filename"])
+    job["title"] = title
+
+    # Step 2 — YouTube upload
+    job["state"] = PROMO_STATE_UPLOADING
+    local_path = Path(job["local_path"])
+    try:
+        result = await asyncio.to_thread(
+            youtube.upload_video,
+            file_path=local_path,
+            title=title,
+            description="Description pending generation.",
+            tags=[],
+            privacy_status="unlisted",
+            publish_at=None,
+        )
+    except Exception as exc:
+        job["state"] = f"failed:{PROMO_STATE_UPLOADING}"
+        job["last_error"] = str(exc)[:500]
+        logger.warning("Promo YT upload failed for %s: %s", job["filename"], exc)
+        return
+
+    video_id = result["id"]
+    youtube_url = f"https://youtu.be/{video_id}"
+
+    duration = tiers.probe_local_duration(local_path)
+    derived_tier = tiers.tier_for_duration(duration)
+    # ``forced_item_type`` is set when the user adds via a per-section
+    # button (Segments / Shorts / Hooks). Top-level "Add" leaves it None
+    # so item_type tracks the duration-derived tier.
+    item_type = (
+        job.get("forced_item_type")
+        or derived_tier
+        # Final fallback: anything we can't classify lands as short so
+        # it shows up on the Promo Videos screen (rather than vanishing).
+        or "short"
+    )
+
+    db = await get_db()
+    await db.execute(
+        """INSERT INTO videos (
+            id, project_id, title, description, tags, privacy_status,
+            video_file_path, status,
+            duration_seconds, tier,
+            item_type, parent_item_id, url,
+            auto_action_state
+        ) VALUES (?, ?, ?, ?, '[]', 'unlisted', ?, 'uploaded',
+                  ?, ?, ?, ?, ?, ?)""",
+        (
+            video_id,
+            project_id,
+            title,
+            "Description pending generation.",
+            str(local_path),
+            duration,
+            derived_tier,
+            item_type,
+            job.get("parent_id") or None,
+            youtube_url,
+            PROMO_STATE_PROBING,
+        ),
+    )
+    await db.commit()
+    job["video_id"] = video_id
+
+    await events.record_event(
+        video_id, "created", {"tier": derived_tier, "item_type": item_type}
+    )
+    await events.record_event(
+        video_id, "uploaded", {"platform": "youtube", "url": youtube_url}
+    )
+
+    # Hand off: upload-job's state is now mirrored from the column the UI
+    # polls; remove it after a short grace so any in-flight polls catch up.
+    job["state"] = PROMO_STATE_PROBING
+
+    try:
+        await _resume_promo_chain(
+            video_id, project_id, start_step=PROMO_STATE_TRANSCRIBING
+        )
+    finally:
+        # Drop the upload-job record — the videos row is the source of
+        # truth from here on. Keep a "completed" marker so a slow client
+        # polling upload-jobs/<id> can find video_id one last time.
+        _UPLOAD_JOBS.pop(job_id, None)
+
+
+async def _resume_promo_chain(
+    video_id: str, project_id: int, *, start_step: str
+) -> None:
+    """Walk the step list from ``start_step`` onward. Each step is gated
+    by an "already done?" check that lets retries skip past completed
+    work without redoing it.
+
+    The orchestrator is split out so :func:`retry_promo_step` can hop in
+    at any point — the file-system / upload state lives entirely on the
+    videos row at this point.
+    """
+    project_row = await get_project_by_id(project_id)
+    if project_row:
+        set_active_project(project_row["slug"])
+
+    try:
+        start_idx = PROMO_STEP_ORDER.index(start_step)
+    except ValueError:
+        await _set_promo_state(
+            video_id, f"failed:{start_step}",
+            error=f"Unknown step: {start_step}",
+        )
+        return
+
+    # ``probing`` happens at INSERT time in the upload step; if the start
+    # point is at or before it, nothing to do — jump to transcribe.
+    if start_idx < PROMO_STEP_ORDER.index(PROMO_STATE_TRANSCRIBING):
+        start_idx = PROMO_STEP_ORDER.index(PROMO_STATE_TRANSCRIBING)
+
+    db = await get_db()
+
+    for step in PROMO_STEP_ORDER[start_idx:]:
+        await _set_promo_state(video_id, step, error=None)
+        try:
+            if step == PROMO_STATE_TRANSCRIBING:
+                await _promo_step_transcribe(video_id)
+            elif step == PROMO_STATE_GENERATING_DESC:
+                await _promo_step_description(video_id, project_id)
+            elif step == PROMO_STATE_GENERATING_TAGS:
+                await _promo_step_tags(video_id, project_id)
+            elif step == PROMO_STATE_PUSHING_METADATA:
+                await _promo_step_push_metadata(video_id)
+        except Exception as exc:
+            logger.warning("Promo step %s failed for %s: %s", step, video_id, exc)
+            await _set_promo_state(
+                video_id, f"failed:{step}", error=str(exc)[:500]
+            )
+            return
+
+    await _set_promo_state(video_id, PROMO_STATE_READY, error=None)
+    # Refresh videos.status to 'ready' so the existing schedule paths see
+    # the row as eligible (matches what _maybe_generate_description does
+    # for the standard upload/import chain).
+    await db.execute(
+        "UPDATE videos SET status = 'ready', updated_at = datetime('now') "
+        "WHERE id = ? AND status != 'published'",
+        (video_id,),
+    )
+    await db.commit()
+
+
+async def _promo_step_transcribe(video_id: str) -> None:
+    """Run Whisper if we don't already have a transcript. Sequential
+    via :data:`_PROMO_WHISPER_LOCK`."""
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT transcript, video_file_path FROM videos WHERE id = ?",
+        (video_id,),
+    )
+    if not rows:
+        raise RuntimeError(f"videos row {video_id} missing")
+    row = dict(rows[0])
+    if (row.get("transcript") or "").strip():
+        return  # already done; the chain will move on
+    async with _PROMO_WHISPER_LOCK:
+        await _maybe_transcribe(
+            video_id, row.get("video_file_path"), backend=None, model=None
+        )
+
+
+async def _promo_step_description(video_id: str, project_id: int) -> None:
+    """Generate a description from transcript (≥10 chars after trim) or
+    from sampled keyframes."""
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id, title, transcript, video_file_path, description "
+        "FROM videos WHERE id = ?",
+        (video_id,),
+    )
+    if not rows:
+        raise RuntimeError(f"videos row {video_id} missing")
+    row = dict(rows[0])
+    if (row.get("description") or "").strip() and (
+        row.get("description") != "Description pending generation."
+    ):
+        return
+    title = row.get("title") or ""
+    transcript = (row.get("transcript") or "").strip()
+    plain_transcript = transcript
+    if transcript:
+        plain_transcript = transcript_service.srt_to_plain_text(transcript).strip()
+
+    if len(plain_transcript) >= 10:
+        description = await ai.generate_seo_description(
+            title=title, transcript=transcript, project_id=project_id,
+        )
+    else:
+        video_file_path = row.get("video_file_path")
+        if not video_file_path or not Path(video_file_path).exists():
+            raise RuntimeError(
+                "No local file for keyframe-based description fallback"
+            )
+        from yt_scheduler.services import media as media_service
+        frames = await asyncio.to_thread(
+            media_service.extract_keyframes, video_file_path, 6,
+        )
+        description = await ai.generate_seo_description_from_frames(
+            title=title, frames=frames, project_id=project_id,
+        )
+
+    await db.execute(
+        """UPDATE videos SET description = ?, description_generated_at = datetime('now'),
+           updated_at = datetime('now') WHERE id = ?""",
+        (description, video_id),
+    )
+    await db.commit()
+    await events.record_event(
+        video_id, "metadata_updated",
+        {"description": {"old": row.get("description") or "", "new": description}},
+    )
+
+
+async def _promo_step_tags(video_id: str, project_id: int) -> None:
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id, title, description, transcript, tags, video_file_path "
+        "FROM videos WHERE id = ?",
+        (video_id,),
+    )
+    if not rows:
+        raise RuntimeError(f"videos row {video_id} missing")
+    row = dict(rows[0])
+    try:
+        existing = json.loads(row.get("tags") or "[]")
+        if not isinstance(existing, list):
+            existing = []
+    except json.JSONDecodeError:
+        existing = []
+    if len(existing) >= 3:
+        return  # readiness gate is "≥3 tags"; treat as already done
+
+    title = row.get("title") or ""
+    description = row.get("description") or ""
+    transcript = (row.get("transcript") or "").strip()
+    plain_transcript = (
+        transcript_service.srt_to_plain_text(transcript).strip()
+        if transcript else ""
+    )
+
+    if len(plain_transcript) >= 10:
+        new_tags = await ai.generate_tags_from_metadata(
+            title=title, description=description, transcript=transcript,
+            project_id=project_id,
+        )
+    else:
+        video_file_path = row.get("video_file_path")
+        if not video_file_path or not Path(video_file_path).exists():
+            raise RuntimeError(
+                "No local file for keyframe-based tags fallback"
+            )
+        from yt_scheduler.services import media as media_service
+        frames = await asyncio.to_thread(
+            media_service.extract_keyframes, video_file_path, 6,
+        )
+        new_tags = await ai.generate_tags_from_frames(
+            title=title, description=description, frames=frames,
+            project_id=project_id,
+        )
+
+    await db.execute(
+        "UPDATE videos SET tags = ?, updated_at = datetime('now') WHERE id = ?",
+        (json.dumps(new_tags), video_id),
+    )
+    await db.commit()
+    await events.record_event(
+        video_id, "metadata_updated", {"tags": {"old": existing, "new": new_tags}},
+    )
+
+
+async def _promo_step_push_metadata(video_id: str) -> None:
+    """Send the newly-generated title / description / tags back to
+    YouTube in a single update call (50 quota units)."""
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT title, description, tags FROM videos WHERE id = ?", (video_id,)
+    )
+    if not rows:
+        raise RuntimeError(f"videos row {video_id} missing")
+    row = dict(rows[0])
+    try:
+        tag_list = json.loads(row.get("tags") or "[]")
+    except json.JSONDecodeError:
+        tag_list = []
+    await asyncio.to_thread(
+        youtube.update_video_metadata,
+        video_id=video_id,
+        title=row.get("title") or "",
+        description=row.get("description") or "",
+        tags=tag_list,
+    )

@@ -27,17 +27,28 @@ async def available(slug: str, max_results: int = 50) -> list[dict]:
 
 @router.post("/import")
 async def do_import(slug: str, payload: dict) -> dict:
-    """Import a specific YouTube video by id."""
+    """Import a specific YouTube video by id.
+
+    Payload:
+        video_id (required): the YouTube id to import.
+        parent_item_id (optional): if set, the imported video lands as a
+            promo child of that primary (hidden from Dashboard, shown on
+            the parent's Promo Videos screen).
+    """
     from yt_scheduler.services import projects as project_service
 
     project = await project_service.get_project_by_slug(slug)
     if project is None:
         raise HTTPException(404, f"Project '{slug}' not found")
-    video_id = (payload or {}).get("video_id")
+    payload = payload or {}
+    video_id = payload.get("video_id")
     if not video_id:
         raise HTTPException(400, "video_id is required")
+    parent_item_id = (payload.get("parent_item_id") or "").strip() or None
     try:
-        return await imports.import_video(video_id, project_id=project["id"])
+        return await imports.import_video(
+            video_id, project_id=project["id"], parent_item_id=parent_item_id,
+        )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     except Exception as exc:

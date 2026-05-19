@@ -116,8 +116,19 @@ async def list_available_imports(project_id: int, max_results: int = 50) -> list
     return out
 
 
-async def import_video(video_id: str, *, project_id: int) -> dict:
+async def import_video(
+    video_id: str,
+    *,
+    project_id: int,
+    parent_item_id: str | None = None,
+) -> dict:
     """Pull metadata + thumbnail + transcript from YouTube into our DB.
+
+    ``parent_item_id`` lets the user designate an existing primary as
+    this import's parent at import time — used by the YouTube import
+    card's "Parent (optional)" dropdown. When set, the imported video
+    is hidden from the Dashboard list and appears on the parent's
+    Promo Videos screen instead.
 
     Returns the inserted/updated row.
     """
@@ -125,6 +136,27 @@ async def import_video(video_id: str, *, project_id: int) -> dict:
     rows = await db.execute_fetchall("SELECT id FROM videos WHERE id = ?", (video_id,))
     if rows:
         raise ValueError(f"Video {video_id} is already imported")
+
+    if parent_item_id:
+        parent_rows = await db.execute_fetchall(
+            "SELECT id, project_id, parent_item_id FROM videos WHERE id = ?",
+            (parent_item_id,),
+        )
+        if not parent_rows:
+            raise ValueError(
+                f"parent_item_id {parent_item_id!r} not found"
+            )
+        parent_row = dict(parent_rows[0])
+        if parent_row.get("parent_item_id"):
+            raise ValueError(
+                f"parent_item_id {parent_item_id!r} is itself a child; "
+                "only one level of parenting is supported"
+            )
+        if int(parent_row.get("project_id") or 0) != project_id:
+            raise ValueError(
+                f"parent_item_id {parent_item_id!r} belongs to a "
+                "different project"
+            )
 
     project = await get_project_by_id(project_id)
     if project:
@@ -186,23 +218,37 @@ async def import_video(video_id: str, *, project_id: int) -> dict:
     youtube_thumbnail_path_value = thumbnail_path
     youtube_thumbnail_url_value = thumb_url if thumbnail_path else None
 
+    # When importing as a child of an existing primary, ``item_type``
+    # tracks the duration-derived tier; the row is hidden from Dashboard
+    # by the parent_item_id filter and surfaces on the parent's Promo
+    # Videos screen instead. Standalone imports keep the legacy default
+    # ('episode') so the existing Dashboard behaviour is preserved.
+    item_type_value = tier if parent_item_id else "episode"
+
     await db.execute(
         """INSERT INTO videos (
             id, project_id, title, description, tags, privacy_status,
             thumbnail_path, status, imported_from_youtube,
             duration_seconds, tier, youtube_kind, url,
-            thumbnail_source, youtube_thumbnail_path, youtube_thumbnail_url
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'uploaded', 1, ?, ?, ?, ?, ?, ?, ?)""",
+            thumbnail_source, youtube_thumbnail_path, youtube_thumbnail_url,
+            item_type, parent_item_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'uploaded', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             video_id, project_id, title, description, json.dumps(tags_list),
             privacy, thumbnail_path, duration, tier, youtube_kind, youtube_url,
             thumbnail_source_value, youtube_thumbnail_path_value, youtube_thumbnail_url_value,
+            item_type_value, parent_item_id or None,
         ),
     )
     await db.commit()
 
     await events.record_event(
-        video_id, "imported", {"source": "youtube", "tier": tier}
+        video_id, "imported",
+        {
+            "source": "youtube",
+            "tier": tier,
+            "parent_item_id": parent_item_id or None,
+        },
     )
 
     # Try to grab the YouTube transcript on import if one exists. Stored as
