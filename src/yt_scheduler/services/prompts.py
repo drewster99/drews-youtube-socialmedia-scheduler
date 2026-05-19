@@ -53,7 +53,8 @@ SEED_DESCRIPTION_FROM_TRANSCRIPT_PROMPT = SeedPrompt(
         "Generate an SEO-friendly YouTube video description.\n\n"
         "Video title: {{title}}\n"
         "{{channel_name_block}}\n"
-        "Transcript:\n{{transcript_truncated}}\n\n"
+        "Transcript:\n{{transcript_truncated}}\n"
+        "{{parent_context_block??}}\n\n"
         "Instructions:\n"
         "- Write a compelling description that summarizes the video content\n"
         "- Include relevant keywords naturally\n"
@@ -68,6 +69,8 @@ SEED_DESCRIPTION_FROM_TRANSCRIPT_PROMPT = SeedPrompt(
     variables=(
         "title", "channel_name", "channel_name_block",
         "transcript", "transcript_truncated", "extra_instructions",
+        "parent_url", "parent_title", "parent_description", "parent_tags",
+        "parent_context_block",
     ),
     # No system prompt — instructions live in the user message body.
     system=None,
@@ -80,17 +83,24 @@ SEED_TAGS_FROM_METADATA_PROMPT = SeedPrompt(
         "Generate 8–15 YouTube tags that maximise discoverability for this video.\n\n"
         "Title: {{title}}\n"
         "Description: {{description}}\n"
-        "Transcript (first 4000 chars): {{transcript_truncated}}\n\n"
+        "Transcript (first 4000 chars): {{transcript_truncated}}\n"
+        "{{parent_context_block??}}\n\n"
         "Instructions:\n"
         "- Output a comma-separated list, no numbering, no quotes.\n"
         "- Each tag must be 1–2 words. NEVER a sentence or a phrase.\n"
         "- Each tag must be at most 24 characters long.\n"
         "- Use lowercase except for proper nouns.\n"
         "- Include both broad terms and specific phrases.\n"
-        "- Avoid duplicates and near-duplicates.\n\n"
+        "- Avoid duplicates and near-duplicates.\n"
+        "- When parent tags are listed above, feel free to reuse the most "
+        "relevant ones so the promo is discoverable alongside the parent.\n\n"
         "Return ONLY the comma-separated list."
     ),
-    variables=("title", "description", "transcript", "transcript_truncated"),
+    variables=(
+        "title", "description", "transcript", "transcript_truncated",
+        "parent_url", "parent_title", "parent_description", "parent_tags",
+        "parent_context_block",
+    ),
     system=(
         "You return ONLY a comma-separated list of tags, no preamble. "
         "Each tag is 1–2 words and at most 24 characters."
@@ -102,7 +112,8 @@ SEED_DESCRIPTION_FROM_FRAMES_PROMPT = SeedPrompt(
     name="Description from keyframes (vision)",
     body=(
         "{{channel_name_block}}"
-        "Title: {{title}}\n\n"
+        "Title: {{title}}\n"
+        "{{parent_context_block??}}\n\n"
         "Below are keyframes sampled in order from a short YouTube video.\n"
         "Write a YouTube SEO description (3-5 short paragraphs) that "
         "describes what happens in the video and would help viewers find "
@@ -116,6 +127,8 @@ SEED_DESCRIPTION_FROM_FRAMES_PROMPT = SeedPrompt(
     variables=(
         "title", "channel_name", "channel_name_block",
         "extra_instructions", "extra_instructions_block",
+        "parent_url", "parent_title", "parent_description", "parent_tags",
+        "parent_context_block",
     ),
     system=None,
 )
@@ -125,18 +138,54 @@ SEED_TAGS_FROM_FRAMES_PROMPT = SeedPrompt(
     name="Tags from keyframes (vision)",
     body=(
         "Title: {{title}}\n"
-        "Description: {{description_or_none}}\n\n"
+        "Description: {{description_or_none}}\n"
+        "{{parent_context_block??}}\n\n"
         "Below are keyframes from the video. Generate 8-12 YouTube search "
         "tags as a comma-separated list. Each tag MUST be 1–2 words and at "
         "most 24 characters long — never a sentence or phrase. Lowercase, "
-        "no quotes, no '#'. Return ONLY the comma-separated tags."
+        "no quotes, no '#'. When parent tags are listed above, feel free "
+        "to reuse the most relevant ones so the promo is discoverable "
+        "alongside the parent. Return ONLY the comma-separated tags."
     ),
-    variables=("title", "description", "description_or_none"),
+    variables=(
+        "title", "description", "description_or_none",
+        "parent_url", "parent_title", "parent_description", "parent_tags",
+        "parent_context_block",
+    ),
     system=(
         "You return ONLY a comma-separated list of tags, no preamble. "
         "Each tag is 1–2 words and at most 24 characters."
     ),
 )
+
+SEED_TITLE_FROM_FILENAME_PROMPT = SeedPrompt(
+    key="title_from_filename_prompt",
+    name="Title from filename (promo upload)",
+    body=(
+        "Generate a concise, SEO-friendly YouTube title for this promo clip.\n\n"
+        "Filename: {{filename}}\n"
+        "{{parent_context_block??}}\n\n"
+        "Rules:\n"
+        "- ≤ 70 characters.\n"
+        "- Title case.\n"
+        "- No quotes, no preamble, no trailing punctuation.\n"
+        "- Strip out recording-software prefixes (riverside_, recording_, "
+        "screen_recording_, untitled_, etc.) and file extensions.\n"
+        "- When parent title is provided, the title should read naturally "
+        "as a clip from that parent — not a copy of the parent's title.\n\n"
+        "Return ONLY the title text."
+    ),
+    variables=(
+        "filename",
+        "parent_url", "parent_title", "parent_description", "parent_tags",
+        "parent_context_block",
+    ),
+    system=(
+        "You return ONLY a single YouTube title under 70 characters. "
+        "No quotes, no preamble, no explanation."
+    ),
+)
+
 
 SEED_SHORTEN_POST_PROMPT = SeedPrompt(
     key="shorten_post_prompt",
@@ -179,6 +228,7 @@ SEED_AI_BLOCK_DEFAULT_SYSTEM_PROMPT = SeedPrompt(
 # applies to every {{ai: ...}} block elsewhere).
 _SEEDS_BY_KEY: dict[str, SeedPrompt] = {
     SEED_SHORTEN_POST_PROMPT.key: SEED_SHORTEN_POST_PROMPT,
+    SEED_TITLE_FROM_FILENAME_PROMPT.key: SEED_TITLE_FROM_FILENAME_PROMPT,
     SEED_DESCRIPTION_FROM_TRANSCRIPT_PROMPT.key: SEED_DESCRIPTION_FROM_TRANSCRIPT_PROMPT,
     SEED_DESCRIPTION_FROM_FRAMES_PROMPT.key: SEED_DESCRIPTION_FROM_FRAMES_PROMPT,
     SEED_TAGS_FROM_METADATA_PROMPT.key: SEED_TAGS_FROM_METADATA_PROMPT,

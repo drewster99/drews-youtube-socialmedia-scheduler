@@ -132,6 +132,42 @@ async def _build_render_context(db, video: dict) -> dict:
     episode_url_value = (parent or {}).get("url") or ""
     project_url_value = project_row.get("project_url") or ""
 
+    parent_url_value = (parent or {}).get("url") or ""
+    parent_title_value = (parent or {}).get("title") or ""
+    parent_description_value = (parent or {}).get("description") or ""
+    parent_tags_value = ""
+    if parent is not None:
+        try:
+            parent_tag_list = json.loads(parent.get("tags") or "[]")
+            parent_tags_value = ", ".join(parent_tag_list)
+        except json.JSONDecodeError:
+            parent_tags_value = ""
+
+    # ``parent_context_block`` collapses the parent fields into a single
+    # ready-to-paste paragraph for prompts that want a one-line opt-in
+    # ({{parent_context_block??}}) instead of stitching the four fields
+    # themselves. Empty string when the video has no parent, which lets
+    # the ??-default form swallow it.
+    parent_context_block_value = ""
+    if parent is not None and parent_title_value:
+        parts = [
+            "This is a promo clip from a parent video:",
+            f"Parent title: {parent_title_value}",
+        ]
+        if parent_url_value:
+            parts.append(f"Parent URL: {parent_url_value}")
+        if parent_description_value:
+            parts.append(
+                f"Parent description: {parent_description_value[:500]}"
+            )
+        if parent_tags_value:
+            parts.append(f"Parent tags: {parent_tags_value}")
+        parts.append(
+            "Where natural, reference or link back to the parent so the "
+            "promo helps viewers find it."
+        )
+        parent_context_block_value = "\n".join(parts)
+
     self_builtins: dict[str, object] = {
         "title": video.get("title") or "",
         "description": description,
@@ -145,6 +181,11 @@ async def _build_render_context(db, video: dict) -> dict:
         "url": url_value,
         "episode_url": episode_url_value,
         "project_url": project_url_value,
+        "parent_url": parent_url_value,
+        "parent_title": parent_title_value,
+        "parent_description": parent_description_value,
+        "parent_tags": parent_tags_value,
+        "parent_context_block": parent_context_block_value,
     }
 
     # Names that resolved to empty string. The renderer treats these as

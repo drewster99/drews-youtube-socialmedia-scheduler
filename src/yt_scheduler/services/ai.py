@@ -384,6 +384,105 @@ async def generate_tags_from_metadata(
     return _clean_tags(message.content[0].text.strip())
 
 
+async def generate_title_from_filename(
+    filename: str,
+    *,
+    project_id: int,
+    parent_url: str = "",
+    parent_title: str = "",
+    parent_description: str = "",
+    parent_tags: str = "",
+    parent_context_block: str = "",
+) -> str:
+    """Generate a YouTube title from a raw filename via the
+    ``title_from_filename_prompt`` seed.
+
+    Used by the Promo Videos auto-action chain to pick a sensible title
+    before the YouTube upload step (so the YT video is born with a real
+    title instead of a placeholder).
+
+    Callers should wrap this in their own try/except and fall back to
+    :func:`fallback_title_from_filename` on failure — the deterministic
+    fallback covers the no-API-key and Claude-down cases so the upload
+    chain can still make progress.
+    """
+    from yt_scheduler.services import prompts as prompt_service
+
+    prompt = await prompt_service.get_prompt_with_fallback(
+        "title_from_filename_prompt", project_id=project_id
+    )
+    rendered = _render_template_body(
+        prompt["body"],
+        {
+            "filename": filename,
+            "parent_url": parent_url,
+            "parent_title": parent_title,
+            "parent_description": parent_description,
+            "parent_tags": parent_tags,
+            "parent_context_block": parent_context_block,
+        },
+    )
+
+    kwargs: dict[str, object] = {
+        "model": await _resolve_model(),
+        "max_tokens": 128,
+        "messages": [{"role": "user", "content": rendered}],
+    }
+    if prompt["system"]:
+        kwargs["system"] = prompt["system"]
+
+    client = get_client()
+    message = await asyncio.to_thread(client.messages.create, **kwargs)
+    raw = message.content[0].text.strip()
+    # Some models still wrap output in quotes despite the system prompt.
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
+        raw = raw[1:-1].strip()
+    return raw[:100]
+
+
+_FILENAME_PREFIX_STRIPS = (
+    "riverside_",
+    "recording_",
+    "screen_recording_",
+    "screenrecording_",
+    "untitled_",
+    "new_recording_",
+)
+
+
+def fallback_title_from_filename(filename: str) -> str:
+    """Deterministic title from a filename, used when the AI call fails.
+
+    Strips known recording-software prefixes, drops the extension,
+    converts separators to spaces, collapses whitespace, and title-cases
+    the result. Always returns a non-empty string; falls back to
+    ``"Untitled video"`` if the filename collapses to nothing.
+    """
+    import os
+    import re
+
+    base = os.path.basename(filename)
+    # ``os.path.splitext`` keeps a leading dot (treats ".mp4" as a hidden
+    # file with no extension), so strip a known video extension manually.
+    stem, ext = os.path.splitext(base)
+    if not stem and ext:
+        stem = ext.lstrip(".")
+        ext = ""
+    base = stem
+    if base.lower().endswith((".mp4", ".mov", ".m4v", ".webm", ".mkv")):
+        base = base.rsplit(".", 1)[0]
+    lower = base.lower()
+    for prefix in _FILENAME_PREFIX_STRIPS:
+        if lower.startswith(prefix):
+            base = base[len(prefix):]
+            break
+    base = re.sub(r"[_\-]+", " ", base)
+    base = re.sub(r"\s+", " ", base).strip()
+    if not base:
+        return "Untitled video"
+    return base.title()[:100]
+
+
 # Seed fallback for ``ai_block_default_system_prompt`` — kept here so an
 # install whose migrations haven't run yet still has a sensible default for
 # bare ``{{ai: …}}`` blocks. The user-editable copy lives in

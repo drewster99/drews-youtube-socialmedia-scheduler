@@ -42,6 +42,8 @@
             <li><code>{{title}}</code>, <code>{{description}}</code>, <code>{{description_short}}</code> (≤150), <code>{{description_medium}}</code> (≤500), <code>{{tags}}</code>, <code>{{hashtags}}</code>, <code>{{tier}}</code>, <code>{{transcript}}</code>, <code>{{user_message}}</code>, <code>{{thumbnail_path}}</code></li>
             <li><code>{{url}}</code> — this item's URL (YouTube URL for YT-uploaded items, or whatever you set on a standalone item).</li>
             <li><code>{{episode_url}}</code> — the parent episode's URL when this item has a parent (e.g. a hook pointing at its primary episode).</li>
+            <li><code>{{parent_url}}</code>, <code>{{parent_title}}</code>, <code>{{parent_description}}</code>, <code>{{parent_tags}}</code> — fields from the parent video when this item has one; empty strings otherwise. Use <code>{{parent_url??}}</code> for silent fallback.</li>
+            <li><code>{{parent_context_block}}</code> — a ready-to-paste paragraph summarising the parent video (title, URL, description, tags), or empty when there's no parent. Designed to be opt-in via <code>{{parent_context_block??}}</code> inside prompt bodies.</li>
             <li><code>{{project_url}}</code> — the project's URL (auto-filled from the YouTube channel handle on YT projects, or set explicitly on GitHub / social-only projects).</li>
             <li><code>{{max_chars}}</code> — this slot's "Max characters" value, as a number. Handy inside an <code>{{ai:}}</code> block so the model knows the limit, e.g. <code>{{ai: Write a post under {{max_chars}} chars about {{title}}}}</code>. (Resolves in real post generation and in the preview below; it stays literal in other render paths.)</li>
         </ul>
