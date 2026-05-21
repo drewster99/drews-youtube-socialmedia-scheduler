@@ -514,6 +514,9 @@ function renderPreview(preview) {
 function onRowDragStart(e) {
     dragFromIndex = Number(e.currentTarget.dataset.idx);
     e.dataTransfer.effectAllowed = 'move';
+    // WebKit (the macOS app's webview) only fires drop reliably when
+    // the drag carries data — the value itself is unused.
+    e.dataTransfer.setData('text/plain', String(dragFromIndex));
     e.currentTarget.classList.add('sched-row-dragging');
 }
 function onRowDragOver(e) {
@@ -524,8 +527,12 @@ function onRowDragOver(e) {
 function onRowDragLeave(e) {
     e.currentTarget.classList.remove('sched-row-dragover');
 }
-function onRowDragEnd(e) {
-    e.currentTarget.classList.remove('sched-row-dragging');
+function onRowDragEnd() {
+    // Clear drag styling from every row — dragleave can miss a row the
+    // cursor crossed quickly.
+    for (const row of document.querySelectorAll('.promo-sched-row')) {
+        row.classList.remove('sched-row-dragging', 'sched-row-dragover');
+    }
 }
 async function onRowDrop(e) {
     e.preventDefault();
