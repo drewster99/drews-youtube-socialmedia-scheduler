@@ -1354,6 +1354,14 @@ dialog.modal input[type="text"] {
 
 dialog.modal-wide { max-width: 720px; width: 90vw; }
 dialog.modal-tall { max-height: 86vh; overflow-y: auto; }
+/* Extra-wide modal: 80% of the viewport, grows to content and scrolls
+   only once it would run past the screen. */
+dialog.modal-xwide {
+    width: 80vw;
+    max-width: 80vw;
+    max-height: 90vh;
+    overflow-y: auto;
+}
 
 /* Local-file status row — sits above .video-meta-row. Filenames
    (Riverside exports, downloaded imports) can be long, so they get a

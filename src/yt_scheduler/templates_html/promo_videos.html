@@ -19,7 +19,7 @@
     </div>
 </div>
 
-<dialog id="schedule-all-modal" class="modal modal-wide">
+<dialog id="schedule-all-modal" class="modal modal-xwide">
     <h3>Schedule all promos</h3>
     <div id="schedule-all-warnings"></div>
     <div id="schedule-all-parent" style="margin: 0.5rem 0;"></div>
@@ -431,10 +431,10 @@ function renderPreview(preview) {
         return;
     }
     rowsEl.innerHTML = rows.map(r => `
-        <div class="status-row" style="padding:0.25rem 0;">
-            <span>${escapeHtml(r.title)}</span>
+        <div class="promo-sched-row">
             <span class="badge badge-type-${escapeHtml(r.item_type)}">${escapeHtml(r.item_type)}</span>
-            <span>${escapeHtml(fmtDateTime(r.target_time))}</span>
+            <span class="promo-sched-title">${escapeHtml(r.title)}</span>
+            <span class="promo-sched-time">${escapeHtml(fmtDateTime(r.target_time))}</span>
             ${renderReadinessChip(r)}
         </div>
     `).join('');
@@ -517,5 +517,21 @@ scheduleAllForm.addEventListener('submit', async (e) => {
 @keyframes spin-dot { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
 .banner { padding: 0.6rem 0.9rem; margin: 0.6rem 0; border-radius: 4px; }
 .banner-error { background: rgba(220,80,80,0.12); color: var(--error, #d44); border: 1px solid rgba(220,80,80,0.25); }
+
+/* Schedule-all modal rows: a 4-column grid so the type pill, title,
+   target time, and readiness chip line up regardless of title length.
+   The pill sits on the leading edge in a fixed-width column. */
+.promo-sched-row {
+    display: grid;
+    grid-template-columns: 5.5rem 1fr auto auto;
+    gap: 0.6rem;
+    align-items: center;
+    padding: 0.3rem 0;
+    border-bottom: 1px solid var(--border);
+}
+.promo-sched-row:last-child { border-bottom: none; }
+.promo-sched-row .badge { justify-self: start; }
+.promo-sched-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.promo-sched-time { color: var(--text-muted, #888); font-variant-numeric: tabular-nums; font-size: 0.9em; }
 </style>
 {% endblock %}
