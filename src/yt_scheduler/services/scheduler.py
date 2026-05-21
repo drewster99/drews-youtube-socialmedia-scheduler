@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -1162,12 +1163,21 @@ def start_scheduler(
         id="prune_social_post_traces",
         replace_existing=True,
     )
+    # First backfill runs 30s after startup so freshly-added promo
+    # videos get a thumbnail without waiting a full interval. Skipped
+    # under pytest: start_scheduler runs inside the app lifespan, which
+    # TestClient exercises too, and the job does real network I/O — an
+    # early fire there hangs the suite.
+    backfill_first_run = None
+    if "pytest" not in sys.modules:
+        backfill_first_run = datetime.now(timezone.utc) + timedelta(seconds=30)
     scheduler.add_job(
         backfill_thumbnails_job,
         "interval",
         minutes=30,
         id="backfill_thumbnails",
         replace_existing=True,
+        next_run_time=backfill_first_run,
     )
     scheduler.start()
     logger.info(
