@@ -1168,9 +1168,6 @@ def start_scheduler(
         minutes=30,
         id="backfill_thumbnails",
         replace_existing=True,
-        # Run shortly after startup so thumbnail-less videos (e.g.
-        # promo uploads) get fixed without waiting a full interval.
-        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=60),
     )
     scheduler.start()
     logger.info(
