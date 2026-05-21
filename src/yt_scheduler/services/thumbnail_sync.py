@@ -256,3 +256,64 @@ async def maybe_refresh_youtube_thumbnail(
         (verdict, local_sha, yt_sha, video_id),
     )
     await db.commit()
+
+
+# YouTube serves a predictable thumbnail URL per video id. maxres often
+# 404s until processing finishes; hqdefault exists within seconds of
+# upload. Try largest-first and take the first that returns content.
+_BACKFILL_THUMB_SIZES = ("maxresdefault", "sddefault", "hqdefault")
+
+
+async def backfill_thumbnail(video_id: str) -> bool:
+    """Download YouTube's current thumbnail for a video that has none
+    locally, and point thumbnail_path / thumbnail_source at it.
+
+    This produces the same end state as an import (which downloads the
+    thumbnail up front). Promo-uploaded videos skip that — the promo
+    pipeline has no thumbnail step — so the periodic
+    :func:`scheduler.backfill_thumbnails_job` sweep calls this to give
+    them YouTube's auto-generated thumbnail. That also lets them pass
+    the schedule-readiness check, which requires a thumbnail.
+
+    Returns True when a thumbnail was written, False when the row
+    already has one or YouTube served nothing usable.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT thumbnail_path FROM videos WHERE id = ?", (video_id,)
+    )
+    if not rows or rows[0]["thumbnail_path"]:
+        return False
+
+    content: bytes | None = None
+    source_url: str | None = None
+    async with httpx.AsyncClient(timeout=30) as client:
+        for size in _BACKFILL_THUMB_SIZES:
+            url = f"https://i.ytimg.com/vi/{video_id}/{size}.jpg"
+            try:
+                resp = await client.get(url, follow_redirects=True)
+            except Exception as exc:
+                logger.debug("Thumbnail backfill GET failed (%s): %s", url, exc)
+                continue
+            if resp.status_code == 200 and resp.content:
+                content = resp.content
+                source_url = url
+                break
+    if content is None:
+        return False
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    target = UPLOAD_DIR / f"{video_id}_thumb.jpg"
+    target.write_bytes(content)
+    # Mirror the import path: thumbnail_source='youtube', and seed the
+    # dual-thumbnail columns so a later maybe_refresh doesn't re-download
+    # an identical image just to find nothing changed.
+    await db.execute(
+        "UPDATE videos SET thumbnail_path = ?, thumbnail_source = 'youtube', "
+        "youtube_thumbnail_path = ?, youtube_thumbnail_url = ?, "
+        "updated_at = datetime('now') WHERE id = ?",
+        (str(target), str(target), source_url, video_id),
+    )
+    await db.commit()
+    logger.info("Backfilled YouTube thumbnail for %s", video_id)
+    return True

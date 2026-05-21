@@ -251,3 +251,87 @@ async def test_extract_youtube_thumbnail_url_prefers_maxres() -> None:
     }) == "MED"
     assert _extract_youtube_thumbnail_url({"snippet": {"thumbnails": {}}}) is None
     assert _extract_youtube_thumbnail_url(None) is None
+
+
+@pytest.mark.asyncio
+async def test_backfill_thumbnail_sets_youtube_source(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A YouTube-backed video with no local thumbnail gets YouTube's
+    thumbnail downloaded and thumbnail_source set to 'youtube' — and a
+    second call is a no-op."""
+    from yt_scheduler.database import get_db
+    db = await get_db()
+    await db.execute(
+        "INSERT INTO videos (id, title, status, imported_from_youtube) "
+        "VALUES ('BACKFILL001', 't', 'ready', 0)"
+    )
+    await db.commit()
+
+    fake_bytes = b"YT_THUMB_JPEG_BYTES"
+
+    class FakeResp:
+        def __init__(self, status_code: int, content: bytes):
+            self.status_code = status_code
+            self.content = content
+
+    class FakeAsyncClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *exc): return False
+        async def get(self, url, **kwargs):
+            # maxres 404s (still processing); hqdefault succeeds.
+            if "maxresdefault" in url:
+                return FakeResp(404, b"")
+            return FakeResp(200, fake_bytes)
+
+    from yt_scheduler.services import thumbnail_sync
+    monkeypatch.setattr(thumbnail_sync.httpx, "AsyncClient", FakeAsyncClient)
+
+    assert await thumbnail_sync.backfill_thumbnail("BACKFILL001") is True
+
+    rows = await db.execute_fetchall(
+        "SELECT thumbnail_path, thumbnail_source FROM videos WHERE id = ?",
+        ("BACKFILL001",),
+    )
+    path, source = rows[0]
+    assert source == "youtube"
+    assert path is not None and Path(path).exists()
+    assert Path(path).read_bytes() == fake_bytes
+
+    # Idempotent: a row that already has a thumbnail is left alone.
+    assert await thumbnail_sync.backfill_thumbnail("BACKFILL001") is False
+
+
+@pytest.mark.asyncio
+async def test_backfill_job_targets_only_youtube_rows_without_thumbnail(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """backfill_thumbnails_job processes only YouTube-backed rows
+    (11-char id) that lack a thumbnail — skips 22-char standalone-item
+    ids and rows that already have a thumbnail."""
+    from yt_scheduler.database import get_db
+    db = await get_db()
+    await db.execute(
+        "INSERT INTO videos (id, title, status) VALUES ('YTVIDEO0001','t','ready')"
+    )
+    await db.execute(
+        "INSERT INTO videos (id, title, status) "
+        "VALUES ('STANDALONExxxxxxxxxxxx','t','ready')"
+    )
+    await db.execute(
+        "INSERT INTO videos (id, title, status, thumbnail_path) "
+        "VALUES ('HASTHUMB001','t','ready','/tmp/x.jpg')"
+    )
+    await db.commit()
+
+    seen: list[str] = []
+
+    async def fake_backfill(video_id: str) -> bool:
+        seen.append(video_id)
+        return True
+
+    from yt_scheduler.services import scheduler as sched, thumbnail_sync
+    monkeypatch.setattr(thumbnail_sync, "backfill_thumbnail", fake_backfill)
+    await sched.backfill_thumbnails_job()
+    assert seen == ["YTVIDEO0001"]

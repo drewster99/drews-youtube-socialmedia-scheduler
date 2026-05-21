@@ -1091,6 +1091,38 @@ async def prune_social_post_traces_job() -> None:
         )
 
 
+async def backfill_thumbnails_job() -> None:
+    """Give YouTube's auto-generated thumbnail to any YouTube-backed
+    video that has no local thumbnail.
+
+    Promo-uploaded videos never get one — the promo pipeline has no
+    thumbnail step — so they show 'No thumbnail' and fail the schedule
+    readiness check. This sweep downloads YouTube's thumbnail and sets
+    thumbnail_source='youtube', the same end state an import produces.
+    YouTube video ids are 11 chars; the app's own standalone-item ids
+    are 22, so LENGTH(id)=11 selects only real YouTube-backed rows.
+    """
+    from yt_scheduler.services import thumbnail_sync
+
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id FROM videos "
+        "WHERE thumbnail_path IS NULL AND LENGTH(id) = 11 "
+        "AND COALESCE(youtube_deleted, 0) = 0"
+    )
+    filled = 0
+    for row in rows:
+        try:
+            if await thumbnail_sync.backfill_thumbnail(row["id"]):
+                filled += 1
+        except Exception as exc:
+            logger.warning(
+                "Thumbnail backfill failed for %s: %s", row["id"], exc
+            )
+    if filled:
+        logger.info("Thumbnail backfill: filled %d video(s)", filled)
+
+
 def start_scheduler(
     caption_interval: int | None = None,
     comment_interval: int | None = None,
@@ -1130,11 +1162,21 @@ def start_scheduler(
         id="prune_social_post_traces",
         replace_existing=True,
     )
+    scheduler.add_job(
+        backfill_thumbnails_job,
+        "interval",
+        minutes=30,
+        id="backfill_thumbnails",
+        replace_existing=True,
+        # Run shortly after startup so thumbnail-less videos (e.g.
+        # promo uploads) get fixed without waiting a full interval.
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=60),
+    )
     scheduler.start()
     logger.info(
         f"Scheduler started (captions every {cap_mins}m, moderation every {mod_mins}m, "
         f"social-token refresh every {_TOKEN_REFRESH_INTERVAL_MINUTES}m, "
-        "trace pruning hourly)"
+        "trace pruning hourly, thumbnail backfill every 30m)"
     )
 
 
