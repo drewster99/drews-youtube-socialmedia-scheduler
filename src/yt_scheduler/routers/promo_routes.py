@@ -67,9 +67,78 @@ async def _ensure_primary(slug: str, parent_id: str) -> tuple[dict, dict]:
     return project, parent
 
 
+def _tier_readiness(children: list[dict]) -> dict:
+    """One-line readiness summary for a tier's promo children, shown on
+    the Promo videos card on the parent's detail page.
+
+    ``children`` are raw ``videos`` rows — not _video_public-processed,
+    because is_ready_for_schedule needs the unpopped thumbnail_path.
+    Each child falls into exactly one bucket; ``line`` lists the
+    non-empty buckets, and ``state`` drives the card's status dot.
+    """
+    from yt_scheduler.services.scheduler import is_ready_for_schedule
+
+    n = len(children)
+    if n == 0:
+        return {"count": 0, "line": "", "state": "empty"}
+
+    failed = processing = published = scheduled = ready = 0
+    missing_counts: dict[str, int] = {}
+    for c in children:
+        auto = str(c.get("auto_action_state") or "")
+        status = (c.get("status") or "").lower()
+        if auto.startswith("failed"):
+            failed += 1
+        elif auto and auto != "ready":
+            processing += 1
+        elif status == "published":
+            published += 1
+        elif c.get("publish_at"):
+            scheduled += 1
+        else:
+            is_ready, missing = is_ready_for_schedule(c)
+            if is_ready:
+                ready += 1
+            else:
+                for m in missing:
+                    key = "tags" if m.startswith("tags") else m
+                    missing_counts[key] = missing_counts.get(key, 0) + 1
+
+    not_ready = n - failed - processing - published - scheduled - ready
+    parts: list[str] = []
+    if published:
+        parts.append(f"{published} published")
+    if scheduled:
+        parts.append(f"{scheduled} scheduled")
+    if ready:
+        parts.append(f"{ready} ready")
+    if processing:
+        parts.append(f"{processing} processing")
+    if failed:
+        parts.append(f"{failed} failed")
+    if not_ready:
+        fields = ", ".join(
+            sorted(missing_counts, key=lambda k: (-missing_counts[k], k))
+        )
+        parts.append(
+            f"{not_ready} need {fields}" if fields else f"{not_ready} not ready"
+        )
+
+    if failed or not_ready:
+        state = "attention"
+    elif processing:
+        state = "working"
+    else:
+        state = "ready"
+
+    line = "all ready" if ready == n else " · ".join(parts)
+    return {"count": n, "line": line, "state": state}
+
+
 @router.get("")
 async def list_promos(slug: str, parent_id: str) -> dict:
-    """Return per-tier counts and the children themselves.
+    """Return per-tier counts, the children themselves, and a per-tier
+    readiness summary.
 
     Response:
         {
@@ -79,10 +148,16 @@ async def list_promos(slug: str, parent_id: str) -> dict:
                 "short":   [...],
                 "hook":    [...],
             },
+            "readiness": {
+                "segment": {"count": int, "line": str, "state": str},
+                "short":   {...},
+                "hook":    {...},
+            },
         }
 
     ``children`` is keyed by ``item_type`` (not ``tier``) so a user-
     forced classification surfaces in the bucket the user picked.
+    ``readiness.state`` is one of empty | ready | working | attention.
     """
     project, _parent = await _ensure_primary(slug, parent_id)
     db = await get_db()
@@ -92,12 +167,19 @@ async def list_promos(slug: str, parent_id: str) -> dict:
         (parent_id, project["id"]),
     )
     buckets: dict[str, list[dict]] = {"segment": [], "short": [], "hook": []}
+    raw_buckets: dict[str, list[dict]] = {"segment": [], "short": [], "hook": []}
     for row in rows:
+        raw = dict(row)
         item = _video_public(dict(row))
         bucket = item.get("item_type") or item.get("tier") or "short"
         buckets.setdefault(bucket, []).append(item)
+        raw_buckets.setdefault(bucket, []).append(raw)
     summary = {k: len(v) for k, v in buckets.items() if k in {"segment", "short", "hook"}}
-    return {"summary": summary, "children": buckets}
+    readiness = {
+        tier: _tier_readiness(raw_buckets.get(tier, []))
+        for tier in ("segment", "short", "hook")
+    }
+    return {"summary": summary, "children": buckets, "readiness": readiness}
 
 
 @router.post("/upload")

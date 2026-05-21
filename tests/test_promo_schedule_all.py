@@ -116,6 +116,56 @@ def test_readiness_accepts_youtube_thumbnail_source() -> None:
     assert ready
 
 
+def test_tier_readiness_summary_line() -> None:
+    """Pure helper behind the Promo videos card's per-tier one-liner."""
+    from yt_scheduler.routers.promo_routes import _tier_readiness
+
+    assert _tier_readiness([])["count"] == 0
+    assert _tier_readiness([])["state"] == "empty"
+
+    ready_child = {
+        "auto_action_state": "ready", "status": "ready",
+        "transcript": "t", "description": "d",
+        "tags": json.dumps(["a", "b", "c"]), "thumbnail_path": "/t.jpg",
+    }
+    r = _tier_readiness([dict(ready_child), dict(ready_child)])
+    assert r["count"] == 2
+    assert r["line"] == "all ready"
+    assert r["state"] == "ready"
+
+    published = {"auto_action_state": "ready", "status": "published"}
+    no_thumb = {
+        "auto_action_state": "ready", "status": "ready",
+        "transcript": "t", "description": "d",
+        "tags": json.dumps(["a", "b", "c"]),
+        "thumbnail_path": None, "thumbnail_source": None,
+    }
+    r = _tier_readiness([published, no_thumb])
+    assert r["count"] == 2
+    assert "1 published" in r["line"]
+    assert "thumbnail" in r["line"]
+    assert r["state"] == "attention"
+
+    r = _tier_readiness([{"auto_action_state": "transcribing", "status": "uploaded"}])
+    assert r["state"] == "working"
+    assert "1 processing" in r["line"]
+
+
+def test_promos_endpoint_includes_readiness(client: TestClient) -> None:
+    _insert_ready_video("rdytparent1", status="captioned", privacy_status="public")
+    _insert_ready_video(
+        "rdytchild01", parent_item_id="rdytparent1", item_type="segment",
+    )
+    resp = client.get("/api/projects/default/videos/rdytparent1/promos")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert set(data["readiness"]) == {"segment", "short", "hook"}
+    seg = data["readiness"]["segment"]
+    assert seg["count"] == 1
+    assert seg["state"] == "ready"
+    assert data["readiness"]["hook"]["count"] == 0
+
+
 def test_preview_requires_parent_publish_or_existing(client: TestClient) -> None:
     _insert_ready_video("parentid001", publish_at=None, status="uploaded")
     _insert_ready_video(

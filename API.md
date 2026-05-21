@@ -1903,7 +1903,7 @@ Bulk-upload promo children under a primary video. Each upload runs through the m
 
 **Purpose** — List the parent's children, bucketed by `item_type`.
 
-**Response 200** — `{"summary": {"segment": N, "short": N, "hook": N}, "children": {"segment": [...], "short": [...], "hook": [...]}}`. Each child entry is the `_video_public` projection.
+**Response 200** — `{"summary": {"segment": N, "short": N, "hook": N}, "children": {"segment": [...], "short": [...], "hook": [...]}, "readiness": {"segment": {"count": N, "line": "...", "state": "..."}, "short": {...}, "hook": {...}}}`. Each child entry is the `_video_public` projection. `readiness` is a per-tier one-line summary for the parent's Promo videos card: `line` is human-readable (e.g. `"4 need thumbnail · 1 ready"`, `"all ready"`); `state` is one of `empty | ready | working | attention` (drives the card's status dot).
 
 **Errors** — `404` (project or parent video not found in project), `400` (parent is itself a child — only one level of parenting is supported).
 

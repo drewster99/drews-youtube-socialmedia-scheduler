@@ -155,16 +155,6 @@
             </div>
         </div>
 
-        <div class="card" id="promo-card" style="display:none;">
-            <h3>Promo videos</h3>
-            <div style="margin-bottom: 0.5rem;">
-                <span id="promo-count-label">Promo videos</span>
-            </div>
-            <a id="promo-link" href="#" class="btn btn-sm btn-secondary" style="width:100%;">
-                Open promo videos →
-            </a>
-        </div>
-
         <div class="card">
             <h3>Schedule publish + social posts</h3>
             <div id="schedule-info" style="margin-bottom: 0.5rem;"></div>
@@ -187,6 +177,15 @@
                 Posts stagger using the project's posting settings (delay + spacing).
                 Adjust those in Project Settings to change the cadence.
             </small>
+        </div>
+
+        <div class="card" id="promo-card" style="display:none;">
+            <h3>Promo videos</h3>
+            <div id="promo-tier-rows"></div>
+            <a id="promo-link" href="#" class="btn btn-sm btn-secondary"
+               style="width:100%; margin-top:0.6rem;">
+                Open promo videos →
+            </a>
         </div>
 
         <div class="card">
@@ -525,6 +524,35 @@ function renderSchedulePostPreview() {
     `;
 }
 
+// Promo videos card (primary episodes only): one row per tier with a
+// count and a server-computed readiness one-liner. `data` is the
+// /promos response (summary + readiness).
+function renderPromoTierRows(data) {
+    const TIERS = [['segment', 'Segments'], ['short', 'Shorts'], ['hook', 'Hooks']];
+    const summary = data.summary || {};
+    const readiness = data.readiness || {};
+    const total = TIERS.reduce((n, [k]) => n + (summary[k] || 0), 0);
+    const rowsEl = document.getElementById('promo-tier-rows');
+    if (total === 0) {
+        rowsEl.innerHTML = '<p class="form-hint" style="margin:0;">No promo videos yet.</p>';
+        return;
+    }
+    const DOT = {empty: '#555', ready: '#3cb44b', working: '#4a90e2', attention: '#d29922'};
+    rowsEl.innerHTML = TIERS.map(([key, label]) => {
+        const count = summary[key] || 0;
+        const r = readiness[key] || {state: 'empty', line: ''};
+        const dot = DOT[r.state] || '#555';
+        const line = count === 0 ? '—' : (r.line || '');
+        return `
+            <div class="promo-tier-row">
+                <span class="promo-tier-dot" style="background:${dot};"></span>
+                <span class="promo-tier-name">${label}</span>
+                <span class="promo-tier-count">${count}</span>
+                <span class="promo-tier-line">${escapeHtml(line)}</span>
+            </div>`;
+    }).join('');
+}
+
 async function loadVideo() {
     const resp = await fetch(`/api/videos/${videoId}`);
     const video = await resp.json();
@@ -551,18 +579,10 @@ async function loadVideo() {
             );
             if (pResp.ok) {
                 const data = await pResp.json();
-                const count =
-                    (data.summary?.segment || 0) +
-                    (data.summary?.short || 0) +
-                    (data.summary?.hook || 0);
-                const card = document.getElementById('promo-card');
-                const label = document.getElementById('promo-count-label');
-                const link = document.getElementById('promo-link');
-                label.textContent = count === 0
-                    ? 'No promo videos yet'
-                    : `${count} promo video${count === 1 ? '' : 's'}`;
-                link.href = `/projects/${projectSlug}/videos/${videoId}/promos`;
-                card.style.display = '';
+                renderPromoTierRows(data);
+                document.getElementById('promo-link').href =
+                    `/projects/${projectSlug}/videos/${videoId}/promos`;
+                document.getElementById('promo-card').style.display = '';
             }
         } catch (e) { /* swallow */ }
     }

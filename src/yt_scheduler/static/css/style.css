@@ -594,6 +594,25 @@ body {
 }
 .video-schedule strong { color: var(--text-primary); }
 
+/* Promo videos card (episode detail) — one row per tier: status dot,
+   tier name, count, then a server-computed readiness one-liner. */
+.promo-tier-row {
+    display: grid;
+    grid-template-columns: auto 5rem 1.5rem 1fr;
+    gap: 0.5rem;
+    align-items: center;
+    padding: 0.25rem 0;
+    font-size: 0.85rem;
+}
+.promo-tier-dot {
+    width: 0.55rem;
+    height: 0.55rem;
+    border-radius: 50%;
+}
+.promo-tier-name { color: var(--text-primary); }
+.promo-tier-count { font-weight: 600; font-variant-numeric: tabular-nums; }
+.promo-tier-line { color: var(--text-muted); text-align: right; }
+
 /* Detail grid (two-column layout). The right column hosts Log + Status +
  * Social posts; widened from 380px to 494px (~30%) so multi-line log
  * entries don't wrap on the platform tag. */
