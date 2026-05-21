@@ -47,6 +47,7 @@ def _insert_ready_video(
     thumbnail_path: str | None = "/tmp/thumb.jpg",
     thumbnail_source: str | None = None,
     status: str = "uploaded",
+    privacy_status: str = "unlisted",
 ) -> None:
     """Insert a videos row that passes the readiness check by default.
     Caller passes empty strings / None to make specific fields fail."""
@@ -59,11 +60,12 @@ def _insert_ready_video(
                privacy_status, status, item_type, parent_item_id,
                publish_at, transcript, thumbnail_path, thumbnail_source,
                url, tier)
-            VALUES (?, 1, ?, ?, ?, 'unlisted', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                video_id, title, description, tag_json, status, item_type,
-                parent_item_id, publish_at, transcript_text, thumbnail_path,
-                thumbnail_source, f"https://youtu.be/{video_id}",
+                video_id, title, description, tag_json, privacy_status,
+                status, item_type, parent_item_id, publish_at,
+                transcript_text, thumbnail_path, thumbnail_source,
+                f"https://youtu.be/{video_id}",
                 item_type if item_type != "episode" else None,
             ),
         )
@@ -126,6 +128,31 @@ def test_preview_requires_parent_publish_or_existing(client: TestClient) -> None
     data = resp.json()
     assert data["anchor_publish_at"] is None
     assert any("publish time" in w.lower() for w in data["warnings"])
+
+
+def test_preview_treats_public_parent_as_published(client: TestClient) -> None:
+    """An imported parent that's already public on YouTube — app status
+    not 'published', no publish_at — must be recognized as published:
+    flagged already_published, no publish-time prompt, no readiness
+    warning (even with no tags), and children anchored from now."""
+    _insert_ready_video(
+        "pubparent01", publish_at=None, status="captioned",
+        privacy_status="public", tags=[],
+    )
+    _insert_ready_video(
+        "segchildp01", parent_item_id="pubparent01", item_type="segment",
+    )
+    resp = client.get(
+        "/api/projects/default/videos/pubparent01/promos/schedule-all/preview"
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["parent"]["already_published"] is True
+    assert not any("publish time" in w.lower() for w in data["warnings"])
+    assert not any("isn't ready" in w.lower() for w in data["warnings"])
+    # Anchored from now, so a concrete child target time is computed.
+    assert data["anchor_publish_at"] is not None
+    assert data["rows"][0]["target_time"] is not None
 
 
 def test_preview_computes_per_tier_chains(client: TestClient) -> None:

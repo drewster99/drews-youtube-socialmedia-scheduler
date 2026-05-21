@@ -373,6 +373,7 @@ async function fetchPreview(parentPublishAt) {
 }
 
 function renderReadinessChip(row) {
+    if (row.already_published) return '<span class="badge badge-published">Published</span>';
     if (row.ready) return '<span class="badge badge-published">Ready</span>';
     const missing = (row.missing || []).join(', ');
     return `<span class="badge badge-error" title="${escapeHtml(missing)}">Not ready</span>`;
@@ -390,14 +391,16 @@ function renderPreview(preview) {
         : '';
 
     const p = preview.parent;
-    needsParentPicker = !p.publish_at && p.status !== 'published';
+    // Picker only when the parent genuinely has no anchor: not already
+    // published (status or public-on-YouTube) and not yet scheduled.
+    needsParentPicker = !p.already_published && !p.publish_at;
     parentEl.innerHTML = `
         <div class="status-row" style="font-weight:600;">
             Parent: ${escapeHtml(p.title || p.id)}
             ${renderReadinessChip(p)}
         </div>
-        ${p.status === 'published'
-            ? '<div class="form-hint">Already published — children anchor to its publish time.</div>'
+        ${p.already_published
+            ? '<div class="form-hint">Already published — promos roll out starting now.</div>'
             : needsParentPicker
                 ? `<div class="form-group" style="margin-top:0.4rem;">
                     <label>Parent publish time</label>
@@ -439,7 +442,7 @@ function renderPreview(preview) {
         ? `Ends ${fmtDateTime(preview.total_span)}.`
         : '';
 
-    const anyMissing = rows.some(r => !r.ready) || !p.ready;
+    const anyMissing = rows.some(r => !r.ready) || (!p.already_published && !p.ready);
     const anyMissingTime = rows.some(r => !r.target_time);
     scheduleAllConfirm.disabled = anyMissing || anyMissingTime;
 }

@@ -1283,10 +1283,24 @@ async def compute_promo_batch_preview(
             "parenting is supported"
         )
 
+    now = datetime.now(timezone.utc)
     parent_publish = (
         parent_publish_at or _parse_iso_datetime(parent.get("publish_at"))
     )
-    parent_already_published = (parent.get("status") or "") == "published"
+    # A parent counts as published when our status says so OR when it's
+    # already public on YouTube. The latter is the common case for an
+    # imported episode that went live outside the app: its app status
+    # stays 'captioned'/'ready' but privacy_status is 'public'.
+    parent_already_published = (
+        (parent.get("status") or "").lower() == "published"
+        or (parent.get("privacy_status") or "").lower() == "public"
+    )
+    # An already-published parent's real publish time is in the past, so
+    # it's useless as a forward anchor — roll the promo chain out from now.
+    if parent_already_published and (
+        parent_publish is None or parent_publish <= now
+    ):
+        parent_publish = now
 
     warnings: list[str] = []
     parent_ready, parent_missing = is_ready_for_schedule(parent)
@@ -1329,7 +1343,7 @@ async def compute_promo_batch_preview(
                 "missing": missing,
             })
         return {
-            "parent": _public_parent(parent, parent_publish),
+            "parent": _public_parent(parent, parent_publish, parent_already_published),
             "rows": rows_out,
             "total_span": None,
             "warnings": warnings + [
@@ -1397,7 +1411,7 @@ async def compute_promo_batch_preview(
 
     rows_out.sort(key=lambda r: r["target_time"] or "")
     return {
-        "parent": _public_parent(parent, parent_publish),
+        "parent": _public_parent(parent, parent_publish, parent_already_published),
         "rows": rows_out,
         "total_span": latest_target.isoformat() if latest_target else None,
         "warnings": warnings,
@@ -1405,14 +1419,20 @@ async def compute_promo_batch_preview(
     }
 
 
-def _public_parent(parent: dict, parent_publish: datetime | None) -> dict:
+def _public_parent(
+    parent: dict,
+    parent_publish: datetime | None,
+    already_published: bool = False,
+) -> dict:
+    ready, missing = is_ready_for_schedule(parent)
     return {
         "id": parent.get("id"),
         "title": parent.get("title") or "",
         "publish_at": parent_publish.isoformat() if parent_publish else None,
         "status": parent.get("status"),
-        "ready": is_ready_for_schedule(parent)[0],
-        "missing": is_ready_for_schedule(parent)[1],
+        "already_published": already_published,
+        "ready": ready,
+        "missing": missing,
     }
 
 
