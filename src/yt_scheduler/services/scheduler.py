@@ -1401,6 +1401,20 @@ async def compute_promo_batch_preview(
     children = [dict(r) for r in children_rows]
     eligible = [c for c in children if (c.get("status") or "") != "published"]
 
+    # Last already-published promo per tier. When a tier's rollout has
+    # already begun, a fresh chain resumes from that promo's time + the
+    # First delay rather than anchoring back at the parent.
+    published_max: dict[str, datetime] = {}
+    for c in children:
+        if (c.get("status") or "").lower() != "published":
+            continue
+        published_at = _parse_iso_datetime(c.get("publish_at"))
+        if published_at is None:
+            continue
+        bucket = (c.get("item_type") or c.get("tier") or "short").lower()
+        if bucket not in published_max or published_at > published_max[bucket]:
+            published_max[bucket] = published_at
+
     quota_units = promo_quota_for(len(eligible))
     if quota_units >= _YT_DAILY_QUOTA * PROMO_BATCH_QUOTA_WARN_FRACTION:
         warnings.append(
@@ -1489,9 +1503,14 @@ async def compute_promo_batch_preview(
                 if latest_target is None or current > latest_target:
                     latest_target = current
         else:
-            # Fresh chain: first child anchors at parent + initial,
-            # the rest follow at +subsequent each.
-            current = parent_publish + cfg["initial"]
+            # Fresh chain: the first child anchors at <anchor> + the
+            # First delay, the rest follow at +subsequent each. The
+            # anchor is the last already-published promo of this tier
+            # when its rollout has started, otherwise the parent's
+            # publish time (already coerced to now for a published
+            # parent).
+            anchor = published_max.get(tier_name) or parent_publish
+            current = anchor + cfg["initial"]
             rows_out.append(_preview_row(unscheduled[0], current))
             if latest_target is None or current > latest_target:
                 latest_target = current

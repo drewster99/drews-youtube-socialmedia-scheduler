@@ -377,6 +377,38 @@ def test_schedule_all_persists_delays(client: TestClient) -> None:
     assert saved["segment"]["subsequent"] == {"value": 8, "unit": "hours"}
 
 
+def test_preview_resumes_from_last_published_promo(client: TestClient) -> None:
+    """When a tier already has a published promo, a fresh chain resumes
+    from that promo's publish time + the First delay — not the parent."""
+    from datetime import datetime, timedelta
+
+    _insert_ready_video("rsparent001", status="published", privacy_status="public")
+    published_iso = "2026-05-01T12:00:00+00:00"
+    _insert_ready_video(
+        "rspublished1", parent_item_id="rsparent001", item_type="segment",
+        status="published", publish_at=published_iso,
+    )
+    _insert_ready_video(
+        "rsnewchild1", parent_item_id="rsparent001", item_type="segment",
+    )
+    delays = {
+        t: {"initial": {"value": 2, "unit": "days"},
+            "subsequent": {"value": 5, "unit": "days"}}
+        for t in ("hook", "short", "segment")
+    }
+    resp = client.post(
+        "/api/projects/default/videos/rsparent001/promos/schedule-all/preview",
+        json={"delays": delays},
+    )
+    assert resp.status_code == 200
+    rows = resp.json()["rows"]
+    # The published promo is excluded; the new one anchors at
+    # last-published + First delay (2 days).
+    assert [r["video_id"] for r in rows] == ["rsnewchild1"]
+    expected = datetime.fromisoformat(published_iso) + timedelta(days=2)
+    assert datetime.fromisoformat(rows[0]["target_time"]) == expected
+
+
 def test_promo_quota_helper() -> None:
     from yt_scheduler.services.scheduler import promo_quota_for
 
