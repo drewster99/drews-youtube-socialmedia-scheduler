@@ -249,20 +249,29 @@ async def get_upload_job(slug: str, parent_id: str, job_id: str) -> dict:
     return job
 
 
-async def _resolve_batch_delays(project_id: int, raw_delays: object) -> dict:
+async def _resolve_batch_delays(
+    project_id: int, raw_delays: object
+) -> tuple[dict, dict | None]:
     """Turn an optional client-supplied promo-delays payload into the
-    timedelta shape the batch math consumes. ``None`` → the project's
-    saved delays; otherwise validate the payload (400 on bad input)."""
+    timedelta shape the batch math consumes.
+
+    Returns ``(timedeltas, validated)``: ``timedeltas`` always feeds the
+    batch math; ``validated`` is the normalized ``{value, unit}`` payload
+    to persist as the project default, or ``None`` when the caller
+    supplied no delays (nothing new to persist).
+
+    ``None`` raw_delays → the project's saved delays; otherwise validate
+    the payload (400 on bad input)."""
     from yt_scheduler.services import project_settings, scheduler as _scheduler
 
     if raw_delays is None:
         stored = await project_settings.get_promo_delays(project_id)
-        return _scheduler._promo_delays_to_timedeltas(stored)
+        return _scheduler._promo_delays_to_timedeltas(stored), None
     try:
         validated = project_settings.validate_promo_delays(raw_delays)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    return _scheduler._promo_delays_to_timedeltas(validated)
+    return _scheduler._promo_delays_to_timedeltas(validated), validated
 
 
 @router.post("/schedule-all/preview")
@@ -283,7 +292,9 @@ async def schedule_all_preview(
     project, _parent = await _ensure_primary(slug, parent_id)
     payload = payload or {}
     parent_dt = _scheduler._parse_iso_datetime(payload.get("parent_publish_at"))
-    delays = await _resolve_batch_delays(project["id"], payload.get("delays"))
+    delays, _validated = await _resolve_batch_delays(
+        project["id"], payload.get("delays")
+    )
     order = payload.get("order") or None
     try:
         preview = await _scheduler.compute_promo_batch_preview(
@@ -298,7 +309,7 @@ async def schedule_all_preview(
 async def schedule_all(
     slug: str,
     parent_id: str,
-    payload: dict,
+    payload: dict | None = None,
 ) -> dict:
     """Commit the batch from the preview modal. Body (all optional):
 
@@ -318,7 +329,9 @@ async def schedule_all(
     project, _parent = await _ensure_primary(slug, parent_id)
     payload = payload or {}
     parent_dt = _scheduler._parse_iso_datetime(payload.get("parent_publish_at"))
-    delays = await _resolve_batch_delays(project["id"], payload.get("delays"))
+    delays, validated_delays = await _resolve_batch_delays(
+        project["id"], payload.get("delays")
+    )
     order = payload.get("order") or None
     try:
         result = await _scheduler.schedule_promo_batch(
@@ -326,11 +339,12 @@ async def schedule_all(
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    # Persist the (possibly edited) delays so the next batch of the same
-    # tier defaults to the same pace.
-    if payload.get("delays") is not None:
-        validated = project_settings.validate_promo_delays(payload["delays"])
-        await project_settings.set_json(project["id"], "promo_delays", validated)
+    # Persist the (already-validated) delays so the next batch of the
+    # same tier defaults to the same pace.
+    if validated_delays is not None:
+        await project_settings.set_json(
+            project["id"], "promo_delays", validated_delays
+        )
     return result
 
 

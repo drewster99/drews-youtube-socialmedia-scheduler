@@ -288,8 +288,8 @@ def test_quota_warning_surfaced_for_large_batches(client: TestClient) -> None:
     _insert_ready_video(
         "parentid004", publish_at=parent_iso, status="scheduled",
     )
-    # 17 children × 150 quota = 2,550 (~25.5% of daily 10k) → warns.
-    for i in range(17):
+    # 51 children × 50 quota = 2,550 (~25.5% of daily 10k) → warns.
+    for i in range(51):
         _insert_ready_video(
             f"hk{i:08d}", parent_item_id="parentid004", item_type="hook",
         )
@@ -412,9 +412,11 @@ def test_preview_resumes_from_last_published_promo(client: TestClient) -> None:
 def test_promo_quota_helper() -> None:
     from yt_scheduler.services.scheduler import promo_quota_for
 
+    # Scheduling cost is the publish-time privacy flip (~50 units/promo),
+    # not the upload chain's ~150 — that was spent before scheduling.
     assert promo_quota_for(0) == 0
-    assert promo_quota_for(1) == 150
-    assert promo_quota_for(10) == 1500
+    assert promo_quota_for(1) == 50
+    assert promo_quota_for(10) == 500
 
 
 def test_preview_preserves_already_scheduled_children(client: TestClient) -> None:
@@ -453,3 +455,132 @@ def test_readiness_accepts_user_edited_description_starting_with_placeholder(
         "thumbnail_path": "/tmp/x.jpg",
     })
     assert ready
+
+
+def test_commit_schedules_parent_when_publish_at_supplied(
+    client: TestClient,
+) -> None:
+    """Committing with parent_publish_at for an unscheduled parent
+    schedules the parent row itself, not just the children."""
+    _insert_ready_video("scparent001", publish_at=None, status="uploaded")
+    _insert_ready_video(
+        "scchild0001", parent_item_id="scparent001", item_type="segment",
+    )
+    parent_iso = "2026-12-01T15:00:00+00:00"
+    resp = client.post(
+        "/api/projects/default/videos/scparent001/promos/schedule-all",
+        json={"parent_publish_at": parent_iso},
+    )
+    assert resp.status_code == 200, resp.text
+    scheduled_ids = {r["video_id"] for r in resp.json()["scheduled"]}
+    assert "scparent001" in scheduled_ids
+
+    from yt_scheduler.config import DB_PATH
+
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT publish_at, status FROM videos WHERE id = ?",
+            ("scparent001",),
+        ).fetchone()
+    assert row[0] is not None
+    assert row[1] == "scheduled"
+
+
+def test_schedule_all_preserves_manual_pin(client: TestClient) -> None:
+    """A child the user manually pinned (publish_at_manual = 1) must keep
+    both its publish time AND the pin through a schedule-all batch —
+    schedule-all is non-destructive to manually-set schedules."""
+    parent_iso = "2026-04-01T17:30:00+00:00"
+    pinned_time = "2026-04-20T09:00:00+00:00"
+    _insert_ready_video("mpparent001", publish_at=parent_iso, status="scheduled")
+    _insert_ready_video(
+        "mppinned001", parent_item_id="mpparent001", item_type="segment",
+        publish_at=pinned_time, status="scheduled",
+    )
+    _insert_ready_video(
+        "mpfresh0001", parent_item_id="mpparent001", item_type="hook",
+    )
+
+    from yt_scheduler.config import DB_PATH
+
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE videos SET publish_at_manual = 1 WHERE id = ?",
+            ("mppinned001",),
+        )
+        conn.commit()
+
+    resp = client.post(
+        "/api/projects/default/videos/mpparent001/promos/schedule-all",
+        json={},
+    )
+    assert resp.status_code == 200, resp.text
+
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT publish_at, publish_at_manual FROM videos WHERE id = ?",
+            ("mppinned001",),
+        ).fetchone()
+    assert row[0] == pinned_time
+    assert row[1] == 1
+
+    scheduled_ids = {r["video_id"] for r in resp.json()["scheduled"]}
+    assert "mpfresh0001" in scheduled_ids
+    assert "mppinned001" not in scheduled_ids
+
+
+def test_schedule_all_endpoints_reject_malformed_delays(
+    client: TestClient,
+) -> None:
+    """A malformed delays payload is a 400 on both the preview and the
+    commit endpoint — validated up front, never silently defaulted."""
+    parent_iso = "2026-04-01T17:30:00+00:00"
+    _insert_ready_video("mdparent001", publish_at=parent_iso, status="scheduled")
+    _insert_ready_video(
+        "mdchild0001", parent_item_id="mdparent001", item_type="segment",
+    )
+    bad = {"delays": {"hook": {"initial": {"value": -1, "unit": "weeks"}}}}
+    for suffix in ("schedule-all/preview", "schedule-all"):
+        resp = client.post(
+            f"/api/projects/default/videos/mdparent001/promos/{suffix}",
+            json=bad,
+        )
+        assert resp.status_code == 400, (suffix, resp.text)
+
+
+def test_schedule_all_reports_partial_failures(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """schedule_publish commits per child, so the batch isn't atomic. A
+    per-child write failure is reported in `errors` while the rest still
+    go through — re-running resumes the chain idempotently."""
+    parent_iso = "2026-04-01T17:30:00+00:00"
+    _insert_ready_video("pfparent001", publish_at=parent_iso, status="scheduled")
+    _insert_ready_video(
+        "pfchildgood", parent_item_id="pfparent001", item_type="hook",
+    )
+    _insert_ready_video(
+        "pfchildbad0", parent_item_id="pfparent001", item_type="segment",
+    )
+
+    from yt_scheduler.services import scheduler as sched
+
+    real_schedule_publish = sched.schedule_publish
+
+    async def flaky(video_id, publish_at):
+        if video_id == "pfchildbad0":
+            raise RuntimeError("simulated APScheduler failure")
+        return await real_schedule_publish(video_id, publish_at)
+
+    monkeypatch.setattr(sched, "schedule_publish", flaky)
+
+    resp = client.post(
+        "/api/projects/default/videos/pfparent001/promos/schedule-all",
+        json={},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    scheduled_ids = {r["video_id"] for r in data["scheduled"]}
+    error_ids = {e["video_id"] for e in data["errors"]}
+    assert "pfchildgood" in scheduled_ids
+    assert error_ids == {"pfchildbad0"}

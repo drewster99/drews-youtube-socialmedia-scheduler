@@ -25,7 +25,7 @@
     <div id="schedule-all-parent" style="margin: 0.5rem 0;"></div>
     <div id="schedule-all-delays"></div>
     <p class="form-hint" id="schedule-all-reorder-hint" style="margin: 0.5rem 0 0.25rem; display:none;">
-        Drag rows to reorder — the schedule recomputes in the new order.
+        Drag rows within a tier to change their publish order — the schedule recomputes.
     </p>
     <div id="schedule-all-rows"></div>
     <div id="schedule-all-span" class="form-hint" style="margin: 0.5rem 0;"></div>
@@ -364,6 +364,14 @@ function fmtDateTime(iso) {
     return d.toLocaleString();
 }
 
+// Surface a failed incremental preview in the modal's warnings strip.
+// The next successful renderPreview() overwrites this container, so the
+// message clears itself once the preview recovers.
+function showPreviewError(msg) {
+    const warnEl = document.getElementById('schedule-all-warnings');
+    warnEl.innerHTML = `<div class="banner banner-error">${escapeHtml(msg)}</div>`;
+}
+
 // Preview is a POST: the body carries the modal-edited delays and the
 // drag-reordered sequence, neither of which fits cleanly in a query.
 async function fetchPreview() {
@@ -433,7 +441,10 @@ document.getElementById('schedule-all-delays').addEventListener('change', async 
         : e.target.value;
     try {
         renderPreview(await fetchPreview());
-    } catch (err) { /* swallow — the field keeps the typed value */ }
+    } catch (err) {
+        // The field keeps the typed value; surface why the preview stalled.
+        showPreviewError(`Couldn't update the preview: ${err}`);
+    }
 });
 
 function renderPreview(preview) {
@@ -473,7 +484,9 @@ function renderPreview(preview) {
                 : null;
             try {
                 renderPreview(await fetchPreview());
-            } catch (err) { /* swallow */ }
+            } catch (err) {
+                showPreviewError(`Couldn't update the preview: ${err}`);
+            }
         });
     }
 
@@ -506,7 +519,10 @@ function renderPreview(preview) {
         ? `Ends ${fmtDateTime(preview.total_span)}.`
         : '';
 
-    const anyMissing = rows.some(r => !r.ready) || (!p.already_published && !p.ready);
+    // Already-scheduled rows are kept as-is and not rewritten on commit,
+    // so their readiness doesn't gate the batch.
+    const anyMissing = rows.some(r => !r.ready && !r.already_scheduled)
+        || (!p.already_published && !p.ready);
     const anyMissingTime = rows.some(r => !r.target_time);
     scheduleAllConfirm.disabled = anyMissing || anyMissingTime;
 }
@@ -544,7 +560,9 @@ async function onRowDrop(e) {
     dragFromIndex = null;
     try {
         renderPreview(await fetchPreview());
-    } catch (err) { /* swallow */ }
+    } catch (err) {
+        showPreviewError(`Couldn't update the preview: ${err}`);
+    }
 }
 
 scheduleAllBtn.addEventListener('click', async () => {
@@ -603,8 +621,22 @@ scheduleAllForm.addEventListener('submit', async (e) => {
             banner.textContent = `Schedule failed: ${err}`;
             banner.style.display = '';
         } else {
-            scheduleAllModal.close();
+            const result = await resp.json();
+            const errs = result.errors || [];
             await loadPromos();
+            if (errs.length) {
+                // Partial success: some children failed to schedule. Keep
+                // the modal open and refresh — the ones that succeeded now
+                // show as already-scheduled, so a re-run retries the rest.
+                try {
+                    renderPreview(await fetchPreview());
+                } catch (err) { /* fall through to the message below */ }
+                showPreviewError(
+                    `Scheduled ${(result.scheduled || []).length}, but `
+                    + `${errs.length} failed — re-run to retry.`);
+            } else {
+                scheduleAllModal.close();
+            }
         }
     } finally {
         scheduleAllConfirm.disabled = false;
