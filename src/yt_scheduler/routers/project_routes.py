@@ -183,6 +183,29 @@ async def put_posting_settings(slug: str, payload: dict) -> dict:
     return await project_settings_service.get_posting_settings(project["id"])
 
 
+@router.get("/{slug}/promo-delays")
+async def get_promo_delays(slug: str) -> dict:
+    project = await project_service.get_project_by_slug(slug)
+    if project is None:
+        raise HTTPException(404, f"Project '{slug}' not found")
+    return await project_settings_service.get_promo_delays(project["id"])
+
+
+@router.put("/{slug}/promo-delays")
+async def put_promo_delays(slug: str, payload: dict) -> dict:
+    project = await project_service.get_project_by_slug(slug)
+    if project is None:
+        raise HTTPException(404, f"Project '{slug}' not found")
+    try:
+        normalized = project_settings_service.validate_promo_delays(payload)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    await project_settings_service.set_json(
+        project["id"], "promo_delays", normalized
+    )
+    return await project_settings_service.get_promo_delays(project["id"])
+
+
 # --- Per-project LLM prompt templates ---------------------------------------
 
 

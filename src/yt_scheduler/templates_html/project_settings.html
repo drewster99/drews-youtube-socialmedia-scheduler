@@ -108,6 +108,29 @@
 </section>
 
 <section class="card">
+    <div class="card-header"><h2>Promo video schedule</h2></div>
+    <div class="card-body">
+        <p class="form-hint" style="margin-top: 0;">
+            How "Schedule all" on a promo screen spaces each tier. "First
+            delay" is measured from the parent episode's publish time;
+            "between videos" is the gap between consecutive promos of that
+            tier.
+        </p>
+        <table class="promo-delay-table">
+            <thead>
+                <tr>
+                    <th>Tier</th>
+                    <th>First delay after episode</th>
+                    <th>Between videos</th>
+                </tr>
+            </thead>
+            <tbody id="promo-delay-rows"></tbody>
+        </table>
+        <button class="btn btn-primary" id="save-promo-delays" style="margin-top: 1rem;" disabled>Save promo schedule</button>
+    </div>
+</section>
+
+<section class="card">
     <div class="card-header"><h2>LLM prompt templates</h2></div>
     <div class="card-body">
         <p class="form-hint">Edit the prompts the app sends to Claude. The
@@ -435,6 +458,85 @@ document.getElementById('save-posting').addEventListener('click', async () => {
         updatePostingButtonState();
     }
 });
+
+// --- Promo video schedule (per-tier delays) ----------------------------
+const PROMO_DELAY_TIERS = [['hook', 'Hooks'], ['short', 'Shorts'], ['segment', 'Segments']];
+const PROMO_DELAY_UNITS = ['minutes', 'hours', 'days'];
+let promoDelaysBaseline = null;
+
+function promoDelayCell(tier, key) {
+    const opts = PROMO_DELAY_UNITS.map(u => `<option value="${u}">${u}</option>`).join('');
+    return `<input type="number" min="0" step="0.5" id="pd-${tier}-${key}-value">`
+         + ` <select id="pd-${tier}-${key}-unit">${opts}</select>`;
+}
+
+function renderPromoDelayRows() {
+    document.getElementById('promo-delay-rows').innerHTML = PROMO_DELAY_TIERS.map(
+        ([tier, label]) => `
+        <tr>
+            <td>${label}</td>
+            <td>${promoDelayCell(tier, 'initial')}</td>
+            <td>${promoDelayCell(tier, 'subsequent')}</td>
+        </tr>`
+    ).join('');
+}
+
+function buildPromoDelaysPayload() {
+    const out = {};
+    for (const [tier] of PROMO_DELAY_TIERS) {
+        out[tier] = {};
+        for (const key of ['initial', 'subsequent']) {
+            out[tier][key] = {
+                value: Number(document.getElementById(`pd-${tier}-${key}-value`).value) || 0,
+                unit: document.getElementById(`pd-${tier}-${key}-unit`).value,
+            };
+        }
+    }
+    return out;
+}
+
+function updatePromoDelaysButtonState() {
+    const btn = document.getElementById('save-promo-delays');
+    if (promoDelaysBaseline === null) { btn.disabled = true; return; }
+    btn.disabled = jsonStable(buildPromoDelaysPayload()) === promoDelaysBaseline;
+}
+
+async function loadPromoDelays() {
+    renderPromoDelayRows();
+    const resp = await fetch(`/api/projects/${slug}/promo-delays`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    for (const [tier] of PROMO_DELAY_TIERS) {
+        for (const key of ['initial', 'subsequent']) {
+            const spec = (data[tier] || {})[key] || {};
+            document.getElementById(`pd-${tier}-${key}-value`).value = spec.value ?? 0;
+            document.getElementById(`pd-${tier}-${key}-unit`).value = spec.unit || 'hours';
+        }
+    }
+    promoDelaysBaseline = jsonStable(buildPromoDelaysPayload());
+    updatePromoDelaysButtonState();
+    const rows = document.getElementById('promo-delay-rows');
+    rows.addEventListener('input', updatePromoDelaysButtonState);
+    rows.addEventListener('change', updatePromoDelaysButtonState);
+}
+
+document.getElementById('save-promo-delays').addEventListener('click', async () => {
+    const resp = await fetch(`/api/projects/${slug}/promo-delays`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(buildPromoDelaysPayload()),
+    });
+    if (resp.ok) {
+        showToast('Promo schedule saved', 'success');
+        promoDelaysBaseline = jsonStable(buildPromoDelaysPayload());
+        updatePromoDelaysButtonState();
+    } else {
+        const err = await resp.json().catch(() => ({}));
+        showToast(err.detail || 'Could not save promo schedule', 'error');
+    }
+});
+
+loadPromoDelays();
 
 // Save (rename) is only enabled when the typed name is non-empty AND
 // different from the project's current display name.

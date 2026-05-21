@@ -264,12 +264,14 @@ async def schedule_all_preview(
     per-child rows grouped by tier with their projected publish times
     and readiness chips, total batch span, and any warnings (quota +
     parent-not-ready)."""
-    from yt_scheduler.services import scheduler as _scheduler
-    _project, _parent = await _ensure_primary(slug, parent_id)
+    from yt_scheduler.services import project_settings, scheduler as _scheduler
+    project, _parent = await _ensure_primary(slug, parent_id)
     parent_dt = _scheduler._parse_iso_datetime(parent_publish_at)
+    raw_delays = await project_settings.get_promo_delays(project["id"])
+    delays = _scheduler._promo_delays_to_timedeltas(raw_delays)
     try:
         preview = await _scheduler.compute_promo_batch_preview(
-            parent_id, parent_publish_at=parent_dt,
+            parent_id, parent_publish_at=parent_dt, delays=delays,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -292,13 +294,15 @@ async def schedule_all(
     omit ``parent_publish_at`` — the chain anchors against the
     existing time.
     """
-    from yt_scheduler.services import scheduler as _scheduler
-    _project, _parent = await _ensure_primary(slug, parent_id)
+    from yt_scheduler.services import project_settings, scheduler as _scheduler
+    project, _parent = await _ensure_primary(slug, parent_id)
     payload = payload or {}
     parent_dt = _scheduler._parse_iso_datetime(payload.get("parent_publish_at"))
+    raw_delays = await project_settings.get_promo_delays(project["id"])
+    delays = _scheduler._promo_delays_to_timedeltas(raw_delays)
     try:
         result = await _scheduler.schedule_promo_batch(
-            parent_id, parent_publish_at=parent_dt,
+            parent_id, parent_publish_at=parent_dt, delays=delays,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc

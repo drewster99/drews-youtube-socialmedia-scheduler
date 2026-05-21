@@ -341,6 +341,24 @@ Stored values are merged on top of the defaults from `services/project_settings.
 
 **Errors** — `404` (unknown slug), `400` (body not an object).
 
+### `GET /api/projects/{slug}/promo-delays`
+
+**Purpose** — Return the project's per-tier promo schedule delays, used by the "Schedule all" batch math. Merged with defaults so every tier/field is present.
+
+**Response 200** — `{"hook": {"initial": {"value": N, "unit": "..."}, "subsequent": {...}}, "short": {...}, "segment": {...}}`. `unit` is one of `minutes | hours | days`. `initial` is the gap from the parent episode's publish time to the first promo of that tier; `subsequent` is the gap between consecutive promos of the tier. Defaults: hook 4h/99h, short 18h/6d, segment 3d/9d.
+
+**Errors** — `404` (unknown slug).
+
+### `PUT /api/projects/{slug}/promo-delays`
+
+**Purpose** — Replace the per-tier promo schedule delays.
+
+**Request body** — Same shape as `GET`. Every tier (`hook`, `short`, `segment`) and both fields (`initial`, `subsequent`) are required; each is `{"value": number ≥ 0, "unit": "minutes"|"hours"|"days"}`.
+
+**Response 200** — Same shape as `GET`.
+
+**Errors** — `404` (unknown slug), `400` (malformed payload — missing tier/field, bad unit, or negative/non-numeric value).
+
 ### `GET /api/projects/{slug}/prompts`
 
 **Purpose** — Return the project's LLM prompt templates, merged with built-in seed defaults so the UI can always show every editable prompt — even before the user has saved any custom row.

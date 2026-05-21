@@ -119,3 +119,76 @@ async def get_posting_settings(project_id: int) -> dict:
     """Return posting delay/spacing settings + per-tier default templates."""
     stored = await get_json(project_id, "posting", {})
     return {**POSTING_DEFAULTS, **(stored or {})}
+
+
+# Per-tier promo schedule delays. ``initial`` is the gap between the
+# parent's publish time and the first promo of that tier; ``subsequent``
+# is the gap between consecutive promos in the tier. Stored as
+# {value, unit} so the user's chosen unit round-trips exactly; mirrors
+# scheduler.DEFAULT_PROMO_DELAYS (hook 4h/99h, short 18h/6d, segment 3d/9d).
+PROMO_DELAY_DEFAULTS = {
+    "hook":    {"initial": {"value": 4, "unit": "hours"},
+                "subsequent": {"value": 99, "unit": "hours"}},
+    "short":   {"initial": {"value": 18, "unit": "hours"},
+                "subsequent": {"value": 6, "unit": "days"}},
+    "segment": {"initial": {"value": 3, "unit": "days"},
+                "subsequent": {"value": 9, "unit": "days"}},
+}
+
+_PROMO_DELAY_UNITS = {"minutes", "hours", "days"}
+_PROMO_DELAY_TIERS = ("hook", "short", "segment")
+
+
+def validate_promo_delays(payload: dict) -> dict:
+    """Validate + normalize a promo_delays payload into the canonical
+    {tier: {initial|subsequent: {value, unit}}} shape.
+
+    Raises ValueError on bad input — the caller maps that to HTTP 400.
+    Surfacing the error beats silently falling back to a default.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("promo_delays must be an object")
+    out: dict = {}
+    for tier in _PROMO_DELAY_TIERS:
+        tcfg = payload.get(tier)
+        if not isinstance(tcfg, dict):
+            raise ValueError(f"missing delay settings for tier '{tier}'")
+        out[tier] = {}
+        for key in ("initial", "subsequent"):
+            spec = tcfg.get(key)
+            if not isinstance(spec, dict):
+                raise ValueError(f"{tier}.{key} must be an object")
+            unit = spec.get("unit")
+            if unit not in _PROMO_DELAY_UNITS:
+                raise ValueError(
+                    f"{tier}.{key}.unit must be one of "
+                    f"{sorted(_PROMO_DELAY_UNITS)}"
+                )
+            try:
+                value = float(spec.get("value"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{tier}.{key}.value must be a number"
+                ) from exc
+            if value < 0:
+                raise ValueError(f"{tier}.{key}.value must be >= 0")
+            if value.is_integer():
+                value = int(value)
+            out[tier][key] = {"value": value, "unit": unit}
+    return out
+
+
+async def get_promo_delays(project_id: int) -> dict:
+    """Per-tier promo schedule delays, merged over defaults so a partial
+    or absent stored value still yields a complete set."""
+    stored = await get_json(project_id, "promo_delays", {}) or {}
+    out: dict = {}
+    for tier, default in PROMO_DELAY_DEFAULTS.items():
+        tcfg = stored.get(tier) or {}
+        out[tier] = {
+            "initial": {**default["initial"], **(tcfg.get("initial") or {})},
+            "subsequent": {
+                **default["subsequent"], **(tcfg.get("subsequent") or {})
+            },
+        }
+    return out

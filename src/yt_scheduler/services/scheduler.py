@@ -1199,6 +1199,40 @@ DEFAULT_PROMO_DELAYS: dict[str, dict[str, timedelta]] = {
     "segment": {"initial": timedelta(days=3),   "subsequent": timedelta(days=9)},
 }
 
+# Stored promo-delay settings use a {value, unit} shape; convert to the
+# {tier: {initial|subsequent: timedelta}} dict the batch math consumes.
+_PROMO_DELAY_UNIT_MINUTES = {"minutes": 1, "hours": 60, "days": 1440}
+
+
+def _promo_delays_to_timedeltas(
+    raw: dict | None,
+) -> dict[str, dict[str, timedelta]]:
+    """Convert stored {tier: {initial|subsequent: {value, unit}}}
+    promo-delay settings into the timedelta shape
+    compute_promo_batch_preview consumes. Falls back to
+    DEFAULT_PROMO_DELAYS for any missing/malformed tier or field."""
+    if not raw:
+        return DEFAULT_PROMO_DELAYS
+    out: dict[str, dict[str, timedelta]] = {}
+    for tier, default in DEFAULT_PROMO_DELAYS.items():
+        cfg = raw.get(tier) or {}
+        td: dict[str, timedelta] = {}
+        for key in ("initial", "subsequent"):
+            spec = cfg.get(key)
+            if not isinstance(spec, dict):
+                td[key] = default[key]
+                continue
+            try:
+                value = float(spec.get("value", 0))
+            except (TypeError, ValueError):
+                value = 0.0
+            factor = _PROMO_DELAY_UNIT_MINUTES.get(
+                str(spec.get("unit") or "minutes"), 1
+            )
+            td[key] = timedelta(minutes=max(value, 0.0) * factor)
+        out[tier] = td
+    return out
+
 # Quota guard for the Promo screen. Each child upload chain costs
 # ≈ 100 (insert) + 50 (metadata update) = 150 YouTube quota units. The
 # daily allowance is 10,000 — this threshold (25%) is what we surface

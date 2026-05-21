@@ -235,6 +235,31 @@ def test_preview_computes_per_tier_chains(client: TestClient) -> None:
     assert datetime.fromisoformat(targets["segchild001"]) == parent_dt + timedelta(days=3)
 
 
+def test_preview_honours_project_promo_delays(client: TestClient) -> None:
+    """A custom per-tier delay saved in project settings changes the
+    schedule-all preview's computed target times."""
+    parent_iso = "2026-04-01T17:30:00+00:00"
+    _insert_ready_video("pdparent001", publish_at=parent_iso, status="scheduled")
+    _insert_ready_video(
+        "pdsegchild1", parent_item_id="pdparent001", item_type="segment",
+    )
+    # Default segment 'initial' is 3 days; override to 1 day.
+    delays = client.get("/api/projects/default/promo-delays").json()
+    delays["segment"]["initial"] = {"value": 1, "unit": "days"}
+    assert client.put(
+        "/api/projects/default/promo-delays", json=delays,
+    ).status_code == 200
+
+    resp = client.get(
+        "/api/projects/default/videos/pdparent001/promos/schedule-all/preview"
+    )
+    assert resp.status_code == 200
+    targets = {r["video_id"]: r["target_time"] for r in resp.json()["rows"]}
+    from datetime import datetime, timedelta
+    parent_dt = datetime.fromisoformat(parent_iso)
+    assert datetime.fromisoformat(targets["pdsegchild1"]) == parent_dt + timedelta(days=1)
+
+
 def test_preview_blocks_when_child_missing_fields(client: TestClient) -> None:
     parent_iso = "2026-04-01T17:30:00+00:00"
     _insert_ready_video(
