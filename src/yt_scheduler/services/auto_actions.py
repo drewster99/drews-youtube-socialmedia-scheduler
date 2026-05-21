@@ -33,7 +33,7 @@ import subprocess
 from pathlib import Path
 from typing import Literal
 
-from yt_scheduler.config import UPLOAD_DIR
+from yt_scheduler.config import UPLOAD_DIR, sanitized_original_filename
 from yt_scheduler.database import get_db
 from yt_scheduler.services import (
     ai,
@@ -722,11 +722,11 @@ async def _run_promo_chain(job_id: str) -> None:
     await db.execute(
         """INSERT INTO videos (
             id, project_id, title, description, tags, privacy_status,
-            video_file_path, status,
+            video_file_path, video_file_original_name, status,
             duration_seconds, tier,
             item_type, parent_item_id, url,
             auto_action_state
-        ) VALUES (?, ?, ?, ?, '[]', 'unlisted', ?, 'uploaded',
+        ) VALUES (?, ?, ?, ?, '[]', 'unlisted', ?, ?, 'uploaded',
                   ?, ?, ?, ?, ?, ?)""",
         (
             video_id,
@@ -734,6 +734,7 @@ async def _run_promo_chain(job_id: str) -> None:
             title,
             "Description pending generation.",
             str(local_path),
+            sanitized_original_filename(job.get("filename")),
             duration,
             derived_tier,
             item_type,

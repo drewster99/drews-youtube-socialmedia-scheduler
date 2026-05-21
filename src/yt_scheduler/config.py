@@ -110,6 +110,48 @@ def media_url(path: str | None) -> str | None:
     return f"{MEDIA_URL_PREFIX}/{urllib.parse.quote(name)}"
 
 
+def safe_upload_ext(filename: str | None, default: str = ".mp4") -> str:
+    """A safe, lowercase file extension derived from a client-supplied
+    filename — used to name on-disk upload copies.
+
+    Never trusts the client string for anything that reaches the
+    filesystem: strips both ``/`` and ``\\`` path components, and falls
+    back to ``default`` for anything that isn't a short alphanumeric
+    extension.
+    """
+    if not filename:
+        return default
+    base = str(filename).replace("\\", "/").rsplit("/", 1)[-1]
+    _head, sep, ext = base.rpartition(".")
+    if not sep:
+        return default
+    ext = ext.lower()
+    if ext and len(ext) <= 5 and ext.isalnum():
+        return f".{ext}"
+    return default
+
+
+def sanitized_original_filename(
+    filename: str | None, limit: int = 120,
+) -> str | None:
+    """The client-supplied filename reduced to a basename, stripped of
+    non-printable characters, and truncated — safe to store and display.
+
+    On-disk names are chosen by the app; this is purely the remembered
+    "uploaded as" label. Returns ``None`` when there's nothing usable
+    (so a caller passing, say, a whole serialized object stores nothing
+    rather than 120 chars of junk that happens to be printable — that
+    case still truncates, but ``.``/``..``/empty are dropped outright).
+    """
+    if not filename:
+        return None
+    base = str(filename).replace("\\", "/").rsplit("/", 1)[-1]
+    base = "".join(ch for ch in base if ch.isprintable()).strip()
+    if not base or base in (".", ".."):
+        return None
+    return base[:limit]
+
+
 # YouTube OAuth scopes
 YOUTUBE_SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",

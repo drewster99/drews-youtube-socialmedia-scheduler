@@ -5,12 +5,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, Form, UploadFile, File, HTTPException, Query
 
-from yt_scheduler.config import UPLOAD_DIR, media_filename, media_url
+from yt_scheduler.config import (
+    UPLOAD_DIR,
+    media_filename,
+    media_url,
+    safe_upload_ext,
+    sanitized_original_filename,
+)
 from yt_scheduler.database import get_db
 from yt_scheduler.services import (
     ai, auto_actions, events, tiers,
@@ -381,16 +388,22 @@ async def upload_video(
 
     db = await get_db()
 
-    # Save video file locally
+    # Save the upload under names we control — never the raw client
+    # filename, which can carry path separators (traversal) or collide
+    # with an unrelated upload. The video id isn't known until the
+    # YouTube upload returns, so write to a temp name and rename after.
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    video_path = UPLOAD_DIR / video_file.filename
+    video_ext = safe_upload_ext(video_file.filename)
+    video_path = UPLOAD_DIR / f"upload_{secrets.token_hex(8)}{video_ext}"
     with open(video_path, "wb") as f:
         shutil.copyfileobj(video_file.file, f)
+    video_original_name = sanitized_original_filename(video_file.filename)
 
     # Save thumbnail if provided
     thumbnail_path = None
     if thumbnail_file and thumbnail_file.filename:
-        thumbnail_path = UPLOAD_DIR / thumbnail_file.filename
+        thumb_ext = safe_upload_ext(thumbnail_file.filename, default=".jpg")
+        thumbnail_path = UPLOAD_DIR / f"upload_{secrets.token_hex(8)}{thumb_ext}"
         with open(thumbnail_path, "wb") as f:
             shutil.copyfileobj(thumbnail_file.file, f)
 
@@ -412,6 +425,23 @@ async def upload_video(
 
     video_id = result["id"]
 
+    # Rename the local files to canonical <video_id> names now the id is
+    # known (matches the import path). Fall back to the temp name on any
+    # rename failure rather than losing the file.
+    canonical_video = UPLOAD_DIR / f"{video_id}{video_ext}"
+    try:
+        video_path.rename(canonical_video)
+        video_path = canonical_video
+    except OSError:
+        pass
+    if thumbnail_path is not None:
+        canonical_thumb = UPLOAD_DIR / f"{video_id}_thumb{thumbnail_path.suffix}"
+        try:
+            thumbnail_path.rename(canonical_thumb)
+            thumbnail_path = canonical_thumb
+        except OSError:
+            pass
+
     # Set thumbnail if provided
     thumbnail_error = None
     if thumbnail_path:
@@ -432,10 +462,10 @@ async def upload_video(
     youtube_url = f"https://youtu.be/{video_id}"
     await db.execute(
         """INSERT INTO videos (id, project_id, title, description, tags, privacy_status, publish_at,
-           thumbnail_path, video_file_path, pinned_links, status,
+           thumbnail_path, video_file_path, video_file_original_name, pinned_links, status,
            duration_seconds, tier,
            item_type, parent_item_id, url)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uploaded', ?, ?, ?, ?, ?)""",
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uploaded', ?, ?, ?, ?, ?)""",
         (
             video_id,
             project["id"],
@@ -446,6 +476,7 @@ async def upload_video(
             publish_at or None,
             str(thumbnail_path) if thumbnail_path else None,
             str(video_path),
+            video_original_name,
             pinned_links,
             duration,
             tier,
@@ -502,7 +533,6 @@ async def create_non_youtube_item(
     For YouTube-backed items (``episode | short | segment``, plus hooks that
     you do want on YouTube), use ``POST /api/videos/upload`` instead.
     """
-    import secrets
     from yt_scheduler.services import projects as project_service
 
     if item_type not in _NON_YT_ITEM_TYPES:
@@ -535,16 +565,22 @@ async def create_non_youtube_item(
     # eliminate any chance of collision with future YT-backed rows.
     video_id = secrets.token_urlsafe(16)[:22]
 
+    # On-disk names are app-chosen (<id>.<ext>) — never the raw client
+    # filename. The id is already known here, so write to the canonical
+    # name directly.
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     video_path: Path | None = None
+    video_original_name: str | None = None
     if video_file is not None and video_file.filename:
-        video_path = UPLOAD_DIR / f"{video_id}__{video_file.filename}"
+        video_path = UPLOAD_DIR / f"{video_id}{safe_upload_ext(video_file.filename)}"
         with open(video_path, "wb") as f:
             shutil.copyfileobj(video_file.file, f)
+        video_original_name = sanitized_original_filename(video_file.filename)
 
     thumbnail_path: Path | None = None
     if thumbnail_file is not None and thumbnail_file.filename:
-        thumbnail_path = UPLOAD_DIR / f"{video_id}__thumb__{thumbnail_file.filename}"
+        thumb_ext = safe_upload_ext(thumbnail_file.filename, default=".jpg")
+        thumbnail_path = UPLOAD_DIR / f"{video_id}_thumb{thumb_ext}"
         with open(thumbnail_path, "wb") as f:
             shutil.copyfileobj(thumbnail_file.file, f)
 
@@ -555,10 +591,10 @@ async def create_non_youtube_item(
     db = await get_db()
     await db.execute(
         """INSERT INTO videos (id, project_id, title, description, tags,
-           thumbnail_path, video_file_path, status,
+           thumbnail_path, video_file_path, video_file_original_name, status,
            duration_seconds, tier,
            item_type, parent_item_id, url)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?)""",
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?)""",
         (
             video_id,
             project["id"],
@@ -567,6 +603,7 @@ async def create_non_youtube_item(
             json.dumps(tag_list),
             str(thumbnail_path) if thumbnail_path else None,
             str(video_path) if video_path else None,
+            video_original_name,
             duration,
             tier,
             item_type,
