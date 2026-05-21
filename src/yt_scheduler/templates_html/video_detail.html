@@ -1814,22 +1814,16 @@ function updateRegenerateVisibility() {
     const fromTranscript = document.getElementById('btn-regen-desc-transcript');
     if (!fromVideo || !fromTranscript || !videoData) return;
 
-    /* Show the row whenever it's likely useful: an imported video, OR a
-     * transcript that's newer than the last generated description. The
-     * frames button is gated on having a local file to extract from;
-     * the transcript button is gated on having a transcript at all. */
-    const imported = !!videoData.imported_from_youtube;
+    /* The regenerate buttons are always available so the description can
+     * be redone on demand (e.g. for a promo child the upload chain
+     * already described). Each is disabled only when its input is
+     * genuinely missing — a local file for frames, a transcript for the
+     * transcript path — with the title explaining why. */
     const hasLocalFile = !!videoData.video_file_url;
     const hasTranscript = !!(videoData.transcript && videoData.transcript.trim());
-    const transcriptUpdated = videoData.transcript_updated_at;
-    const descriptionGenAt = videoData.description_generated_at;
-    const transcriptNewer = transcriptUpdated && descriptionGenAt
-        ? new Date(_ensureUtc(transcriptUpdated)) > new Date(_ensureUtc(descriptionGenAt))
-        : (transcriptUpdated && !descriptionGenAt);
-    const showRow = imported || transcriptNewer || (!hasTranscript && hasLocalFile);
 
-    fromVideo.style.display = showRow ? 'inline-flex' : 'none';
-    fromTranscript.style.display = showRow ? 'inline-flex' : 'none';
+    fromVideo.style.display = 'inline-flex';
+    fromTranscript.style.display = 'inline-flex';
 
     fromVideo.disabled = !hasLocalFile;
     fromVideo.title = hasLocalFile
