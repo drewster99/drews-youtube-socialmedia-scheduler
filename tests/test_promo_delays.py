@@ -79,6 +79,11 @@ def test_validate_promo_delays_rejects_bad_input() -> None:
         bad = json.loads(json.dumps(good))
         bad["short"]["subsequent"]["value"] = -1
         validate_promo_delays(bad)
+    with pytest.raises(ValueError):
+        # Absurd value would overflow timedelta() downstream.
+        bad = json.loads(json.dumps(good))
+        bad["segment"]["initial"] = {"value": 1_000_000_000, "unit": "days"}
+        validate_promo_delays(bad)
 
 
 def test_promo_delays_endpoints_round_trip(client: TestClient) -> None:

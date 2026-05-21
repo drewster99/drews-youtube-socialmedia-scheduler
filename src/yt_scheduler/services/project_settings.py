@@ -172,6 +172,13 @@ def validate_promo_delays(payload: dict) -> dict:
                 ) from exc
             if value < 0:
                 raise ValueError(f"{tier}.{key}.value must be >= 0")
+            # Upper bound: keeps a bogus value from overflowing the
+            # timedelta() that _promo_delays_to_timedeltas builds.
+            minutes = value * {"minutes": 1, "hours": 60, "days": 1440}[unit]
+            if minutes > 366 * 24 * 60:
+                raise ValueError(
+                    f"{tier}.{key} is unreasonably large (max ~1 year)"
+                )
             if value.is_integer():
                 value = int(value)
             out[tier][key] = {"value": value, "unit": unit}

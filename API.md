@@ -357,7 +357,7 @@ Stored values are merged on top of the defaults from `services/project_settings.
 
 **Response 200** — Same shape as `GET`.
 
-**Errors** — `404` (unknown slug), `400` (malformed payload — missing tier/field, bad unit, or negative/non-numeric value).
+**Errors** — `404` (unknown slug), `400` (malformed payload — missing tier/field, bad unit, negative/non-numeric value, or a value larger than ~1 year).
 
 ### `GET /api/projects/{slug}/prompts`
 
