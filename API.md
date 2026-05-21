@@ -922,6 +922,22 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 
 **Side effects** — Marks `thumbnail_compare_verdict='same'` and stamps `thumbnail_compared_at` (best-effort — the next GET re-runs the compare if YouTube re-encoded the upload into something visually distinct).
 
+### `GET /api/videos/{video_id}/file-info`
+
+**Purpose** — Local-file details for the detail page's file-info popup.
+
+**Response 200** — `{"has_file": bool, "original_name": str|null, "disk_name": str|null, "server_path": str|null, "exists": bool, "can_reveal": bool}`. `original_name` is the filename the file was uploaded with (sanitized); `disk_name` is the app-chosen on-disk basename; `server_path` is the absolute path on the machine running the server; `can_reveal` is true on macOS.
+
+**Errors** — `404` (no video row).
+
+### `POST /api/videos/{video_id}/reveal-file`
+
+**Purpose** — Reveal the video's local file in Finder (macOS). The path is resolved server-side from the row and confirmed inside `UPLOAD_DIR` — the client never supplies a path.
+
+**Response 200** — `{"revealed": true}`.
+
+**Errors** — `404` (no video row, or no local file on disk), `501` (not macOS), `500` (`open -R` failed).
+
 ---
 
 ## Transcripts (`/api/videos/{video_id}/transcripts`)

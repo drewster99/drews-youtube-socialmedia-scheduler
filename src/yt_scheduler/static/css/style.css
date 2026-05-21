@@ -1407,6 +1407,28 @@ dialog.modal-xwide {
     border-radius: var(--radius-sm);
     text-align: left;
 }
+/* The local-file pill is a <button> (opens the file-info popup) but
+   should still read as the badge it replaced. */
+.file-pill {
+    cursor: pointer;
+    border: none;
+    font-family: inherit;
+}
+.file-pill:hover { filter: brightness(1.12); }
+
+/* File-info popup values. */
+.fi-value {
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 0.45rem 0.6rem;
+    margin-top: 0.25rem;
+}
+.fi-path {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.85rem;
+    word-break: break-all;
+}
 
 .video-meta-row {
     display: flex;

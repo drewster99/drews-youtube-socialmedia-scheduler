@@ -7,6 +7,8 @@ import json
 import logging
 import secrets
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 from fastapi import APIRouter, Form, UploadFile, File, HTTPException, Query
@@ -1353,3 +1355,68 @@ async def push_thumbnail_to_youtube(video_id: str):
     )
     await db.commit()
     return {"status": "ok"}
+
+
+def _resolve_video_file(video_file_path: str | None) -> Path | None:
+    """Resolve a stored ``video_file_path`` and confirm it sits inside
+    UPLOAD_DIR. Returns the resolved path, or ``None`` when there's no
+    file or it would escape the upload dir — the latter guards the
+    reveal action from ever acting on an arbitrary filesystem path.
+    """
+    if not video_file_path:
+        return None
+    try:
+        resolved = Path(video_file_path).resolve()
+        resolved.relative_to(UPLOAD_DIR.resolve())
+    except (ValueError, OSError):
+        return None
+    return resolved
+
+
+@router.get("/{video_id}/file-info")
+async def video_file_info(video_id: str) -> dict:
+    """Local-file details for the detail page's file-info popup: the
+    name it was uploaded with and the current path on this machine."""
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT video_file_path, video_file_original_name "
+        "FROM videos WHERE id = ?",
+        (video_id,),
+    )
+    if not rows:
+        raise HTTPException(404, f"Video '{video_id}' not found")
+    raw_path = rows[0]["video_file_path"]
+    resolved = _resolve_video_file(raw_path)
+    return {
+        "has_file": bool(raw_path),
+        "original_name": rows[0]["video_file_original_name"],
+        "disk_name": media_filename(raw_path),
+        "server_path": str(resolved) if resolved else raw_path,
+        "exists": bool(resolved and resolved.exists()),
+        "can_reveal": sys.platform == "darwin",
+    }
+
+
+@router.post("/{video_id}/reveal-file")
+async def reveal_video_file(video_id: str) -> dict:
+    """Reveal the video's local file in Finder (macOS only). The path is
+    resolved server-side from the row and confirmed inside UPLOAD_DIR —
+    the client never supplies a path."""
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT video_file_path FROM videos WHERE id = ?", (video_id,)
+    )
+    if not rows:
+        raise HTTPException(404, f"Video '{video_id}' not found")
+    path = _resolve_video_file(rows[0]["video_file_path"])
+    if path is None or not path.exists():
+        raise HTTPException(404, "No local video file for this video.")
+    if sys.platform != "darwin":
+        raise HTTPException(501, "Reveal in Finder is only supported on macOS.")
+    try:
+        await asyncio.to_thread(
+            subprocess.run, ["open", "-R", str(path)], check=True, timeout=10,
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Could not reveal file: {exc}") from exc
+    return {"revealed": True}

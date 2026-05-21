@@ -369,6 +369,26 @@
         <button type="button" class="btn btn-primary" id="uvd-generate">Generate</button>
     </div>
 </dialog>
+
+<dialog id="file-info-modal" class="modal">
+    <h3>Local video file</h3>
+    <div class="form-group">
+        <label>Uploaded as</label>
+        <div id="fi-original" class="fi-value">—</div>
+    </div>
+    <div class="form-group">
+        <label>File on this computer</label>
+        <div id="fi-path" class="fi-value fi-path">—</div>
+        <div id="fi-missing" class="form-hint" style="display:none; color: var(--danger);">
+            ⚠ This file is no longer on disk.
+        </div>
+    </div>
+    <div class="modal-actions">
+        <button type="button" class="btn" id="fi-copy">Copy path</button>
+        <button type="button" class="btn" id="fi-reveal">Reveal in Finder</button>
+        <button type="button" class="btn btn-primary" id="fi-close">Close</button>
+    </div>
+</dialog>
 {% endblock %}
 
 {% block scripts %}
@@ -622,8 +642,10 @@ async function loadVideo() {
     const dlState = video.video_file_download_state || null;
     let fileHtml;
     if (video.video_file_url) {
-        const name = video.video_file_name || '';
-        fileHtml = `<span class="badge badge-published" title="${escapeHtml(name)}">🎬 local file: ${escapeHtml(name)}</span>`;
+        // Show the name the file was uploaded with (on-disk names are now
+        // canonical <id>.<ext>); the pill opens a details popup.
+        const shown = video.video_file_original_name || video.video_file_name || 'video file';
+        fileHtml = `<button type="button" class="badge badge-published file-pill" id="local-file-pill" title="Click for file details">🎬 local file: ${escapeHtml(shown)}</button>`;
     } else if (dlState === 'in_progress') {
         fileHtml = `<span class="badge badge-draft">⬇︎ downloading video from YouTube…</span>`;
     } else if (dlState === 'unavailable') {
@@ -635,6 +657,8 @@ async function loadVideo() {
     }
     fileRow.innerHTML = fileHtml;
     fileRow.style.display = 'flex';
+    const filePill = document.getElementById('local-file-pill');
+    if (filePill) filePill.addEventListener('click', openFileInfoModal);
     maybePollWhileBusy(video);
 
     // Player
@@ -2765,5 +2789,61 @@ async function addItemVariable() {
         showToast(`Add failed: ${detail}`, 'error');
     }
 }
+
+// --- Local-file info popup ---------------------------------------------
+// Opened from the local-file pill above the player. Shows the name the
+// file was uploaded with, its current path on this machine, and offers
+// copy-path + reveal-in-Finder (the latter via a server-side endpoint).
+let fileInfoPath = '';
+
+async function openFileInfoModal() {
+    const modal = document.getElementById('file-info-modal');
+    document.getElementById('fi-original').textContent = 'Loading…';
+    document.getElementById('fi-path').textContent = '';
+    document.getElementById('fi-missing').style.display = 'none';
+    fileInfoPath = '';
+    modal.showModal();
+    try {
+        const resp = await fetch(`/api/videos/${videoId}/file-info`);
+        if (!resp.ok) throw new Error('file-info failed');
+        const info = await resp.json();
+        document.getElementById('fi-original').textContent =
+            info.original_name || info.disk_name || '—';
+        document.getElementById('fi-path').textContent = info.server_path || '—';
+        document.getElementById('fi-missing').style.display = info.exists ? 'none' : '';
+        document.getElementById('fi-reveal').style.display = info.can_reveal ? '' : 'none';
+        fileInfoPath = info.server_path || '';
+    } catch (e) {
+        document.getElementById('fi-original').textContent = 'Could not load file info.';
+    }
+}
+
+document.getElementById('fi-close').addEventListener('click', () => {
+    document.getElementById('file-info-modal').close();
+});
+
+document.getElementById('fi-copy').addEventListener('click', async () => {
+    if (!fileInfoPath) return;
+    try {
+        await navigator.clipboard.writeText(fileInfoPath);
+        showToast('Path copied', 'success');
+    } catch (e) {
+        showToast('Could not copy path', 'error');
+    }
+});
+
+document.getElementById('fi-reveal').addEventListener('click', async () => {
+    try {
+        const resp = await fetch(`/api/videos/${videoId}/reveal-file`, {method: 'POST'});
+        if (resp.ok) {
+            showToast('Revealed in Finder', 'success');
+        } else {
+            const err = await resp.json().catch(() => ({}));
+            showToast(err.detail || 'Could not reveal file', 'error');
+        }
+    } catch (e) {
+        showToast('Could not reveal file', 'error');
+    }
+});
 </script>
 {% endblock %}
