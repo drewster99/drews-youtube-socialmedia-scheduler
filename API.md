@@ -1961,24 +1961,24 @@ Bulk-upload promo children under a primary video. Each upload runs through the m
 
 **Errors** — `404` (job not found / already completed).
 
-### `GET /api/projects/{slug}/videos/{parent_id}/promos/schedule-all/preview`
+### `POST /api/projects/{slug}/videos/{parent_id}/promos/schedule-all/preview`
 
-**Purpose** — Dry-run for the review modal. Computes per-tier independent schedule chains anchored to the parent's `publish_at` (or the optional `parent_publish_at` query param when the parent isn't scheduled yet).
+**Purpose** — Dry-run for the review modal. Computes per-tier independent schedule chains anchored to the parent's `publish_at` (or `parent_publish_at` when the parent isn't scheduled yet, or now when the parent is already published).
 
-**Query params** — `parent_publish_at` (optional ISO 8601 string; only honoured when the parent has no `publish_at` and isn't `published`).
+**Request body** (all optional) — `{"parent_publish_at": "ISO 8601", "delays": {<per-tier {value,unit} overrides, same shape as `promo-delays`>}, "order": ["<video_id>", ...]}`. `parent_publish_at` is only honoured when the parent has no `publish_at` and isn't published. `delays` overrides the project's saved per-tier delays for this computation; when omitted, the saved delays are used. `order` is an explicit video-id sequence (from drag-reordering) — children within each tier are sequenced by their index in it.
 
 **Response 200** — `{"parent": {"id","title","publish_at","status","already_published","ready","missing"}, "rows": [{"video_id","title","item_type","tier","target_time","ready","missing"}, ...], "total_span": ISO|null, "warnings": [...], "anchor_publish_at": ISO|null}`. Rows sorted by `target_time`; each row's `ready` reflects the same readiness check used by the commit endpoint. `parent.already_published` is true when the parent's app status is `published` **or** it is already public on YouTube (an imported episode that went live outside the app); for such a parent the readiness check and publish-time prompt are skipped and the promo chains anchor from now.
 
-**Errors** — `404` (project / parent missing), `400` (parent is itself a child).
+**Errors** — `404` (project / parent missing), `400` (parent is itself a child, or a malformed `delays` payload).
 
 ### `POST /api/projects/{slug}/videos/{parent_id}/promos/schedule-all`
 
 **Purpose** — Commit the batch from the preview modal. Calls `schedule_publish` for each eligible child (and for the parent when `parent_publish_at` is supplied and the parent isn't already published).
 
-**Request body** — `{"parent_publish_at": "ISO 8601" | null}`.
+**Request body** (all optional) — `{"parent_publish_at": "ISO 8601", "delays": {<per-tier {value,unit} overrides>}, "order": ["<video_id>", ...]}`. Same `delays` / `order` semantics as the preview. A supplied `delays` is additionally saved as the project's `promo_delays` default so the next batch keeps the same pace.
 
 **Response 200** — `{"scheduled": [{"video_id", "publish_at"}, ...], "warnings": [...]}`.
 
-**Errors** — `404` (project / parent missing), `400` (parent is itself a child / readiness gates fail / no eligible children).
+**Errors** — `404` (project / parent missing), `400` (parent is itself a child / readiness gates fail / no eligible children / malformed `delays`).
 
 **Side effects** — For each scheduled video: writes `videos.publish_at`, sets `videos.status='scheduled'`, registers the APScheduler `publish_video_job` (which also re-stages per-post social jobs), and stamps `publish_at_manual = 0` so future cascade routines may sweep these rows.

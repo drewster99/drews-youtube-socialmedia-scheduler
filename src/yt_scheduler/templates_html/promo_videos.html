@@ -23,6 +23,10 @@
     <h3>Schedule all promos</h3>
     <div id="schedule-all-warnings"></div>
     <div id="schedule-all-parent" style="margin: 0.5rem 0;"></div>
+    <div id="schedule-all-delays"></div>
+    <p class="form-hint" id="schedule-all-reorder-hint" style="margin: 0.5rem 0 0.25rem; display:none;">
+        Drag rows to reorder — the schedule recomputes in the new order.
+    </p>
     <div id="schedule-all-rows"></div>
     <div id="schedule-all-span" class="form-hint" style="margin: 0.5rem 0;"></div>
     <form id="schedule-all-form">
@@ -346,10 +350,12 @@ const scheduleAllForm = document.getElementById('schedule-all-form');
 const scheduleAllCancel = document.getElementById('schedule-all-cancel');
 const scheduleAllConfirm = document.getElementById('schedule-all-confirm');
 
-// Track the modal's "are we letting the user pick a parent time?" state.
-// Re-set every time the modal opens based on the preview's anchor.
+// Modal state, re-initialised each time the modal opens.
 let needsParentPicker = false;
 let parentPickedAt = null;
+let promoDelays = null;     // {tier:{initial:{value,unit},subsequent:{value,unit}}}
+let currentOrder = null;    // [video_id, ...] — drag-reorderable
+let dragFromIndex = null;
 
 function fmtDateTime(iso) {
     if (!iso) return '—';
@@ -358,16 +364,23 @@ function fmtDateTime(iso) {
     return d.toLocaleString();
 }
 
-async function fetchPreview(parentPublishAt) {
-    const qs = parentPublishAt
-        ? `?parent_publish_at=${encodeURIComponent(parentPublishAt)}`
-        : '';
+// Preview is a POST: the body carries the modal-edited delays and the
+// drag-reordered sequence, neither of which fits cleanly in a query.
+async function fetchPreview() {
     const resp = await fetch(
-        `/api/projects/${projectSlug}/videos/${parentId}/promos/schedule-all/preview${qs}`,
+        `/api/projects/${projectSlug}/videos/${parentId}/promos/schedule-all/preview`,
+        {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                parent_publish_at: parentPickedAt,
+                delays: promoDelays,
+                order: currentOrder,
+            }),
+        },
     );
     if (!resp.ok) {
-        const err = await resp.text();
-        throw new Error(err || 'Preview failed');
+        throw new Error((await resp.text()) || 'Preview failed');
     }
     return await resp.json();
 }
@@ -379,11 +392,56 @@ function renderReadinessChip(row) {
     return `<span class="badge badge-error" title="${escapeHtml(missing)}">Not ready</span>`;
 }
 
+const SCHED_DELAY_UNITS = ['minutes', 'hours', 'days'];
+const SCHED_TIER_LABEL = {hook: 'Hooks', short: 'Shorts', segment: 'Segments'};
+
+// Per-tier delay editors. Rendered once per modal-open (not on every
+// preview refresh) so editing a field doesn't yank focus out from under
+// the user.
+function renderDelayEditors(tiersPresent) {
+    const el = document.getElementById('schedule-all-delays');
+    if (!promoDelays || !tiersPresent.length) { el.innerHTML = ''; return; }
+    el.innerHTML = tiersPresent.map(tier => {
+        const cfg = promoDelays[tier];
+        if (!cfg) return '';
+        const unitOpts = (sel) => SCHED_DELAY_UNITS.map(u =>
+            `<option value="${u}"${sel === u ? ' selected' : ''}>${u}</option>`).join('');
+        return `
+        <div class="sched-delay-row">
+            <span class="sched-delay-tier">${escapeHtml(SCHED_TIER_LABEL[tier] || tier)}</span>
+            <label>First delay
+                <input type="number" min="0" step="0.5" data-d="${tier}.initial.value" value="${cfg.initial.value}">
+                <select data-d="${tier}.initial.unit">${unitOpts(cfg.initial.unit)}</select>
+            </label>
+            <label>Then every
+                <input type="number" min="0" step="0.5" data-d="${tier}.subsequent.value" value="${cfg.subsequent.value}">
+                <select data-d="${tier}.subsequent.unit">${unitOpts(cfg.subsequent.unit)}</select>
+            </label>
+        </div>`;
+    }).join('');
+}
+
+// A delay field changed: fold it into promoDelays and re-preview.
+// Delegated + bound once; 'change' fires on commit, not on each keystroke.
+document.getElementById('schedule-all-delays').addEventListener('change', async (e) => {
+    const spec = e.target.getAttribute('data-d');
+    if (!spec || !promoDelays) return;
+    const [tier, key, field] = spec.split('.');
+    if (!promoDelays[tier] || !promoDelays[tier][key]) return;
+    promoDelays[tier][key][field] = field === 'value'
+        ? Math.max(0, Number(e.target.value) || 0)
+        : e.target.value;
+    try {
+        renderPreview(await fetchPreview());
+    } catch (err) { /* swallow — the field keeps the typed value */ }
+});
+
 function renderPreview(preview) {
     const parentEl = document.getElementById('schedule-all-parent');
     const rowsEl = document.getElementById('schedule-all-rows');
     const spanEl = document.getElementById('schedule-all-span');
     const warnEl = document.getElementById('schedule-all-warnings');
+    const hintEl = document.getElementById('schedule-all-reorder-hint');
 
     const warnings = preview.warnings || [];
     warnEl.innerHTML = warnings.length
@@ -408,36 +466,42 @@ function renderPreview(preview) {
                 </div>`
                 : `<div class="form-hint">Scheduled for ${fmtDateTime(p.publish_at)}.</div>`}
     `;
-
     if (needsParentPicker) {
-        // Re-pull preview on parent-time change so children's targets
-        // update live as the user picks a time.
         document.getElementById('parent-publish-input').addEventListener('change', async (e) => {
             parentPickedAt = e.target.value
                 ? new Date(e.target.value).toISOString()
                 : null;
             try {
-                const fresh = await fetchPreview(parentPickedAt);
-                renderPreview(fresh);
+                renderPreview(await fetchPreview());
             } catch (err) { /* swallow */ }
         });
     }
 
     const rows = preview.rows || [];
+    currentOrder = rows.map(r => r.video_id);
+    hintEl.style.display = rows.length > 1 ? '' : 'none';
     if (!rows.length) {
         rowsEl.innerHTML = '<p class="empty-state">No children to schedule.</p>';
         spanEl.textContent = '';
         scheduleAllConfirm.disabled = true;
         return;
     }
-    rowsEl.innerHTML = rows.map(r => `
-        <div class="promo-sched-row">
+    rowsEl.innerHTML = rows.map((r, i) => `
+        <div class="promo-sched-row" draggable="true" data-idx="${i}">
+            <span class="sched-drag-grip" aria-hidden="true">⠿</span>
             <span class="badge badge-type-${escapeHtml(r.item_type)}">${escapeHtml(r.item_type)}</span>
             <span class="promo-sched-title">${escapeHtml(r.title)}</span>
             <span class="promo-sched-time">${escapeHtml(fmtDateTime(r.target_time))}</span>
             ${renderReadinessChip(r)}
         </div>
     `).join('');
+    for (const row of rowsEl.querySelectorAll('.promo-sched-row')) {
+        row.addEventListener('dragstart', onRowDragStart);
+        row.addEventListener('dragover', onRowDragOver);
+        row.addEventListener('dragleave', onRowDragLeave);
+        row.addEventListener('drop', onRowDrop);
+        row.addEventListener('dragend', onRowDragEnd);
+    }
     spanEl.textContent = preview.total_span
         ? `Ends ${fmtDateTime(preview.total_span)}.`
         : '';
@@ -447,10 +511,47 @@ function renderPreview(preview) {
     scheduleAllConfirm.disabled = anyMissing || anyMissingTime;
 }
 
+function onRowDragStart(e) {
+    dragFromIndex = Number(e.currentTarget.dataset.idx);
+    e.dataTransfer.effectAllowed = 'move';
+    e.currentTarget.classList.add('sched-row-dragging');
+}
+function onRowDragOver(e) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    e.currentTarget.classList.add('sched-row-dragover');
+}
+function onRowDragLeave(e) {
+    e.currentTarget.classList.remove('sched-row-dragover');
+}
+function onRowDragEnd(e) {
+    e.currentTarget.classList.remove('sched-row-dragging');
+}
+async function onRowDrop(e) {
+    e.preventDefault();
+    e.currentTarget.classList.remove('sched-row-dragover');
+    const to = Number(e.currentTarget.dataset.idx);
+    if (dragFromIndex === null || dragFromIndex === to || !currentOrder) return;
+    const moved = currentOrder.splice(dragFromIndex, 1)[0];
+    currentOrder.splice(to, 0, moved);
+    dragFromIndex = null;
+    try {
+        renderPreview(await fetchPreview());
+    } catch (err) { /* swallow */ }
+}
+
 scheduleAllBtn.addEventListener('click', async () => {
     parentPickedAt = null;
+    currentOrder = null;
     try {
-        const preview = await fetchPreview(null);
+        // Pre-fill the delay editors from the project's saved per-tier
+        // delays; editing them here re-previews live and, on confirm,
+        // saves them back as the default so the next batch keeps pace.
+        const dResp = await fetch(`/api/projects/${projectSlug}/promo-delays`);
+        promoDelays = dResp.ok ? await dResp.json() : null;
+        const preview = await fetchPreview();
+        const tiersPresent = [...new Set((preview.rows || []).map(r => r.item_type))];
+        renderDelayEditors(tiersPresent);
         renderPreview(preview);
         scheduleAllModal.showModal();
     } catch (err) {
@@ -482,7 +583,11 @@ scheduleAllForm.addEventListener('submit', async (e) => {
             {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({parent_publish_at: parentPickedAt}),
+                body: JSON.stringify({
+                    parent_publish_at: parentPickedAt,
+                    delays: promoDelays,
+                    order: currentOrder,
+                }),
             },
         );
         if (!resp.ok) {
@@ -523,15 +628,37 @@ scheduleAllForm.addEventListener('submit', async (e) => {
    The pill sits on the leading edge in a fixed-width column. */
 .promo-sched-row {
     display: grid;
-    grid-template-columns: 5.5rem 1fr auto auto;
+    grid-template-columns: auto 5.5rem 1fr auto auto;
     gap: 0.6rem;
     align-items: center;
-    padding: 0.3rem 0;
+    padding: 0.35rem 0.3rem;
     border-bottom: 1px solid var(--border);
+    cursor: grab;
 }
 .promo-sched-row:last-child { border-bottom: none; }
 .promo-sched-row .badge { justify-self: start; }
 .promo-sched-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .promo-sched-time { color: var(--text-muted, #888); font-variant-numeric: tabular-nums; font-size: 0.9em; }
+.sched-drag-grip { color: var(--text-muted, #888); user-select: none; }
+.sched-row-dragging { opacity: 0.4; }
+.sched-row-dragover { box-shadow: inset 0 2px 0 0 var(--accent, #4a90e2); }
+
+/* Per-tier delay editors at the top of the Schedule-all modal. */
+.sched-delay-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.4rem 0;
+}
+.sched-delay-tier { font-weight: 600; min-width: 5.5rem; }
+.sched-delay-row label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.9rem;
+    color: var(--text-muted, #888);
+}
+.sched-delay-row input[type="number"] { width: 4rem; }
 </style>
 {% endblock %}

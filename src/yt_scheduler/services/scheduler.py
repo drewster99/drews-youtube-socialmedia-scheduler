@@ -1328,6 +1328,7 @@ async def compute_promo_batch_preview(
     *,
     parent_publish_at: datetime | None = None,
     delays: dict[str, dict[str, timedelta]] | None = None,
+    order: list[str] | None = None,
 ) -> dict:
     """Dry-run: compute what :func:`schedule_promo_batch` would write.
 
@@ -1447,6 +1448,14 @@ async def compute_promo_batch_preview(
             chains[bucket].append(child)
         else:
             chains.setdefault(bucket, []).append(child)
+
+    # ``order`` is an explicit video-id sequence from a drag-reordered
+    # modal. Children within each tier are sequenced by their index in
+    # it; anything missing keeps its created_at position at the end.
+    if order:
+        order_index = {vid: i for i, vid in enumerate(order)}
+        for group in chains.values():
+            group.sort(key=lambda c: order_index.get(c["id"], len(order_index)))
 
     for tier_name, group in chains.items():
         if tier_name not in DEFAULT_PROMO_DELAYS:
@@ -1706,6 +1715,7 @@ async def schedule_promo_batch(
     *,
     parent_publish_at: datetime | None = None,
     delays: dict[str, dict[str, timedelta]] | None = None,
+    order: list[str] | None = None,
 ) -> dict:
     """Schedule every eligible child of ``parent_id`` using
     :func:`compute_promo_batch_preview` for the math, then writing
@@ -1720,6 +1730,7 @@ async def schedule_promo_batch(
     """
     preview = await compute_promo_batch_preview(
         parent_id, parent_publish_at=parent_publish_at, delays=delays,
+        order=order,
     )
     if not preview["rows"] and parent_publish_at is None:
         raise ValueError("No promo children eligible for scheduling")

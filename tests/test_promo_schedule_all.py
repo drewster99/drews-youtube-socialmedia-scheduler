@@ -171,8 +171,9 @@ def test_preview_requires_parent_publish_or_existing(client: TestClient) -> None
     _insert_ready_video(
         "child000001", parent_item_id="parentid001", item_type="short",
     )
-    resp = client.get(
-        "/api/projects/default/videos/parentid001/promos/schedule-all/preview"
+    resp = client.post(
+        "/api/projects/default/videos/parentid001/promos/schedule-all/preview",
+        json={},
     )
     assert resp.status_code == 200
     data = resp.json()
@@ -192,8 +193,9 @@ def test_preview_treats_public_parent_as_published(client: TestClient) -> None:
     _insert_ready_video(
         "segchildp01", parent_item_id="pubparent01", item_type="segment",
     )
-    resp = client.get(
-        "/api/projects/default/videos/pubparent01/promos/schedule-all/preview"
+    resp = client.post(
+        "/api/projects/default/videos/pubparent01/promos/schedule-all/preview",
+        json={},
     )
     assert resp.status_code == 200
     data = resp.json()
@@ -220,8 +222,9 @@ def test_preview_computes_per_tier_chains(client: TestClient) -> None:
         "segchild001", parent_item_id="parentid002", item_type="segment",
     )
 
-    resp = client.get(
-        "/api/projects/default/videos/parentid002/promos/schedule-all/preview"
+    resp = client.post(
+        "/api/projects/default/videos/parentid002/promos/schedule-all/preview",
+        json={},
     )
     assert resp.status_code == 200
     data = resp.json()
@@ -250,8 +253,9 @@ def test_preview_honours_project_promo_delays(client: TestClient) -> None:
         "/api/projects/default/promo-delays", json=delays,
     ).status_code == 200
 
-    resp = client.get(
-        "/api/projects/default/videos/pdparent001/promos/schedule-all/preview"
+    resp = client.post(
+        "/api/projects/default/videos/pdparent001/promos/schedule-all/preview",
+        json={},
     )
     assert resp.status_code == 200
     targets = {r["video_id"]: r["target_time"] for r in resp.json()["rows"]}
@@ -269,8 +273,9 @@ def test_preview_blocks_when_child_missing_fields(client: TestClient) -> None:
         "missingtag1", parent_item_id="parentid003", item_type="hook",
         tags=[],
     )
-    resp = client.get(
-        "/api/projects/default/videos/parentid003/promos/schedule-all/preview"
+    resp = client.post(
+        "/api/projects/default/videos/parentid003/promos/schedule-all/preview",
+        json={},
     )
     data = resp.json()
     row = next(r for r in data["rows"] if r["video_id"] == "missingtag1")
@@ -288,8 +293,9 @@ def test_quota_warning_surfaced_for_large_batches(client: TestClient) -> None:
         _insert_ready_video(
             f"hk{i:08d}", parent_item_id="parentid004", item_type="hook",
         )
-    resp = client.get(
-        "/api/projects/default/videos/parentid004/promos/schedule-all/preview"
+    resp = client.post(
+        "/api/projects/default/videos/parentid004/promos/schedule-all/preview",
+        json={},
     )
     data = resp.json()
     assert any("quota" in w.lower() for w in data["warnings"])
@@ -310,6 +316,65 @@ def test_commit_rejects_not_ready_children(client: TestClient) -> None:
     )
     assert resp.status_code == 400
     assert "ready" in resp.json()["detail"].lower()
+
+
+def test_preview_honours_explicit_order(client: TestClient) -> None:
+    """A drag-reordered video-id sequence resequences the tier chain."""
+    parent_iso = "2026-04-01T17:30:00+00:00"
+    _insert_ready_video("ordparent01", publish_at=parent_iso, status="scheduled")
+    _insert_ready_video("ordsegmentA", parent_item_id="ordparent01", item_type="segment")
+    _insert_ready_video("ordsegmentB", parent_item_id="ordparent01", item_type="segment")
+
+    resp = client.post(
+        "/api/projects/default/videos/ordparent01/promos/schedule-all/preview",
+        json={"order": ["ordsegmentB", "ordsegmentA"]},
+    )
+    assert resp.status_code == 200
+    rows = resp.json()["rows"]
+    assert [r["video_id"] for r in rows] == ["ordsegmentB", "ordsegmentA"]
+
+
+def test_preview_accepts_delay_override(client: TestClient) -> None:
+    """Delays in the POST body override the project's saved delays."""
+    from datetime import datetime, timedelta
+
+    parent_iso = "2026-04-01T17:30:00+00:00"
+    _insert_ready_video("ovparent001", publish_at=parent_iso, status="scheduled")
+    _insert_ready_video("ovsegchild1", parent_item_id="ovparent001", item_type="segment")
+    delays = {
+        t: {"initial": {"value": 2, "unit": "hours"},
+            "subsequent": {"value": 1, "unit": "days"}}
+        for t in ("hook", "short", "segment")
+    }
+    resp = client.post(
+        "/api/projects/default/videos/ovparent001/promos/schedule-all/preview",
+        json={"delays": delays},
+    )
+    assert resp.status_code == 200
+    targets = {r["video_id"]: r["target_time"] for r in resp.json()["rows"]}
+    parent_dt = datetime.fromisoformat(parent_iso)
+    assert datetime.fromisoformat(targets["ovsegchild1"]) == parent_dt + timedelta(hours=2)
+
+
+def test_schedule_all_persists_delays(client: TestClient) -> None:
+    """A delays payload sent with the commit is saved as the project
+    default so the next batch keeps the same pace."""
+    parent_iso = "2026-04-01T17:30:00+00:00"
+    _insert_ready_video("perparent01", publish_at=parent_iso, status="scheduled")
+    _insert_ready_video("persegchild", parent_item_id="perparent01", item_type="segment")
+    delays = {
+        t: {"initial": {"value": 5, "unit": "hours"},
+            "subsequent": {"value": 8, "unit": "hours"}}
+        for t in ("hook", "short", "segment")
+    }
+    resp = client.post(
+        "/api/projects/default/videos/perparent01/promos/schedule-all",
+        json={"delays": delays},
+    )
+    assert resp.status_code == 200, resp.text
+    saved = client.get("/api/projects/default/promo-delays").json()
+    assert saved["segment"]["initial"] == {"value": 5, "unit": "hours"}
+    assert saved["segment"]["subsequent"] == {"value": 8, "unit": "hours"}
 
 
 def test_promo_quota_helper() -> None:
@@ -333,8 +398,9 @@ def test_preview_preserves_already_scheduled_children(client: TestClient) -> Non
         "shortmanl1", parent_item_id="parentid006", item_type="short",
         publish_at=custom_short_time, status="scheduled",
     )
-    resp = client.get(
-        "/api/projects/default/videos/parentid006/promos/schedule-all/preview"
+    resp = client.post(
+        "/api/projects/default/videos/parentid006/promos/schedule-all/preview",
+        json={},
     )
     data = resp.json()
     row = next(r for r in data["rows"] if r["video_id"] == "shortmanl1")

@@ -249,24 +249,45 @@ async def get_upload_job(slug: str, parent_id: str, job_id: str) -> dict:
     return job
 
 
-@router.get("/schedule-all/preview")
+async def _resolve_batch_delays(project_id: int, raw_delays: object) -> dict:
+    """Turn an optional client-supplied promo-delays payload into the
+    timedelta shape the batch math consumes. ``None`` → the project's
+    saved delays; otherwise validate the payload (400 on bad input)."""
+    from yt_scheduler.services import project_settings, scheduler as _scheduler
+
+    if raw_delays is None:
+        stored = await project_settings.get_promo_delays(project_id)
+        return _scheduler._promo_delays_to_timedeltas(stored)
+    try:
+        validated = project_settings.validate_promo_delays(raw_delays)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return _scheduler._promo_delays_to_timedeltas(validated)
+
+
+@router.post("/schedule-all/preview")
 async def schedule_all_preview(
     slug: str,
     parent_id: str,
-    parent_publish_at: str | None = None,
+    payload: dict | None = None,
 ) -> dict:
-    """Dry-run for the review modal. Returns parent row at the top,
-    per-child rows grouped by tier with their projected publish times
-    and readiness chips, total batch span, and any warnings (quota +
-    parent-not-ready)."""
-    from yt_scheduler.services import project_settings, scheduler as _scheduler
+    """Dry-run for the review modal. Returns the parent row, per-child
+    rows grouped by tier with projected publish times and readiness
+    chips, total batch span, and warnings.
+
+    Body (all optional): ``parent_publish_at`` (ISO), ``delays``
+    (per-tier overrides edited in the modal), ``order`` (explicit
+    video-id sequence from drag-reordering)."""
+    from yt_scheduler.services import scheduler as _scheduler
+
     project, _parent = await _ensure_primary(slug, parent_id)
-    parent_dt = _scheduler._parse_iso_datetime(parent_publish_at)
-    raw_delays = await project_settings.get_promo_delays(project["id"])
-    delays = _scheduler._promo_delays_to_timedeltas(raw_delays)
+    payload = payload or {}
+    parent_dt = _scheduler._parse_iso_datetime(payload.get("parent_publish_at"))
+    delays = await _resolve_batch_delays(project["id"], payload.get("delays"))
+    order = payload.get("order") or None
     try:
         preview = await _scheduler.compute_promo_batch_preview(
-            parent_id, parent_publish_at=parent_dt, delays=delays,
+            parent_id, parent_publish_at=parent_dt, delays=delays, order=order,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -279,28 +300,37 @@ async def schedule_all(
     parent_id: str,
     payload: dict,
 ) -> dict:
-    """Commit the batch from the preview modal. Body:
+    """Commit the batch from the preview modal. Body (all optional):
 
     ```
-    {"parent_publish_at": "2026-04-01T17:30:00Z"}     # optional
+    {"parent_publish_at": "2026-04-01T17:30:00Z",
+     "delays": {<per-tier {value,unit} overrides>},
+     "order": ["<video_id>", ...]}
     ```
 
-    When the parent already has a publish_at (or status='published'),
-    omit ``parent_publish_at`` — the chain anchors against the
-    existing time.
+    When the parent already has a publish_at (or is published), omit
+    ``parent_publish_at`` — the chain anchors against the existing time.
+    A supplied ``delays`` is also saved as the project default so the
+    next batch continues at the same pace.
     """
     from yt_scheduler.services import project_settings, scheduler as _scheduler
+
     project, _parent = await _ensure_primary(slug, parent_id)
     payload = payload or {}
     parent_dt = _scheduler._parse_iso_datetime(payload.get("parent_publish_at"))
-    raw_delays = await project_settings.get_promo_delays(project["id"])
-    delays = _scheduler._promo_delays_to_timedeltas(raw_delays)
+    delays = await _resolve_batch_delays(project["id"], payload.get("delays"))
+    order = payload.get("order") or None
     try:
         result = await _scheduler.schedule_promo_batch(
-            parent_id, parent_publish_at=parent_dt, delays=delays,
+            parent_id, parent_publish_at=parent_dt, delays=delays, order=order,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    # Persist the (possibly edited) delays so the next batch of the same
+    # tier defaults to the same pace.
+    if payload.get("delays") is not None:
+        validated = project_settings.validate_promo_delays(payload["delays"])
+        await project_settings.set_json(project["id"], "promo_delays", validated)
     return result
 
 
