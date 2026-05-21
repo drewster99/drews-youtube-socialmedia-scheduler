@@ -574,6 +574,7 @@ body {
 
 .video-meta {
     display: flex;
+    flex-wrap: wrap;
     gap: 0.4rem;
     margin-bottom: 0.3rem;
 }
@@ -1353,6 +1354,20 @@ dialog.modal input[type="text"] {
 
 dialog.modal-wide { max-width: 720px; width: 90vw; }
 dialog.modal-tall { max-height: 86vh; overflow-y: auto; }
+
+/* Local-file status row — sits above .video-meta-row. Filenames
+   (Riverside exports, downloaded imports) can be long, so they get a
+   full-width row of their own instead of crowding the badge row. */
+.video-file-row {
+    display: flex;
+    margin-top: 0.6rem;
+}
+/* A long filename wrapped inside a 999px-radius pill reads as a blob —
+   square the corners off for this one badge. */
+.video-file-row .badge {
+    border-radius: var(--radius-sm);
+    text-align: left;
+}
 
 .video-meta-row {
     display: flex;

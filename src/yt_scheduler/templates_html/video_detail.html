@@ -34,6 +34,10 @@
             <div class="video-player" id="video-player">
                 <p>Loading player...</p>
             </div>
+            <!-- Local-file status on its own row — filenames run long
+                 enough (Riverside exports, etc.) that inlining them with
+                 the tier/duration badges below blew the row out. -->
+            <div id="video-file-row" class="video-file-row" style="display:none;"></div>
             <div id="video-meta-row" class="video-meta-row" style="display:none;">
                 <div class="video-meta-left" id="video-meta-left"></div>
                 <div class="video-meta-right">
@@ -579,6 +583,7 @@ async function loadVideo() {
     }
     const metaRow = document.getElementById('video-meta-row');
     const metaLeft = document.getElementById('video-meta-left');
+    const fileRow = document.getElementById('video-file-row');
     let metaHtml = '';
     const durSec = parseIsoDuration(video.youtube_data?.contentDetails?.duration);
     if (durSec != null) {
@@ -586,25 +591,30 @@ async function loadVideo() {
         metaHtml += `<span class="badge ${tier.cls}">${tier.label}</span>`
                   + `<span class="video-duration">${formatDuration(durSec)}</span>`;
     }
-    // Whether there's a local video file is what {{video}} attaches; surface it
-    // so it's obvious before generating socials. The "downloading" pill comes
-    // from videos.video_file_download_state — auto_actions sets it on import,
-    // the maybePollWhileBusy() loop below picks up the change and re-renders.
-    const dlState = video.video_file_download_state || null;
-    if (video.video_file_url) {
-        const name = video.video_file_name || '';
-        metaHtml += ` <span class="badge badge-published" title="${escapeHtml(name)}">🎬 local file: ${escapeHtml(name)}</span>`;
-    } else if (dlState === 'in_progress') {
-        metaHtml += ` <span class="badge badge-draft">⬇︎ downloading video from YouTube…</span>`;
-    } else if (dlState === 'unavailable') {
-        metaHtml += ` <span class="badge badge-error" title="Private or age-gated on YouTube">⚠ download blocked — video is private on YouTube</span>`;
-    } else if (dlState === 'failed') {
-        metaHtml += ` <span class="badge badge-error">⚠ video download failed — try Transcribe to retry</span>`;
-    } else {
-        metaHtml += ` <span class="form-hint" style="margin-left:0.25rem;">no local video file — {{ '{{video}}' }} won't attach</span>`;
-    }
     metaLeft.innerHTML = metaHtml;
     metaRow.style.display = 'flex';
+
+    // Whether there's a local video file is what {{video}} attaches; surface it
+    // on its own row above the tier/duration badges — filenames run long enough
+    // that inlining them blew the row out. The "downloading" pill comes from
+    // videos.video_file_download_state — auto_actions sets it on import, the
+    // maybePollWhileBusy() loop below picks up the change and re-renders.
+    const dlState = video.video_file_download_state || null;
+    let fileHtml;
+    if (video.video_file_url) {
+        const name = video.video_file_name || '';
+        fileHtml = `<span class="badge badge-published" title="${escapeHtml(name)}">🎬 local file: ${escapeHtml(name)}</span>`;
+    } else if (dlState === 'in_progress') {
+        fileHtml = `<span class="badge badge-draft">⬇︎ downloading video from YouTube…</span>`;
+    } else if (dlState === 'unavailable') {
+        fileHtml = `<span class="badge badge-error" title="Private or age-gated on YouTube">⚠ download blocked — video is private on YouTube</span>`;
+    } else if (dlState === 'failed') {
+        fileHtml = `<span class="badge badge-error">⚠ video download failed — try Transcribe to retry</span>`;
+    } else {
+        fileHtml = `<span class="form-hint">no local video file — {{ '{{video}}' }} won't attach</span>`;
+    }
+    fileRow.innerHTML = fileHtml;
+    fileRow.style.display = 'flex';
     maybePollWhileBusy(video);
 
     // Player
