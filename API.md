@@ -1967,7 +1967,7 @@ Bulk-upload promo children under a primary video. Each upload runs through the m
 
 **Query params** — `parent_publish_at` (optional ISO 8601 string; only honoured when the parent has no `publish_at` and isn't `published`).
 
-**Response 200** — `{"parent": {"id","title","publish_at","status","ready","missing"}, "rows": [{"video_id","title","item_type","tier","target_time","ready","missing"}, ...], "total_span": ISO|null, "warnings": [...], "anchor_publish_at": ISO|null}`. Rows sorted by `target_time`; each row's `ready` reflects the same readiness check used by the commit endpoint.
+**Response 200** — `{"parent": {"id","title","publish_at","status","already_published","ready","missing"}, "rows": [{"video_id","title","item_type","tier","target_time","ready","missing"}, ...], "total_span": ISO|null, "warnings": [...], "anchor_publish_at": ISO|null}`. Rows sorted by `target_time`; each row's `ready` reflects the same readiness check used by the commit endpoint. `parent.already_published` is true when the parent's app status is `published` **or** it is already public on YouTube (an imported episode that went live outside the app); for such a parent the readiness check and publish-time prompt are skipped and the promo chains anchor from now.
 
 **Errors** — `404` (project / parent missing), `400` (parent is itself a child).
 
