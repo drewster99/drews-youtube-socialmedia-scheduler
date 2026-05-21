@@ -1084,13 +1084,19 @@ body {
     font-weight: 600;
     font-size: 0.8rem;
 }
-.settings-table input[type="text"] {
+.settings-table input[type="text"],
+.settings-table textarea {
     width: 100%;
     padding: 0.25rem 0.4rem;
     background: var(--bg-input);
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
+}
+/* Variable values can be multi-line; let the row editor grow/shrink. */
+.settings-table textarea {
+    font-family: inherit;
+    resize: vertical;
 }
 .settings-table code {
     background: var(--bg-primary);

@@ -282,7 +282,7 @@
                 </div>
                 <div class="form-group flex-2">
                     <label>Value</label>
-                    <input type="text" id="new-item-var-value">
+                    <textarea id="new-item-var-value" rows="2"></textarea>
                 </div>
                 <div class="form-group" style="display: flex; align-items: flex-end;">
                     <button type="button" class="btn btn-sm btn-primary" onclick="addItemVariable()">Add</button>
@@ -2728,7 +2728,7 @@ async function loadItemVariables() {
         body.innerHTML = rows.map(r => `
             <tr>
                 <td><code>{{ '{{' }}${escapeHtml(r.key)}{{ '}}' }}</code></td>
-                <td><input type="text" class="iv-value" value="${escapeHtml(r.value)}" data-key="${escapeHtml(r.key)}"></td>
+                <td><textarea class="iv-value" rows="2" data-key="${escapeHtml(r.key)}">${escapeHtml(r.value)}</textarea></td>
                 <td style="text-align: right;">
                     <button class="btn btn-sm" onclick="saveItemVariable('${escapeHtml(r.key)}')">Save</button>
                     <button class="btn btn-sm btn-danger" onclick="deleteItemVariable('${escapeHtml(r.key)}')">Delete</button>
