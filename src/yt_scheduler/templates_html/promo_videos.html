@@ -143,9 +143,13 @@ function renderChildCard(child) {
     const thumb = child.thumbnail_url
         ? `<img src="${escapeHtml(child.thumbnail_url)}" alt="${escapeHtml(child.title)}">`
         : '<div class="thumb-placeholder">No thumbnail</div>';
+    // Whole card is the link (matches the dashboard) so a click anywhere
+    // on the thumbnail or the info pane opens the detail page. The Retry
+    // button inside stops propagation so it doesn't also navigate.
     return `
-        <div class="video-card promo-card${editable}" data-child-id="${escapeHtml(child.id)}">
-            <a href="/projects/${escapeHtml(projectSlug)}/videos/${escapeHtml(child.id)}" class="video-thumb">${thumb}</a>
+        <a href="/projects/${escapeHtml(projectSlug)}/videos/${escapeHtml(child.id)}"
+           class="video-card promo-card${editable}" data-child-id="${escapeHtml(child.id)}">
+            <div class="video-thumb">${thumb}</div>
             <div class="video-info">
                 <h3>${escapeHtml(child.title)}</h3>
                 ${progressStripFor(state, child.auto_action_last_error || null)}
@@ -154,7 +158,7 @@ function renderChildCard(child) {
                     ${child.tier ? `<span class="badge badge-tier-${escapeHtml(child.tier)}">${escapeHtml(child.tier)}</span>` : ''}
                 </div>
             </div>
-        </div>
+        </a>
     `;
 }
 
@@ -198,7 +202,11 @@ async function loadPromos() {
 
 function bindRetryButtons() {
     for (const btn of document.querySelectorAll('[data-retry-step]')) {
-        btn.addEventListener('click', async () => {
+        btn.addEventListener('click', async (e) => {
+            // The card itself is a link now — keep a Retry click from
+            // also navigating to the detail page.
+            e.preventDefault();
+            e.stopPropagation();
             const card = btn.closest('[data-child-id]');
             if (!card) return;
             const videoId = card.getAttribute('data-child-id');
