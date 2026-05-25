@@ -705,13 +705,13 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 
 ### `PUT /api/videos/{video_id}`
 
-**Purpose** — Update video metadata (title, description, tags, privacy, publish time, pinned links, status, manual tier override).
+**Purpose** — Update video metadata (title, description, tags, privacy, publish time, pinned links, status, manual tier override, optional episode number).
 
-**Request body** — Object with any subset of: `title`, `description`, `tags` (list), `privacy_status`, `publish_at`, `pinned_links`, `status`, `tier`.
+**Request body** — Object with any subset of: `title`, `description`, `tags` (list), `privacy_status`, `publish_at`, `pinned_links`, `status`, `tier`, `episode_number`. `episode_number` is local-only metadata (never sent to YouTube); `null` or `""` clears the value.
 
 **Response 200** — `{"status": "ok"}`.
 
-**Errors** — `404` (no local row), `400` (invalid `tier` value — must be one of `hook`, `short`, `segment`, `video`, `null`, or `""`), `500` (YouTube update failed).
+**Errors** — `404` (no local row), `400` (invalid `tier` value — must be one of `hook`, `short`, `segment`, `video`, `null`, or `""`; or `episode_number` not coercible to an integer), `500` (YouTube update failed).
 
 **Side effects** — Calls `youtube.update_video_metadata` (50 quota), reads back via `youtube.get_video` to capture any silent coercion (privacy clamp, tag truncation), writes confirmed values to the DB, and records a `metadata_updated` event with a per-field `{old, new}` diff for changed tracked fields. When the body includes `publish_at`, that field is **not** written directly — it routes through `services/scheduler.apply_user_reschedule(...)` so the APScheduler `publish_<video_id>` job actually re-registers, `publish_at_manual` flips to `1`, and the promo cascade fires (children-of-parent when the row is a primary, same-tier siblings when the row is a child).
 

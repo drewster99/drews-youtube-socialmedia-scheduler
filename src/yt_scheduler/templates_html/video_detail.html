@@ -24,7 +24,10 @@
             ← Promo of: <span id="parent-backlink-title"></span>
         </a>
     </div>
-    <h1 id="video-title" style="margin-top: 0.5rem;">Loading...</h1>
+    <h1 id="video-title-row" style="margin-top: 0.5rem;">
+        <span id="video-episode-chip" class="badge badge-episode episode-chip-title" style="display:none;"></span>
+        <span id="video-title">Loading...</span>
+    </h1>
 </div>
 
 <div class="detail-grid">
@@ -54,6 +57,10 @@
         <div class="card">
             <h2>YouTube metadata</h2>
             <form id="metadata-form">
+                <div class="form-group" data-field="episode_number">
+                    <label>Episode # <small class="form-hint" style="font-weight: normal;">(optional — appears as a chip next to the title)</small></label>
+                    <input type="number" id="meta-episode-number" name="episode_number" min="0" step="1" inputmode="numeric" style="max-width: 8rem;">
+                </div>
                 <div class="form-group" data-field="title">
                     <label>Title</label>
                     <input type="text" id="meta-title" name="title">
@@ -397,7 +404,7 @@ const videoId = '{{ video_id }}';
 const projectSlug = "{{ current_project.slug }}";
 
 // Last loaded snapshot of metadata fields, used by Revert + dirty tracking.
-let metaSnapshot = { title: '', description: '', tags: '', privacy_status: 'unlisted' };
+let metaSnapshot = { episode_number: '', title: '', description: '', tags: '', privacy_status: 'unlisted' };
 let videoData = null;
 
 // Build a datetime-local-compatible string (YYYY-MM-DDTHH:mm) for the given Date,
@@ -580,6 +587,16 @@ async function loadVideo() {
 
     document.getElementById('video-title').textContent = video.title;
 
+    // Optional episode-number chip — local-only metadata, hidden when unset.
+    const epChip = document.getElementById('video-episode-chip');
+    if (video.episode_number != null && video.episode_number !== '') {
+        epChip.textContent = `Ep ${video.episode_number}`;
+        epChip.style.display = '';
+    } else {
+        epChip.textContent = '';
+        epChip.style.display = 'none';
+    }
+
     // Promo / parent wiring. Children get the "Promo of: <parent>"
     // backlink at the top; primaries get the right-sidebar promo card
     // showing their child count and a link to the Promo Videos screen.
@@ -616,7 +633,7 @@ async function loadVideo() {
             deletedBanner.id = 'youtube-deleted-banner';
             deletedBanner.className = 'banner banner-danger';
             deletedBanner.textContent = 'This video has been deleted on YouTube. Metadata and history are still available locally.';
-            document.getElementById('video-title').after(deletedBanner);
+            document.getElementById('video-title-row').after(deletedBanner);
         }
     } else if (deletedBanner) {
         deletedBanner.remove();
@@ -677,12 +694,14 @@ async function loadVideo() {
     // against current truth.
     const tags = video.tags ? JSON.parse(video.tags) : [];
     const newSnap = {
+        episode_number: video.episode_number == null ? '' : String(video.episode_number),
         title: video.title || '',
         description: video.description || '',
         tags: tags.join(', '),
         privacy_status: video.privacy_status || 'unlisted',
     };
     const prevForm = {
+        episode_number: document.getElementById('meta-episode-number').value,
         title: document.getElementById('meta-title').value,
         description: document.getElementById('meta-description').value,
         tags: document.getElementById('meta-tags').value,
@@ -693,6 +712,7 @@ async function loadVideo() {
     // a field is "dirty" iff its current value differs from the prior
     // snapshot — that's the only thing we treat as user-typed.
     const wasDirty = (k) => prevForm[k] !== metaSnapshot[k];
+    if (!wasDirty('episode_number')) document.getElementById('meta-episode-number').value = newSnap.episode_number;
     if (!wasDirty('title'))          document.getElementById('meta-title').value = newSnap.title;
     if (!wasDirty('description'))    document.getElementById('meta-description').value = newSnap.description;
     if (!wasDirty('tags'))           document.getElementById('meta-tags').value = newSnap.tags;
@@ -1713,6 +1733,7 @@ function showPlatformPicker(only) {
 // --- Metadata dirty tracking + Save / Revert -------------------------------
 
 const metaFieldIds = {
+    episode_number: 'meta-episode-number',
     title: 'meta-title',
     description: 'meta-description',
     tags: 'meta-tags',
@@ -1721,6 +1742,7 @@ const metaFieldIds = {
 
 function readMetaForm() {
     return {
+        episode_number: document.getElementById('meta-episode-number').value,
         title: document.getElementById('meta-title').value,
         description: document.getElementById('meta-description').value,
         tags: document.getElementById('meta-tags').value,
@@ -1748,6 +1770,7 @@ for (const id of Object.values(metaFieldIds)) {
 }
 
 function revertMetadata() {
+    document.getElementById('meta-episode-number').value = metaSnapshot.episode_number;
     document.getElementById('meta-title').value = metaSnapshot.title;
     document.getElementById('meta-description').value = metaSnapshot.description;
     document.getElementById('meta-tags').value = metaSnapshot.tags;
@@ -1762,6 +1785,7 @@ document.getElementById('metadata-form').addEventListener('submit', async (event
     if (saveBtn.disabled) return;
     const current = readMetaForm();
     const data = {
+        episode_number: current.episode_number === '' ? null : current.episode_number,
         title: current.title,
         description: current.description,
         tags: current.tags.split(',').map(t => t.trim()).filter(Boolean),

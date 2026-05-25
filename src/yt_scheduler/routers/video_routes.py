@@ -729,6 +729,22 @@ async def update_video(video_id: str, data: dict):
         updates.append("tier = ?")
         params.append(tier_value or None)
 
+    # Optional user-supplied episode number — local-only, never sent to
+    # YouTube. Empty string / null clears the value (chip disappears).
+    if "episode_number" in data:
+        raw = data["episode_number"]
+        if raw in (None, ""):
+            episode_value: int | None = None
+        else:
+            try:
+                episode_value = int(raw)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    400, f"episode_number must be an integer or null; got {raw!r}"
+                ) from exc
+        updates.append("episode_number = ?")
+        params.append(episode_value)
+
     if updates:
         updates.append("updated_at = datetime('now')")
         params.append(video_id)

@@ -417,6 +417,22 @@ body {
 .badge-duration        { background: #1f2937; color: #d1d5db; border: 1px solid #4b5563; font-variant-numeric: tabular-nums; }
 .badge-deleted         { background: #7f1d1d; color: #fef2f2; }
 
+/* Episode-number chip — shown next to the video title on the detail page
+   and the dashboard card. Uses tabular numerals so a two-digit number
+   doesn't shift the title when it changes width. */
+.badge-episode {
+    background: #1f2937;
+    color: #d1d5db;
+    border: 1px solid #4b5563;
+    font-variant-numeric: tabular-nums;
+}
+.episode-chip-title {
+    font-size: 0.85em;
+    padding: 0.2rem 0.55rem;
+    vertical-align: middle;
+    margin-right: 0.5rem;
+}
+
 .video-card-deleted    { opacity: 0.6; }
 .video-card-deleted .video-thumb { filter: grayscale(0.7); }
 

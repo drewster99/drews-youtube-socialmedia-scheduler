@@ -172,6 +172,9 @@ async function loadVideos() {
             const deletedBadge = v.youtube_deleted
                 ? `<span class="badge badge-deleted">deleted on YouTube</span>`
                 : '';
+            const episodeChip = (v.episode_number != null && v.episode_number !== '')
+                ? `<span class="badge badge-episode episode-chip-title">Ep ${v.episode_number}</span>`
+                : '';
             return `
                 <a href="/projects/${projectSlug}/videos/${v.id}" class="video-card${v.youtube_deleted ? ' video-card-deleted' : ''}">
                     <div class="video-thumb">
@@ -180,7 +183,7 @@ async function loadVideos() {
                             : '<div class="thumb-placeholder">No thumbnail</div>'}
                     </div>
                     <div class="video-info">
-                        <h3>${v.title}</h3>
+                        <h3>${episodeChip}${v.title}</h3>
                         ${scheduleLine}
                         <div class="video-meta">
                             <span class="badge badge-type-${v.item_type || 'episode'}">${v.item_type || 'episode'}</span>
