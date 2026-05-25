@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -78,6 +79,48 @@ class BuildIdentityMiddleware(BaseHTTPMiddleware):
         return response
 
 
+# Anything slower than this gets logged at WARNING so it stands out when
+# scanning logs for "what's making the UI feel sluggish." Tuned to surface
+# the kind of half-second-plus stalls that block other requests sharing
+# the event loop (sync keychain calls, sync HTTP, etc.), without spamming
+# the log for normal sub-100ms responses.
+_SLOW_REQUEST_MS = 250
+
+
+class TimingMiddleware(BaseHTTPMiddleware):
+    """Log wall-clock duration of every request.
+
+    Sits at INFO for normal traffic and bumps to WARNING when a single
+    request crosses ``_SLOW_REQUEST_MS`` — the threshold beyond which a
+    response is long enough that it has likely held up other concurrent
+    requests sharing the event loop. ``/static/*`` is skipped to keep
+    page-load noise out of the log; static files are served by Starlette
+    and never block real handlers anyway.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if path.startswith("/static/"):
+            return await call_next(request)
+        start = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.warning(
+                "%s %s — raised after %.0fms", request.method, path, elapsed_ms,
+            )
+            raise
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        level = logging.WARNING if elapsed_ms >= _SLOW_REQUEST_MS else logging.INFO
+        logger.log(
+            level,
+            "%s %s → %d in %.0fms",
+            request.method, path, response.status_code, elapsed_ms,
+        )
+        return response
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown."""
@@ -131,6 +174,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.add_middleware(BuildIdentityMiddleware)
+# Added LAST so it wraps everything else — the duration we log includes
+# the build-identity middleware and any future middleware so the number
+# matches what the client actually waited for.
+app.add_middleware(TimingMiddleware)
 
 # Make sure the data directories exist before anything tries to use them.
 # Migration runs in the lifespan instead — triggering it at module load means
