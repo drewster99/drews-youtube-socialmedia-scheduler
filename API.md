@@ -872,6 +872,28 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 
 **Side effects** — Removes the publish APScheduler job and all per-post jobs (see Cascades); clears `videos.publish_at`; resets `videos.status` to `'ready'`.
 
+### `POST /api/videos/{video_id}/schedule-social`
+
+**Purpose** — Stagger this video's approved social posts on a chosen timeline **without** touching the video itself. For use when the video is already public and only the social fan-out needs scheduling.
+
+**Request body** — `{"first_post_at": "2026-04-25T14:00:00-07:00", "spacing_minutes": 60}`. `first_post_at` is ISO 8601, must be in the future, naive datetimes treated as UTC. `spacing_minutes` is optional (≥ 0, integer); when omitted, the project's `inter_post_spacing_minutes` setting is used. The override is per-batch — the project setting is not mutated.
+
+**Response 200** — `{"status": "ok", "scheduled": <int>, "first_post_at": "<iso>", "spacing_minutes": <int|null>}`. `scheduled` is the number of approved posts a job was registered for; `0` means there were no approved posts. `spacing_minutes` echoes the override the caller sent (or `null` when it wasn't supplied).
+
+**Errors** — `400` on missing/invalid `first_post_at`, a past time, or a non-integer / negative `spacing_minutes`; `404` if the video doesn't exist.
+
+**Behavior** — Cancels every pre-existing pending per-post job for this video (rows with `scheduler_job_id IS NOT NULL`) via `cancel_scheduled_post()`, then re-schedules every `approved` post anchored at `first_post_at` and spaced by either the supplied `spacing_minutes` or the project's `inter_post_spacing_minutes`. Unlike the video-level `POST /api/videos/{video_id}/schedule` flow, **`post_video_delay_minutes` is intentionally ignored** here — "wait X minutes after the video goes live" has no meaning once the video is already live, so the picked time IS when the first approved post fires.
+
+**Side effects** — Per-post `social_posts` rows get `scheduled_at`/`scheduler_job_id` set by `schedule_social_post`; **`videos.publish_at` and `videos.status` are NOT touched.** Records one `social_post_scheduled` event per re-attached post.
+
+### `DELETE /api/videos/{video_id}/schedule-social`
+
+**Purpose** — Cancel every pending per-post job for the video without touching the video's own `publish_at`/`status`. Pairs with `POST .../schedule-social` for the already-published case where `DELETE .../schedule` would also un-publish the video (reset `status='ready'`, null `publish_at`).
+
+**Response 200** — `{"status": "ok", "cancelled": <int>}` where `cancelled` is the number of per-post jobs actually torn down (`0` is not an error).
+
+**Side effects** — Calls `cancel_scheduled_post()` for each row with `scheduler_job_id IS NOT NULL`: their APScheduler `DateTrigger` is removed and `scheduled_at`/`scheduler_job_id` are nulled. Already-posted rows are unaffected. The video row itself is not modified.
+
 ### `GET /api/videos/{video_id}/captions`
 
 **Purpose** — List YouTube caption tracks for the video.

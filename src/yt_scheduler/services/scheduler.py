@@ -733,6 +733,105 @@ async def schedule_publish(video_id: str, publish_at: datetime) -> str:
     return job_id
 
 
+async def schedule_approved_social_posts_only(
+    video_id: str,
+    first_post_at: datetime,
+    *,
+    spacing_minutes: int | None = None,
+) -> int:
+    """Stagger a video's approved social posts starting at ``first_post_at``,
+    spaced by ``spacing_minutes`` (falls back to the project's
+    ``inter_post_spacing_minutes`` setting). Cancels any pending per-post
+    jobs first so we don't double-fire.
+
+    Unlike :func:`schedule_publish`, this does NOT touch the video's
+    ``publish_at`` or ``status`` — use it when the video is already
+    public and the user just wants a custom timeline for the post
+    fan-out. The ``post_video_delay_minutes`` setting is intentionally
+    ignored here: it expresses "wait this long after the video goes
+    live", which has no meaning once the video is already live; the
+    picked time IS when the first post fires.
+
+    ``spacing_minutes`` overrides the project default for THIS batch
+    only — the project setting isn't mutated, so the next batch picks
+    its cadence from project settings again unless the caller
+    specifies another override.
+
+    Returns the number of posts actually scheduled.
+    """
+    if first_post_at.tzinfo is None:
+        first_post_at = first_post_at.replace(tzinfo=timezone.utc)
+
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT project_id FROM videos WHERE id = ?", (video_id,)
+    )
+    row = await cursor.fetchone()
+    if not row:
+        raise ValueError(f"Video {video_id} not found")
+    project_id = int(row["project_id"]) if row["project_id"] is not None else 1
+
+    pending = await db.execute_fetchall(
+        "SELECT id FROM social_posts "
+        "WHERE video_id = ? AND scheduler_job_id IS NOT NULL",
+        (video_id,),
+    )
+    for r in pending:
+        await cancel_scheduled_post(int(r["id"]))
+
+    from datetime import timedelta
+    if spacing_minutes is not None:
+        spacing_min = max(0, int(spacing_minutes))
+    else:
+        from yt_scheduler.services import project_settings as _ps
+        posting = await _ps.get_posting_settings(project_id)
+        spacing_min = int(posting.get("inter_post_spacing_minutes", 5) or 0)
+
+    approved = await db.execute_fetchall(
+        "SELECT id FROM social_posts "
+        "WHERE video_id = ? AND status = 'approved' "
+        "ORDER BY id",
+        (video_id,),
+    )
+    attached = 0
+    for i, r in enumerate(approved):
+        when = first_post_at + timedelta(minutes=i * spacing_min)
+        try:
+            await schedule_social_post(int(r["id"]), when)
+            attached += 1
+        except Exception as exc:
+            logger.error(
+                "Failed to schedule post %s for video %s: %s",
+                r["id"], video_id, exc,
+            )
+    if attached:
+        logger.info(
+            "Scheduled %d social post(s) for video %s starting %s (spacing=%dm)",
+            attached, video_id, first_post_at.isoformat(), spacing_min,
+        )
+    return attached
+
+
+async def cancel_video_social_post_schedule(video_id: str) -> int:
+    """Cancel every pending per-post job for a video WITHOUT touching the
+    video's own ``publish_at`` / ``status``. Pairs with
+    :func:`schedule_approved_social_posts_only` for the
+    already-published case where the existing
+    :func:`cancel_scheduled_publish` would also reset the video to
+    ``status='ready'`` and clear its publish time."""
+    db = await get_db()
+    pending = await db.execute_fetchall(
+        "SELECT id FROM social_posts "
+        "WHERE video_id = ? AND scheduler_job_id IS NOT NULL",
+        (video_id,),
+    )
+    cancelled = 0
+    for r in pending:
+        if await cancel_scheduled_post(int(r["id"])):
+            cancelled += 1
+    return cancelled
+
+
 async def cancel_scheduled_publish(video_id: str) -> bool:
     """Cancel the video's publish job and all of its pending per-post jobs."""
     job_id = f"publish_{video_id}"

@@ -1254,6 +1254,73 @@ async def cancel_schedule(video_id: str):
     raise HTTPException(404, "No scheduled publish found for this video")
 
 
+@router.post("/{video_id}/schedule-social")
+async def schedule_social_only(video_id: str, data: dict):
+    """Stagger this video's approved social posts on a chosen timeline,
+    without touching the video itself. Use this when the video is
+    already public and you just want a custom fan-out for the posts.
+
+    Body:
+        ``first_post_at`` (required, ISO 8601) — when the first approved
+            post fires; subsequent posts each follow at ``+spacing``.
+        ``spacing_minutes`` (optional, int ≥ 0) — per-batch override of
+            the project's ``inter_post_spacing_minutes``. Not persisted.
+
+    ``post_video_delay_minutes`` is intentionally ignored — "wait X
+    minutes after the video goes live" has no meaning once the video
+    is already live, so the picked time IS when the first post fires.
+    """
+    from datetime import datetime as dt, timezone
+    from yt_scheduler.services.scheduler import (
+        schedule_approved_social_posts_only,
+    )
+
+    raw = data.get("first_post_at")
+    if not raw:
+        raise HTTPException(400, "first_post_at is required (ISO 8601 datetime)")
+    try:
+        when = dt.fromisoformat(raw)
+    except ValueError as exc:
+        raise HTTPException(400, "Invalid datetime format") from exc
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    if when <= dt.now(timezone.utc):
+        raise HTTPException(400, "first_post_at must be in the future")
+
+    spacing_minutes = data.get("spacing_minutes")
+    if spacing_minutes is not None:
+        try:
+            spacing_minutes = int(spacing_minutes)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "spacing_minutes must be an integer") from exc
+        if spacing_minutes < 0:
+            raise HTTPException(400, "spacing_minutes must be ≥ 0")
+
+    try:
+        count = await schedule_approved_social_posts_only(
+            video_id, when, spacing_minutes=spacing_minutes,
+        )
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return {
+        "status": "ok",
+        "scheduled": count,
+        "first_post_at": when.isoformat(),
+        "spacing_minutes": spacing_minutes,
+    }
+
+
+@router.delete("/{video_id}/schedule-social")
+async def cancel_schedule_social(video_id: str):
+    """Cancel every per-post job for this video, leaving the video's own
+    publish_at / status alone. Pairs with the POST sibling above."""
+    from yt_scheduler.services.scheduler import (
+        cancel_video_social_post_schedule,
+    )
+    cancelled = await cancel_video_social_post_schedule(video_id)
+    return {"status": "ok", "cancelled": cancelled}
+
+
 @router.get("/{video_id}/captions")
 async def list_captions(video_id: str):
     """List available caption tracks."""

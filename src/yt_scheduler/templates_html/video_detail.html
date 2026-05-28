@@ -163,15 +163,24 @@
         </div>
 
         <div class="card">
-            <h3>Schedule publish + social posts</h3>
+            <h3 id="schedule-card-title">Schedule publish + social posts</h3>
             <div id="schedule-info" style="margin-bottom: 0.5rem;"></div>
             <div id="schedule-collapsed">
-                <button type="button" class="schedule-pill schedule-pill-empty" onclick="scheduleReveal()" style="width: 100%;">Not scheduled — click to set</button>
+                <button type="button" id="schedule-collapsed-btn" class="schedule-pill schedule-pill-empty" onclick="scheduleReveal()" style="width: 100%;">Not scheduled — click to set</button>
             </div>
             <div id="schedule-expanded" style="display:none;">
                 <div class="form-group" style="margin-bottom: 0.5rem;">
-                    <label>Publish date & time</label>
+                    <label id="schedule-datetime-label">Publish date & time</label>
                     <input type="datetime-local" id="schedule-datetime">
+                </div>
+                <div class="form-group" id="schedule-spacing-row" style="margin-bottom: 0.5rem; display:none; align-items:center; gap:0.4rem;">
+                    <label for="schedule-spacing-value" style="margin-right:0.4rem;">Space posts by</label>
+                    <input type="number" min="0" step="1" id="schedule-spacing-value" style="width: 5rem;">
+                    <select id="schedule-spacing-unit">
+                        <option value="minutes">minutes</option>
+                        <option value="hours">hours</option>
+                        <option value="days">days</option>
+                    </select>
                 </div>
                 <div id="schedule-post-preview" style="margin-bottom: 0.5rem;"></div>
                 <div class="form-actions">
@@ -180,7 +189,7 @@
                     <button class="btn btn-sm btn-danger" id="btn-cancel-schedule" onclick="cancelSchedule()" style="display:none;">Cancel schedule</button>
                 </div>
             </div>
-            <small style="color: var(--text-muted); display: block; margin-top: 0.5rem;">
+            <small id="schedule-card-hint" style="color: var(--text-muted); display: block; margin-top: 0.5rem;">
                 Posts stagger using the project's posting settings (delay + spacing).
                 Adjust those in Project Settings to change the cadence.
             </small>
@@ -467,6 +476,51 @@ const PLATFORM_SHORT = {
     linkedin: 'LinkedIn', threads: 'Threads',
 };
 
+// Convert "N minutes" into the most readable {value, unit} pair for the
+// spacing input — picks days/hours/minutes by whichever divides cleanly.
+function _spacingMinutesToControl(totalMin) {
+    const n = Math.max(0, Math.round(Number(totalMin) || 0));
+    if (n > 0 && n % (60 * 24) === 0) return {value: n / (60 * 24), unit: 'days'};
+    if (n > 0 && n % 60 === 0) return {value: n / 60, unit: 'hours'};
+    return {value: n, unit: 'minutes'};
+}
+
+// Read the inline spacing control back into minutes (the unit the
+// backend / project settings store).
+function _readSpacingControlMinutes() {
+    const valueInput = document.getElementById('schedule-spacing-value');
+    const unitSelect = document.getElementById('schedule-spacing-unit');
+    if (!valueInput || !unitSelect) return null;
+    const raw = Number(valueInput.value);
+    if (!Number.isFinite(raw) || raw < 0) return null;
+    const factor = unitSelect.value === 'days' ? 60 * 24
+                 : unitSelect.value === 'hours' ? 60 : 1;
+    return Math.round(raw * factor);
+}
+
+// Pre-populate the spacing input from the project setting only on first
+// reveal; subsequent renders preserve whatever the user typed so a
+// loadVideo() refresh mid-edit doesn't wipe their value.
+function seedSpacingControlIfEmpty() {
+    const valueInput = document.getElementById('schedule-spacing-value');
+    const unitSelect = document.getElementById('schedule-spacing-unit');
+    if (!valueInput || !unitSelect) return;
+    if (valueInput.dataset.userTouched === '1') return;
+    const projectMin = Number(postingSettingsCache?.inter_post_spacing_minutes ?? 5);
+    const {value, unit} = _spacingMinutesToControl(projectMin);
+    valueInput.value = value;
+    unitSelect.value = unit;
+    if (!valueInput.dataset.changeBound) {
+        const onChange = () => {
+            valueInput.dataset.userTouched = '1';
+            renderSchedulePostPreview();
+        };
+        valueInput.addEventListener('input', onChange);
+        unitSelect.addEventListener('change', onChange);
+        valueInput.dataset.changeBound = '1';
+    }
+}
+
 function renderSchedulePostPreview() {
     const preview = document.getElementById('schedule-post-preview');
     const btn = document.getElementById('btn-schedule');
@@ -478,31 +532,49 @@ function renderSchedulePostPreview() {
     const approved = socialPostsCache.filter(p => p.status === 'approved');
     const draft = socialPostsCache.filter(p => p.status === 'draft');
 
+    // Social-only mode (video already public): the picker schedules the
+    // posts, not the video; first post fires AT the picked time, no
+    // post_video_delay applied.
+    const ytIsPublic = videoData?.youtube_data?.status?.privacyStatus === 'public';
+    const isPublished = videoData?.status === 'published' || ytIsPublic;
+
     // Derive button state from whether the video is already scheduled
     // and whether the user has changed the datetime input from the
-    // existing scheduled time:
-    //   - not scheduled                -> "Schedule video + N posts"   (enabled)
-    //   - scheduled, date unchanged    -> "Already scheduled"          (disabled)
-    //   - scheduled, date changed      -> "Reschedule video + N posts" (enabled)
-    const isScheduled = videoData?.status === 'scheduled'
-        && videoData?.publish_at
-        && (videoData?.youtube_data?.status?.privacyStatus !== 'public');
-    const currentScheduledLocal = isScheduled
-        ? toLocalInputValue(new Date(_ensureUtc(videoData.publish_at)))
+    // existing scheduled time. Same three cases for video and
+    // social-only modes; the verb just changes.
+    const scheduledPosts = isPublished
+        ? approved.filter(p => p.scheduled_at)
+        : [];
+    const firstScheduledMs = scheduledPosts.length
+        ? scheduledPosts.map(p => new Date(_ensureUtc(p.scheduled_at)).getTime())
+                        .reduce((a, b) => Math.min(a, b))
         : null;
-    const countSuffix = approved.length
-        ? ` video + ${approved.length} post${approved.length === 1 ? '' : 's'}`
-        : ' video';
+    const isScheduled = isPublished
+        ? scheduledPosts.length > 0
+        : (videoData?.status === 'scheduled'
+            && videoData?.publish_at
+            && !ytIsPublic);
+    const currentScheduledLocal = isPublished
+        ? (firstScheduledMs !== null
+            ? toLocalInputValue(new Date(firstScheduledMs))
+            : null)
+        : (isScheduled
+            ? toLocalInputValue(new Date(_ensureUtc(videoData.publish_at)))
+            : null);
+    const verb = isScheduled ? 'Reschedule' : 'Schedule';
+    const subject = isPublished
+        ? (approved.length
+            ? `${approved.length} post${approved.length === 1 ? '' : 's'}`
+            : 'posts')
+        : (approved.length
+            ? `video + ${approved.length} post${approved.length === 1 ? '' : 's'}`
+            : 'video');
     if (isScheduled && dtStr === currentScheduledLocal) {
         btn.textContent = 'Already scheduled';
         btn.disabled = true;
         btn.title = 'Pick a different date/time to reschedule, or use Cancel Schedule below.';
-    } else if (isScheduled) {
-        btn.textContent = `Reschedule${countSuffix}`;
-        btn.disabled = false;
-        btn.title = '';
     } else {
-        btn.textContent = `Schedule${countSuffix}`;
+        btn.textContent = `${verb} ${subject}`;
         btn.disabled = false;
         btn.title = '';
     }
@@ -513,9 +585,18 @@ function renderSchedulePostPreview() {
     }
 
     // Predict each post's time using the project's stagger settings —
-    // matches what the server will compute when Schedule fires.
-    const delayMin = Number(postingSettingsCache?.post_video_delay_minutes ?? 15);
-    const spacingMin = Number(postingSettingsCache?.inter_post_spacing_minutes ?? 5);
+    // matches what the server will compute when Schedule fires. In
+    // social-only mode (video already public) the picker IS when the
+    // first post fires, so we don't apply post_video_delay_minutes,
+    // and the spacing comes from the inline control (which seeds from
+    // the project setting but the user can override per-schedule).
+    const delayMin = isPublished
+        ? 0
+        : Number(postingSettingsCache?.post_video_delay_minutes ?? 15);
+    const inlineSpacing = isPublished ? _readSpacingControlMinutes() : null;
+    const spacingMin = inlineSpacing !== null
+        ? inlineSpacing
+        : Number(postingSettingsCache?.inter_post_spacing_minutes ?? 5);
 
     const rows = [];
     approved.forEach((p, i) => {
@@ -759,6 +840,30 @@ async function loadVideo() {
     }
     const ytPrivacy = video.youtube_data?.status?.privacyStatus;
     const ytIsPublic = ytPrivacy === 'public';
+    const isPublished = video.status === 'published' || ytIsPublic;
+    // Reset card copy each render so a status flip (scheduled → published)
+    // doesn't leave stale labels around.
+    const cardTitle = document.getElementById('schedule-card-title');
+    const collapsedBtn = document.getElementById('schedule-collapsed-btn');
+    const dtLabel = document.getElementById('schedule-datetime-label');
+    const cardHint = document.getElementById('schedule-card-hint');
+    const spacingRow = document.getElementById('schedule-spacing-row');
+    if (isPublished) {
+        cardTitle.textContent = 'Schedule social posts';
+        collapsedBtn.textContent = 'Social posts not scheduled — click to set';
+        dtLabel.textContent = 'First post at';
+        cardHint.textContent = 'Video is already public — picking a time schedules just the social posts. '
+            + 'Adjust the spacing above to change the cadence (defaults to the project setting).';
+        spacingRow.style.display = 'flex';
+        seedSpacingControlIfEmpty();
+    } else {
+        cardTitle.textContent = 'Schedule publish + social posts';
+        collapsedBtn.textContent = 'Not scheduled — click to set';
+        dtLabel.textContent = 'Publish date & time';
+        cardHint.textContent = "Posts stagger using the project's posting settings (delay + spacing). "
+            + 'Adjust those in Project Settings to change the cadence.';
+        spacingRow.style.display = 'none';
+    }
     if (video.status === 'scheduled' && video.publish_at && !ytIsPublic) {
         const pubDate = new Date(_ensureUtc(video.publish_at));
         scheduleInfo.innerHTML = `<span class="badge badge-scheduled">Scheduled</span>
@@ -771,16 +876,32 @@ async function loadVideo() {
         // up the "Already scheduled" state instead of stale "Schedule
         // video + N posts".
         renderSchedulePostPreview();
-    } else if (video.status === 'published' || ytIsPublic) {
+    } else if (isPublished) {
         const ytPublishedAt = video.youtube_data?.status?.publishAt
                            || video.youtube_data?.snippet?.publishedAt
                            || video.publish_at;
         const when = ytPublishedAt ? new Date(_ensureUtc(ytPublishedAt)).toLocaleString() : '';
         scheduleInfo.innerHTML = `<span class="badge badge-published">Published</span>`
                                + (when ? ` <span style="margin-left: 0.5rem;">${when}</span>` : '');
-        cancelBtn.style.display = 'none';
-        document.getElementById('schedule-collapsed').style.display = 'none';
-        document.getElementById('schedule-expanded').style.display = 'none';
+        // Surface any already-scheduled per-post jobs so the user knows
+        // there's an active schedule before they touch the picker.
+        const scheduledPosts = (socialPostsCache || []).filter(
+            p => p.status === 'approved' && p.scheduled_at
+        );
+        if (scheduledPosts.length) {
+            const firstAt = scheduledPosts
+                .map(p => new Date(_ensureUtc(p.scheduled_at)).getTime())
+                .reduce((a, b) => Math.min(a, b));
+            const firstLabel = new Date(firstAt).toLocaleString();
+            scheduleInfo.innerHTML += ` · <span class="badge badge-scheduled">${scheduledPosts.length} post${scheduledPosts.length === 1 ? '' : 's'} scheduled</span> <span style="margin-left:0.5rem;">first at ${firstLabel}</span>`;
+            cancelBtn.style.display = 'inline-flex';
+            document.getElementById('schedule-datetime').value = toLocalInputValue(new Date(firstAt));
+            scheduleReveal();
+            renderSchedulePostPreview();
+        } else {
+            cancelBtn.style.display = 'none';
+            scheduleCollapse();
+        }
     } else {
         scheduleInfo.innerHTML = '<span class="badge schedule-badge-unset">Not scheduled</span>';
         cancelBtn.style.display = 'none';
@@ -2479,21 +2600,46 @@ async function schedulePublish() {
     // datetime-local is naive; send ISO with the browser's current offset so
     // the server doesn't misread it as UTC.
     const iso = new Date(dt).toISOString();
-    const resp = await fetch(`/api/videos/${videoId}/schedule`, {
+    const ytIsPublic = videoData?.youtube_data?.status?.privacyStatus === 'public';
+    const isPublished = videoData?.status === 'published' || ytIsPublic;
+    // Published videos route to the posts-only endpoint so we don't
+    // clobber publish_at/status on a live video.
+    const endpoint = isPublished
+        ? `/api/videos/${videoId}/schedule-social`
+        : `/api/videos/${videoId}/schedule`;
+    const body = isPublished
+        ? {first_post_at: iso}
+        : {publish_at: iso};
+    if (isPublished) {
+        const inlineSpacing = _readSpacingControlMinutes();
+        if (inlineSpacing !== null) body.spacing_minutes = inlineSpacing;
+    }
+    const resp = await fetch(endpoint, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({publish_at: iso}),
+        body: JSON.stringify(body),
     });
     const result = await resp.json();
     if (resp.ok) {
-        const approved = socialPostsCache.filter(p => p.status === 'approved').length;
-        const when = new Date(_ensureUtc(result.publish_at)).toLocaleString();
-        showToast(
-            approved
-                ? `Scheduled video + ${approved} post${approved === 1 ? '' : 's'} for ${when}`
-                : `Scheduled video for ${when}`,
-            'success',
-        );
+        if (isPublished) {
+            const n = result.scheduled || 0;
+            const when = new Date(_ensureUtc(result.first_post_at)).toLocaleString();
+            showToast(
+                n
+                    ? `Scheduled ${n} post${n === 1 ? '' : 's'} starting ${when}`
+                    : 'No approved posts to schedule',
+                n ? 'success' : 'error',
+            );
+        } else {
+            const approved = socialPostsCache.filter(p => p.status === 'approved').length;
+            const when = new Date(_ensureUtc(result.publish_at)).toLocaleString();
+            showToast(
+                approved
+                    ? `Scheduled video + ${approved} post${approved === 1 ? '' : 's'} for ${when}`
+                    : `Scheduled video for ${when}`,
+                'success',
+            );
+        }
         loadVideo();
         loadSocialPosts();
         loadEventLog();
@@ -2503,11 +2649,20 @@ async function schedulePublish() {
 }
 
 async function cancelSchedule() {
-    if (!confirm('Cancel the scheduled publish?')) return;
-    const resp = await fetch(`/api/videos/${videoId}/schedule`, {method: 'DELETE'});
+    const ytIsPublic = videoData?.youtube_data?.status?.privacyStatus === 'public';
+    const isPublished = videoData?.status === 'published' || ytIsPublic;
+    const prompt = isPublished
+        ? 'Cancel the scheduled social posts?'
+        : 'Cancel the scheduled publish?';
+    if (!confirm(prompt)) return;
+    const endpoint = isPublished
+        ? `/api/videos/${videoId}/schedule-social`
+        : `/api/videos/${videoId}/schedule`;
+    const resp = await fetch(endpoint, {method: 'DELETE'});
     if (resp.ok) {
         showToast('Schedule cancelled', 'success');
         loadVideo();
+        loadSocialPosts();
     } else {
         showToast('Failed to cancel', 'error');
     }
