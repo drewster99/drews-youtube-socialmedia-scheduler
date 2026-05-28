@@ -486,6 +486,11 @@ async function fetchPreview() {
 
 function renderReadinessChip(row) {
     if (row.already_published) return '<span class="badge badge-published">Published</span>';
+    // Already-scheduled rows are kept at their existing time and are
+    // NOT rewritten on confirm (schedule_promo_batch filters them out).
+    // Surface that so the user knows which rows are static context vs
+    // which ones the batch will actually write.
+    if (row.already_scheduled) return '<span class="badge badge-scheduled">Scheduled</span>';
     if (row.ready) return '<span class="badge badge-published">Ready</span>';
     const missing = (row.missing || []).join(', ');
     return `<span class="badge badge-error" title="${escapeHtml(missing)}">Not ready</span>`;
