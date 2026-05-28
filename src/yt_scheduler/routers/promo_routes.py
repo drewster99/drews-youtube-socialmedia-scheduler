@@ -24,6 +24,8 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import secrets
 import shutil
 
@@ -33,6 +35,8 @@ from yt_scheduler.config import UPLOAD_DIR, safe_upload_ext
 from yt_scheduler.database import get_db
 from yt_scheduler.routers.video_routes import _video_public
 from yt_scheduler.services import auto_actions, projects as project_service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/projects/{slug}/videos/{parent_id}/promos",
@@ -274,6 +278,43 @@ async def _resolve_batch_delays(
     return _scheduler._promo_delays_to_timedeltas(validated), validated
 
 
+async def _sweep_missing_thumbnails(parent_id: str, project_id: int) -> None:
+    """Pull YouTube's auto-thumbnail for any eligible promo child that
+    doesn't have one yet. Run before computing the schedule preview so
+    "Not ready · thumbnail" cases self-heal when the user opens the
+    modal, rather than waiting for the 30-min sweep.
+
+    Each child is fetched in parallel — opening the modal shouldn't be
+    gated on N sequential YouTube HTTP calls. Failures are logged and
+    ignored; the chain just keeps showing as not ready, which the user
+    can then act on.
+    """
+    from yt_scheduler.services import thumbnail_sync
+
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id FROM videos "
+        "WHERE parent_item_id = ? AND project_id = ? "
+        "AND thumbnail_path IS NULL AND LENGTH(id) = 11 "
+        "AND COALESCE(youtube_deleted, 0) = 0 "
+        "AND COALESCE(LOWER(status), '') != 'published'",
+        (parent_id, project_id),
+    )
+    if not rows:
+        return
+
+    async def _try(video_id: str) -> None:
+        try:
+            await thumbnail_sync.backfill_thumbnail(video_id)
+        except Exception as exc:
+            logger.warning(
+                "Pre-schedule thumbnail backfill failed for %s: %s",
+                video_id, exc,
+            )
+
+    await asyncio.gather(*(_try(row["id"]) for row in rows))
+
+
 @router.post("/schedule-all/preview")
 async def schedule_all_preview(
     slug: str,
@@ -296,6 +337,10 @@ async def schedule_all_preview(
         project["id"], payload.get("delays")
     )
     order = payload.get("order") or None
+    # Backfill missing thumbnails BEFORE computing readiness so a freshly
+    # uploaded promo doesn't fail readiness purely because the periodic
+    # sweep hasn't run yet.
+    await _sweep_missing_thumbnails(parent_id, int(project["id"]))
     try:
         preview = await _scheduler.compute_promo_batch_preview(
             parent_id, parent_publish_at=parent_dt, delays=delays, order=order,
@@ -333,6 +378,11 @@ async def schedule_all(
         project["id"], payload.get("delays")
     )
     order = payload.get("order") or None
+    # Mirror the preview's pre-sweep so a child that arrived between
+    # modal-open and Confirm doesn't fail readiness purely on thumbnail.
+    # backfill_thumbnail is a no-op when one already exists, so paying
+    # this once on commit is cheap.
+    await _sweep_missing_thumbnails(parent_id, int(project["id"]))
     try:
         result = await _scheduler.schedule_promo_batch(
             parent_id, parent_publish_at=parent_dt, delays=delays, order=order,

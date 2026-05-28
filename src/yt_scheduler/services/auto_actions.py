@@ -676,11 +676,15 @@ async def _run_promo_chain(job_id: str) -> None:
             parent_tags=parent_ctx.get("tags", ""),
         )
     except Exception as exc:
-        # Log the local on-disk path alongside the user-facing filename so
-        # "file not found" failures can be diagnosed without guessing which
-        # path the error refers to (the on-disk path is always app-chosen
-        # and has no spaces; the original filename does).
-        logger.warning(
+        # ERROR (not warning): if Claude is unreachable here, every
+        # downstream AI step (description, tags) will also fail, so this
+        # is a "the whole pipeline is degraded" signal, not a routine
+        # fallback. The deterministic title is still used so the chain
+        # can keep going. local_path is logged alongside the user-facing
+        # filename so "file not found" failures can be diagnosed without
+        # guessing which path the error refers to (the on-disk path is
+        # always app-chosen and has no spaces; the original filename does).
+        logger.error(
             "AI title failed for %s (local_path=%s), using deterministic fallback: %r",
             job["filename"], job.get("local_path"), exc,
             exc_info=True,
