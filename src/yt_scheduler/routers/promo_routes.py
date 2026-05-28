@@ -24,6 +24,8 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import secrets
 import shutil
 
@@ -33,6 +35,8 @@ from yt_scheduler.config import UPLOAD_DIR, safe_upload_ext
 from yt_scheduler.database import get_db
 from yt_scheduler.routers.video_routes import _video_public
 from yt_scheduler.services import auto_actions, projects as project_service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/projects/{slug}/videos/{parent_id}/promos",
@@ -249,20 +253,66 @@ async def get_upload_job(slug: str, parent_id: str, job_id: str) -> dict:
     return job
 
 
-async def _resolve_batch_delays(project_id: int, raw_delays: object) -> dict:
+async def _resolve_batch_delays(
+    project_id: int, raw_delays: object
+) -> tuple[dict, dict | None]:
     """Turn an optional client-supplied promo-delays payload into the
-    timedelta shape the batch math consumes. ``None`` → the project's
-    saved delays; otherwise validate the payload (400 on bad input)."""
+    timedelta shape the batch math consumes.
+
+    Returns ``(timedeltas, validated)``: ``timedeltas`` always feeds the
+    batch math; ``validated`` is the normalized ``{value, unit}`` payload
+    to persist as the project default, or ``None`` when the caller
+    supplied no delays (nothing new to persist).
+
+    ``None`` raw_delays → the project's saved delays; otherwise validate
+    the payload (400 on bad input)."""
     from yt_scheduler.services import project_settings, scheduler as _scheduler
 
     if raw_delays is None:
         stored = await project_settings.get_promo_delays(project_id)
-        return _scheduler._promo_delays_to_timedeltas(stored)
+        return _scheduler._promo_delays_to_timedeltas(stored), None
     try:
         validated = project_settings.validate_promo_delays(raw_delays)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    return _scheduler._promo_delays_to_timedeltas(validated)
+    return _scheduler._promo_delays_to_timedeltas(validated), validated
+
+
+async def _sweep_missing_thumbnails(parent_id: str, project_id: int) -> None:
+    """Pull YouTube's auto-thumbnail for any eligible promo child that
+    doesn't have one yet. Run before computing the schedule preview so
+    "Not ready · thumbnail" cases self-heal when the user opens the
+    modal, rather than waiting for the 30-min sweep.
+
+    Each child is fetched in parallel — opening the modal shouldn't be
+    gated on N sequential YouTube HTTP calls. Failures are logged and
+    ignored; the chain just keeps showing as not ready, which the user
+    can then act on.
+    """
+    from yt_scheduler.services import thumbnail_sync
+
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id FROM videos "
+        "WHERE parent_item_id = ? AND project_id = ? "
+        "AND thumbnail_path IS NULL AND LENGTH(id) = 11 "
+        "AND COALESCE(youtube_deleted, 0) = 0 "
+        "AND COALESCE(LOWER(status), '') != 'published'",
+        (parent_id, project_id),
+    )
+    if not rows:
+        return
+
+    async def _try(video_id: str) -> None:
+        try:
+            await thumbnail_sync.backfill_thumbnail(video_id)
+        except Exception as exc:
+            logger.warning(
+                "Pre-schedule thumbnail backfill failed for %s: %s",
+                video_id, exc,
+            )
+
+    await asyncio.gather(*(_try(row["id"]) for row in rows))
 
 
 @router.post("/schedule-all/preview")
@@ -283,8 +333,14 @@ async def schedule_all_preview(
     project, _parent = await _ensure_primary(slug, parent_id)
     payload = payload or {}
     parent_dt = _scheduler._parse_iso_datetime(payload.get("parent_publish_at"))
-    delays = await _resolve_batch_delays(project["id"], payload.get("delays"))
+    delays, _validated = await _resolve_batch_delays(
+        project["id"], payload.get("delays")
+    )
     order = payload.get("order") or None
+    # Backfill missing thumbnails BEFORE computing readiness so a freshly
+    # uploaded promo doesn't fail readiness purely because the periodic
+    # sweep hasn't run yet.
+    await _sweep_missing_thumbnails(parent_id, int(project["id"]))
     try:
         preview = await _scheduler.compute_promo_batch_preview(
             parent_id, parent_publish_at=parent_dt, delays=delays, order=order,
@@ -298,7 +354,7 @@ async def schedule_all_preview(
 async def schedule_all(
     slug: str,
     parent_id: str,
-    payload: dict,
+    payload: dict | None = None,
 ) -> dict:
     """Commit the batch from the preview modal. Body (all optional):
 
@@ -318,19 +374,27 @@ async def schedule_all(
     project, _parent = await _ensure_primary(slug, parent_id)
     payload = payload or {}
     parent_dt = _scheduler._parse_iso_datetime(payload.get("parent_publish_at"))
-    delays = await _resolve_batch_delays(project["id"], payload.get("delays"))
+    delays, validated_delays = await _resolve_batch_delays(
+        project["id"], payload.get("delays")
+    )
     order = payload.get("order") or None
+    # Mirror the preview's pre-sweep so a child that arrived between
+    # modal-open and Confirm doesn't fail readiness purely on thumbnail.
+    # backfill_thumbnail is a no-op when one already exists, so paying
+    # this once on commit is cheap.
+    await _sweep_missing_thumbnails(parent_id, int(project["id"]))
     try:
         result = await _scheduler.schedule_promo_batch(
             parent_id, parent_publish_at=parent_dt, delays=delays, order=order,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    # Persist the (possibly edited) delays so the next batch of the same
-    # tier defaults to the same pace.
-    if payload.get("delays") is not None:
-        validated = project_settings.validate_promo_delays(payload["delays"])
-        await project_settings.set_json(project["id"], "promo_delays", validated)
+    # Persist the (already-validated) delays so the next batch of the
+    # same tier defaults to the same pace.
+    if validated_delays is not None:
+        await project_settings.set_json(
+            project["id"], "promo_delays", validated_delays
+        )
     return result
 
 

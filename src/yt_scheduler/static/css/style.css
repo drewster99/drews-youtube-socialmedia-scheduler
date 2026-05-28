@@ -417,6 +417,22 @@ body {
 .badge-duration        { background: #1f2937; color: #d1d5db; border: 1px solid #4b5563; font-variant-numeric: tabular-nums; }
 .badge-deleted         { background: #7f1d1d; color: #fef2f2; }
 
+/* Episode-number chip — shown next to the video title on the detail page
+   and the dashboard card. Uses tabular numerals so a two-digit number
+   doesn't shift the title when it changes width. */
+.badge-episode {
+    background: #1f2937;
+    color: #d1d5db;
+    border: 1px solid #4b5563;
+    font-variant-numeric: tabular-nums;
+}
+.episode-chip-title {
+    font-size: 0.85em;
+    padding: 0.2rem 0.55rem;
+    vertical-align: middle;
+    margin-right: 0.5rem;
+}
+
 .video-card-deleted    { opacity: 0.6; }
 .video-card-deleted .video-thumb { filter: grayscale(0.7); }
 
@@ -1084,13 +1100,19 @@ body {
     font-weight: 600;
     font-size: 0.8rem;
 }
-.settings-table input[type="text"] {
+.settings-table input[type="text"],
+.settings-table textarea {
     width: 100%;
     padding: 0.25rem 0.4rem;
     background: var(--bg-input);
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
+}
+/* Variable values can be multi-line; let the row editor grow/shrink. */
+.settings-table textarea {
+    font-family: inherit;
+    resize: vertical;
 }
 .settings-table code {
     background: var(--bg-primary);
@@ -1167,9 +1189,17 @@ body {
 }
 .project-card-wrap {
     position: relative;
+    /* Fill the grid row so the wrap stretches to the tallest sibling. */
+    height: 100%;
 }
 .project-card {
-    display: block;
+    /* Flex column + height:100% lets cards without a banner stretch to
+       match cards that have one — without it the grid row stretches the
+       wrap but the inner card stays its natural (shorter) height and
+       looks ragged next to a banner-bearing sibling. */
+    display: flex;
+    flex-direction: column;
+    height: 100%;
     padding: 1rem;
     background: var(--bg-card);
     border: 1px solid var(--border);

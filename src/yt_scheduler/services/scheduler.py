@@ -721,11 +721,115 @@ async def schedule_publish(video_id: str, publish_at: datetime) -> str:
                 r["id"], video_id, exc,
             )
 
-    logger.info(
-        "Scheduled video %s for %s + %d posts (delay=%dm, spacing=%dm)",
-        video_id, publish_at.isoformat(), attached_count, delay_min, spacing_min,
-    )
+    if attached_count:
+        logger.info(
+            "Scheduled video %s for %s + %d posts (delay=%dm, spacing=%dm)",
+            video_id, publish_at.isoformat(), attached_count, delay_min, spacing_min,
+        )
+    else:
+        logger.info(
+            "Scheduled video %s for %s", video_id, publish_at.isoformat(),
+        )
     return job_id
+
+
+async def schedule_approved_social_posts_only(
+    video_id: str,
+    first_post_at: datetime,
+    *,
+    spacing_minutes: int | None = None,
+) -> int:
+    """Stagger a video's approved social posts starting at ``first_post_at``,
+    spaced by ``spacing_minutes`` (falls back to the project's
+    ``inter_post_spacing_minutes`` setting). Cancels any pending per-post
+    jobs first so we don't double-fire.
+
+    Unlike :func:`schedule_publish`, this does NOT touch the video's
+    ``publish_at`` or ``status`` — use it when the video is already
+    public and the user just wants a custom timeline for the post
+    fan-out. The ``post_video_delay_minutes`` setting is intentionally
+    ignored here: it expresses "wait this long after the video goes
+    live", which has no meaning once the video is already live; the
+    picked time IS when the first post fires.
+
+    ``spacing_minutes`` overrides the project default for THIS batch
+    only — the project setting isn't mutated, so the next batch picks
+    its cadence from project settings again unless the caller
+    specifies another override.
+
+    Returns the number of posts actually scheduled.
+    """
+    if first_post_at.tzinfo is None:
+        first_post_at = first_post_at.replace(tzinfo=timezone.utc)
+
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT project_id FROM videos WHERE id = ?", (video_id,)
+    )
+    row = await cursor.fetchone()
+    if not row:
+        raise ValueError(f"Video {video_id} not found")
+    project_id = int(row["project_id"]) if row["project_id"] is not None else 1
+
+    pending = await db.execute_fetchall(
+        "SELECT id FROM social_posts "
+        "WHERE video_id = ? AND scheduler_job_id IS NOT NULL",
+        (video_id,),
+    )
+    for r in pending:
+        await cancel_scheduled_post(int(r["id"]))
+
+    from datetime import timedelta
+    if spacing_minutes is not None:
+        spacing_min = max(0, int(spacing_minutes))
+    else:
+        from yt_scheduler.services import project_settings as _ps
+        posting = await _ps.get_posting_settings(project_id)
+        spacing_min = int(posting.get("inter_post_spacing_minutes", 5) or 0)
+
+    approved = await db.execute_fetchall(
+        "SELECT id FROM social_posts "
+        "WHERE video_id = ? AND status = 'approved' "
+        "ORDER BY id",
+        (video_id,),
+    )
+    attached = 0
+    for i, r in enumerate(approved):
+        when = first_post_at + timedelta(minutes=i * spacing_min)
+        try:
+            await schedule_social_post(int(r["id"]), when)
+            attached += 1
+        except Exception as exc:
+            logger.error(
+                "Failed to schedule post %s for video %s: %s",
+                r["id"], video_id, exc,
+            )
+    if attached:
+        logger.info(
+            "Scheduled %d social post(s) for video %s starting %s (spacing=%dm)",
+            attached, video_id, first_post_at.isoformat(), spacing_min,
+        )
+    return attached
+
+
+async def cancel_video_social_post_schedule(video_id: str) -> int:
+    """Cancel every pending per-post job for a video WITHOUT touching the
+    video's own ``publish_at`` / ``status``. Pairs with
+    :func:`schedule_approved_social_posts_only` for the
+    already-published case where the existing
+    :func:`cancel_scheduled_publish` would also reset the video to
+    ``status='ready'`` and clear its publish time."""
+    db = await get_db()
+    pending = await db.execute_fetchall(
+        "SELECT id FROM social_posts "
+        "WHERE video_id = ? AND scheduler_job_id IS NOT NULL",
+        (video_id,),
+    )
+    cancelled = 0
+    for r in pending:
+        if await cancel_scheduled_post(int(r["id"])):
+            cancelled += 1
+    return cancelled
 
 
 async def cancel_scheduled_publish(video_id: str) -> bool:
@@ -1219,7 +1323,9 @@ def _promo_delays_to_timedeltas(
     compute_promo_batch_preview consumes. Falls back to
     DEFAULT_PROMO_DELAYS for any missing/malformed tier or field."""
     if not raw:
-        return DEFAULT_PROMO_DELAYS
+        # Fresh copy — never hand back the shared module-level default,
+        # so a caller that mutates the result can't corrupt it.
+        return {tier: dict(cfg) for tier, cfg in DEFAULT_PROMO_DELAYS.items()}
     out: dict[str, dict[str, timedelta]] = {}
     for tier, default in DEFAULT_PROMO_DELAYS.items():
         cfg = raw.get(tier) or {}
@@ -1240,18 +1346,20 @@ def _promo_delays_to_timedeltas(
         out[tier] = td
     return out
 
-# Quota guard for the Promo screen. Each child upload chain costs
-# ≈ 100 (insert) + 50 (metadata update) = 150 YouTube quota units. The
-# daily allowance is 10,000 — this threshold (25%) is what we surface
-# as a "heads up" banner. Doesn't block scheduling — just warns.
+# Quota guard for the Schedule-all screen. Scheduling a promo doesn't
+# touch YouTube; the cost lands later when publish_video_job flips the
+# video to public — one videos.update call ≈ 50 quota units per promo.
+# (The upload chain's ~150 units were already spent before scheduling.)
+# The daily allowance is 10,000 — this threshold (25%) is what we
+# surface as a "heads up" banner. Doesn't block scheduling — just warns.
 PROMO_BATCH_QUOTA_WARN_FRACTION = 0.25
 _YT_DAILY_QUOTA = 10_000
-_YT_PROMO_UNITS_PER_VIDEO = 150
+_YT_PROMO_PUBLISH_UNITS = 50
 
 
 def promo_quota_for(child_count: int) -> int:
-    """Estimated YouTube quota units for a batch upload of N promos."""
-    return child_count * _YT_PROMO_UNITS_PER_VIDEO
+    """Estimated YouTube quota units to publish a batch of N promos."""
+    return child_count * _YT_PROMO_PUBLISH_UNITS
 
 
 def _decode_tags(raw: str | None) -> list:
@@ -1439,6 +1547,7 @@ async def compute_promo_batch_preview(
                 "target_time": None,
                 "ready": ready,
                 "missing": missing,
+                "already_scheduled": False,
             })
         return {
             "parent": _public_parent(parent, parent_publish, parent_already_published),
@@ -1488,7 +1597,9 @@ async def compute_promo_batch_preview(
         # previously-batched schedules. Newly-added (unscheduled)
         # children chain off the latest existing time + subsequent.
         for child, existing in scheduled_in_tier:
-            rows_out.append(_preview_row(child, existing))
+            rows_out.append(
+                _preview_row(child, existing, already_scheduled=True)
+            )
             if latest_target is None or existing > latest_target:
                 latest_target = existing
 
@@ -1547,7 +1658,9 @@ def _public_parent(
     }
 
 
-def _preview_row(child: dict, target: datetime) -> dict:
+def _preview_row(
+    child: dict, target: datetime, *, already_scheduled: bool = False,
+) -> dict:
     ready, missing = is_ready_for_schedule(child)
     return {
         "video_id": child["id"],
@@ -1557,6 +1670,7 @@ def _preview_row(child: dict, target: datetime) -> dict:
         "target_time": target.isoformat(),
         "ready": ready,
         "missing": missing,
+        "already_scheduled": already_scheduled,
     }
 
 
@@ -1736,25 +1850,45 @@ async def schedule_promo_batch(
     delays: dict[str, dict[str, timedelta]] | None = None,
     order: list[str] | None = None,
 ) -> dict:
-    """Schedule every eligible child of ``parent_id`` using
-    :func:`compute_promo_batch_preview` for the math, then writing
-    each child via :func:`schedule_publish` (which re-registers the
-    APScheduler job AND re-stages any per-post social jobs).
+    """Schedule every freshly-computed child of ``parent_id`` using
+    :func:`compute_promo_batch_preview` for the math, then writing each
+    via :func:`schedule_publish` (which re-registers the APScheduler job
+    AND re-stages any per-post social jobs).
 
-    Optionally also schedules the parent when it isn't already
-    published and ``parent_publish_at`` is supplied.
+    Children that are already scheduled are left untouched — the preview
+    keeps them at their existing times and this writer skips them, so any
+    manual publish-time pin (``publish_at_manual = 1``) is preserved.
+
+    Optionally also schedules the parent when it isn't already published
+    and ``parent_publish_at`` is supplied.
+
+    Returns ``{"scheduled": [...], "errors": [...], "warnings": [...]}``.
+    Per-child write failures are collected in ``errors`` rather than
+    aborting the batch; the operation is idempotent, so a re-run resumes
+    the chain from whatever was already scheduled.
 
     Raises :class:`ValueError` when the parent is missing / itself a
-    child / has no readiness-OK children to schedule.
+    child / has no publish time / has no eligible children.
     """
     preview = await compute_promo_batch_preview(
         parent_id, parent_publish_at=parent_publish_at, delays=delays,
         order=order,
     )
-    if not preview["rows"] and parent_publish_at is None:
+    if preview.get("anchor_publish_at") is None:
+        raise ValueError(
+            "Parent has no publish time set; pick one to schedule the batch."
+        )
+    if not preview["rows"]:
         raise ValueError("No promo children eligible for scheduling")
-    if not all(r["ready"] for r in preview["rows"]):
-        not_ready = [r["video_id"] for r in preview["rows"] if not r["ready"]]
+
+    # Already-scheduled children are kept at their existing times by the
+    # preview and are NOT rewritten here: rewriting would needlessly
+    # re-stage their social jobs and clear any publish_at_manual pin the
+    # user set. Only freshly-computed rows get written.
+    to_write = [r for r in preview["rows"] if not r.get("already_scheduled")]
+
+    if not all(r["ready"] for r in to_write):
+        not_ready = [r["video_id"] for r in to_write if not r["ready"]]
         raise ValueError(
             "Some children aren't ready to schedule: " + ", ".join(not_ready)
         )
@@ -1768,7 +1902,7 @@ async def schedule_promo_batch(
     db = await get_db()
 
     scheduled: list[dict] = []
-    if parent_publish_at is not None and parent_info.get("status") != "published":
+    if parent_publish_at is not None and not parent_info.get("already_published"):
         await schedule_publish(parent_id, parent_publish_at)
         # Schedule-all batches are auto-anchored; mark the parent so a
         # future cascade still moves it.
@@ -1781,21 +1915,34 @@ async def schedule_promo_batch(
             "video_id": parent_id, "publish_at": parent_publish_at.isoformat(),
         })
 
-    for row in preview["rows"]:
+    # schedule_publish commits internally, so the batch isn't a single
+    # transaction. A per-child failure is recorded rather than aborting —
+    # the operation is idempotent, so re-running resumes the chain.
+    errors: list[dict] = []
+    for row in to_write:
         target = _parse_iso_datetime(row["target_time"])
         if not target:
             continue
-        await schedule_publish(row["video_id"], target)
-        # Batch-scheduled children are "auto", not "manual"; the
-        # cascade routines will sweep them on the next parent move.
-        await db.execute(
-            "UPDATE videos SET publish_at_manual = 0 WHERE id = ?",
-            (row["video_id"],),
-        )
-        await db.commit()
+        try:
+            await schedule_publish(row["video_id"], target)
+            # Batch-scheduled children are "auto", not "manual"; the
+            # cascade routines will sweep them on the next parent move.
+            await db.execute(
+                "UPDATE videos SET publish_at_manual = 0 WHERE id = ?",
+                (row["video_id"],),
+            )
+            await db.commit()
+        except Exception as exc:
+            # Collect and keep going — don't strand the rest of the batch.
+            errors.append({"video_id": row["video_id"], "error": str(exc)})
+            continue
         scheduled.append({
             "video_id": row["video_id"],
             "publish_at": target.isoformat(),
         })
 
-    return {"scheduled": scheduled, "warnings": preview["warnings"]}
+    return {
+        "scheduled": scheduled,
+        "errors": errors,
+        "warnings": preview["warnings"],
+    }

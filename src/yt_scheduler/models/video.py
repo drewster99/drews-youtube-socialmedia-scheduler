@@ -18,6 +18,7 @@ class Video(BaseModel):
     id: str
     project_id: int | None = None
     title: str
+    episode_number: int | None = None
     description: str = ""
     tags: list[str] = Field(default_factory=list)
     privacy_status: PrivacyStatus = "unlisted"

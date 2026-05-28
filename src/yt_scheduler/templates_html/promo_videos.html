@@ -25,7 +25,7 @@
     <div id="schedule-all-parent" style="margin: 0.5rem 0;"></div>
     <div id="schedule-all-delays"></div>
     <p class="form-hint" id="schedule-all-reorder-hint" style="margin: 0.5rem 0 0.25rem; display:none;">
-        Drag rows to reorder — the schedule recomputes in the new order.
+        Drag rows within a tier to change their publish order — the schedule recomputes.
     </p>
     <div id="schedule-all-rows"></div>
     <div id="schedule-all-span" class="form-hint" style="margin: 0.5rem 0;"></div>
@@ -113,6 +113,32 @@ function escapeHtml(s) {
         .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
+// SQLite stores timestamps without a timezone marker; treat them as UTC
+// so Date() doesn't apply the browser's local offset to a naive string.
+function _ensureUtc(iso) {
+    if (typeof iso !== 'string') return iso;
+    if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(iso) && !/(?:Z|[+-]\d\d:?\d\d)$/.test(iso)) {
+        return iso.replace(' ', 'T') + 'Z';
+    }
+    return iso;
+}
+
+// Matches the dashboard's scheduled-time format: "Mon 4/27 2:30pm".
+function fmtScheduledWhen(iso) {
+    const d = new Date(_ensureUtc(iso));
+    if (Number.isNaN(d.getTime())) return iso;
+    const dow = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()];
+    const sameYear = d.getFullYear() === new Date().getFullYear();
+    const datePart = sameYear
+        ? `${d.getMonth() + 1}/${d.getDate()}`
+        : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    let h = d.getHours();
+    const m = String(d.getMinutes()).padStart(2, '0');
+    const ampm = h >= 12 ? 'pm' : 'am';
+    h = h % 12 || 12;
+    return `${dow} ${datePart} ${h}:${m}${ampm}`;
+}
+
 function progressStripFor(state, lastError) {
     if (!state) return '';
     if (state === 'ready') {
@@ -136,6 +162,23 @@ function progressStripFor(state, lastError) {
     return `<div class="promo-progress promo-progress-active"><span class="spinner-dot"></span> ${escapeHtml(label)}</div>`;
 }
 
+// Pick the most informative status strip for a promo card. Auto-action
+// progress wins while the chain is still running; otherwise published /
+// scheduled trump the generic "Ready" so the user can see *when*.
+function statusStripFor(child) {
+    const state = child.auto_action_state;
+    if (state && state !== 'ready') {
+        return progressStripFor(state, child.auto_action_last_error || null);
+    }
+    if ((child.status || '').toLowerCase() === 'published') {
+        return '<div class="promo-progress promo-progress-published">Published</div>';
+    }
+    if (child.publish_at) {
+        return `<div class="promo-progress promo-progress-scheduled">⏰ Scheduled: <strong>${escapeHtml(fmtScheduledWhen(child.publish_at))}</strong></div>`;
+    }
+    return progressStripFor(state, child.auto_action_last_error || null);
+}
+
 function renderChildCard(child) {
     const state = child.auto_action_state;
     const ready = state === 'ready' || state == null;
@@ -143,28 +186,55 @@ function renderChildCard(child) {
     const thumb = child.thumbnail_url
         ? `<img src="${escapeHtml(child.thumbnail_url)}" alt="${escapeHtml(child.title)}">`
         : '<div class="thumb-placeholder">No thumbnail</div>';
+    // Whole card is the link (matches the dashboard) so a click anywhere
+    // on the thumbnail or the info pane opens the detail page. The Retry
+    // button inside stops propagation so it doesn't also navigate.
     return `
-        <div class="video-card promo-card${editable}" data-child-id="${escapeHtml(child.id)}">
-            <a href="/projects/${escapeHtml(projectSlug)}/videos/${escapeHtml(child.id)}" class="video-thumb">${thumb}</a>
+        <a href="/projects/${escapeHtml(projectSlug)}/videos/${escapeHtml(child.id)}"
+           class="video-card promo-card${editable}" data-child-id="${escapeHtml(child.id)}">
+            <div class="video-thumb">${thumb}</div>
             <div class="video-info">
                 <h3>${escapeHtml(child.title)}</h3>
-                ${progressStripFor(state, child.auto_action_last_error || null)}
+                ${statusStripFor(child)}
                 <div class="video-meta">
                     <span class="badge badge-type-${escapeHtml(child.item_type || 'short')}">${escapeHtml(child.item_type || 'short')}</span>
                     ${child.tier ? `<span class="badge badge-tier-${escapeHtml(child.tier)}">${escapeHtml(child.tier)}</span>` : ''}
                 </div>
             </div>
-        </div>
+        </a>
     `;
 }
 
 function renderUploadJobCard(job) {
+    // Upload-job failures are pre-video-row, so there's nothing to
+    // retry against in the DB — render Dismiss instead of Retry so the
+    // card doesn't silently vanish on failure (it used to be auto-evicted
+    // from activeJobs, which left the user with no clue what went wrong).
+    const failed = typeof job.state === 'string' && job.state.startsWith('failed:');
+    let strip;
+    if (failed) {
+        const failedStep = job.state.slice('failed:'.length);
+        const stepLabel = PROMO_STATE_LABELS[failedStep] || failedStep;
+        const errorMsg = job.last_error
+            ? `<div class="promo-error-msg">${escapeHtml(job.last_error)}</div>` : '';
+        strip = `
+            <div class="promo-progress promo-progress-failed">
+                Failed at: ${escapeHtml(stepLabel)}
+                ${errorMsg}
+                <button class="btn btn-sm btn-secondary promo-dismiss-btn"
+                        data-dismiss-job="${escapeHtml(job.job_id)}">
+                    Dismiss
+                </button>
+            </div>`;
+    } else {
+        strip = progressStripFor(job.state, job.last_error || null);
+    }
     return `
         <div class="video-card promo-card promo-card-locked" data-job-id="${escapeHtml(job.job_id)}">
-            <div class="video-thumb"><div class="thumb-placeholder">Uploading…</div></div>
+            <div class="video-thumb"><div class="thumb-placeholder">${failed ? 'Upload failed' : 'Uploading…'}</div></div>
             <div class="video-info">
                 <h3>${escapeHtml(job.title || job.filename || 'New promo')}</h3>
-                ${progressStripFor(job.state, job.last_error || null)}
+                ${strip}
             </div>
         </div>
     `;
@@ -198,7 +268,11 @@ async function loadPromos() {
 
 function bindRetryButtons() {
     for (const btn of document.querySelectorAll('[data-retry-step]')) {
-        btn.addEventListener('click', async () => {
+        btn.addEventListener('click', async (e) => {
+            // The card itself is a link now — keep a Retry click from
+            // also navigating to the detail page.
+            e.preventDefault();
+            e.stopPropagation();
             const card = btn.closest('[data-child-id]');
             if (!card) return;
             const videoId = card.getAttribute('data-child-id');
@@ -211,6 +285,14 @@ function bindRetryButtons() {
             setTimeout(loadPromos, 1500);
         });
     }
+    for (const btn of document.querySelectorAll('[data-dismiss-job]')) {
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            activeJobs.delete(btn.getAttribute('data-dismiss-job'));
+            loadPromos();
+        });
+    }
 }
 
 async function pollUploadJobs() {
@@ -218,6 +300,10 @@ async function pollUploadJobs() {
     const toDelete = [];
     let anyStateChange = false;
     for (const [jobId, job] of activeJobs) {
+        // Failed jobs don't change server-side — no point re-fetching.
+        if (typeof job.state === 'string' && job.state.startsWith('failed:')) {
+            continue;
+        }
         try {
             const resp = await fetch(
                 `/api/projects/${projectSlug}/videos/${parentId}/promos/upload-jobs/${encodeURIComponent(jobId)}`,
@@ -240,7 +326,11 @@ async function pollUploadJobs() {
                 job.title = data.title || job.title;
                 anyStateChange = true;
             }
-            if (data.state && (data.state === 'ready' || data.state.startsWith('failed:'))) {
+            // Drop on success only. A failed job has no DB-backed card to
+            // fall back on, so evicting it here is what made errors
+            // silently disappear from the UI. Keep it until the user
+            // hits Dismiss (or the server forgets it, returning 404 above).
+            if (data.state === 'ready') {
                 toDelete.push(jobId);
             }
         } catch (e) { /* swallow; we'll retry next tick */ }
@@ -329,9 +419,10 @@ for (const list of document.querySelectorAll('.promo-grid')) {
 let pollTimer = null;
 function scheduleNextPoll() {
     if (pollTimer) clearTimeout(pollTimer);
-    const anyActive = document.querySelector(
-        '.promo-progress-active, [data-job-id]'
-    ) || activeJobs.size > 0;
+    // `.promo-progress-active` only matches in-flight cards (failed +
+    // ready use different classes), so a wholly-failed batch backs off
+    // to the slow tick instead of polling forever.
+    const anyActive = !!document.querySelector('.promo-progress-active');
     const delay = anyActive ? 3000 : 15000;
     pollTimer = setTimeout(async () => {
         await pollUploadJobs();
@@ -364,6 +455,14 @@ function fmtDateTime(iso) {
     return d.toLocaleString();
 }
 
+// Surface a failed incremental preview in the modal's warnings strip.
+// The next successful renderPreview() overwrites this container, so the
+// message clears itself once the preview recovers.
+function showPreviewError(msg) {
+    const warnEl = document.getElementById('schedule-all-warnings');
+    warnEl.innerHTML = `<div class="banner banner-error">${escapeHtml(msg)}</div>`;
+}
+
 // Preview is a POST: the body carries the modal-edited delays and the
 // drag-reordered sequence, neither of which fits cleanly in a query.
 async function fetchPreview() {
@@ -387,6 +486,11 @@ async function fetchPreview() {
 
 function renderReadinessChip(row) {
     if (row.already_published) return '<span class="badge badge-published">Published</span>';
+    // Already-scheduled rows are kept at their existing time and are
+    // NOT rewritten on confirm (schedule_promo_batch filters them out).
+    // Surface that so the user knows which rows are static context vs
+    // which ones the batch will actually write.
+    if (row.already_scheduled) return '<span class="badge badge-scheduled">Scheduled</span>';
     if (row.ready) return '<span class="badge badge-published">Ready</span>';
     const missing = (row.missing || []).join(', ');
     return `<span class="badge badge-error" title="${escapeHtml(missing)}">Not ready</span>`;
@@ -433,7 +537,10 @@ document.getElementById('schedule-all-delays').addEventListener('change', async 
         : e.target.value;
     try {
         renderPreview(await fetchPreview());
-    } catch (err) { /* swallow — the field keeps the typed value */ }
+    } catch (err) {
+        // The field keeps the typed value; surface why the preview stalled.
+        showPreviewError(`Couldn't update the preview: ${err}`);
+    }
 });
 
 function renderPreview(preview) {
@@ -473,7 +580,9 @@ function renderPreview(preview) {
                 : null;
             try {
                 renderPreview(await fetchPreview());
-            } catch (err) { /* swallow */ }
+            } catch (err) {
+                showPreviewError(`Couldn't update the preview: ${err}`);
+            }
         });
     }
 
@@ -506,7 +615,10 @@ function renderPreview(preview) {
         ? `Ends ${fmtDateTime(preview.total_span)}.`
         : '';
 
-    const anyMissing = rows.some(r => !r.ready) || (!p.already_published && !p.ready);
+    // Already-scheduled rows are kept as-is and not rewritten on commit,
+    // so their readiness doesn't gate the batch.
+    const anyMissing = rows.some(r => !r.ready && !r.already_scheduled)
+        || (!p.already_published && !p.ready);
     const anyMissingTime = rows.some(r => !r.target_time);
     scheduleAllConfirm.disabled = anyMissing || anyMissingTime;
 }
@@ -544,7 +656,9 @@ async function onRowDrop(e) {
     dragFromIndex = null;
     try {
         renderPreview(await fetchPreview());
-    } catch (err) { /* swallow */ }
+    } catch (err) {
+        showPreviewError(`Couldn't update the preview: ${err}`);
+    }
 }
 
 scheduleAllBtn.addEventListener('click', async () => {
@@ -603,8 +717,22 @@ scheduleAllForm.addEventListener('submit', async (e) => {
             banner.textContent = `Schedule failed: ${err}`;
             banner.style.display = '';
         } else {
-            scheduleAllModal.close();
+            const result = await resp.json();
+            const errs = result.errors || [];
             await loadPromos();
+            if (errs.length) {
+                // Partial success: some children failed to schedule. Keep
+                // the modal open and refresh — the ones that succeeded now
+                // show as already-scheduled, so a re-run retries the rest.
+                try {
+                    renderPreview(await fetchPreview());
+                } catch (err) { /* fall through to the message below */ }
+                showPreviewError(
+                    `Scheduled ${(result.scheduled || []).length}, but `
+                    + `${errs.length} failed — re-run to retry.`);
+            } else {
+                scheduleAllModal.close();
+            }
         }
     } finally {
         scheduleAllConfirm.disabled = false;
@@ -622,6 +750,8 @@ scheduleAllForm.addEventListener('submit', async (e) => {
 .promo-progress { margin: 0.4rem 0; font-size: 0.85em; padding: 0.35rem 0.5rem; border-radius: 4px; }
 .promo-progress-active { background: rgba(74,144,226,0.12); color: var(--accent, #4a90e2); }
 .promo-progress-ready { background: rgba(60,180,75,0.12); color: var(--success, #3cb44b); }
+.promo-progress-published { background: rgba(60,180,75,0.18); color: var(--success, #3cb44b); font-weight: 600; }
+.promo-progress-scheduled { background: rgba(139,92,246,0.15); color: #b39bff; }
 .promo-progress-failed { background: rgba(220,80,80,0.12); color: var(--error, #d44); }
 .promo-error-msg { margin: 0.3rem 0; font-size: 0.85em; opacity: 0.85; }
 .promo-retry-btn { margin-top: 0.3rem; }

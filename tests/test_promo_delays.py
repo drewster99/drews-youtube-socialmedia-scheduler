@@ -52,7 +52,11 @@ def test_promo_delays_to_timedeltas_falls_back_on_missing() -> None:
         _promo_delays_to_timedeltas,
     )
 
-    assert _promo_delays_to_timedeltas(None) is DEFAULT_PROMO_DELAYS
+    # Falls back to the defaults by value — but as a fresh copy, never
+    # the shared module-level dict (so a mutating caller can't corrupt it).
+    fallback = _promo_delays_to_timedeltas(None)
+    assert fallback == DEFAULT_PROMO_DELAYS
+    assert fallback is not DEFAULT_PROMO_DELAYS
     # A tier with a malformed field falls back to that tier's default.
     td = _promo_delays_to_timedeltas({"hook": {"initial": "bogus"}})
     assert td["hook"]["initial"] == DEFAULT_PROMO_DELAYS["hook"]["initial"]

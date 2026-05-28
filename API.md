@@ -705,13 +705,13 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 
 ### `PUT /api/videos/{video_id}`
 
-**Purpose** — Update video metadata (title, description, tags, privacy, publish time, pinned links, status, manual tier override).
+**Purpose** — Update video metadata (title, description, tags, privacy, publish time, pinned links, status, manual tier override, optional episode number).
 
-**Request body** — Object with any subset of: `title`, `description`, `tags` (list), `privacy_status`, `publish_at`, `pinned_links`, `status`, `tier`.
+**Request body** — Object with any subset of: `title`, `description`, `tags` (list), `privacy_status`, `publish_at`, `pinned_links`, `status`, `tier`, `episode_number`. `episode_number` is local-only metadata (never sent to YouTube); `null` or `""` clears the value.
 
 **Response 200** — `{"status": "ok"}`.
 
-**Errors** — `404` (no local row), `400` (invalid `tier` value — must be one of `hook`, `short`, `segment`, `video`, `null`, or `""`), `500` (YouTube update failed).
+**Errors** — `404` (no local row), `400` (invalid `tier` value — must be one of `hook`, `short`, `segment`, `video`, `null`, or `""`; or `episode_number` not coercible to an integer), `500` (YouTube update failed).
 
 **Side effects** — Calls `youtube.update_video_metadata` (50 quota), reads back via `youtube.get_video` to capture any silent coercion (privacy clamp, tag truncation), writes confirmed values to the DB, and records a `metadata_updated` event with a per-field `{old, new}` diff for changed tracked fields. When the body includes `publish_at`, that field is **not** written directly — it routes through `services/scheduler.apply_user_reschedule(...)` so the APScheduler `publish_<video_id>` job actually re-registers, `publish_at_manual` flips to `1`, and the promo cascade fires (children-of-parent when the row is a primary, same-tier siblings when the row is a child).
 
@@ -871,6 +871,28 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 **Cascades** — **Cancels every pending per-post job for this video.** All `social_posts` rows with `scheduler_job_id IS NOT NULL` go through `cancel_scheduled_post()`: their APScheduler `DateTrigger` is removed and `scheduled_at` / `scheduler_job_id` are nulled. Already-posted rows are unaffected (their `scheduler_job_id` is already NULL).
 
 **Side effects** — Removes the publish APScheduler job and all per-post jobs (see Cascades); clears `videos.publish_at`; resets `videos.status` to `'ready'`.
+
+### `POST /api/videos/{video_id}/schedule-social`
+
+**Purpose** — Stagger this video's approved social posts on a chosen timeline **without** touching the video itself. For use when the video is already public and only the social fan-out needs scheduling.
+
+**Request body** — `{"first_post_at": "2026-04-25T14:00:00-07:00", "spacing_minutes": 60}`. `first_post_at` is ISO 8601, must be in the future, naive datetimes treated as UTC. `spacing_minutes` is optional (≥ 0, integer); when omitted, the project's `inter_post_spacing_minutes` setting is used. The override is per-batch — the project setting is not mutated.
+
+**Response 200** — `{"status": "ok", "scheduled": <int>, "first_post_at": "<iso>", "spacing_minutes": <int|null>}`. `scheduled` is the number of approved posts a job was registered for; `0` means there were no approved posts. `spacing_minutes` echoes the override the caller sent (or `null` when it wasn't supplied).
+
+**Errors** — `400` on missing/invalid `first_post_at`, a past time, or a non-integer / negative `spacing_minutes`; `404` if the video doesn't exist.
+
+**Behavior** — Cancels every pre-existing pending per-post job for this video (rows with `scheduler_job_id IS NOT NULL`) via `cancel_scheduled_post()`, then re-schedules every `approved` post anchored at `first_post_at` and spaced by either the supplied `spacing_minutes` or the project's `inter_post_spacing_minutes`. Unlike the video-level `POST /api/videos/{video_id}/schedule` flow, **`post_video_delay_minutes` is intentionally ignored** here — "wait X minutes after the video goes live" has no meaning once the video is already live, so the picked time IS when the first approved post fires.
+
+**Side effects** — Per-post `social_posts` rows get `scheduled_at`/`scheduler_job_id` set by `schedule_social_post`; **`videos.publish_at` and `videos.status` are NOT touched.** Records one `social_post_scheduled` event per re-attached post.
+
+### `DELETE /api/videos/{video_id}/schedule-social`
+
+**Purpose** — Cancel every pending per-post job for the video without touching the video's own `publish_at`/`status`. Pairs with `POST .../schedule-social` for the already-published case where `DELETE .../schedule` would also un-publish the video (reset `status='ready'`, null `publish_at`).
+
+**Response 200** — `{"status": "ok", "cancelled": <int>}` where `cancelled` is the number of per-post jobs actually torn down (`0` is not an error).
+
+**Side effects** — Calls `cancel_scheduled_post()` for each row with `scheduler_job_id IS NOT NULL`: their APScheduler `DateTrigger` is removed and `scheduled_at`/`scheduler_job_id` are nulled. Already-posted rows are unaffected. The video row itself is not modified.
 
 ### `GET /api/videos/{video_id}/captions`
 
@@ -1967,18 +1989,18 @@ Bulk-upload promo children under a primary video. Each upload runs through the m
 
 **Request body** (all optional) — `{"parent_publish_at": "ISO 8601", "delays": {<per-tier {value,unit} overrides, same shape as `promo-delays`>}, "order": ["<video_id>", ...]}`. `parent_publish_at` is only honoured when the parent has no `publish_at` and isn't published. `delays` overrides the project's saved per-tier delays for this computation; when omitted, the saved delays are used. `order` is an explicit video-id sequence (from drag-reordering) — children within each tier are sequenced by their index in it.
 
-**Response 200** — `{"parent": {"id","title","publish_at","status","already_published","ready","missing"}, "rows": [{"video_id","title","item_type","tier","target_time","ready","missing"}, ...], "total_span": ISO|null, "warnings": [...], "anchor_publish_at": ISO|null}`. Rows sorted by `target_time`; each row's `ready` reflects the same readiness check used by the commit endpoint. `parent.already_published` is true when the parent's app status is `published` **or** it is already public on YouTube (an imported episode that went live outside the app); for such a parent the readiness check and publish-time prompt are skipped and the promo chains anchor from now.
+**Response 200** — `{"parent": {"id","title","publish_at","status","already_published","ready","missing"}, "rows": [{"video_id","title","item_type","tier","target_time","ready","missing","already_scheduled"}, ...], "total_span": ISO|null, "warnings": [...], "anchor_publish_at": ISO|null}`. Rows sorted by `target_time`; each row's `ready` reflects the same readiness check used by the commit endpoint. `already_scheduled` is true for a child that already has a `publish_at` — such rows are shown at their existing time and are left untouched by the commit endpoint (so their readiness does not gate the batch and any manual publish-time pin is preserved). `parent.already_published` is true when the parent's app status is `published` **or** it is already public on YouTube (an imported episode that went live outside the app); for such a parent the readiness check and publish-time prompt are skipped and the promo chains anchor from now.
 
 **Errors** — `404` (project / parent missing), `400` (parent is itself a child, or a malformed `delays` payload).
 
 ### `POST /api/projects/{slug}/videos/{parent_id}/promos/schedule-all`
 
-**Purpose** — Commit the batch from the preview modal. Calls `schedule_publish` for each eligible child (and for the parent when `parent_publish_at` is supplied and the parent isn't already published).
+**Purpose** — Commit the batch from the preview modal. Calls `schedule_publish` for each freshly-computed child (and for the parent when `parent_publish_at` is supplied and the parent isn't already published). Children that are already scheduled (`already_scheduled` in the preview) are left untouched.
 
 **Request body** (all optional) — `{"parent_publish_at": "ISO 8601", "delays": {<per-tier {value,unit} overrides>}, "order": ["<video_id>", ...]}`. Same `delays` / `order` semantics as the preview. A supplied `delays` is additionally saved as the project's `promo_delays` default so the next batch keeps the same pace.
 
-**Response 200** — `{"scheduled": [{"video_id", "publish_at"}, ...], "warnings": [...]}`.
+**Response 200** — `{"scheduled": [{"video_id", "publish_at"}, ...], "errors": [{"video_id", "error"}, ...], "warnings": [...]}`. `schedule_publish` commits per child, so the batch is not a single transaction; a per-child write failure is reported in `errors` rather than aborting the batch. The operation is idempotent — re-running resumes the chain from whatever was already scheduled.
 
-**Errors** — `404` (project / parent missing), `400` (parent is itself a child / readiness gates fail / no eligible children / malformed `delays`).
+**Errors** — `404` (project / parent missing), `400` (parent is itself a child / parent has no publish time / readiness gates fail / no eligible children / malformed `delays`).
 
 **Side effects** — For each scheduled video: writes `videos.publish_at`, sets `videos.status='scheduled'`, registers the APScheduler `publish_video_job` (which also re-stages per-post social jobs), and stamps `publish_at_manual = 0` so future cascade routines may sweep these rows.
