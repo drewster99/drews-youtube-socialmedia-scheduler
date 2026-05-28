@@ -721,10 +721,15 @@ async def schedule_publish(video_id: str, publish_at: datetime) -> str:
                 r["id"], video_id, exc,
             )
 
-    logger.info(
-        "Scheduled video %s for %s + %d posts (delay=%dm, spacing=%dm)",
-        video_id, publish_at.isoformat(), attached_count, delay_min, spacing_min,
-    )
+    if attached_count:
+        logger.info(
+            "Scheduled video %s for %s + %d posts (delay=%dm, spacing=%dm)",
+            video_id, publish_at.isoformat(), attached_count, delay_min, spacing_min,
+        )
+    else:
+        logger.info(
+            "Scheduled video %s for %s", video_id, publish_at.isoformat(),
+        )
     return job_id
 
 

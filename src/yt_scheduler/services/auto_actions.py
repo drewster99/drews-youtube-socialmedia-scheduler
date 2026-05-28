@@ -676,9 +676,14 @@ async def _run_promo_chain(job_id: str) -> None:
             parent_tags=parent_ctx.get("tags", ""),
         )
     except Exception as exc:
-        logger.info(
-            "AI title failed for %s, using deterministic fallback: %s",
-            job["filename"], exc,
+        # Log the local on-disk path alongside the user-facing filename so
+        # "file not found" failures can be diagnosed without guessing which
+        # path the error refers to (the on-disk path is always app-chosen
+        # and has no spaces; the original filename does).
+        logger.warning(
+            "AI title failed for %s (local_path=%s), using deterministic fallback: %r",
+            job["filename"], job.get("local_path"), exc,
+            exc_info=True,
         )
         title = ai.fallback_title_from_filename(job["filename"])
     job["title"] = title
@@ -698,8 +703,12 @@ async def _run_promo_chain(job_id: str) -> None:
         )
     except Exception as exc:
         job["state"] = f"failed:{PROMO_STATE_UPLOADING}"
-        job["last_error"] = str(exc)[:500]
-        logger.warning("Promo YT upload failed for %s: %s", job["filename"], exc)
+        job["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+        logger.warning(
+            "Promo YT upload failed for %s (local_path=%s): %r",
+            job["filename"], local_path, exc,
+            exc_info=True,
+        )
         return
 
     video_id = result["id"]
