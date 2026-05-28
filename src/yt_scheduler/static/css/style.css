@@ -1189,9 +1189,17 @@ body {
 }
 .project-card-wrap {
     position: relative;
+    /* Fill the grid row so the wrap stretches to the tallest sibling. */
+    height: 100%;
 }
 .project-card {
-    display: block;
+    /* Flex column + height:100% lets cards without a banner stretch to
+       match cards that have one — without it the grid row stretches the
+       wrap but the inner card stays its natural (shorter) height and
+       looks ragged next to a banner-bearing sibling. */
+    display: flex;
+    flex-direction: column;
+    height: 100%;
     padding: 1rem;
     background: var(--bg-card);
     border: 1px solid var(--border);
