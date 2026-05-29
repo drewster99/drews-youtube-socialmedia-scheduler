@@ -113,6 +113,73 @@ def test_validate_drops_out_of_parent_bounds():
     assert titles == ["ok"]
 
 
+def test_evict_stale_upload_jobs_drops_old_failures():
+    """Failed upload jobs past the TTL get evicted; in-progress + fresh
+    failures stay."""
+    import time
+
+    from yt_scheduler.services import auto_actions
+
+    auto_actions._UPLOAD_JOBS.clear()
+    auto_actions._UPLOAD_JOBS["fresh"] = {
+        "state": "failed:cutting",
+        "_failed_at": time.monotonic(),  # right now
+    }
+    auto_actions._UPLOAD_JOBS["stale"] = {
+        "state": "failed:cutting",
+        "_failed_at": (
+            time.monotonic() - auto_actions._UPLOAD_JOB_FAILED_TTL_SECONDS - 1
+        ),
+    }
+    auto_actions._UPLOAD_JOBS["alive"] = {
+        "state": "transcribing",
+    }
+    auto_actions._evict_stale_upload_jobs()
+    assert "fresh" in auto_actions._UPLOAD_JOBS
+    assert "stale" not in auto_actions._UPLOAD_JOBS
+    assert "alive" in auto_actions._UPLOAD_JOBS
+    auto_actions._UPLOAD_JOBS.clear()
+
+
+def test_mark_upload_failed_stamps_state_and_timestamp():
+    import time
+    from yt_scheduler.services import auto_actions
+
+    job: dict = {}
+    auto_actions._mark_upload_failed(job, "failed:uploading", error="boom")
+    assert job["state"] == "failed:uploading"
+    assert job["last_error"] == "boom"
+    assert isinstance(job["_failed_at"], float)
+    assert abs(job["_failed_at"] - time.monotonic()) < 1.0
+
+
+def test_evict_stale_generate_jobs_drops_old_terminals():
+    import time
+
+    from yt_scheduler.services import clipper
+
+    clipper._GENERATE_JOBS.clear()
+    clipper._GENERATE_JOBS["gen_fresh"] = {
+        "state": "done",
+        "_terminal_at": time.monotonic(),
+    }
+    clipper._GENERATE_JOBS["gen_stale"] = {
+        "state": "done",
+        "_terminal_at": (
+            time.monotonic() - clipper._GENERATE_JOB_TTL_SECONDS - 1
+        ),
+    }
+    clipper._GENERATE_JOBS["gen_active"] = {
+        "state": "proposing",
+        "_terminal_at": None,
+    }
+    clipper._evict_stale_generate_jobs()
+    assert "gen_fresh" in clipper._GENERATE_JOBS
+    assert "gen_stale" not in clipper._GENERATE_JOBS
+    assert "gen_active" in clipper._GENERATE_JOBS
+    clipper._GENERATE_JOBS.clear()
+
+
 def test_validate_drops_nan_and_inf():
     """NaN compares False to every numeric bound, would slip past the
     range guards and crash _format_ffmpeg_timestamp downstream."""
