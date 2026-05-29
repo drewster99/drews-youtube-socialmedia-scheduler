@@ -671,9 +671,18 @@ async def retry_promo_step(video_id: str, step: str) -> None:
     video = dict(rows[0])
     project_id = int(video.get("project_id") or 1)
     await _set_promo_state(video_id, step, error=None)
-    task = asyncio.create_task(
-        _resume_promo_chain(video_id, project_id, start_step=step)
-    )
+
+    async def _gated_resume() -> None:
+        # Retries enter the chain mid-stream, but the rest of the chain
+        # (Claude calls, ffmpeg keyframe extraction, YouTube metadata)
+        # is exactly what _PROMO_CHAIN_SEMAPHORE was sized to throttle.
+        # Without this gate a user who mass-retries 12 failed cards
+        # fan-outs 12 simultaneous chains and we lose the cap the new-
+        # upload entrypoint installed.
+        async with _PROMO_CHAIN_SEMAPHORE:
+            await _resume_promo_chain(video_id, project_id, start_step=step)
+
+    task = asyncio.create_task(_gated_resume())
     _pending_tasks.add(task)
     task.add_done_callback(_pending_tasks.discard)
 
