@@ -389,6 +389,10 @@
 <dialog id="file-info-modal" class="modal">
     <h3>Local video file</h3>
     <div class="form-group">
+        <label>Source</label>
+        <div id="fi-origin" class="fi-value">—</div>
+    </div>
+    <div class="form-group">
         <label>Uploaded as</label>
         <div id="fi-original" class="fi-value">—</div>
     </div>
@@ -399,10 +403,41 @@
             ⚠ This file is no longer on disk.
         </div>
     </div>
+    <div class="form-group">
+        <label>Technical</label>
+        <div id="fi-tech" class="fi-value">—</div>
+    </div>
+    <div class="form-group" id="fi-playable-row" style="display:none;">
+        <label>Browser preview</label>
+        <div id="fi-playable" class="fi-value">—</div>
+    </div>
+    <div class="form-group" id="fi-warnings-row" style="display:none;">
+        <label>Source quality</label>
+        <ul id="fi-warnings" class="fi-warnings"></ul>
+    </div>
+    <p class="form-hint" style="margin-top: 0.6rem;">
+        Replacing the source updates the local file used for clip
+        generation and other on-device tasks only. The video on YouTube
+        isn't affected — YouTube doesn't allow replacing an uploaded file.
+    </p>
+    <input type="file" id="fi-replace-input" accept="video/*" style="display:none;">
     <div class="modal-actions">
         <button type="button" class="btn" id="fi-copy">Copy path</button>
         <button type="button" class="btn" id="fi-reveal">Reveal in Finder</button>
+        <button type="button" class="btn btn-secondary" id="fi-replace">Replace source</button>
         <button type="button" class="btn btn-primary" id="fi-close">Close</button>
+    </div>
+    <div id="fi-replace-status" class="form-hint" style="display:none; margin-top: 0.5rem;"></div>
+    <progress id="fi-replace-progress" value="0" max="100" style="display:none; width: 100%; margin-top: 0.3rem;"></progress>
+</dialog>
+
+<dialog id="fi-force-modal" class="modal">
+    <h3 id="fi-force-title">Sanity check failed</h3>
+    <div id="fi-force-body" style="white-space: pre-wrap; margin-bottom: 0.6rem;"></div>
+    <p id="fi-force-warning" class="form-hint" style="color: var(--danger); display:none;"></p>
+    <div class="modal-actions">
+        <button type="button" class="btn" id="fi-force-cancel">Cancel</button>
+        <button type="button" class="btn btn-primary" id="fi-force-confirm">Attach anyway</button>
     </div>
 </dialog>
 {% endblock %}
@@ -764,22 +799,40 @@ async function loadVideo() {
     let fileHtml;
     if (video.video_file_url) {
         // Show the name the file was uploaded with (on-disk names are now
-        // canonical <id>.<ext>); the pill opens a details popup.
+        // canonical <id>.<ext>); the pill opens a details popup. The
+        // origin tag (YT-DL / master) lets the user see at a glance
+        // whether the file is a lossy YouTube re-download or the user's
+        // own master — important because clip cuts inherit fidelity from
+        // whatever the local file is.
         const shown = video.video_file_original_name || video.video_file_name || 'video file';
-        fileHtml = `<button type="button" class="badge badge-published file-pill" id="local-file-pill" title="Click for file details">🎬 local file: ${escapeHtml(shown)}</button>`;
+        let originTag = '';
+        let originTitle = 'Click for file details';
+        if (video.source_file_origin === 'youtube_download') {
+            originTag = ` <span class="file-pill-tag file-pill-tag-yt">YT-DL</span>`;
+            originTitle = 'Re-downloaded from YouTube (lossy). Click for details / replace with master.';
+        } else if (video.source_file_origin === 'user_attached') {
+            originTag = ` <span class="file-pill-tag file-pill-tag-master">master</span>`;
+            originTitle = 'User-attached master. Click for details.';
+        }
+        fileHtml = `<button type="button" class="badge badge-published file-pill" id="local-file-pill" title="${originTitle}">🎬 local file: ${escapeHtml(shown)}${originTag}</button>`;
     } else if (dlState === 'in_progress') {
         fileHtml = `<span class="badge badge-draft">⬇︎ downloading video from YouTube…</span>`;
     } else if (dlState === 'unavailable') {
-        fileHtml = `<span class="badge badge-error" title="Private or age-gated on YouTube">⚠ download blocked — video is private on YouTube</span>`;
+        fileHtml = `<span class="badge badge-error" title="Private or age-gated on YouTube">⚠ download blocked — video is private on YouTube</span>`
+                 + ` <button type="button" class="btn btn-sm" id="btn-attach-source">Attach source</button>`;
     } else if (dlState === 'failed') {
-        fileHtml = `<span class="badge badge-error">⚠ video download failed — try Transcribe to retry</span>`;
+        fileHtml = `<span class="badge badge-error">⚠ video download failed — try Transcribe to retry</span>`
+                 + ` <button type="button" class="btn btn-sm" id="btn-attach-source">Attach source</button>`;
     } else {
-        fileHtml = `<span class="form-hint">no local video file — {{ '{{video}}' }} won't attach</span>`;
+        fileHtml = `<span class="form-hint">no local video file — {{ '{{video}}' }} won't attach</span>`
+                 + ` <button type="button" class="btn btn-sm" id="btn-attach-source">Attach source</button>`;
     }
     fileRow.innerHTML = fileHtml;
     fileRow.style.display = 'flex';
     const filePill = document.getElementById('local-file-pill');
     if (filePill) filePill.addEventListener('click', openFileInfoModal);
+    const attachBtn = document.getElementById('btn-attach-source');
+    if (attachBtn) attachBtn.addEventListener('click', openFileInfoModal);
     maybePollWhileBusy(video);
 
     // Player
@@ -3012,35 +3065,150 @@ async function addItemVariable() {
 }
 
 // --- Local-file info popup ---------------------------------------------
-// Opened from the local-file pill above the player. Shows the name the
-// file was uploaded with, its current path on this machine, and offers
-// copy-path + reveal-in-Finder (the latter via a server-side endpoint).
+// Opened from the local-file pill above the player (or the "Attach source"
+// button when there's no file yet). Shows where the local file came from,
+// the name it was uploaded with, its current path on this machine, its
+// technical shape, and offers copy-path + reveal-in-Finder + replace.
 let fileInfoPath = '';
+let fileInfoHasFile = false;
+
+const FI_ORIGIN_LABELS = {
+    uploaded: 'Original upload',
+    youtube_download: 'Re-downloaded from YouTube',
+    user_attached: 'Replaced by user',
+};
+
+function formatBytesPretty(n) {
+    if (n == null) return null;
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    let v = Number(n);
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
+    return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
+}
+
+function formatBitratePretty(bps) {
+    if (bps == null) return null;
+    const mbps = bps / 1_000_000;
+    if (mbps >= 1) return `${mbps.toFixed(1)} Mbps`;
+    const kbps = bps / 1000;
+    return `${kbps.toFixed(0)} kbps`;
+}
+
+function formatTechnicalLine(info) {
+    const parts = [];
+    if (info.width && info.height) parts.push(`${info.width}×${info.height}`);
+    if (info.duration_seconds != null) parts.push(formatDuration(info.duration_seconds));
+    const size = formatBytesPretty(info.size_bytes);
+    if (size) parts.push(size);
+    const bitrate = formatBitratePretty(info.bitrate_bps);
+    if (bitrate) parts.push(bitrate);
+    return parts.length ? parts.join(' · ') : '—';
+}
 
 async function openFileInfoModal() {
     const modal = document.getElementById('file-info-modal');
-    document.getElementById('fi-original').textContent = 'Loading…';
+    document.getElementById('fi-origin').textContent = 'Loading…';
+    document.getElementById('fi-original').textContent = '';
     document.getElementById('fi-path').textContent = '';
+    document.getElementById('fi-tech').textContent = '';
     document.getElementById('fi-missing').style.display = 'none';
+    document.getElementById('fi-replace-status').style.display = 'none';
     fileInfoPath = '';
+    fileInfoHasFile = false;
     modal.showModal();
+    await refreshFileInfo();
+}
+
+function formatPlayability(info) {
+    if (!info.has_file || !info.exists) return null;
+    if (info.browser_playable === true) {
+        const codec = info.codec_name ? info.codec_name.toUpperCase() : 'video';
+        return { ok: true, text: `✓ Plays in browser (${codec})` };
+    }
+    if (info.browser_playable === false) {
+        const codec = info.codec_name ? info.codec_name.toUpperCase() : 'codec';
+        return {
+            ok: false,
+            text: `⚠ Won't play in browser (${codec}). Inline preview will fall back to the YouTube embed.`,
+        };
+    }
+    return null;  // unknown codec — say nothing rather than guess
+}
+
+async function refreshFileInfo() {
     try {
         const resp = await fetch(`/api/videos/${videoId}/file-info`);
         if (!resp.ok) throw new Error('file-info failed');
         const info = await resp.json();
+        fileInfoHasFile = !!info.has_file;
+        const originLabel = info.source_origin
+            ? (FI_ORIGIN_LABELS[info.source_origin] || info.source_origin)
+            : (info.has_file ? 'Unknown' : 'No local file yet');
+        document.getElementById('fi-origin').textContent = originLabel;
         document.getElementById('fi-original').textContent =
             info.original_name || info.disk_name || '—';
         document.getElementById('fi-path').textContent = info.server_path || '—';
-        document.getElementById('fi-missing').style.display = info.exists ? 'none' : '';
-        document.getElementById('fi-reveal').style.display = info.can_reveal ? '' : 'none';
+        document.getElementById('fi-missing').style.display = info.has_file && !info.exists ? '' : 'none';
+        document.getElementById('fi-tech').textContent = formatTechnicalLine(info);
+
+        const play = formatPlayability(info);
+        const playRow = document.getElementById('fi-playable-row');
+        if (play) {
+            playRow.style.display = '';
+            const pillEl = document.getElementById('fi-playable');
+            pillEl.textContent = play.text;
+            pillEl.style.color = play.ok ? '' : 'var(--danger)';
+        } else {
+            playRow.style.display = 'none';
+        }
+
+        const warnRow = document.getElementById('fi-warnings-row');
+        const warnList = document.getElementById('fi-warnings');
+        warnList.innerHTML = '';
+        const warnings = info.quality_warnings || [];
+        if (warnings.length) {
+            warnRow.style.display = '';
+            for (const w of warnings) {
+                const li = document.createElement('li');
+                li.textContent = w.message;
+                warnList.appendChild(li);
+            }
+        } else {
+            warnRow.style.display = 'none';
+        }
+
+        document.getElementById('fi-reveal').style.display =
+            info.can_reveal && info.exists ? '' : 'none';
+        document.getElementById('fi-copy').style.display =
+            info.has_file ? '' : 'none';
+        document.getElementById('fi-replace').textContent =
+            info.has_file ? 'Replace source' : 'Attach source';
         fileInfoPath = info.server_path || '';
     } catch (e) {
-        document.getElementById('fi-original').textContent = 'Could not load file info.';
+        document.getElementById('fi-origin').textContent = 'Could not load file info.';
     }
 }
 
-document.getElementById('fi-close').addEventListener('click', () => {
+// In-flight upload XHR — kept on this scope so the Close button can
+// abort it. Replacing a multi-GB master can take minutes; the user
+// expects "Close" to mean "I changed my mind", not "let it finish in
+// the background". xhr.abort() also tells the server to clean up the
+// partial file via the streaming cap.
+let fiReplaceXhr = null;
+
+function closeFileInfoModal() {
+    if (fiReplaceXhr) {
+        try { fiReplaceXhr.abort(); } catch (e) { /* already done */ }
+        fiReplaceXhr = null;
+    }
     document.getElementById('file-info-modal').close();
+}
+
+document.getElementById('fi-close').addEventListener('click', closeFileInfoModal);
+document.getElementById('file-info-modal').addEventListener('cancel', (ev) => {
+    ev.preventDefault();
+    closeFileInfoModal();
 });
 
 document.getElementById('fi-copy').addEventListener('click', async () => {
@@ -3066,5 +3234,152 @@ document.getElementById('fi-reveal').addEventListener('click', async () => {
         showToast('Could not reveal file', 'error');
     }
 });
+
+document.getElementById('fi-replace').addEventListener('click', () => {
+    document.getElementById('fi-replace-input').click();
+});
+
+document.getElementById('fi-replace-input').addEventListener('change', async (ev) => {
+    const input = ev.target;
+    const file = input.files && input.files[0];
+    input.value = '';
+    if (!file) return;
+    await uploadReplacementSource(file, false);
+});
+
+function formatReplacementIssue(issue) {
+    if (issue.code === 'duration_mismatch') {
+        const fmt = (s) => s == null ? '?' : formatDuration(s);
+        return `Length mismatch: this video is ${fmt(issue.expected_seconds)}, `
+             + `the file you picked is ${fmt(issue.incoming_seconds)} `
+             + `(tolerance ±${issue.tolerance_seconds}s).`;
+    }
+    if (issue.code === 'resolution_downgrade') {
+        return `Resolution downgrade: current ${issue.current}, incoming ${issue.incoming}.`;
+    }
+    return issue.code;
+}
+
+function promptForceReplacement(issues) {
+    return new Promise((resolve) => {
+        const modal = document.getElementById('fi-force-modal');
+        const body = document.getElementById('fi-force-body');
+        const warning = document.getElementById('fi-force-warning');
+        body.textContent = issues.map(formatReplacementIssue).join('\n\n');
+        const hasDuration = issues.some(i => i.code === 'duration_mismatch');
+        if (hasDuration) {
+            warning.style.display = '';
+            warning.textContent = 'Forcing past the length mismatch will clear the saved transcript — the timestamps no longer match the new file.';
+        } else {
+            warning.style.display = 'none';
+        }
+        const onCancel = () => { cleanup(); resolve(false); };
+        const onConfirm = () => { cleanup(); resolve(true); };
+        const cancelBtn = document.getElementById('fi-force-cancel');
+        const confirmBtn = document.getElementById('fi-force-confirm');
+        function cleanup() {
+            modal.close();
+            cancelBtn.removeEventListener('click', onCancel);
+            confirmBtn.removeEventListener('click', onConfirm);
+            modal.removeEventListener('cancel', onCancel);
+        }
+        cancelBtn.addEventListener('click', onCancel);
+        confirmBtn.addEventListener('click', onConfirm);
+        modal.addEventListener('cancel', onCancel);
+        modal.showModal();
+    });
+}
+
+// Upload via XHR (fetch can't report upload progress). xhrPromise
+// resolves to {status, body} or rejects on network error / abort.
+function xhrUpload(url, file, onProgress) {
+    return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        fiReplaceXhr = xhr;
+        xhr.open('POST', url);
+        xhr.responseType = 'text';
+        xhr.upload.addEventListener('progress', (ev) => {
+            if (ev.lengthComputable) onProgress(ev.loaded, ev.total);
+        });
+        xhr.onload = () => {
+            if (fiReplaceXhr === xhr) fiReplaceXhr = null;
+            let body = {};
+            try { body = JSON.parse(xhr.responseText || '{}'); } catch (e) { /* ignore */ }
+            resolve({ status: xhr.status, body });
+        };
+        xhr.onerror = () => {
+            if (fiReplaceXhr === xhr) fiReplaceXhr = null;
+            reject(new Error('network'));
+        };
+        xhr.onabort = () => {
+            if (fiReplaceXhr === xhr) fiReplaceXhr = null;
+            reject(new Error('aborted'));
+        };
+        const form = new FormData();
+        form.append('file', file);
+        xhr.send(form);
+    });
+}
+
+async function uploadReplacementSource(file, force) {
+    const status = document.getElementById('fi-replace-status');
+    const progress = document.getElementById('fi-replace-progress');
+    status.style.display = '';
+    status.style.color = '';
+    status.textContent = `Uploading ${file.name}… 0%`;
+    progress.style.display = '';
+    progress.value = 0;
+
+    let result;
+    try {
+        result = await xhrUpload(
+            `/api/videos/${videoId}/source-file${force ? '?force=1' : ''}`,
+            file,
+            (loaded, total) => {
+                const pct = Math.floor((loaded / total) * 100);
+                progress.value = pct;
+                const mb = (n) => (n / (1024 * 1024)).toFixed(1);
+                status.textContent = `Uploading ${file.name}… ${pct}% (${mb(loaded)} / ${mb(total)} MB)`;
+            }
+        );
+    } catch (e) {
+        progress.style.display = 'none';
+        if (e.message === 'aborted') {
+            status.style.display = 'none';
+        } else {
+            status.style.color = 'var(--danger)';
+            status.textContent = 'Upload failed: network error.';
+        }
+        return;
+    }
+
+    progress.style.display = 'none';
+
+    if (result.status === 422) {
+        const issues = (result.body.detail && result.body.detail.issues) || [];
+        status.style.display = 'none';
+        const proceed = await promptForceReplacement(issues);
+        if (proceed) {
+            await uploadReplacementSource(file, true);
+        }
+        return;
+    }
+
+    if (result.status < 200 || result.status >= 300) {
+        status.style.color = 'var(--danger)';
+        const detail = result.body && result.body.detail;
+        status.textContent = `Upload failed: ${detail || ('HTTP ' + result.status)}`;
+        return;
+    }
+
+    status.textContent = result.body.transcript_cleared
+        ? 'Source updated. Saved transcript was cleared because the new file is a different length.'
+        : 'Source updated.';
+    await refreshFileInfo();
+    if (typeof loadVideo === 'function') {
+        loadVideo().catch(() => {});
+    }
+    showToast('Source file replaced', 'success');
+}
 </script>
 {% endblock %}

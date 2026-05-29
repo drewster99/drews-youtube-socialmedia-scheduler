@@ -948,9 +948,33 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 
 **Purpose** — Local-file details for the detail page's file-info popup.
 
-**Response 200** — `{"has_file": bool, "original_name": str|null, "disk_name": str|null, "server_path": str|null, "exists": bool, "can_reveal": bool}`. `original_name` is the filename the file was uploaded with (sanitized); `disk_name` is the app-chosen on-disk basename; `server_path` is the absolute path on the machine running the server; `can_reveal` is true on macOS.
+**Response 200** — `{"has_file": bool, "original_name": str|null, "disk_name": str|null, "server_path": str|null, "exists": bool, "can_reveal": bool, "source_origin": str|null, "duration_seconds": float|null, "width": int|null, "height": int|null, "bitrate_bps": int|null, "size_bytes": int|null, "codec_name": str|null, "container": str|null, "browser_playable": bool|null, "quality_warnings": [{"code": str, "message": str, ...}]}`. `original_name` is the filename the file was uploaded with (sanitized); `disk_name` is the app-chosen on-disk basename; `server_path` is the absolute path on the machine running the server; `can_reveal` is true on macOS. `source_origin` is one of `uploaded | youtube_download | user_attached` (or null for pre-026 rows / no local file). `codec_name` (e.g. `h264`, `hevc`, `vp9`, `av1`, `prores`) and `container` (`mp4`, `mov`, `webm`, …) come straight from ffprobe. `browser_playable` is `true` when the `(codec, container)` pair is in the Safari/WKWebView allowlist (h264 / hevc in mp4·mov, vp9 in webm, av1 in mp4·webm), `false` when it's a recognised codec outside the allowlist, and `null` when the codec is unknown — UIs should treat `null` as "fall back to YouTube embed for preview". `quality_warnings` is a list of structured warnings about the source itself; current codes are `low_resolution` (carries `min_dimension`/`width`/`height`) when `min(width,height) < 1080`, and `youtube_download_lossy` when `source_origin == 'youtube_download'`. All other technical fields come from the same ffprobe call and are null when the file is missing or ffprobe couldn't read it.
 
 **Errors** — `404` (no video row).
+
+### `POST /api/videos/{video_id}/source-file`
+
+**Purpose** — Attach or replace the local high-fidelity source file for a video. The YouTube-hosted video is never touched — this only swaps the local file used for clip extraction and other on-device tasks. Used by the "Replace source" / "Attach source" button on the video detail page.
+
+**Query params** — `force` (int, default `0`): set to `1` to override the 422 sanity checks below. Has no effect on the 400 / 413 hard rejects.
+
+**Request body** — `multipart/form-data` with a single `file` field (the new source file).
+
+**Response 200** — `{"status": "ok", "server_path": str, "original_name": str, "duration_seconds": float|null, "width": int|null, "height": int|null, "bitrate_bps": int|null, "size_bytes": int|null, "source_origin": "user_attached", "transcript_cleared": bool}`. `transcript_cleared` is `true` when the call also blanked the row's transcript columns because the user forced past a `duration_mismatch`.
+
+**Side effects** — The previous local file is *not* renamed or deleted: the row is re-pointed at the new file via a single atomic UPDATE, and the old file stays on disk as an orphan (intentional — trades disk hygiene for crash-safety; no half-written rename + DB state can co-occur). The row's `video_file_path`, `video_file_original_name`, `duration_seconds`, and `source_file_origin` are updated; `video_file_download_state` is cleared. When `force=1` overrides a `duration_mismatch` issue, the row's `transcript`, `transcript_id`, `transcript_source`, `transcript_created_at`, `transcript_updated_at`, and `transcript_is_edited` are also cleared (the saved caption timestamps no longer align with the new file).
+
+**Concurrency** — Calls for the same `video_id` are serialized via a per-video asyncio lock. Different videos still proceed in parallel.
+
+**Errors**:
+
+- `400` — no file in the request, or ffprobe ran on the upload and found no video stream (the user picked a non-video file). Not overridable.
+- `404` — video row not found.
+- `413` — file exceeds the 10 GiB cap (checked from `Content-Length` upfront and again as a streaming counter during the copy, so a lying header still gets caught). Not overridable.
+- `422` — sanity check failed. Body is `{"detail": {"issues": [{...}]}}` where each issue is one of:
+  - `{"code": "duration_mismatch", "expected_seconds": float, "incoming_seconds": float, "tolerance_seconds": float}` — the incoming file's duration differs from the row's `duration_seconds` by more than the tolerance (currently 2.0 s).
+  - `{"code": "resolution_downgrade", "current": "WxH", "incoming": "WxH"}` — the incoming file is strictly smaller in both width and height than the current file. Only fires when a current file exists and isn't itself a `youtube_download` (replacing a YouTube re-download is always considered an upgrade).
+  - Resubmit with `?force=1` to bypass.
 
 ### `POST /api/videos/{video_id}/reveal-file`
 
@@ -1982,6 +2006,34 @@ Bulk-upload promo children under a primary video. Each upload runs through the m
 **Response 200** — `{"job_id": "...", "filename": "...", "parent_id": "...", "video_id": "..." | null, "state": "...", "last_error": "..." | null, "title": "..." | null}`. `video_id` is `null` until the YouTube upload step succeeds; once set, the UI should switch to polling `GET /api/videos/{video_id}/auto-actions` (the job dict is dropped from memory when the chain terminates, returning 404 on a stale poll).
 
 **Errors** — `404` (job not found / already completed).
+
+### `POST /api/projects/{slug}/videos/{parent_id}/promos/generate/preview`
+
+**Purpose** — Kick off a Generate-from-source preview job. Claude proposes hook / short / segment ranges out of the parent's local MP4 using the parent's SRT transcript. Returns a job_id the client polls; the heavy lifting (transcription if missing + the three parallel Claude calls) runs in the background.
+
+**Request body** — `{"kinds": [...], "crop_vertical": {"hook": bool, "short": bool, "segment": bool}}`. `kinds` is a non-empty subset of `hook | short | segment`. `crop_vertical` defaults to `{hook: true, short: true, segment: false}` for any kind not explicitly set.
+
+**Response 200** — `{"job_id": "gen_...", "eligible_kinds": [...], "ineligible_kinds": [...], "parent_warnings": [...], "parent_video_file_url": str|null, "parent_browser_playable": bool|null, "parent_youtube_id": str}`. `eligible_kinds` is the subset of `kinds` whose minimum required parent length is satisfied (each kind needs `kind_max + 15 s` of parent); `ineligible_kinds` is the rest. `parent_warnings` is the same `quality_warnings` shape from `GET /file-info`. The `parent_*` fields tell the client how to render proposal previews (`<video src="…">` when `parent_browser_playable` is true, YouTube iframe with `?start=&end=` otherwise).
+
+**Errors** — `400` (no kinds requested; parent duration unknown; parent longer than 4 h; no requested kind eligible; parent has no local file; transcript was hand-edited and lacks timestamps), `404` (project or parent missing or parent is itself a child).
+
+### `GET /api/projects/{slug}/videos/{parent_id}/promos/generate/jobs/{job_id}`
+
+**Purpose** — Poll a generate preview job.
+
+**Response 200** — `{"job_id", "parent_id", "project_id", "kinds", "crop_vertical", "state", "last_error", "progress_message", "proposals"}`. `state` transitions `pending → transcribing? → proposing → done | failed`. `transcribing` only appears when the parent had no usable timestamped transcript at job start; the inline whisper run upserts back into the transcripts table when complete so future Generates on the same parent skip it. When `state == "done"`, `proposals` is a `{kind: [{start_seconds, end_seconds, duration_seconds, title, reason, kind}]}` map ready for the modal's proposal cards.
+
+**Errors** — `404` (job not found / dropped from memory after a process restart).
+
+### `POST /api/projects/{slug}/videos/{parent_id}/promos/generate/confirm`
+
+**Purpose** — Cut and insert the user-accepted proposals. Each accepted entry spawns a promo chain job: ffmpeg cut (gated by an 8-wide semaphore in `services/clipper`), YouTube upload, then the regular probe → transcribe → describe → tag → push-metadata steps (the chain itself is gated by a 4-wide semaphore in `services/auto_actions` so a 16-clip burst queues rather than thrashes the box). The new rows have `cut_start_seconds` / `cut_end_seconds` populated so the next Generate run on the same parent can skip those ranges.
+
+**Request body** — `{"accepted": [{"kind": "hook" | "short" | "segment", "start_seconds": float, "end_seconds": float, "title": str}, ...]}`.
+
+**Response 200** — `{"jobs": [{"job_id", "kind", "title"}, ...]}`. Each `job_id` is polled via the existing `/upload-jobs/{job_id}` endpoint; the initial state is `cutting`.
+
+**Errors** — `400` (empty `accepted`, no usable entries after defensive filtering, or parent has no local file), `404` (project / parent missing).
 
 ### `POST /api/projects/{slug}/videos/{parent_id}/promos/schedule-all/preview`
 

@@ -232,6 +232,125 @@ SEED_AI_BLOCK_DEFAULT_SYSTEM_PROMPT = SeedPrompt(
 # the prompt cards. Group related concerns: shorten (tiny utility) →
 # description (transcript-driven, then vision) → tags (metadata-driven,
 # then vision) → default system prompt (catch-all, last because it
+# --- Generate-from-source clip proposals ----------------------------------
+# One per kind. The clipper service prepends the parent's SRT transcript as
+# a separate cached message block, so the body here is the per-kind tail
+# (instructions + parent context + existing-ranges + optional crop block).
+#
+# Output is structured: Claude is forced to respond via the
+# ``propose_clips`` tool; the body says so explicitly to keep behavior
+# stable if the prompt is edited.
+
+_CLIP_PROPOSAL_VARIABLES = (
+    "parent_title",
+    "parent_duration_human",
+    "existing_ranges_block",
+    "crop_constraints",
+)
+
+SEED_CLIP_PROPOSALS_HOOK_PROMPT = SeedPrompt(
+    key="promo_clip_proposals_hook",
+    name="Promo clip proposals — Hook",
+    body=(
+        "Parent video: {{parent_title}}\n"
+        "Duration: {{parent_duration_human}}\n\n"
+        "You are looking for HOOKS — standalone clips that grab attention in "
+        "under 30 seconds. Each proposal must:\n"
+        "- Be between 5 and 30 seconds long.\n"
+        "- Have a self-contained payoff inside the clip itself "
+        "(no cliffhangers, no 'wait for it' that pays off after the cut).\n"
+        "- Snap to natural sentence boundaries visible in the transcript "
+        "timestamps — never start or end mid-word or mid-sentence.\n"
+        "- Stand alone without context from elsewhere in the video.\n\n"
+        "{{existing_ranges_block??}}"
+        "{{crop_constraints??}}"
+        "\nPropose up to 8 hooks that genuinely stand alone. Returning fewer "
+        "(or zero) is much better than padding with mediocre ones.\n\n"
+        "For each proposal:\n"
+        "- start_seconds and end_seconds: exact timestamps from the "
+        "transcript above; do not round.\n"
+        "- title: a punchy 4-8 word working title for the hook.\n"
+        "- reason: one sentence on what makes this work as a hook.\n\n"
+        "Return your proposals via the propose_clips tool."
+    ),
+    variables=_CLIP_PROPOSAL_VARIABLES,
+    system=(
+        "You find compelling hook clips inside a longer video. A hook is a "
+        "short standalone clip (5-30 seconds) that grabs attention "
+        "immediately: a strong cold open, a surprising statement, a one-line "
+        "story or punchline that pays off entirely within the clip. You output "
+        "your proposals via the propose_clips tool, never as prose."
+    ),
+)
+
+SEED_CLIP_PROPOSALS_SHORT_PROMPT = SeedPrompt(
+    key="promo_clip_proposals_short",
+    name="Promo clip proposals — Short",
+    body=(
+        "Parent video: {{parent_title}}\n"
+        "Duration: {{parent_duration_human}}\n\n"
+        "You are looking for SHORTS — complete bits with a setup→payoff arc "
+        "that fit between 45 and 75 seconds. Each proposal must:\n"
+        "- Be between 45 and 75 seconds long.\n"
+        "- Contain a complete idea, story, or answer to a question.\n"
+        "- Have enough setup that a viewer landing cold can follow it.\n"
+        "- Snap to natural sentence boundaries in the transcript timestamps.\n"
+        "- Stand alone — no required context from elsewhere in the video.\n\n"
+        "{{existing_ranges_block??}}"
+        "{{crop_constraints??}}"
+        "\nPropose up to 8 shorts that genuinely have a complete arc. "
+        "Returning fewer (or zero) is much better than padding.\n\n"
+        "For each proposal:\n"
+        "- start_seconds and end_seconds: exact timestamps from the "
+        "transcript above; do not round.\n"
+        "- title: a 4-8 word working title for the short.\n"
+        "- reason: one sentence describing the setup→payoff arc.\n\n"
+        "Return your proposals via the propose_clips tool."
+    ),
+    variables=_CLIP_PROPOSAL_VARIABLES,
+    system=(
+        "You find compelling short clips inside a longer video. A short is a "
+        "45-75 second clip with a complete setup→payoff arc — a bit, a "
+        "story, an answer to a question — that stands on its own. You output "
+        "your proposals via the propose_clips tool, never as prose."
+    ),
+)
+
+SEED_CLIP_PROPOSALS_SEGMENT_PROMPT = SeedPrompt(
+    key="promo_clip_proposals_segment",
+    name="Promo clip proposals — Segment",
+    body=(
+        "Parent video: {{parent_title}}\n"
+        "Duration: {{parent_duration_human}}\n\n"
+        "You are looking for SEGMENTS — coherent topic blocks that pull a "
+        "whole sub-topic out of the parent. Each proposal must:\n"
+        "- Be at least 60 seconds long. No maximum — as long as the topic "
+        "naturally runs.\n"
+        "- Cover one coherent subject, with the discussion ending naturally "
+        "rather than mid-thought.\n"
+        "- Snap to natural sentence and topic boundaries in the transcript.\n"
+        "- Stand on its own as a discussion of that subject.\n\n"
+        "{{existing_ranges_block??}}"
+        "{{crop_constraints??}}"
+        "\nPropose up to 8 segments that pull out coherent topic blocks. "
+        "Returning fewer (or zero) is much better than padding with weakly-"
+        "bounded slices.\n\n"
+        "For each proposal:\n"
+        "- start_seconds and end_seconds: exact timestamps from the "
+        "transcript above; do not round.\n"
+        "- title: a 4-8 word working title describing the topic.\n"
+        "- reason: one sentence on why this is a coherent standalone segment.\n\n"
+        "Return your proposals via the propose_clips tool."
+    ),
+    variables=_CLIP_PROPOSAL_VARIABLES,
+    system=(
+        "You find coherent topic segments inside a longer video. A segment is "
+        "a self-contained discussion of one subject — there is no length "
+        "cap, but the segment must end naturally rather than mid-thought. "
+        "You output your proposals via the propose_clips tool, never as prose."
+    ),
+)
+
 # applies to every {{ai: ...}} block elsewhere).
 _SEEDS_BY_KEY: dict[str, SeedPrompt] = {
     SEED_SHORTEN_POST_PROMPT.key: SEED_SHORTEN_POST_PROMPT,
@@ -241,6 +360,9 @@ _SEEDS_BY_KEY: dict[str, SeedPrompt] = {
     SEED_TAGS_FROM_METADATA_PROMPT.key: SEED_TAGS_FROM_METADATA_PROMPT,
     SEED_TAGS_FROM_FRAMES_PROMPT.key: SEED_TAGS_FROM_FRAMES_PROMPT,
     SEED_AI_BLOCK_DEFAULT_SYSTEM_PROMPT.key: SEED_AI_BLOCK_DEFAULT_SYSTEM_PROMPT,
+    SEED_CLIP_PROPOSALS_HOOK_PROMPT.key: SEED_CLIP_PROPOSALS_HOOK_PROMPT,
+    SEED_CLIP_PROPOSALS_SHORT_PROMPT.key: SEED_CLIP_PROPOSALS_SHORT_PROMPT,
+    SEED_CLIP_PROPOSALS_SEGMENT_PROMPT.key: SEED_CLIP_PROPOSALS_SEGMENT_PROMPT,
 }
 
 

@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from fastapi import APIRouter, Form, UploadFile, File, HTTPException, Query
+from fastapi import APIRouter, Form, Header, UploadFile, File, HTTPException, Query
 
 from yt_scheduler.config import (
     UPLOAD_DIR,
@@ -22,7 +22,7 @@ from yt_scheduler.config import (
 )
 from yt_scheduler.database import get_db
 from yt_scheduler.services import (
-    ai, auto_actions, events, tiers,
+    ai, auto_actions, events, media as media_service, tiers,
     transcripts as transcript_service, youtube,
 )
 from yt_scheduler.services.auth import set_active_project
@@ -81,7 +81,14 @@ def _decode_tags(raw: str | None) -> list[str]:
 
 def _video_public(row: dict) -> dict:
     """Project a ``videos`` row for the API: expose ``/media/...`` URLs and a
-    display filename instead of the server's absolute filesystem paths."""
+    display filename instead of the server's absolute filesystem paths.
+
+    Note: ``source_file_origin`` (migration 026) flows through unchanged
+    because the client needs it to render the origin tag on the local-
+    file pill and the origin row in the file-info modal. It's a plain
+    enum string — no path to strip — so it survives the absolute-path
+    cleanup below by virtue of not being on the strip list.
+    """
     out = dict(row)
     out["thumbnail_url"] = media_url(out.get("thumbnail_path"))
     out["video_file_url"] = media_url(out.get("video_file_path"))
@@ -466,8 +473,8 @@ async def upload_video(
         """INSERT INTO videos (id, project_id, title, description, tags, privacy_status, publish_at,
            thumbnail_path, video_file_path, video_file_original_name, pinned_links, status,
            duration_seconds, tier,
-           item_type, parent_item_id, url)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uploaded', ?, ?, ?, ?, ?)""",
+           item_type, parent_item_id, url, source_file_origin)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uploaded', ?, ?, ?, ?, ?, 'uploaded')""",
         (
             video_id,
             project["id"],
@@ -595,8 +602,8 @@ async def create_non_youtube_item(
         """INSERT INTO videos (id, project_id, title, description, tags,
            thumbnail_path, video_file_path, video_file_original_name, status,
            duration_seconds, tier,
-           item_type, parent_item_id, url)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?)""",
+           item_type, parent_item_id, url, source_file_origin)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?)""",
         (
             video_id,
             project["id"],
@@ -611,6 +618,7 @@ async def create_non_youtube_item(
             item_type,
             parent_item_id,
             (url or "").strip() or None,
+            "uploaded" if video_path else None,
         ),
     )
     await db.commit()
@@ -1467,10 +1475,12 @@ def _resolve_video_file(video_file_path: str | None) -> Path | None:
 @router.get("/{video_id}/file-info")
 async def video_file_info(video_id: str) -> dict:
     """Local-file details for the detail page's file-info popup: the
-    name it was uploaded with and the current path on this machine."""
+    name it was uploaded with, the current path on this machine, and
+    the technical shape (resolution, duration, bitrate, size) of the
+    file on disk if it's still there."""
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT video_file_path, video_file_original_name "
+        "SELECT video_file_path, video_file_original_name, source_file_origin "
         "FROM videos WHERE id = ?",
         (video_id,),
     )
@@ -1478,13 +1488,321 @@ async def video_file_info(video_id: str) -> dict:
         raise HTTPException(404, f"Video '{video_id}' not found")
     raw_path = rows[0]["video_file_path"]
     resolved = _resolve_video_file(raw_path)
+    exists = bool(resolved and resolved.exists())
+    probe: media_service.VideoProbe | None = None
+    if exists and resolved is not None:
+        probe = await asyncio.to_thread(media_service.probe_video_file, resolved)
+    width = probe.width if probe else None
+    height = probe.height if probe else None
+    codec_name = probe.codec_name if probe else None
+    container = probe.container if probe else None
     return {
         "has_file": bool(raw_path),
         "original_name": rows[0]["video_file_original_name"],
         "disk_name": media_filename(raw_path),
         "server_path": str(resolved) if resolved else raw_path,
-        "exists": bool(resolved and resolved.exists()),
+        "exists": exists,
         "can_reveal": sys.platform == "darwin",
+        "source_origin": rows[0]["source_file_origin"],
+        "duration_seconds": probe.duration_seconds if probe else None,
+        "width": width,
+        "height": height,
+        "bitrate_bps": probe.bitrate_bps if probe else None,
+        "size_bytes": probe.size_bytes if probe else None,
+        "codec_name": codec_name,
+        "container": container,
+        "browser_playable": media_service.is_browser_playable(codec_name, container),
+        "quality_warnings": media_service.source_quality_warnings(
+            width=width, height=height,
+            source_origin=rows[0]["source_file_origin"],
+        ),
+    }
+
+
+_DURATION_TOLERANCE_SECONDS = 2.0
+_MAX_SOURCE_FILE_BYTES = 10 * 1024**3  # 10 GiB; defense against pathological uploads.
+
+# Per-video locks: serialize concurrent POST /source-file calls for the
+# same video so we can't race the SELECT-row → write-file → UPDATE-row
+# sequence into producing orphans. Different videos still proceed in
+# parallel. Locks live for the process lifetime; in single-user usage
+# the dict stays tiny.
+_source_file_locks: dict[str, asyncio.Lock] = {}
+
+
+def _source_file_lock(video_id: str) -> asyncio.Lock:
+    lock = _source_file_locks.get(video_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _source_file_locks[video_id] = lock
+    return lock
+
+
+def _format_resolution(width: int | None, height: int | None) -> str | None:
+    if width is None or height is None:
+        return None
+    return f"{width}x{height}"
+
+
+def _evaluate_replacement(
+    *,
+    incoming: media_service.VideoProbe | None,
+    row: dict,
+    current: media_service.VideoProbe | None,
+) -> list[dict]:
+    """Build the list of blocking issues for a source-file replacement.
+
+    Each issue is a structured dict the client renders into a clear
+    confirm prompt; the client then resubmits with ``?force=1`` to
+    override. We collect every applicable issue rather than failing
+    fast so the user sees the full picture in one round trip.
+
+    A ``None`` ``incoming`` means ffprobe wasn't available — the caller
+    can't validate and accepts the upload as a best-effort attach
+    (consistent with how the rest of the app treats a missing ffprobe).
+    """
+    if incoming is None:
+        return []
+    issues: list[dict] = []
+
+    expected_duration = row.get("duration_seconds")
+    incoming_duration = incoming.duration_seconds
+    if (
+        expected_duration is not None
+        and incoming_duration is not None
+        and abs(float(expected_duration) - float(incoming_duration)) > _DURATION_TOLERANCE_SECONDS
+    ):
+        issues.append({
+            "code": "duration_mismatch",
+            "expected_seconds": float(expected_duration),
+            "incoming_seconds": float(incoming_duration),
+            "tolerance_seconds": _DURATION_TOLERANCE_SECONDS,
+        })
+
+    # Resolution downgrade only matters when there's a current file to
+    # compare against AND that file isn't itself a known-lossy YouTube
+    # re-download (replacing those is always an upgrade in spirit).
+    current_origin = row.get("source_file_origin")
+    if (
+        current is not None
+        and current.width is not None
+        and current.height is not None
+        and incoming.width is not None
+        and incoming.height is not None
+        and current_origin != "youtube_download"
+    ):
+        if incoming.width < current.width and incoming.height < current.height:
+            issues.append({
+                "code": "resolution_downgrade",
+                "current": _format_resolution(current.width, current.height),
+                "incoming": _format_resolution(incoming.width, incoming.height),
+            })
+
+    return issues
+
+
+@router.post("/{video_id}/source-file")
+async def replace_video_source_file(
+    video_id: str,
+    file: UploadFile = File(...),
+    force: int = Query(0),
+    content_length: int | None = Header(default=None),
+) -> dict:
+    """Attach or replace the local high-fidelity source file for a video.
+
+    Used by the "Replace source" / "Attach source" button on the video
+    detail page. The YouTube-hosted video is never touched — this only
+    swaps the local file the app uses for clip extraction and other
+    on-device tasks.
+
+    Sanity checks (override with ``?force=1``):
+
+    * Duration must be within ``_DURATION_TOLERANCE_SECONDS`` of the row's
+      recorded duration. A larger drift almost always means the wrong
+      cut was selected. Forcing past this also blanks the stored
+      transcript columns, since timestamped captions are no longer
+      aligned with the new file's audio.
+    * If a current local file exists and isn't itself a youtube_download,
+      the incoming file's resolution must not be strictly smaller in both
+      width and height.
+
+    Hard rejects (no force override):
+
+    * 400 — empty upload, or ffprobe ran on the file and produced no
+      recognisable video stream (the user picked, say, a text file).
+    * 413 — file larger than ``_MAX_SOURCE_FILE_BYTES``.
+
+    On 422 the body contains ``issues: [{code, ...details}]`` so the UI
+    can render a precise confirm prompt before resubmitting with
+    ``force=1``.
+
+    The previous file is *not* renamed or deleted — the row is just
+    re-pointed to the new file (atomic single UPDATE). The old file
+    stays on disk as an orphan; this trades a little disk hygiene for
+    crash-safety and avoids needing to coordinate filesystem renames
+    with the DB write.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id, video_file_path, video_file_original_name, "
+        "duration_seconds, source_file_origin FROM videos WHERE id = ?",
+        (video_id,),
+    )
+    if not rows:
+        raise HTTPException(404, f"Video '{video_id}' not found")
+    row = dict(rows[0])
+
+    if not file.filename:
+        raise HTTPException(400, "No file uploaded")
+
+    # Pre-flight size check from the request header before we copy a
+    # 10 GB+ body to disk. A lying client can still slip past with a
+    # missing/wrong header — _copy_to_disk_capped is the defense in
+    # depth that catches that case at write time.
+    if content_length is not None and content_length > _MAX_SOURCE_FILE_BYTES:
+        raise HTTPException(
+            413,
+            f"File too large: {content_length} bytes exceeds "
+            f"{_MAX_SOURCE_FILE_BYTES} byte cap.",
+        )
+
+    # All disk + DB work happens under a per-video lock so two
+    # simultaneous replaces for the same video can't see each other's
+    # half-written state and produce orphan files / stale rows.
+    async with _source_file_lock(video_id):
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        incoming_name = f"source_{secrets.token_hex(8)}{safe_upload_ext(file.filename)}"
+        incoming_path = UPLOAD_DIR / incoming_name
+
+        def _copy_to_disk_capped(src, target: Path, cap: int) -> bool:
+            """Stream ``src`` to ``target`` up to ``cap`` bytes. Returns
+            True on success, False if the cap was exceeded — in which case
+            the partial file has already been deleted before the return."""
+            written = 0
+            chunk_size = 1024 * 1024
+            with open(target, "wb") as fh:
+                while True:
+                    chunk = src.read(chunk_size)
+                    if not chunk:
+                        return True
+                    written += len(chunk)
+                    if written > cap:
+                        fh.close()
+                        target.unlink(missing_ok=True)
+                        return False
+                    fh.write(chunk)
+
+        ok = await asyncio.to_thread(
+            _copy_to_disk_capped, file.file, incoming_path, _MAX_SOURCE_FILE_BYTES
+        )
+        if not ok:
+            raise HTTPException(
+                413,
+                f"File too large: exceeds {_MAX_SOURCE_FILE_BYTES} byte cap.",
+            )
+
+        incoming_probe = await asyncio.to_thread(
+            media_service.probe_video_file, incoming_path
+        )
+        if not media_service.probe_is_video(incoming_probe):
+            # ffprobe ran but the file has no decodable video stream —
+            # the user picked the wrong thing. Hard reject, not even
+            # force=1 can attach a non-video.
+            incoming_path.unlink(missing_ok=True)
+            raise HTTPException(
+                400,
+                "The uploaded file isn't a recognisable video.",
+            )
+
+        current_resolved = _resolve_video_file(row.get("video_file_path"))
+        current_probe: media_service.VideoProbe | None = None
+        if current_resolved is not None and current_resolved.exists():
+            current_probe = await asyncio.to_thread(
+                media_service.probe_video_file, current_resolved
+            )
+
+        issues = _evaluate_replacement(
+            incoming=incoming_probe, row=row, current=current_probe
+        )
+        if issues and not force:
+            incoming_path.unlink(missing_ok=True)
+            raise HTTPException(422, detail={"issues": issues})
+
+        # Forcing past a duration mismatch invalidates the timestamped
+        # transcript — the audio in the new file no longer lines up with
+        # the cues we stored. Blank the per-video transcript columns so
+        # downstream features (promo clip generation, caption upload)
+        # don't operate on stale data. The transcripts table row itself
+        # is left alone; the user can re-select it via the chooser if
+        # they replaced with the same content under a different file.
+        force_past_duration = force and any(
+            i["code"] == "duration_mismatch" for i in issues
+        )
+
+        new_original = sanitized_original_filename(file.filename)
+        # incoming_probe is not None here (probe_is_video guarded above)
+        # but Optional in the type system — assert to narrow.
+        assert incoming_probe is not None
+        new_duration = (
+            incoming_probe.duration_seconds
+            if incoming_probe.duration_seconds is not None
+            else row.get("duration_seconds")
+        )
+        if force_past_duration:
+            await db.execute(
+                """UPDATE videos SET
+                    video_file_path = ?,
+                    video_file_original_name = ?,
+                    duration_seconds = ?,
+                    source_file_origin = 'user_attached',
+                    video_file_download_state = NULL,
+                    transcript = NULL,
+                    transcript_id = NULL,
+                    transcript_source = NULL,
+                    transcript_created_at = NULL,
+                    transcript_updated_at = NULL,
+                    transcript_is_edited = 0,
+                    updated_at = datetime('now')
+                WHERE id = ?""",
+                (str(incoming_path), new_original, new_duration, video_id),
+            )
+        else:
+            await db.execute(
+                """UPDATE videos SET
+                    video_file_path = ?,
+                    video_file_original_name = ?,
+                    duration_seconds = ?,
+                    source_file_origin = 'user_attached',
+                    video_file_download_state = NULL,
+                    updated_at = datetime('now')
+                WHERE id = ?""",
+                (str(incoming_path), new_original, new_duration, video_id),
+            )
+        await db.commit()
+
+    await events.record_event(
+        video_id,
+        "metadata_updated",
+        {"source_file_origin": {"old": row.get("source_file_origin"), "new": "user_attached"}},
+    )
+    if force_past_duration:
+        await events.record_event(
+            video_id,
+            "metadata_updated",
+            {"transcript_cleared_reason": "source_file_duration_mismatch_forced"},
+        )
+
+    return {
+        "status": "ok",
+        "server_path": str(incoming_path),
+        "original_name": new_original,
+        "duration_seconds": incoming_probe.duration_seconds,
+        "width": incoming_probe.width,
+        "height": incoming_probe.height,
+        "bitrate_bps": incoming_probe.bitrate_bps,
+        "size_bytes": incoming_probe.size_bytes,
+        "source_origin": "user_attached",
+        "transcript_cleared": force_past_duration,
     }
 
 

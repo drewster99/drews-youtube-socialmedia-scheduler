@@ -69,6 +69,67 @@ def test_reveal_file_404_without_local_file(client: TestClient) -> None:
     assert client.post("/api/videos/NOFILE00001/reveal-file").status_code == 404
 
 
+def test_file_info_surfaces_codec_playable_and_warnings(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The /file-info response carries codec_name, container,
+    browser_playable, and quality_warnings derived from probe + origin."""
+    from yt_scheduler.config import UPLOAD_DIR
+    from yt_scheduler.services import media
+    from yt_scheduler.routers import video_routes
+
+    f = UPLOAD_DIR / "PLAY1234567.mp4"
+    f.write_bytes(b"\x00")
+    _insert(
+        "PLAY1234567",
+        video_file_path=str(f),
+        source_file_origin="youtube_download",
+    )
+
+    fake = media.VideoProbe(
+        duration_seconds=60.0, width=1280, height=720,
+        bitrate_bps=5_000_000, size_bytes=100_000,
+        codec_name="h264", container="mp4",
+    )
+    monkeypatch.setattr(media, "probe_video_file", lambda _p: fake)
+    monkeypatch.setattr(video_routes.media_service, "probe_video_file", lambda _p: fake)
+
+    resp = client.get("/api/videos/PLAY1234567/file-info")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["codec_name"] == "h264"
+    assert data["container"] == "mp4"
+    assert data["browser_playable"] is True
+    codes = [w["code"] for w in data["quality_warnings"]]
+    assert codes == ["low_resolution", "youtube_download_lossy"]
+
+
+def test_file_info_unplayable_codec(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from yt_scheduler.config import UPLOAD_DIR
+    from yt_scheduler.services import media
+    from yt_scheduler.routers import video_routes
+
+    f = UPLOAD_DIR / "PRORES12345.mov"
+    f.write_bytes(b"\x00")
+    _insert("PRORES12345", video_file_path=str(f), source_file_origin="uploaded")
+
+    fake = media.VideoProbe(
+        duration_seconds=60.0, width=3840, height=2160,
+        bitrate_bps=200_000_000, size_bytes=1_500_000_000,
+        codec_name="prores", container="mov",
+    )
+    monkeypatch.setattr(media, "probe_video_file", lambda _p: fake)
+    monkeypatch.setattr(video_routes.media_service, "probe_video_file", lambda _p: fake)
+
+    resp = client.get("/api/videos/PRORES12345/file-info")
+    data = resp.json()
+    assert data["codec_name"] == "prores"
+    assert data["browser_playable"] is False
+    assert data["quality_warnings"] == []  # 4K uploaded master, nothing to warn about
+
+
 def test_reveal_file_runs_open_dash_r(
     client: TestClient, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

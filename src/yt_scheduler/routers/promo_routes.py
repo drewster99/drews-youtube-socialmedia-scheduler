@@ -31,10 +31,17 @@ import shutil
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
+from pathlib import Path
+
 from yt_scheduler.config import UPLOAD_DIR, safe_upload_ext
 from yt_scheduler.database import get_db
-from yt_scheduler.routers.video_routes import _video_public
-from yt_scheduler.services import auto_actions, projects as project_service
+from yt_scheduler.routers.video_routes import _resolve_video_file, _video_public
+from yt_scheduler.services import (
+    auto_actions,
+    clipper,
+    media as media_service,
+    projects as project_service,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +52,32 @@ router = APIRouter(
 
 
 _VALID_FORCED_ITEM_TYPES = {"segment", "short", "hook"}
+
+# Hard parent-length cap for Generate-from-source. Above this, the
+# transcript is too long to round-trip into Claude affordably and the
+# preview would be unusably slow. The user can still cut clips manually
+# from a longer parent via the existing upload path.
+_GENERATE_MAX_PARENT_SECONDS: float = 4 * 60 * 60  # 4 hours
+
+
+async def _existing_cut_ranges(
+    parent_id: str, project_id: int,
+) -> dict[str, list[tuple[float, float]]]:
+    """Per-kind ranges already cut from this parent, for the overlap filter."""
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT item_type, cut_start_seconds, cut_end_seconds "
+        "FROM videos WHERE parent_item_id = ? AND project_id = ? "
+        "AND cut_start_seconds IS NOT NULL AND cut_end_seconds IS NOT NULL",
+        (parent_id, project_id),
+    )
+    out: dict[str, list[tuple[float, float]]] = {"hook": [], "short": [], "segment": []}
+    for r in rows:
+        kind = r["item_type"]
+        if kind not in out:
+            continue
+        out[kind].append((float(r["cut_start_seconds"]), float(r["cut_end_seconds"])))
+    return out
 
 
 async def _ensure_primary(slug: str, parent_id: str) -> tuple[dict, dict]:
@@ -322,6 +355,237 @@ async def _sweep_missing_thumbnails(parent_id: str, project_id: int) -> None:
             )
 
     await asyncio.gather(*(_try(row["id"]) for row in rows))
+
+
+@router.post("/generate/preview")
+async def generate_preview(
+    slug: str,
+    parent_id: str,
+    payload: dict | None = None,
+) -> dict:
+    """Kick off a Generate-from-source preview job.
+
+    Body:
+        ``{"kinds": ["hook", "short", "segment"],
+           "crop_vertical": {"hook": true, "short": true, "segment": false}}``
+
+    Returns ``{"job_id": "..."}`` immediately. The client polls
+    ``GET /generate/jobs/{job_id}`` until ``state == "done"`` (proposals
+    ready) or ``"failed"`` (with ``last_error``).
+
+    Pre-flight refuses (400):
+
+    * Parent has no local video file (the cut step needs the bytes).
+    * Parent's duration is unknown or exceeds the 4-hour cap.
+    * No kinds requested.
+    * None of the requested kinds are eligible at this parent length.
+    * Parent has a transcript that lacks SRT timestamps AND
+      ``transcript_source == 'user_edited'`` — the user pasted plain
+      prose; we refuse rather than silently re-transcribe over their
+      edits. Other no-transcript cases fall through and the job will
+      transcribe inline as its first state.
+    """
+    from yt_scheduler.services import transcripts as transcript_service
+
+    project, parent = await _ensure_primary(slug, parent_id)
+    payload = payload or {}
+    raw_kinds = payload.get("kinds") or []
+    requested_kinds = [k for k in raw_kinds if k in _VALID_FORCED_ITEM_TYPES]
+    if not requested_kinds:
+        raise HTTPException(
+            400, "Request must include at least one kind (hook|short|segment).",
+        )
+    raw_crop = payload.get("crop_vertical") or {}
+    crop_vertical = {
+        k: bool(raw_crop.get(k, k in ("hook", "short")))
+        for k in requested_kinds
+    }
+
+    parent_duration = float(parent.get("duration_seconds") or 0.0)
+    if parent_duration <= 0:
+        raise HTTPException(
+            400,
+            "Parent video has no known duration — cannot generate clips. "
+            "Probe the local file first.",
+        )
+    if parent_duration > _GENERATE_MAX_PARENT_SECONDS:
+        raise HTTPException(
+            400,
+            f"Parent is longer than {int(_GENERATE_MAX_PARENT_SECONDS / 3600)} "
+            "hours — too large for Generate-from-source. Cut a shorter "
+            "section first.",
+        )
+
+    eligible_kinds = [
+        k for k in requested_kinds
+        if clipper.is_parent_eligible_for_kind(parent_duration, k)
+    ]
+    if not eligible_kinds:
+        raise HTTPException(
+            400,
+            "None of the requested kinds fit this parent's duration "
+            "(each kind requires at least kind_max + 15 s of parent length).",
+        )
+
+    parent_path = _resolve_video_file(parent.get("video_file_path"))
+    if parent_path is None or not parent_path.exists():
+        raise HTTPException(
+            400,
+            "Parent has no local video file. Attach a source on the parent's "
+            "detail page first.",
+        )
+
+    # User-edited transcript without timestamps → refuse. Other missing-
+    # transcript cases will auto-transcribe inside the job.
+    transcript = parent.get("transcript") or ""
+    transcript_source = parent.get("transcript_source") or ""
+    if (
+        transcript_source == "user_edited"
+        and transcript
+        and not transcript_service.has_timestamps(transcript)
+    ):
+        raise HTTPException(
+            400,
+            "Active transcript was hand-edited and has no timestamps. "
+            "Switch to a source-backed transcript in the chooser, or "
+            "re-transcribe, then try again.",
+        )
+
+    existing_ranges = await _existing_cut_ranges(parent_id, int(project["id"]))
+
+    job_id = await clipper.start_generate_job(
+        parent_id=parent_id,
+        project_id=int(project["id"]),
+        parent_video_path=str(parent_path),
+        parent_title=parent.get("title") or "",
+        parent_duration_seconds=parent_duration,
+        kinds=eligible_kinds,
+        crop_vertical_for_kind=crop_vertical,
+        existing_ranges_per_kind=existing_ranges,
+    )
+
+    # Source-quality warnings on the parent are useful to surface here
+    # too — the modal renders them above the proposals. Computed from
+    # the parent's last-probed width/height; null when we haven't probed.
+    parent_probe = await asyncio.to_thread(
+        media_service.probe_video_file, parent_path,
+    )
+    warnings = media_service.source_quality_warnings(
+        width=parent_probe.width if parent_probe else None,
+        height=parent_probe.height if parent_probe else None,
+        source_origin=parent.get("source_file_origin"),
+    )
+
+    # Inline-preview metadata: the client uses these to decide whether
+    # to render a <video src="/uploads/..."> tag or a YouTube iframe with
+    # start/end. ``parent_youtube_id`` is the 11-char id when the parent
+    # is YouTube-backed (the normal case for the promos page); falsy
+    # otherwise.
+    public_parent = _video_public(dict(parent))
+    parent_youtube_id = parent_id if len(parent_id) == 11 else ""
+    browser_playable = media_service.is_browser_playable(
+        parent_probe.codec_name if parent_probe else None,
+        parent_probe.container if parent_probe else None,
+    )
+
+    return {
+        "job_id": job_id,
+        "eligible_kinds": eligible_kinds,
+        "ineligible_kinds": [k for k in requested_kinds if k not in eligible_kinds],
+        "parent_warnings": warnings,
+        "parent_video_file_url": public_parent.get("video_file_url"),
+        "parent_browser_playable": browser_playable,
+        "parent_youtube_id": parent_youtube_id,
+    }
+
+
+@router.get("/generate/jobs/{job_id}")
+async def generate_job_status(slug: str, parent_id: str, job_id: str) -> dict:
+    """Poll a generate preview job. Returns the latest state + proposals
+    when done."""
+    job = clipper.get_generate_job(job_id)
+    if job is None:
+        raise HTTPException(404, "Generate job not found or already discarded")
+    return job
+
+
+@router.post("/generate/confirm")
+async def generate_confirm(
+    slug: str,
+    parent_id: str,
+    payload: dict | None = None,
+) -> dict:
+    """Cut + insert the user-accepted clips.
+
+    Body:
+        ``{"accepted": [{"kind": "hook", "start_seconds": 12.3,
+                         "end_seconds": 28.5, "title": "..."}]}``
+
+    Returns ``{"jobs": [{"job_id", "kind", "title"}]}`` immediately;
+    each new job's state starts at ``cutting`` and the UI polls the
+    existing ``/upload-jobs/{job_id}`` endpoint to follow it through
+    the regular promo chain.
+    """
+    project, parent = await _ensure_primary(slug, parent_id)
+    payload = payload or {}
+    accepted = payload.get("accepted") or []
+    if not isinstance(accepted, list) or not accepted:
+        raise HTTPException(400, "Request must include an 'accepted' array.")
+
+    parent_path = _resolve_video_file(parent.get("video_file_path"))
+    if parent_path is None or not parent_path.exists():
+        raise HTTPException(
+            400, "Parent has no local video file to cut from.",
+        )
+    parent_duration = float(parent.get("duration_seconds") or 0.0)
+
+    jobs_out: list[dict] = []
+    for entry in accepted:
+        if not isinstance(entry, dict):
+            continue
+        kind = entry.get("kind")
+        if kind not in _VALID_FORCED_ITEM_TYPES:
+            continue
+        try:
+            start = float(entry["start_seconds"])
+            end = float(entry["end_seconds"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        title = str(entry.get("title") or "").strip()
+        if not title or end <= start:
+            continue
+        # Defensive bounds check — the preview already validated, but
+        # nothing stops a client from POSTing a hand-crafted body.
+        if start < 0 or end > parent_duration + 0.5:
+            continue
+
+        # Optional per-clip crop fields from the client. Both default to
+        # off / no-shift for backwards compatibility with the 3b API.
+        vertical_crop = bool(entry.get("vertical_crop", False))
+        try:
+            x_shift = float(entry.get("x_shift_normalized") or 0.0)
+        except (TypeError, ValueError):
+            x_shift = 0.0
+        # Clamp to the same range extract_clip clamps to so logs and
+        # event records match what actually runs.
+        x_shift = max(-1.0, min(1.0, x_shift))
+
+        job_id = await auto_actions.start_promo_from_cut(
+            parent_video_path=Path(parent_path),
+            parent_id=parent_id,
+            project_id=int(project["id"]),
+            item_type=kind,
+            title=title,
+            cut_start_seconds=start,
+            cut_end_seconds=end,
+            vertical_crop=vertical_crop,
+            x_shift_normalized=x_shift,
+        )
+        jobs_out.append({"job_id": job_id, "kind": kind, "title": title})
+
+    if not jobs_out:
+        raise HTTPException(400, "No usable entries in 'accepted'.")
+    return {"jobs": jobs_out}
 
 
 @router.post("/schedule-all/preview")

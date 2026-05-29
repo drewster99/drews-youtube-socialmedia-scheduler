@@ -14,6 +14,25 @@ from yt_scheduler.database import get_db
 _SRT_TIMESTAMP_RE = re.compile(
     r"^\d{2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{1,3}"
 )
+# Same shape, unanchored — used by has_timestamps to scan a whole
+# transcript string for any cue line, not just one at the start.
+_SRT_TIMESTAMP_SEARCH_RE = re.compile(
+    r"\d{2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{1,3}"
+)
+
+
+def has_timestamps(text: str | None) -> bool:
+    """True when ``text`` contains at least one SRT-style cue line
+    (``HH:MM:SS,mmm --> HH:MM:SS,mmm``).
+
+    The Generate-from-source flow needs timestamped transcripts to give
+    Claude meaningful range proposals — a plain-text user-edited
+    transcript that lost its timestamps can't be used. This is the
+    cheap detector for that pre-flight gate.
+    """
+    if not text:
+        return False
+    return bool(_SRT_TIMESTAMP_SEARCH_RE.search(text))
 
 
 def srt_to_plain_text(srt: str) -> str:

@@ -184,7 +184,8 @@ async def _maybe_download_video_file(video_id: str) -> None:
     db = await get_db()
     await db.execute(
         "UPDATE videos SET video_file_path = ?, video_file_download_state = NULL, "
-        "updated_at = datetime('now') WHERE id = ?",
+        "source_file_origin = 'youtube_download', updated_at = datetime('now') "
+        "WHERE id = ?",
         (str(downloaded), video_id),
     )
     await db.commit()
@@ -514,6 +515,7 @@ async def _maybe_generate_socials(
 
 # Step state strings persisted to ``videos.auto_action_state``.
 PROMO_STATE_PENDING = "pending"
+PROMO_STATE_CUTTING = "cutting"
 PROMO_STATE_GENERATING_TITLE = "generating_title"
 PROMO_STATE_UPLOADING = "uploading"
 PROMO_STATE_PROBING = "probing"
@@ -544,6 +546,14 @@ _PROMO_WHISPER_LOCK: asyncio.Lock = asyncio.Lock()
 # polls upload-jobs/<id> until ``video_id`` flips to a real id, then
 # switches to polling /api/videos/{id}/auto-actions.
 _UPLOAD_JOBS: dict[str, dict] = {}
+
+
+# Cap on simultaneously-running promo chains. The chain itself fans out
+# to ffprobe + whisper + 2-3 Claude calls + a YouTube upload; 16 chains
+# in parallel would saturate a Mac (whisper alone is CPU-bound and
+# YouTube's upload SDK isn't reentrant per-token). 4 is comfortable on
+# wide hardware and keeps individual jobs from starving each other.
+_PROMO_CHAIN_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(4)
 
 
 def get_upload_job(job_id: str) -> dict | None:
@@ -578,6 +588,67 @@ async def start_promo_upload(
         "state": PROMO_STATE_PENDING,
         "last_error": None,
         "title": None,
+    }
+    task = asyncio.create_task(_run_promo_chain(job_id))
+    _pending_tasks.add(task)
+    task.add_done_callback(_pending_tasks.discard)
+    return job_id
+
+
+async def start_promo_from_cut(
+    *,
+    parent_video_path: Path,
+    parent_id: str,
+    project_id: int,
+    item_type: str,
+    title: str,
+    cut_start_seconds: float,
+    cut_end_seconds: float,
+    vertical_crop: bool = False,
+    x_shift_normalized: float = 0.0,
+) -> str:
+    """Queue a Promo chain for a clip cut from a parent video.
+
+    The chain runs an ffmpeg cut as its first step (gated by the cut
+    semaphore in ``services/clipper``), then continues into the normal
+    promo flow. Differs from :func:`start_promo_upload` in three ways:
+
+    * The local file doesn't exist yet at call time — the chain creates
+      it via ``clipper.cut_clip_from_parent`` before the YouTube upload.
+    * ``title`` is supplied by the caller (Claude proposed it during the
+      Generate-from-source preview) so the chain skips its AI-title step.
+    * ``cut_start_seconds`` / ``cut_end_seconds`` are written to the
+      videos row at INSERT so the next Generate run on the same parent
+      can avoid re-proposing the same ranges.
+
+    Same return contract as :func:`start_promo_upload` — a ``job_id`` the
+    UI polls until the YouTube upload step lands and a real video_id is
+    available. The job's initial state is ``cutting``.
+    """
+    job_id = "job_" + secrets.token_hex(8)
+    # Derive a sensible client-facing filename from the parent + range so
+    # the title/filename pair makes sense in logs.
+    pretty_name = (
+        f"{Path(parent_video_path).stem}_clip_"
+        f"{int(cut_start_seconds)}-{int(cut_end_seconds)}.mp4"
+    )
+    _UPLOAD_JOBS[job_id] = {
+        "job_id": job_id,
+        "filename": pretty_name,
+        "local_path": None,  # written after the cut step completes
+        "parent_id": parent_id,
+        "project_id": project_id,
+        "forced_item_type": item_type,
+        "video_id": None,
+        "state": PROMO_STATE_CUTTING,
+        "last_error": None,
+        "title": title,
+        "pre_supplied_title": title,
+        "cut_start_seconds": float(cut_start_seconds),
+        "cut_end_seconds": float(cut_end_seconds),
+        "parent_video_path": str(parent_video_path),
+        "vertical_crop": bool(vertical_crop),
+        "x_shift_normalized": float(x_shift_normalized),
     }
     task = asyncio.create_task(_run_promo_chain(job_id))
     _pending_tasks.add(task)
@@ -652,11 +723,52 @@ async def _run_promo_chain(job_id: str) -> None:
     YouTube returns an id we INSERT the row, the upload job hands off to
     the videos row's ``auto_action_state``, and remaining steps update
     that column.
+
+    Wrapped in :data:`_PROMO_CHAIN_SEMAPHORE` so a burst of new jobs (e.g.
+    the user accepting 12 generated clips) queues rather than thrashes
+    the machine.
     """
+    async with _PROMO_CHAIN_SEMAPHORE:
+        await _run_promo_chain_inner(job_id)
+
+
+async def _run_promo_chain_inner(job_id: str) -> None:
     job = _UPLOAD_JOBS.get(job_id)
     if job is None:
         return
     project_id = int(job["project_id"])
+
+    # Step 0 — cut from parent (Generate-from-source flow only).
+    # ``parent_video_path`` is set by :func:`start_promo_from_cut`. We do
+    # this *before* setting the project context because the cut is a
+    # pure ffmpeg subprocess call and doesn't need the OAuth token.
+    if job.get("parent_video_path") and not job.get("local_path"):
+        from yt_scheduler.services import clipper
+
+        try:
+            proposal = clipper.ProposedClip(
+                kind=job.get("forced_item_type") or "short",  # type: ignore[arg-type]
+                start_seconds=float(job["cut_start_seconds"]),
+                end_seconds=float(job["cut_end_seconds"]),
+                title=job.get("pre_supplied_title") or "",
+                reason="",
+            )
+            cut_path = await clipper.cut_clip_from_parent(
+                parent_video_path=Path(job["parent_video_path"]),
+                proposal=proposal,
+                vertical_crop=bool(job.get("vertical_crop", False)),
+                x_shift_normalized=float(job.get("x_shift_normalized", 0.0)),
+            )
+        except Exception as exc:
+            job["state"] = f"failed:{PROMO_STATE_CUTTING}"
+            job["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+            logger.warning(
+                "Promo cut failed for parent=%s range=%s-%s: %r",
+                job.get("parent_id"), job.get("cut_start_seconds"),
+                job.get("cut_end_seconds"), exc, exc_info=True,
+            )
+            return
+        job["local_path"] = str(cut_path)
 
     project_row = await get_project_by_id(project_id)
     if project_row:
@@ -664,32 +776,39 @@ async def _run_promo_chain(job_id: str) -> None:
 
     parent_ctx = await _load_parent_context(job.get("parent_id"))
 
-    # Step 1 — generate title
-    job["state"] = PROMO_STATE_GENERATING_TITLE
-    try:
-        title = await ai.generate_title_from_filename(
-            filename=job["filename"],
-            project_id=project_id,
-            parent_url=parent_ctx.get("url", ""),
-            parent_title=parent_ctx.get("title", ""),
-            parent_description=parent_ctx.get("description", ""),
-            parent_tags=parent_ctx.get("tags", ""),
-        )
-    except Exception as exc:
-        # ERROR (not warning): if Claude is unreachable here, every
-        # downstream AI step (description, tags) will also fail, so this
-        # is a "the whole pipeline is degraded" signal, not a routine
-        # fallback. The deterministic title is still used so the chain
-        # can keep going. local_path is logged alongside the user-facing
-        # filename so "file not found" failures can be diagnosed without
-        # guessing which path the error refers to (the on-disk path is
-        # always app-chosen and has no spaces; the original filename does).
-        logger.error(
-            "AI title failed for %s (local_path=%s), using deterministic fallback: %r",
-            job["filename"], job.get("local_path"), exc,
-            exc_info=True,
-        )
-        title = ai.fallback_title_from_filename(job["filename"])
+    # Step 1 — generate title. Skipped when a title was supplied by the
+    # caller (Generate-from-source flow: Claude already proposed one
+    # during preview, so re-running title-from-filename would just throw
+    # that away in favour of a worse guess).
+    pre_supplied_title = job.get("pre_supplied_title")
+    if pre_supplied_title:
+        title = pre_supplied_title
+    else:
+        job["state"] = PROMO_STATE_GENERATING_TITLE
+        try:
+            title = await ai.generate_title_from_filename(
+                filename=job["filename"],
+                project_id=project_id,
+                parent_url=parent_ctx.get("url", ""),
+                parent_title=parent_ctx.get("title", ""),
+                parent_description=parent_ctx.get("description", ""),
+                parent_tags=parent_ctx.get("tags", ""),
+            )
+        except Exception as exc:
+            # ERROR (not warning): if Claude is unreachable here, every
+            # downstream AI step (description, tags) will also fail, so this
+            # is a "the whole pipeline is degraded" signal, not a routine
+            # fallback. The deterministic title is still used so the chain
+            # can keep going. local_path is logged alongside the user-facing
+            # filename so "file not found" failures can be diagnosed without
+            # guessing which path the error refers to (the on-disk path is
+            # always app-chosen and has no spaces; the original filename does).
+            logger.error(
+                "AI title failed for %s (local_path=%s), using deterministic fallback: %r",
+                job["filename"], job.get("local_path"), exc,
+                exc_info=True,
+            )
+            title = ai.fallback_title_from_filename(job["filename"])
     job["title"] = title
 
     # Step 2 — YouTube upload
@@ -738,9 +857,10 @@ async def _run_promo_chain(job_id: str) -> None:
             video_file_path, video_file_original_name, status,
             duration_seconds, tier,
             item_type, parent_item_id, url,
-            auto_action_state
+            auto_action_state, source_file_origin,
+            cut_start_seconds, cut_end_seconds
         ) VALUES (?, ?, ?, ?, '[]', 'unlisted', ?, ?, 'uploaded',
-                  ?, ?, ?, ?, ?, ?)""",
+                  ?, ?, ?, ?, ?, ?, 'uploaded', ?, ?)""",
         (
             video_id,
             project_id,
@@ -754,6 +874,8 @@ async def _run_promo_chain(job_id: str) -> None:
             job.get("parent_id") or None,
             youtube_url,
             PROMO_STATE_PROBING,
+            job.get("cut_start_seconds"),
+            job.get("cut_end_seconds"),
         ),
     )
     await db.commit()

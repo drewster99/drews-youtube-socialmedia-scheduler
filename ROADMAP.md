@@ -57,3 +57,90 @@ purely defense-in-depth for users who choose to expose it anyway.
 - A simple shared-secret header set by the .app shell when it spawns
   the server would also work, and keeps the browser-on-the-same-Mac
   case ergonomic.
+
+## Vertical crop — face-follow (Generate from source, v2)
+
+The first iteration of "Generate from source" ships with a center-crop
+toggle for 9:16 hooks/shorts. Center crop misses the action when the
+subject isn't framed dead-center, which is most of the time on
+multi-camera podcast / interview footage.
+
+**Acceptance:**
+
+- macOS Vision framework face detection (built-in, no extra install)
+  run on every Nth frame (e.g. every 5 frames at 30fps = every ~165ms).
+- Track the dominant face position over the clip; smooth across detections
+  with a 1-second moving average so the crop doesn't jitter.
+- Fall back to center crop when no face is detected for a sustained run.
+- New per-kind setting in the Generate modal: crop mode = center | follow.
+
+**Notes:**
+
+- For multi-speaker scenes the "dominant" face heuristic does best when
+  one person dominates frame size. Active-speaker tracking is v3 below.
+- Implement as a small Swift helper (Vision is Swift-native) called from
+  Python via subprocess, or use PyObjC. Avoid mediapipe / PyTorch — the
+  install cost would dwarf the feature.
+
+## Vertical crop — active-speaker tracking (Generate from source, v3)
+
+Multi-person podcasts cut to vertical look best when the crop follows the
+person currently talking. v2's "follow dominant face" doesn't switch
+between speakers.
+
+**Acceptance:**
+
+- Per-time-window identify which detected face is the active speaker.
+  Two viable signals: audio diarization (whisperx, pyannote — requires
+  GPU/MLX), or mouth-motion analysis from Vision face landmarks.
+- Smooth the active-speaker switch (don't flip mid-word). Slight lead
+  time (~250ms) so the switch happens just as a new speaker starts.
+
+**Notes:**
+
+- Significantly more complex than v2 — its own work item.
+
+## Token-cost estimate on Generate from source
+
+Each Generate-from-source call hits Claude with the parent's transcript +
+prompt for N proposals. For a 3-hour podcast this can be 80K input tokens
++ a few thousand output tokens. The user has no visibility into the cost
+before clicking Generate.
+
+**Acceptance:**
+
+- Estimate input tokens from transcript byte length (rough ~4 chars per
+  token) plus the prompt template overhead. Show "Estimated cost: ~$0.12"
+  in the modal, computed against the current `ANTHROPIC_MODEL` rate card.
+- Rate card is small (3 models × 2 prices), can be hardcoded with a note.
+- Recompute when counts change (more proposals = more output tokens).
+
+**Notes:**
+
+- Defer until the feature has been used enough to know whether users care.
+  If they don't notice spend, this is wasted scope.
+
+## Source-file backup cleanup
+
+The "Replace source" flow (migration 026, `POST /api/videos/{id}/source-file`)
+intentionally never renames or deletes the previous local file — the row
+is just re-pointed at the new one. That avoids the half-renamed-row crash
+window, but it means every replace leaves the old file on disk as an
+orphan. After many replacements of a multi-GB master, disk usage grows
+silently.
+
+**Acceptance:**
+
+- A janitor that finds `UPLOAD_DIR` files no longer referenced by any
+  `videos.video_file_path` and older than some threshold (e.g. 7 days)
+  and deletes them. Either a CLI subcommand (`yt-scheduler gc-uploads`)
+  or a periodic scheduler job, or both. Dry-run by default; require an
+  explicit `--apply` to actually unlink.
+
+**Notes:**
+
+- Be careful: ``UPLOAD_DIR`` also holds thumbnails, item images, and
+  per-video transcript artifacts. The janitor must only act on files
+  it can positively identify as orphaned *video* sources (extension
+  set + cross-check against all rows' `video_file_path`). When in
+  doubt, leave it.

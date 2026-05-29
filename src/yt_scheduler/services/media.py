@@ -2,10 +2,331 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from yt_scheduler.config import UPLOAD_DIR
+
+
+@dataclass(frozen=True)
+class VideoProbe:
+    """Summary of an on-disk video file as seen by ffprobe.
+
+    Fields are ``None`` when ffprobe didn't return that piece — the caller
+    must treat a missing field as "unknown" rather than 0. ``width`` and
+    ``height`` come from the first video stream; rotation metadata is not
+    applied so they describe the encoded frame, not the display frame
+    (irrelevant for fidelity comparisons since both files being compared
+    use the same convention).
+
+    ``codec_name`` is the ffprobe codec_name string for the first video
+    stream (e.g. ``h264``, ``hevc``, ``vp9``, ``av1``, ``prores``).
+    ``container`` is a single canonical token derived from ffprobe's
+    ``format_name`` — that field is a comma-separated list (``mov,mp4,m4a,3gp,3g2,mj2``),
+    so we pick the first token that's a meaningful container for our
+    purposes. Used by :func:`is_browser_playable`.
+    """
+
+    duration_seconds: float | None
+    width: int | None
+    height: int | None
+    bitrate_bps: int | None
+    size_bytes: int | None
+    codec_name: str | None = None
+    container: str | None = None
+
+
+def probe_video_file(video_path: str | Path) -> VideoProbe | None:
+    """Run ffprobe once and return duration + dimensions + bitrate.
+
+    Returns ``None`` when ffprobe isn't installed (the caller should treat
+    that as "can't validate, accept best-effort"). Returns a ``VideoProbe``
+    instance otherwise — its fields are individually ``None`` for any
+    metric ffprobe didn't produce. A returned probe whose ``width``,
+    ``height``, ``and`` ``duration_seconds`` are all ``None`` means
+    ffprobe ran but the file has no readable video stream; callers
+    treat that as "not a video file" rather than "unknown".
+    """
+    path = Path(video_path)
+    if not path.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-print_format", "json",
+                "-show_format",
+                "-show_streams",
+                "-select_streams", "v:0",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        return VideoProbe(None, None, None, None, None)
+    if result.returncode != 0:
+        return VideoProbe(None, None, None, None, None)
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return VideoProbe(None, None, None, None, None)
+
+    streams = data.get("streams") or []
+    fmt = data.get("format") or {}
+    width = height = None
+    codec_name: str | None = None
+    if streams:
+        stream = streams[0]
+        try:
+            width = int(stream["width"]) if "width" in stream else None
+            height = int(stream["height"]) if "height" in stream else None
+        except (TypeError, ValueError):
+            pass
+        raw_codec = stream.get("codec_name")
+        if isinstance(raw_codec, str) and raw_codec:
+            codec_name = raw_codec.lower()
+
+    # ffprobe's format_name is a comma-separated list of compatible
+    # container labels. We pick the first non-generic token. This is a
+    # heuristic ("good enough for our allowlist check") rather than a
+    # ground truth — for browser-playability the (codec, container) pair
+    # matches one of a small handful of known-good tuples, and the first
+    # token is reliably the most specific.
+    container: str | None = None
+    raw_format = fmt.get("format_name")
+    if isinstance(raw_format, str) and raw_format:
+        container = raw_format.split(",")[0].strip().lower() or None
+
+    def _maybe_float(value: object) -> float | None:
+        try:
+            return float(value) if value is not None else None  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    def _maybe_int(value: object) -> int | None:
+        try:
+            return int(value) if value is not None else None  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    return VideoProbe(
+        duration_seconds=_maybe_float(fmt.get("duration")),
+        width=width,
+        height=height,
+        bitrate_bps=_maybe_int(fmt.get("bit_rate")),
+        size_bytes=_maybe_int(fmt.get("size")),
+        codec_name=codec_name,
+        container=container,
+    )
+
+
+# Safari-friendly (codec, container) pairs. Generated/preview UI in
+# the browser only embeds a <video> element for files in this allowlist;
+# anything else falls back to a YouTube iframe with #t=start,end. We
+# scope to Safari because the macOS app is the target browser (system
+# Safari / WKWebView).
+#
+# Conservative — not exhaustive. Some browsers play more than this in
+# practice, but Safari/WKWebView has more edge cases than Chrome and
+# the YouTube fallback is fine for the uncovered cases.
+_BROWSER_PLAYABLE_PAIRS: frozenset[tuple[str, str]] = frozenset({
+    ("h264", "mp4"),
+    ("h264", "mov"),
+    ("hevc", "mp4"),
+    ("hevc", "mov"),
+    ("vp9", "webm"),
+    ("av1", "mp4"),
+    ("av1", "webm"),
+})
+
+
+def is_browser_playable(
+    codec_name: str | None, container: str | None,
+) -> bool | None:
+    """True when the (codec, container) pair plays in a `<video>` element
+    on the target browser (Safari / WKWebView).
+
+    Returns ``None`` when either piece is unknown — the caller should
+    treat that as "don't know, probably best to fall back to the YouTube
+    embed" rather than as a positive or negative answer.
+    """
+    if not codec_name or not container:
+        return None
+    return (codec_name.lower(), container.lower()) in _BROWSER_PLAYABLE_PAIRS
+
+
+def source_quality_warnings(
+    *,
+    width: int | None,
+    height: int | None,
+    source_origin: str | None,
+) -> list[dict]:
+    """Structured warnings about a source video's quality.
+
+    Returned as a list of ``{"code": str, "message": str, ...}`` dicts so the
+    UI can render each one independently (and so logic elsewhere — e.g. the
+    Generate-from-source modal — can branch on the codes). Empty list when
+    there's nothing to warn about.
+
+    The thresholds are deliberately permissive: we only warn for the cases
+    that meaningfully hurt clip output (sub-HD source pixels, or a known-
+    lossy YouTube re-download). Bitrate alone is a misleading signal with
+    modern codecs and is intentionally excluded.
+    """
+    warnings: list[dict] = []
+
+    if width is not None and height is not None:
+        small_dim = min(width, height)
+        if small_dim < 1080:
+            warnings.append({
+                "code": "low_resolution",
+                "min_dimension": small_dim,
+                "width": width,
+                "height": height,
+                "message": (
+                    f"Source is {width}×{height} — under 1080p in its short "
+                    "dimension. Clips cut from it will look soft on modern "
+                    "phones. Consider attaching a higher-resolution master."
+                ),
+            })
+
+    if source_origin == "youtube_download":
+        warnings.append({
+            "code": "youtube_download_lossy",
+            "message": (
+                "Source was re-downloaded from YouTube (lossy transcode). "
+                "Clips inherit that fidelity. Attach the original master "
+                "for best results."
+            ),
+        })
+
+    return warnings
+
+
+# --- Hardware encoder availability (videotoolbox on macOS) ----------------
+#
+# Probed once at import time and cached. On Apple Silicon the
+# videotoolbox encoders are 5–10× faster than libx264 for typical
+# settings; the catch is they have finite parallel session slots before
+# the encoder engine starts queuing internally. The exact ceiling varies
+# by chip, so the project caps Generate cuts at 4 concurrent hardware
+# jobs (paired with an 8-wide software fallback).
+#
+# An empty result means ffmpeg isn't installed or wasn't built with
+# videotoolbox — both software-only situations the caller treats as
+# "use libx264". Probing once at import keeps the per-cut path
+# subprocess-free.
+
+
+def _detect_hardware_encoders() -> frozenset[str]:
+    """Return the set of available ``*_videotoolbox`` encoder names.
+
+    Failure modes (ffmpeg missing, build without videotoolbox, weird
+    output) all degrade silently to ``frozenset()`` so the software path
+    becomes the no-questions-asked default.
+    """
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return frozenset()
+    if result.returncode != 0:
+        return frozenset()
+    found: set[str] = set()
+    for line in result.stdout.splitlines():
+        # ffmpeg prints "V....D h264_videotoolbox     VideoToolbox H.264 Encoder".
+        # The second whitespace-separated token is the encoder name.
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].endswith("_videotoolbox"):
+            found.add(parts[1])
+    return frozenset(found)
+
+
+_HARDWARE_ENCODERS: frozenset[str] = _detect_hardware_encoders()
+
+
+def hardware_encoder_available(codec: str = "h264") -> bool:
+    """True when ffmpeg can encode ``codec`` via videotoolbox.
+
+    ``codec`` is the bare codec name (``h264`` / ``hevc``); the function
+    appends ``_videotoolbox`` to match what ffmpeg lists.
+    """
+    return f"{codec}_videotoolbox" in _HARDWARE_ENCODERS
+
+
+def probe_is_video(probe: VideoProbe | None) -> bool:
+    """True when ``probe`` came back with at least one of width/height/duration.
+
+    Returns False when ffprobe ran but produced nothing usable — the
+    file isn't a recognisable video. Returns True when ``probe`` is
+    ``None`` (ffprobe wasn't installed), because in that case the
+    caller can't tell either way and "trust the user" is the right
+    posture.
+    """
+    if probe is None:
+        return True
+    return (
+        probe.width is not None
+        or probe.height is not None
+        or probe.duration_seconds is not None
+    )
+
+
+# 9:16 vertical crop output dimensions. Standard "Shorts/TikTok" size.
+_VERTICAL_OUTPUT_WIDTH: int = 1080
+_VERTICAL_OUTPUT_HEIGHT: int = 1920
+
+# Hardware encoder bitrate target — videotoolbox needs an explicit
+# -b:v (no -crf support). 6 Mbps gives clean 1080p output for social
+# clips while keeping file sizes modest.
+_HARDWARE_BITRATE: str = "6M"
+
+
+def _vertical_crop_filter(x_shift_normalized: float) -> str:
+    """ffmpeg ``-vf`` filter chain that crops to 9:16 centered + scales.
+
+    ``x_shift_normalized`` ∈ [-1.0, 1.0] moves the crop column away from
+    center toward the right (positive) or left (negative) as a fraction
+    of the available room (``iw - crop_width``). 0 is dead-center, which
+    is what 3c uses by default. 3d's vision pass produces non-zero
+    values from face position estimates.
+
+    The expression handles both landscape and vertical sources without
+    branching: ``min(iw, ih*9/16)`` picks the largest 9:16-wide column
+    that fits, so a 1080×1920 phone clip leaves the column at full
+    frame and a 1920×1080 horizontal clip pulls a 608-wide strip out of
+    the middle.
+
+    Output is always scaled to 1080×1920 — downscale from 4K is sharp;
+    upscale from 720p is soft (we warn about that in the source-quality
+    UI).
+    """
+    # Clamp the shift so the crop never walks off the source frame.
+    shift = max(-1.0, min(1.0, float(x_shift_normalized)))
+    # Build the x-offset expression. ``(iw - cw) / 2`` is center;
+    # ``shift * (iw - cw) / 2`` adds up to a full half-frame in either
+    # direction. ``cw`` is the min(iw, ih*9/16) value above; reuse the
+    # same sub-expression to keep ffmpeg parsing happy without a
+    # named alias.
+    cw = "min(iw,ih*9/16)"
+    if shift == 0.0:
+        x_expr = f"(iw-{cw})/2"
+    else:
+        x_expr = f"(iw-{cw})/2+({shift:.4f})*(iw-{cw})/2"
+    return (
+        f"crop={cw}:ih:{x_expr}:0,"
+        f"scale={_VERTICAL_OUTPUT_WIDTH}:{_VERTICAL_OUTPUT_HEIGHT}"
+    )
 
 
 def extract_clip(
@@ -13,10 +334,44 @@ def extract_clip(
     start: str,
     end: str,
     output_name: str | None = None,
+    *,
+    precise: bool = True,
+    vertical_crop: bool = False,
+    x_shift_normalized: float = 0.0,
+    encoder: Literal["auto", "hardware", "software"] = "auto",
 ) -> Path:
-    """Extract a video clip.
+    """Extract a video clip from ``start`` to ``end``.
 
-    start/end: timestamps like "0:30" or "1:30:00"
+    ``start`` / ``end`` are ffmpeg-style timestamps — ``"0:30"`` or
+    ``"1:30:00"``.
+
+    ``precise=True`` (default) puts ``-ss`` *after* ``-i`` so ffmpeg
+    decodes from the nearest preceding keyframe forward and the cut
+    lands sample-accurate. The cost is re-encoding the leading GOP
+    (the frames between the keyframe and the requested start). This is
+    the right setting for the Generate-from-source flow where Claude's
+    proposed timestamps should be respected exactly.
+
+    ``precise=False`` puts ``-ss`` *before* ``-i`` for a fast seek that
+    snaps to the nearest preceding keyframe — the cut may start up to
+    one GOP early. Useful when accuracy doesn't matter and throughput
+    does (e.g. preview thumbnails). The output is still re-encoded.
+
+    ``vertical_crop=True`` crops the output to 9:16 (1080×1920) using
+    :func:`_vertical_crop_filter`. ``x_shift_normalized`` shifts the
+    crop column away from dead-center; values come from the 3d vision
+    pass when available, default 0 for 3c's center-only behaviour.
+
+    ``encoder`` selects the H.264 encoder:
+
+    * ``"auto"`` — videotoolbox when ffmpeg has it built in,
+      libx264 otherwise.
+    * ``"hardware"`` — force ``h264_videotoolbox``. Raises if the
+      detection at module-import said it's not available.
+    * ``"software"`` — force ``libx264``.
+
+    Callers wrap the call in the appropriate semaphore in
+    ``services/clipper`` so concurrent cuts queue rather than fight.
     """
     video_path = Path(video_path)
     if output_name is None:
@@ -24,20 +379,57 @@ def extract_clip(
 
     output = UPLOAD_DIR / output_name
 
-    subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-i", str(video_path),
-            "-ss", start,
-            "-to", end,
+    use_hardware = False
+    if encoder == "hardware":
+        if not hardware_encoder_available("h264"):
+            raise RuntimeError(
+                "Hardware encoder requested but h264_videotoolbox is not "
+                "available in this ffmpeg build."
+            )
+        use_hardware = True
+    elif encoder == "auto":
+        # ``auto`` is conservative on purpose: videotoolbox needs an
+        # explicit bitrate (``_HARDWARE_BITRATE``) which we've tuned for
+        # the fixed 1080×1920 vertical output. For a non-vertical cut
+        # the output resolution matches the source, so a 4K parent
+        # would be re-encoded at the same 6 Mbps and look terrible —
+        # libx264 with its quality-targeted CRF is the right tool there.
+        # Hardware kicks in only when we know the output is being
+        # scaled down to 1080p.
+        use_hardware = vertical_crop and hardware_encoder_available("h264")
+    # else "software" — leave use_hardware False.
+
+    cmd: list[str] = ["ffmpeg", "-y"]
+    if precise:
+        # Slow seek inside the decoder — sample-accurate.
+        cmd.extend(["-i", str(video_path), "-ss", start, "-to", end])
+    else:
+        # Fast seek at the container level — keyframe-snap.
+        cmd.extend(["-ss", start, "-to", end, "-i", str(video_path)])
+
+    if vertical_crop:
+        cmd.extend(["-vf", _vertical_crop_filter(x_shift_normalized)])
+
+    if use_hardware:
+        # videotoolbox doesn't accept -crf; needs -b:v. Quality at 6M
+        # for 1080p is comparable to libx264 -crf 20 for typical
+        # content.
+        cmd.extend([
+            "-c:v", "h264_videotoolbox",
+            "-b:v", _HARDWARE_BITRATE,
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            str(output),
+        ])
+    else:
+        cmd.extend([
             "-c:v", "libx264",
             "-c:a", "aac",
             "-movflags", "+faststart",
             str(output),
-        ],
-        check=True,
-        capture_output=True,
-    )
+        ])
+
+    subprocess.run(cmd, check=True, capture_output=True)
 
     return output
 

@@ -11,6 +11,7 @@
         <span class="crumb crumb-page">Promo videos</span>
     </h1>
     <div style="display:flex; gap:0.5rem;">
+        <button type="button" class="btn btn-secondary" id="generate-from-source-btn">Generate from source</button>
         <button type="button" class="btn btn-secondary" id="schedule-all-btn">Schedule all</button>
         <label for="add-files-all" class="btn btn-primary" id="add-files-all-label">
             + Add videos
@@ -18,6 +19,56 @@
         </label>
     </div>
 </div>
+
+<dialog id="generate-modal" class="modal modal-xwide">
+    <h3>Generate from source</h3>
+    <p class="form-hint" id="generate-parent-line"></p>
+
+    <div id="generate-warnings" style="display:none; margin: 0.6rem 0;"></div>
+
+    <fieldset id="generate-kinds-fieldset" style="margin: 0.6rem 0; padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: var(--radius-sm);">
+        <legend>Kinds to propose</legend>
+        <label class="generate-kind-row">
+            <input type="checkbox" id="generate-kind-hook" checked>
+            Hooks (5–30 s)
+            <span class="generate-kind-crop">
+                <input type="checkbox" id="generate-crop-hook" checked>
+                <span>9:16 vertical crop</span>
+            </span>
+        </label>
+        <label class="generate-kind-row">
+            <input type="checkbox" id="generate-kind-short" checked>
+            Shorts (45–75 s)
+            <span class="generate-kind-crop">
+                <input type="checkbox" id="generate-crop-short" checked>
+                <span>9:16 vertical crop</span>
+            </span>
+        </label>
+        <label class="generate-kind-row">
+            <input type="checkbox" id="generate-kind-segment" checked>
+            Segments (60 s+)
+            <span class="generate-kind-crop">
+                <input type="checkbox" id="generate-crop-segment">
+                <span>9:16 vertical crop</span>
+            </span>
+        </label>
+        <p class="form-hint" id="generate-eligibility-hint" style="margin: 0.4rem 0 0;"></p>
+    </fieldset>
+
+    <div id="generate-progress" style="display:none; margin: 0.6rem 0;">
+        <div id="generate-progress-text" class="form-hint"></div>
+    </div>
+
+    <div id="generate-proposals" style="display:none; margin: 0.6rem 0;"></div>
+
+    <div id="generate-error" class="form-hint" style="display:none; color: var(--danger); margin: 0.6rem 0;"></div>
+
+    <div class="modal-actions">
+        <button type="button" class="btn" id="generate-cancel">Cancel</button>
+        <button type="button" class="btn btn-primary" id="generate-go">Generate</button>
+        <button type="button" class="btn btn-primary" id="generate-confirm" style="display:none;">Cut & insert selected</button>
+    </div>
+</dialog>
 
 <dialog id="schedule-all-modal" class="modal modal-xwide">
     <h3>Schedule all promos</h3>
@@ -89,6 +140,7 @@ const PROMO_STATE_LABELS = {
     // think the click was ignored during a slow multipart POST.
     transferring: 'Sending to server…',
     pending: 'Queued…',
+    cutting: 'Cutting clip from parent…',
     generating_title: 'Generating title…',
     uploading: 'Uploading to YouTube…',
     probing: 'Probing duration…',
@@ -802,6 +854,299 @@ scheduleAllForm.addEventListener('submit', async (e) => {
         scheduleAllConfirm.textContent = 'Confirm schedule';
     }
 });
+
+// --- Generate from source -----------------------------------------------
+//
+// User clicks "Generate from source" → modal opens with kind checkboxes.
+// User clicks "Generate" → POST /generate/preview, then poll
+// /generate/jobs/{id} until done/failed. On done, render proposal cards
+// with inline preview (local <video> when codec is browser-playable,
+// YouTube iframe otherwise) and per-card accept checkboxes. User clicks
+// "Cut & insert selected" → POST /generate/confirm; the resulting jobs
+// flow through the existing upload-jobs polling (placeholder cards,
+// state transitions) since cut + insert reuses the promo chain.
+
+const GENERATE_KIND_LABELS = { hook: 'Hook', short: 'Short', segment: 'Segment' };
+
+let generatePreviewData = null;     // last /preview response
+let generatePollHandle = null;      // setTimeout for polling
+let generatePreviewCropSelection = {}; // per-kind crop_vertical at preview time
+
+function fmtSeconds(s) {
+    if (s == null || isNaN(s)) return '?';
+    const total = Math.floor(s);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const sec = total % 60;
+    if (h) return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+    return `${m}:${String(sec).padStart(2, '0')}`;
+}
+
+document.getElementById('generate-from-source-btn').addEventListener('click', openGenerateModal);
+document.getElementById('generate-cancel').addEventListener('click', closeGenerateModal);
+document.getElementById('generate-modal').addEventListener('cancel', (ev) => {
+    ev.preventDefault();
+    closeGenerateModal();
+});
+
+function openGenerateModal() {
+    document.getElementById('generate-parent-line').textContent = 'Cutting from this primary video.';
+    document.getElementById('generate-warnings').style.display = 'none';
+    document.getElementById('generate-warnings').innerHTML = '';
+    document.getElementById('generate-proposals').style.display = 'none';
+    document.getElementById('generate-proposals').innerHTML = '';
+    document.getElementById('generate-progress').style.display = 'none';
+    document.getElementById('generate-error').style.display = 'none';
+    document.getElementById('generate-go').style.display = '';
+    document.getElementById('generate-go').disabled = false;
+    document.getElementById('generate-confirm').style.display = 'none';
+    document.getElementById('generate-eligibility-hint').textContent = '';
+    document.getElementById('generate-kinds-fieldset').style.display = '';
+    document.getElementById('generate-modal').showModal();
+}
+
+function closeGenerateModal() {
+    if (generatePollHandle) { clearTimeout(generatePollHandle); generatePollHandle = null; }
+    generatePreviewData = null;
+    document.getElementById('generate-modal').close();
+}
+
+document.getElementById('generate-go').addEventListener('click', async () => {
+    const kinds = ['hook', 'short', 'segment'].filter(k =>
+        document.getElementById(`generate-kind-${k}`).checked,
+    );
+    if (!kinds.length) {
+        showGenerateError('Pick at least one kind.');
+        return;
+    }
+    const cropVertical = {
+        hook: document.getElementById('generate-crop-hook').checked,
+        short: document.getElementById('generate-crop-short').checked,
+        segment: document.getElementById('generate-crop-segment').checked,
+    };
+    // Remember the per-kind crop flags so the confirm step can stamp
+    // each accepted proposal with the right vertical_crop value before
+    // POSTing.
+    generatePreviewCropSelection = cropVertical;
+    document.getElementById('generate-go').disabled = true;
+    document.getElementById('generate-progress').style.display = '';
+    document.getElementById('generate-progress-text').textContent = 'Starting…';
+    document.getElementById('generate-error').style.display = 'none';
+
+    let resp, body;
+    try {
+        resp = await fetch(`/api/projects/${projectSlug}/videos/${parentId}/promos/generate/preview`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kinds, crop_vertical: cropVertical }),
+        });
+        body = await resp.json();
+    } catch (e) {
+        showGenerateError('Could not reach the server.');
+        document.getElementById('generate-go').disabled = false;
+        return;
+    }
+    if (!resp.ok) {
+        showGenerateError(body.detail || `HTTP ${resp.status}`);
+        document.getElementById('generate-go').disabled = false;
+        document.getElementById('generate-progress').style.display = 'none';
+        return;
+    }
+
+    generatePreviewData = body;
+    renderGenerateWarnings(body.parent_warnings || []);
+    if (body.ineligible_kinds && body.ineligible_kinds.length) {
+        document.getElementById('generate-eligibility-hint').textContent =
+            `Skipping ${body.ineligible_kinds.join(', ')} — parent too short for those.`;
+    }
+    // Hide the kinds picker now that we're committed; show the
+    // progress text while we poll.
+    document.getElementById('generate-kinds-fieldset').style.display = 'none';
+    document.getElementById('generate-go').style.display = 'none';
+
+    pollGenerateJob(body.job_id);
+});
+
+function renderGenerateWarnings(warnings) {
+    const el = document.getElementById('generate-warnings');
+    if (!warnings.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+    el.innerHTML = `<ul class="fi-warnings">${
+        warnings.map(w => `<li>${escapeHtml(w.message)}</li>`).join('')
+    }</ul>`;
+    el.style.display = '';
+}
+
+function showGenerateError(text) {
+    const el = document.getElementById('generate-error');
+    el.textContent = text;
+    el.style.display = '';
+}
+
+async function pollGenerateJob(jobId) {
+    let resp, body;
+    try {
+        resp = await fetch(`/api/projects/${projectSlug}/videos/${parentId}/promos/generate/jobs/${jobId}`);
+        body = await resp.json();
+    } catch (e) {
+        showGenerateError('Lost connection while polling.');
+        return;
+    }
+    if (!resp.ok) {
+        showGenerateError(body.detail || `HTTP ${resp.status}`);
+        return;
+    }
+    const state = body.state;
+    const msg = body.progress_message || ({
+        pending: 'Queued…',
+        transcribing: 'Transcribing parent video…',
+        proposing: 'Asking Claude to propose clips…',
+        done: 'Done.',
+        failed: 'Failed.',
+    })[state] || state;
+    document.getElementById('generate-progress-text').textContent = msg;
+
+    if (state === 'done') {
+        document.getElementById('generate-progress').style.display = 'none';
+        renderProposalsList(body.proposals || {});
+        return;
+    }
+    if (state === 'failed') {
+        document.getElementById('generate-progress').style.display = 'none';
+        showGenerateError(body.last_error || 'Generate job failed.');
+        return;
+    }
+    generatePollHandle = setTimeout(() => pollGenerateJob(jobId), 1500);
+}
+
+function renderProposalsList(proposalsByKind) {
+    const container = document.getElementById('generate-proposals');
+    container.innerHTML = '';
+    const allProposals = [];
+    let any = false;
+
+    for (const kind of ['hook', 'short', 'segment']) {
+        const list = proposalsByKind[kind] || [];
+        if (!list.length) continue;
+        any = true;
+        const section = document.createElement('div');
+        section.style.margin = '0.5rem 0';
+        section.innerHTML = `<h4>${GENERATE_KIND_LABELS[kind]}s · ${list.length}</h4>`;
+        const cards = document.createElement('div');
+        cards.className = 'generate-proposal-grid';
+        list.forEach((p, idx) => {
+            const id = `prop-${kind}-${idx}`;
+            allProposals.push({ id, proposal: p });
+            cards.appendChild(buildProposalCard(id, p));
+        });
+        section.appendChild(cards);
+        container.appendChild(section);
+    }
+    if (!any) {
+        container.innerHTML = '<p class="form-hint">Claude returned no proposals for this video.</p>';
+    }
+    container.style.display = '';
+    document.getElementById('generate-confirm').style.display = '';
+    document.getElementById('generate-confirm').onclick = () => confirmAccepted(allProposals);
+}
+
+function buildProposalCard(id, p) {
+    const card = document.createElement('div');
+    card.className = 'generate-proposal-card card';
+    const previewHtml = buildProposalPreview(p);
+    card.innerHTML = `
+        <label class="generate-proposal-accept">
+            <input type="checkbox" id="${id}-accept" checked>
+            Include
+        </label>
+        <div class="generate-proposal-title">${escapeHtml(p.title || '(untitled)')}</div>
+        <div class="form-hint">
+            ${fmtSeconds(p.start_seconds)} – ${fmtSeconds(p.end_seconds)}
+            · ${fmtSeconds(p.duration_seconds)}
+        </div>
+        ${p.reason ? `<div class="form-hint" style="margin-top:0.25rem;">${escapeHtml(p.reason)}</div>` : ''}
+        <div class="generate-proposal-preview" style="margin-top:0.4rem;">${previewHtml}</div>
+    `;
+    return card;
+}
+
+function buildProposalPreview(p) {
+    const data = generatePreviewData;
+    if (!data) return '';
+    if (data.parent_browser_playable && data.parent_video_file_url) {
+        const url = `${data.parent_video_file_url}#t=${p.start_seconds},${p.end_seconds}`;
+        return `<video src="${escapeAttr(url)}" controls preload="metadata" style="width:100%; max-height:240px;"></video>`;
+    }
+    if (data.parent_youtube_id) {
+        const start = Math.floor(p.start_seconds);
+        const end = Math.ceil(p.end_seconds);
+        const url = `https://www.youtube.com/embed/${encodeURIComponent(data.parent_youtube_id)}?start=${start}&end=${end}`;
+        return `<div class="form-hint" style="margin-bottom:0.2rem;">Preview from YouTube</div>`
+             + `<iframe width="100%" height="220" src="${escapeAttr(url)}" frameborder="0" allowfullscreen></iframe>`;
+    }
+    return `<div class="form-hint">Preview unavailable for this parent.</div>`;
+}
+
+function escapeAttr(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+}
+
+async function confirmAccepted(allProposals) {
+    const accepted = allProposals
+        .filter(({ id }) => document.getElementById(`${id}-accept`).checked)
+        .map(({ proposal }) => ({
+            kind: proposal.kind,
+            start_seconds: proposal.start_seconds,
+            end_seconds: proposal.end_seconds,
+            title: proposal.title,
+            // Per-kind crop selection from the modal. 3d will also flow
+            // x_shift_normalized in alongside this once Claude vision
+            // returns refined positions.
+            vertical_crop: !!generatePreviewCropSelection[proposal.kind],
+            x_shift_normalized: Number(proposal.x_shift_normalized || 0),
+        }));
+    if (!accepted.length) {
+        showGenerateError('Select at least one proposal to cut.');
+        return;
+    }
+    const btn = document.getElementById('generate-confirm');
+    btn.disabled = true;
+    btn.textContent = 'Cutting…';
+    try {
+        const resp = await fetch(`/api/projects/${projectSlug}/videos/${parentId}/promos/generate/confirm`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ accepted }),
+        });
+        const body = await resp.json();
+        if (!resp.ok) {
+            showGenerateError(body.detail || `HTTP ${resp.status}`);
+            return;
+        }
+        // The new jobs flow through the existing upload-jobs polling
+        // pattern — register placeholder activeJobs entries with the
+        // 'cutting' state so the cards appear immediately. activeJobs is
+        // a Map (see line ~153), not a plain object.
+        for (const job of body.jobs || []) {
+            activeJobs.set(job.job_id, {
+                job_id: job.job_id,
+                filename: job.title || 'clip',
+                state: 'cutting',
+                last_error: null,
+                video_id: null,
+                title: job.title,
+                expectedTier: job.kind,
+            });
+        }
+        showToast(`Queued ${body.jobs.length} clip${body.jobs.length === 1 ? '' : 's'} for cutting`, 'success');
+        closeGenerateModal();
+        await loadPromos();
+    } catch (e) {
+        showGenerateError('Network error while submitting.');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Cut & insert selected';
+    }
+}
 </script>
 
 <style>
@@ -872,5 +1217,48 @@ scheduleAllForm.addEventListener('submit', async (e) => {
     color: var(--text-muted, #888);
 }
 .sched-delay-row input[type="number"] { width: 4rem; }
+
+/* Generate-from-source kind rows in the modal. */
+.generate-kind-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.2rem 0;
+    flex-wrap: wrap;
+}
+.generate-kind-crop {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    margin-left: auto;
+    font-size: 0.85em;
+    color: var(--text-muted, #888);
+}
+.generate-kind-crop input { margin: 0; }
+
+/* Generate-from-source proposal cards. */
+.generate-proposal-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 0.6rem;
+    margin-top: 0.3rem;
+}
+.generate-proposal-card {
+    padding: 0.6rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-card, transparent);
+}
+.generate-proposal-accept {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.85rem;
+    color: var(--text-muted, #888);
+    margin-bottom: 0.3rem;
+}
+.generate-proposal-title { font-weight: 600; }
+.generate-proposal-preview video,
+.generate-proposal-preview iframe { display: block; width: 100%; }
 </style>
 {% endblock %}
