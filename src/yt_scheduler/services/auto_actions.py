@@ -878,6 +878,14 @@ async def _run_promo_chain_inner(job_id: str) -> None:
         or "short"
     )
 
+    # Generate-from-source clips are derived from a parent's local
+    # file — they were never directly uploaded by the user. Stamp them
+    # 'generated_clip' so the file-info modal can show that honestly
+    # and so future Replace-source attempts on a 9:16 generated short
+    # don't trip the resolution-downgrade warning against the 1080×1920
+    # cut's own dimensions.
+    file_origin = "generated_clip" if job.get("parent_video_path") else "uploaded"
+
     db = await get_db()
     await db.execute(
         """INSERT INTO videos (
@@ -888,7 +896,7 @@ async def _run_promo_chain_inner(job_id: str) -> None:
             auto_action_state, source_file_origin,
             cut_start_seconds, cut_end_seconds
         ) VALUES (?, ?, ?, ?, '[]', 'unlisted', ?, ?, 'uploaded',
-                  ?, ?, ?, ?, ?, ?, 'uploaded', ?, ?)""",
+                  ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             video_id,
             project_id,
@@ -902,6 +910,7 @@ async def _run_promo_chain_inner(job_id: str) -> None:
             job.get("parent_id") or None,
             youtube_url,
             PROMO_STATE_PROBING,
+            file_origin,
             job.get("cut_start_seconds"),
             job.get("cut_end_seconds"),
         ),

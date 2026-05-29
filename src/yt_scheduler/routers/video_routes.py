@@ -1581,7 +1581,10 @@ def _evaluate_replacement(
 
     # Resolution downgrade only matters when there's a current file to
     # compare against AND that file isn't itself a known-lossy YouTube
-    # re-download (replacing those is always an upgrade in spirit).
+    # re-download (replacing those is always an upgrade in spirit). The
+    # same applies to generated_clip outputs: a 9:16 vertical short is
+    # always 1080×1920 by construction, and attaching the original
+    # landscape master would otherwise trip the height check incorrectly.
     current_origin = row.get("source_file_origin")
     if (
         current is not None
@@ -1589,7 +1592,7 @@ def _evaluate_replacement(
         and current.height is not None
         and incoming.width is not None
         and incoming.height is not None
-        and current_origin != "youtube_download"
+        and current_origin not in ("youtube_download", "generated_clip")
     ):
         if incoming.width < current.width and incoming.height < current.height:
             issues.append({
