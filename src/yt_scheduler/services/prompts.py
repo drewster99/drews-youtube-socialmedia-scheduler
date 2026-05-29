@@ -246,6 +246,11 @@ _CLIP_PROPOSAL_VARIABLES = (
     "parent_duration_human",
     "existing_ranges_block",
     "crop_constraints",
+    # Per-kind length bounds — sourced from clipper._PER_KIND_BOUNDS so
+    # editing the prompt template can't accidentally drift the numbers
+    # away from what the server-side validator enforces.
+    "min_seconds",
+    "max_seconds",
 )
 
 SEED_CLIP_PROPOSALS_HOOK_PROMPT = SeedPrompt(
@@ -256,7 +261,7 @@ SEED_CLIP_PROPOSALS_HOOK_PROMPT = SeedPrompt(
         "Duration: {{parent_duration_human}}\n\n"
         "You are looking for HOOKS — standalone clips that grab attention in "
         "under 30 seconds. Each proposal must:\n"
-        "- Be between 5 and 30 seconds long.\n"
+        "- Be between {{min_seconds}} and {{max_seconds}} seconds long.\n"
         "- Have a self-contained payoff inside the clip itself "
         "(no cliffhangers, no 'wait for it' that pays off after the cut).\n"
         "- Snap to natural sentence boundaries visible in the transcript "
@@ -276,10 +281,10 @@ SEED_CLIP_PROPOSALS_HOOK_PROMPT = SeedPrompt(
     variables=_CLIP_PROPOSAL_VARIABLES,
     system=(
         "You find compelling hook clips inside a longer video. A hook is a "
-        "short standalone clip (5-30 seconds) that grabs attention "
-        "immediately: a strong cold open, a surprising statement, a one-line "
-        "story or punchline that pays off entirely within the clip. You output "
-        "your proposals via the propose_clips tool, never as prose."
+        "short standalone clip that grabs attention immediately: a strong "
+        "cold open, a surprising statement, a one-line story or punchline "
+        "that pays off entirely within the clip. You output your proposals "
+        "via the propose_clips tool, never as prose."
     ),
 )
 
@@ -290,8 +295,9 @@ SEED_CLIP_PROPOSALS_SHORT_PROMPT = SeedPrompt(
         "Parent video: {{parent_title}}\n"
         "Duration: {{parent_duration_human}}\n\n"
         "You are looking for SHORTS — complete bits with a setup→payoff arc "
-        "that fit between 45 and 75 seconds. Each proposal must:\n"
-        "- Be between 45 and 75 seconds long.\n"
+        "that fit between {{min_seconds}} and {{max_seconds}} seconds. "
+        "Each proposal must:\n"
+        "- Be between {{min_seconds}} and {{max_seconds}} seconds long.\n"
         "- Contain a complete idea, story, or answer to a question.\n"
         "- Have enough setup that a viewer landing cold can follow it.\n"
         "- Snap to natural sentence boundaries in the transcript timestamps.\n"
@@ -310,9 +316,10 @@ SEED_CLIP_PROPOSALS_SHORT_PROMPT = SeedPrompt(
     variables=_CLIP_PROPOSAL_VARIABLES,
     system=(
         "You find compelling short clips inside a longer video. A short is a "
-        "45-75 second clip with a complete setup→payoff arc — a bit, a "
-        "story, an answer to a question — that stands on its own. You output "
-        "your proposals via the propose_clips tool, never as prose."
+        "clip with a complete setup→payoff arc — a bit, a story, an answer "
+        "to a question — that stands on its own. The exact length band is "
+        "given per-call in the user message. You output your proposals via "
+        "the propose_clips tool, never as prose."
     ),
 )
 
@@ -358,8 +365,8 @@ SEED_CLIP_PROPOSALS_SEGMENT_PROMPT = SeedPrompt(
         "Duration: {{parent_duration_human}}\n\n"
         "You are looking for SEGMENTS — coherent topic blocks that pull a "
         "whole sub-topic out of the parent. Each proposal must:\n"
-        "- Be at least 60 seconds long. No maximum — as long as the topic "
-        "naturally runs.\n"
+        "- Be at least {{min_seconds}} seconds long. No fixed maximum — as "
+        "long as the topic naturally runs.\n"
         "- Cover one coherent subject, with the discussion ending naturally "
         "rather than mid-thought.\n"
         "- Snap to natural sentence and topic boundaries in the transcript.\n"

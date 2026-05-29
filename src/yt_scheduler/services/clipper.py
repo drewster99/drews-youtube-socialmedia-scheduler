@@ -341,6 +341,12 @@ async def propose_clips_for_kind(
     prompt = await prompt_service.get_prompt_with_fallback(
         _PER_KIND_PROMPT_KEY[kind], project_id=project_id,
     )
+    # _PER_KIND_BOUNDS is the single source of truth for the length
+    # band — render the numbers into the prompt body via variables so a
+    # future bound change updates the prompt and the validator together.
+    # Segments have no fixed max; we render an empty string so the
+    # prompt's "No fixed maximum" prose still reads cleanly.
+    min_s, max_s = _PER_KIND_BOUNDS[kind]
     rendered_body = ai._render_template_body(
         prompt["body"],
         {
@@ -352,6 +358,8 @@ async def propose_clips_for_kind(
             "crop_constraints": (
                 VERTICAL_CROP_PROMPT_BLOCK if crop_vertical else ""
             ),
+            "min_seconds": f"{int(min_s)}",
+            "max_seconds": f"{int(max_s)}" if max_s is not None else "",
         },
     )
 

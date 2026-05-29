@@ -113,6 +113,40 @@ def test_validate_drops_out_of_parent_bounds():
     assert titles == ["ok"]
 
 
+def test_seed_prompts_render_bounds_from_per_kind_bounds():
+    """The clip-proposal seed bodies use {{min_seconds}} / {{max_seconds}}
+    so the duration band stays in sync with clipper._PER_KIND_BOUNDS.
+    Edit one without the other and a future maintainer would otherwise
+    end up with Claude proposing 30-90s shorts that the server then
+    silently filters down to the 45-75s band."""
+    from yt_scheduler.services import templates
+    from yt_scheduler.services.prompts import _SEEDS_BY_KEY
+    from yt_scheduler.services.clipper import _PER_KIND_BOUNDS
+
+    cases = [
+        ("hook", "promo_clip_proposals_hook", "5 and 30 seconds"),
+        ("short", "promo_clip_proposals_short", "45 and 75 seconds"),
+        ("segment", "promo_clip_proposals_segment", "at least 60 seconds"),
+    ]
+    for kind, key, expected_phrase in cases:
+        mn, mx = _PER_KIND_BOUNDS[kind]
+        rendered = templates.render(
+            _SEEDS_BY_KEY[key].body,
+            {
+                "parent_title": "X",
+                "parent_duration_human": "1h",
+                "existing_ranges_block": "",
+                "crop_constraints": "",
+                "min_seconds": str(int(mn)),
+                "max_seconds": str(int(mx)) if mx is not None else "",
+            },
+        )
+        assert expected_phrase in rendered, (
+            f"Rendered {kind} prompt does not contain {expected_phrase!r}: "
+            f"{rendered}"
+        )
+
+
 def test_evict_stale_upload_jobs_drops_old_failures():
     """Failed upload jobs past the TTL get evicted; in-progress + fresh
     failures stay."""
