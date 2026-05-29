@@ -81,7 +81,8 @@ Environment variables (loaded from `.env`; legacy `YTP_*` names are honoured as 
 4. **Configure auto-actions** — Project Settings → toggle the Uploads | Imports matrix and the Posting-to-social-media defaults.
 5. **Upload or import** — Dashboard → "Upload new video", or pick from "YouTube videos available to import".
 6. **Compose socials from a template** — Video detail → "Socials from template" → pick template, check accounts, write `{{user_message}}`, Generate. Edit each card individually, then Post now or Schedule.
-7. **Publish** — Either schedule the video itself (dashed-amber pill on the detail screen) or click "Publish + post now" to flip privacy to public + fire all approved socials immediately.
+7. **Cut promos from the source** *(optional)* — Promo Videos screen → "Generate from source" → pick which kinds (Hooks / Shorts / Segments) and whether to crop to 9:16. Claude proposes ranges from the parent's transcript; an optional vision pass refines the crop position per range. Review the cards, dismiss any you don't want, then "Cut & insert selected" — the cut MP4s drop into the promo grid and run through the normal upload chain (AI title kept from the proposal, AI description / tags / YouTube push happen automatically).
+8. **Publish** — Either schedule the video itself (dashed-amber pill on the detail screen) or click "Publish + post now" to flip privacy to public + fire all approved socials immediately.
 
 ### Templates
 
