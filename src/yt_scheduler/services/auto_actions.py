@@ -571,7 +571,14 @@ _PROMO_WHISPER_LOCK: asyncio.Lock = asyncio.Lock()
 # In-flight upload jobs that don't yet have a videos row. The Promo screen
 # polls upload-jobs/<id> until ``video_id`` flips to a real id, then
 # switches to polling /api/videos/{id}/auto-actions.
+#
+# Terminal failures (state startswith 'failed:') are popped after
+# ``_UPLOAD_JOB_FAILED_TTL_SECONDS`` past their state change so the dict
+# doesn't grow unboundedly on a session that hits many cut / upload /
+# title-gen failures. Successful jobs are popped at the end of the chain
+# already (see _run_promo_chain_inner finally-block).
 _UPLOAD_JOBS: dict[str, dict] = {}
+_UPLOAD_JOB_FAILED_TTL_SECONDS: float = 10 * 60  # 10 minutes
 
 
 # Cap on simultaneously-running promo chains. The chain itself fans out
@@ -582,8 +589,40 @@ _UPLOAD_JOBS: dict[str, dict] = {}
 _PROMO_CHAIN_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(4)
 
 
+def _evict_stale_upload_jobs() -> None:
+    """Drop terminal-failed upload jobs past their TTL.
+
+    Cheap O(N) sweep run on every read/write of the dict. Success-path
+    jobs already get popped at chain completion (see
+    ``_run_promo_chain_inner``), so this only catches the failure
+    paths that previously had no eviction at all.
+    """
+    import time
+
+    now = time.monotonic()
+    stale = [
+        job_id for job_id, job in _UPLOAD_JOBS.items()
+        if str(job.get("state", "")).startswith("failed:")
+        and job.get("_failed_at") is not None
+        and (now - float(job["_failed_at"])) > _UPLOAD_JOB_FAILED_TTL_SECONDS
+    ]
+    for job_id in stale:
+        _UPLOAD_JOBS.pop(job_id, None)
+
+
+def _mark_upload_failed(job: dict, state: str, error: str | None = None) -> None:
+    """Stamp the failed-state timestamp + state so eviction can age the job out."""
+    import time
+
+    job["state"] = state
+    if error is not None:
+        job["last_error"] = error
+    job["_failed_at"] = time.monotonic()
+
+
 def get_upload_job(job_id: str) -> dict | None:
     """Public read of an upload-job's current state."""
+    _evict_stale_upload_jobs()
     job = _UPLOAD_JOBS.get(job_id)
     if job is None:
         return None
@@ -795,8 +834,10 @@ async def _run_promo_chain_inner(job_id: str) -> None:
                 x_shift_normalized=float(job.get("x_shift_normalized", 0.0)),
             )
         except Exception as exc:
-            job["state"] = f"failed:{PROMO_STATE_CUTTING}"
-            job["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+            _mark_upload_failed(
+                job, f"failed:{PROMO_STATE_CUTTING}",
+                error=f"{type(exc).__name__}: {exc}"[:500],
+            )
             logger.warning(
                 "Promo cut failed for parent=%s range=%s-%s: %r",
                 job.get("parent_id"), job.get("cut_start_seconds"),
@@ -861,8 +902,10 @@ async def _run_promo_chain_inner(job_id: str) -> None:
             publish_at=None,
         )
     except Exception as exc:
-        job["state"] = f"failed:{PROMO_STATE_UPLOADING}"
-        job["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+        _mark_upload_failed(
+            job, f"failed:{PROMO_STATE_UPLOADING}",
+            error=f"{type(exc).__name__}: {exc}"[:500],
+        )
         logger.warning(
             "Promo YT upload failed for %s (local_path=%s): %r",
             job["filename"], local_path, exc,
