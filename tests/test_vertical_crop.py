@@ -292,6 +292,49 @@ async def test_cut_clip_picks_lane_matching_extract_clip_choice(
 
 
 @pytest.mark.asyncio
+async def test_cut_clip_cleans_up_partial_output_on_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+):
+    """When ffmpeg raises mid-cut, cut_clip_from_parent must unlink
+    the half-written output so it doesn't accumulate in UPLOAD_DIR
+    with no row pointing at it."""
+    from yt_scheduler.services import clipper, media
+
+    monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(clipper, "UPLOAD_DIR", tmp_path)
+    # Bypass the semaphores so we don't accidentally hold one.
+    monkeypatch.setattr(clipper, "_HARDWARE_CUT_SEMAPHORE", _TracingSemaphore([], "hw"))
+    monkeypatch.setattr(clipper, "_SOFTWARE_CUT_SEMAPHORE", _TracingSemaphore([], "sw"))
+
+    leaked_paths: list = []
+
+    def fake_extract_clip(*args, **kwargs):
+        # Simulate ffmpeg writing a partial output, then failing.
+        out_name = kwargs["output_name"]
+        partial = tmp_path / out_name
+        partial.write_bytes(b"partial mp4 header...")
+        leaked_paths.append(partial)
+        raise RuntimeError("ffmpeg returned non-zero")
+
+    monkeypatch.setattr(media, "extract_clip", fake_extract_clip)
+
+    proposal = clipper.ProposedClip(
+        kind="hook", start_seconds=0, end_seconds=10, title="x", reason="x",
+    )
+    with pytest.raises(RuntimeError):
+        await clipper.cut_clip_from_parent(
+            parent_video_path=tmp_path / "src.mp4",
+            proposal=proposal,
+        )
+
+    # The partial file written before the raise must have been cleaned up.
+    assert leaked_paths, "fake_extract_clip must have been called"
+    assert not leaked_paths[0].exists(), (
+        f"Partial cut output {leaked_paths[0]} survived the failure"
+    )
+
+
+@pytest.mark.asyncio
 async def test_cut_clip_uses_software_lane_when_hardware_unavailable(
     monkeypatch: pytest.MonkeyPatch, tmp_path,
 ):
