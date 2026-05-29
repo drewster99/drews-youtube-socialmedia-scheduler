@@ -100,3 +100,40 @@ async def test_generic_failure_marks_failed(
     state, path = await _state(db, "DLTEST00001")
     assert state == "failed"
     assert path is None
+
+
+@pytest.mark.asyncio
+async def test_does_not_overwrite_user_attached_master(
+    db, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A user-attached master must not be clobbered by a re-download.
+    Regression test for the code-review fix that protects
+    source_file_origin='user_attached' from _maybe_download_video_file.
+    """
+    auto_actions = importlib.import_module("yt_scheduler.services.auto_actions")
+
+    # Set up the row as if Replace source had already run.
+    master = tmp_path / "uploads" / "MASTER.mov"
+    master.write_bytes(b"\xff" * 32)
+    await db.execute(
+        "UPDATE videos SET source_file_origin = 'user_attached', "
+        "video_file_path = ? WHERE id = ?",
+        (str(master), "DLTEST00001"),
+    )
+    await db.commit()
+
+    download_calls: list[str] = []
+
+    def fake_download(video_id, target_dir):
+        download_calls.append(video_id)
+        return target_dir / "lossy.mp4"
+
+    monkeypatch.setattr(auto_actions.youtube, "download_video_file", fake_download)
+    await auto_actions._maybe_download_video_file("DLTEST00001")
+
+    # No download attempted; the row still points at the master.
+    assert download_calls == []
+    state, path = await _state(db, "DLTEST00001")
+    assert path == str(master)
+    # State column untouched (no in_progress / failed transition).
+    assert state is None
