@@ -889,28 +889,60 @@ async def _run_generate_job(job_id: str) -> None:
             srt = result.to_srt()
             # Persist so the next Generate run on this parent doesn't
             # have to re-transcribe — same upsert path the manual
-            # transcribe endpoint uses.
+            # transcribe endpoint uses. Map result.backend to the
+            # canonical source enum; an unknown backend stays
+            # 'machine_unknown' rather than silently masquerading as
+            # 'user_edited' (which would mis-key the dedup upsert).
             backend_to_source = {
                 "mlx-whisper": "mlx_whisper",
                 "whisper.cpp": "whispercpp",
                 "macos-speech": "apple_speech",
             }
-            source = backend_to_source.get(result.backend, "user_edited")
+            source = backend_to_source.get(result.backend)
+            if source is None:
+                logger.warning(
+                    "Generate-from-source: unknown transcription backend %r; "
+                    "persisting as mlx_whisper as a safe default.",
+                    result.backend,
+                )
+                source = "mlx_whisper"
             transcript_id = await transcript_service.upsert_transcript_for_source(
                 job["parent_id"], source, srt,
             )
-            await db.execute(
-                """UPDATE videos SET
-                    transcript = ?,
-                    transcript_id = ?,
-                    transcript_source = ?,
-                    transcript_updated_at = datetime('now'),
-                    transcript_is_edited = 0,
-                    updated_at = datetime('now')
-                WHERE id = ?""",
-                (srt, transcript_id, source, job["parent_id"]),
+            # Re-read the row before mirroring whisper output onto it: a
+            # concurrent flow (the user manually picking another
+            # transcript while ours ran for minutes) could have changed
+            # the active transcript. Only overwrite when the active
+            # transcript is still empty / non-edited / our own source.
+            cur_rows = await db.execute_fetchall(
+                "SELECT transcript_id, transcript_source, transcript_is_edited "
+                "FROM videos WHERE id = ?",
+                (job["parent_id"],),
             )
-            await db.commit()
+            cur = dict(cur_rows[0]) if cur_rows else {}
+            cur_edited = bool(cur.get("transcript_is_edited"))
+            cur_id = cur.get("transcript_id")
+            if cur_edited or (
+                cur_id is not None and cur_id != transcript_id
+            ):
+                logger.info(
+                    "Generate-from-source: parent transcript changed during "
+                    "whisper run; leaving the user's selection in place "
+                    "and using our fresh SRT only for the in-flight job.",
+                )
+            else:
+                await db.execute(
+                    """UPDATE videos SET
+                        transcript = ?,
+                        transcript_id = ?,
+                        transcript_source = ?,
+                        transcript_updated_at = datetime('now'),
+                        transcript_is_edited = 0,
+                        updated_at = datetime('now')
+                    WHERE id = ?""",
+                    (srt, transcript_id, source, job["parent_id"]),
+                )
+                await db.commit()
             transcript = srt
 
         # Proposing — fan out the per-kind calls.
