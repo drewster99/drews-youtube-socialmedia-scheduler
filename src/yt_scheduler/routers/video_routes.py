@@ -1740,14 +1740,23 @@ async def replace_video_source_file(
         )
 
         new_original = sanitized_original_filename(file.filename)
-        # incoming_probe is not None here (probe_is_video guarded above)
-        # but Optional in the type system — assert to narrow.
-        assert incoming_probe is not None
-        new_duration = (
-            incoming_probe.duration_seconds
-            if incoming_probe.duration_seconds is not None
-            else row.get("duration_seconds")
-        )
+        # probe_is_video(None) → True (when ffprobe isn't installed we
+        # trust the user's upload as best-effort), so incoming_probe can
+        # legitimately be None here. The previous `assert ... is not None`
+        # would 500 in that case. Fall back to existing-row duration when
+        # we can't probe.
+        if incoming_probe is None or incoming_probe.duration_seconds is None:
+            new_duration = row.get("duration_seconds")
+            new_width = incoming_probe.width if incoming_probe else None
+            new_height = incoming_probe.height if incoming_probe else None
+            new_bitrate = incoming_probe.bitrate_bps if incoming_probe else None
+            new_size = incoming_probe.size_bytes if incoming_probe else None
+        else:
+            new_duration = incoming_probe.duration_seconds
+            new_width = incoming_probe.width
+            new_height = incoming_probe.height
+            new_bitrate = incoming_probe.bitrate_bps
+            new_size = incoming_probe.size_bytes
         if force_past_duration:
             await db.execute(
                 """UPDATE videos SET
@@ -1796,11 +1805,11 @@ async def replace_video_source_file(
         "status": "ok",
         "server_path": str(incoming_path),
         "original_name": new_original,
-        "duration_seconds": incoming_probe.duration_seconds,
-        "width": incoming_probe.width,
-        "height": incoming_probe.height,
-        "bitrate_bps": incoming_probe.bitrate_bps,
-        "size_bytes": incoming_probe.size_bytes,
+        "duration_seconds": new_duration,
+        "width": new_width,
+        "height": new_height,
+        "bitrate_bps": new_bitrate,
+        "size_bytes": new_size,
         "source_origin": "user_attached",
         "transcript_cleared": force_past_duration,
     }

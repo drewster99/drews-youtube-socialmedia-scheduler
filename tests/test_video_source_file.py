@@ -408,6 +408,26 @@ def test_oversize_upload_rejected_via_content_length(
     assert resp.status_code == 200, resp.text
 
 
+def test_replace_works_when_ffprobe_unavailable(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """probe_video_file → None (no ffprobe). probe_is_video(None) → True
+    (trust the user). The endpoint must not crash on the previous
+    `assert incoming_probe is not None`."""
+    _insert("NOPROBE0001", duration_seconds=60.0)
+    _stub_probe(monkeypatch, {"__default__": None})
+    resp = client.post(
+        "/api/videos/NOPROBE0001/source-file",
+        files={"file": ("master.mp4", b"\x00" * 64, "video/mp4")},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["source_origin"] == "user_attached"
+    # No probe → fall back to row's existing duration.
+    assert data["duration_seconds"] == 60.0
+    assert data["width"] is None
+
+
 def test_unknown_video_404(client: TestClient):
     resp = client.post(
         "/api/videos/NOPE0000001/source-file",
