@@ -438,11 +438,47 @@ _CUT_SEMAPHORE = _SOFTWARE_CUT_SEMAPHORE
 # at preview-start; the chain fires a fresh whisper run inline. ``done``
 # state carries ``proposals: dict[kind → list[ProposedClip-as-dict]]``
 # which the client renders.
+#
+# Terminal jobs (``done`` / ``failed``) live for ``_GENERATE_JOB_TTL_SECONDS``
+# past the moment they entered the terminal state — long enough that a
+# slow client polling at 1.5 s intervals will land at least one final
+# read, short enough that the dict can't grow unboundedly on a long-
+# running install. _evict_stale_generate_jobs runs on every read/write
+# of the dict, so no separate timer is needed.
 _GENERATE_JOBS: dict[str, dict] = {}
+_GENERATE_JOB_TTL_SECONDS: float = 5 * 60  # 5 minutes
+
+
+def _evict_stale_generate_jobs() -> None:
+    """Drop terminal-state jobs that have exceeded their TTL.
+
+    Cheap O(N) sweep — N is bounded by typical user activity (a few
+    dozen at most) and this runs on every poll/write of the dict, so
+    stale entries are reaped opportunistically without a background
+    timer.
+    """
+    import time
+
+    now = time.monotonic()
+    stale = [
+        job_id for job_id, job in _GENERATE_JOBS.items()
+        if job.get("state") in ("done", "failed")
+        and job.get("_terminal_at") is not None
+        and (now - float(job["_terminal_at"])) > _GENERATE_JOB_TTL_SECONDS
+    ]
+    for job_id in stale:
+        _GENERATE_JOBS.pop(job_id, None)
+
+
+def _mark_terminal(job: dict) -> None:
+    """Stamp the terminal-state timestamp so eviction can age the job out."""
+    import time
+    job["_terminal_at"] = time.monotonic()
 
 
 def get_generate_job(job_id: str) -> dict | None:
     """Read of a generate job's current state for the polling endpoint."""
+    _evict_stale_generate_jobs()
     job = _GENERATE_JOBS.get(job_id)
     if job is None:
         return None
@@ -815,6 +851,7 @@ async def start_generate_job(
     transitions through a ``transcribing`` state and re-uses
     :mod:`services.transcription` to produce one.
     """
+    _evict_stale_generate_jobs()
     job_id = "gen_" + secrets.token_hex(8)
     _GENERATE_JOBS[job_id] = {
         "job_id": job_id,
@@ -1027,7 +1064,9 @@ async def _run_generate_job(job_id: str) -> None:
         }
         job["state"] = "done"
         job["progress_message"] = None
+        _mark_terminal(job)
     except Exception as exc:
         logger.exception("Generate-from-source job %s failed", job_id)
         job["state"] = "failed"
         job["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+        _mark_terminal(job)
