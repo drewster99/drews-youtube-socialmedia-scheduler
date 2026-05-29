@@ -251,6 +251,9 @@ _CLIP_PROPOSAL_VARIABLES = (
     # away from what the server-side validator enforces.
     "min_seconds",
     "max_seconds",
+    # Output cap — sourced from clipper._OUTPUT_CAP_PER_KIND so a future
+    # cap change updates the prompt instruction at the same time.
+    "max_proposals",
 )
 
 SEED_CLIP_PROPOSALS_HOOK_PROMPT = SeedPrompt(
@@ -269,7 +272,7 @@ SEED_CLIP_PROPOSALS_HOOK_PROMPT = SeedPrompt(
         "- Stand alone without context from elsewhere in the video.\n\n"
         "{{existing_ranges_block??}}"
         "{{crop_constraints??}}"
-        "\nPropose up to 8 hooks that genuinely stand alone. Returning fewer "
+        "\nPropose up to {{max_proposals}} hooks that genuinely stand alone. Returning fewer "
         "(or zero) is much better than padding with mediocre ones.\n\n"
         "For each proposal:\n"
         "- start_seconds and end_seconds: exact timestamps from the "
@@ -304,7 +307,7 @@ SEED_CLIP_PROPOSALS_SHORT_PROMPT = SeedPrompt(
         "- Stand alone — no required context from elsewhere in the video.\n\n"
         "{{existing_ranges_block??}}"
         "{{crop_constraints??}}"
-        "\nPropose up to 8 shorts that genuinely have a complete arc. "
+        "\nPropose up to {{max_proposals}} shorts that genuinely have a complete arc. "
         "Returning fewer (or zero) is much better than padding.\n\n"
         "For each proposal:\n"
         "- start_seconds and end_seconds: exact timestamps from the "
@@ -373,7 +376,7 @@ SEED_CLIP_PROPOSALS_SEGMENT_PROMPT = SeedPrompt(
         "- Stand on its own as a discussion of that subject.\n\n"
         "{{existing_ranges_block??}}"
         "{{crop_constraints??}}"
-        "\nPropose up to 8 segments that pull out coherent topic blocks. "
+        "\nPropose up to {{max_proposals}} segments that pull out coherent topic blocks. "
         "Returning fewer (or zero) is much better than padding with weakly-"
         "bounded slices.\n\n"
         "For each proposal:\n"

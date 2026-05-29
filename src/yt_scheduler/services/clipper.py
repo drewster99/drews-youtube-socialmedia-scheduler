@@ -360,6 +360,7 @@ async def propose_clips_for_kind(
             ),
             "min_seconds": f"{int(min_s)}",
             "max_seconds": f"{int(max_s)}" if max_s is not None else "",
+            "max_proposals": str(_OUTPUT_CAP_PER_KIND),
         },
     )
 

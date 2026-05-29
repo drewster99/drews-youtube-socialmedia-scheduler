@@ -113,6 +113,39 @@ def test_validate_drops_out_of_parent_bounds():
     assert titles == ["ok"]
 
 
+def test_seed_prompts_render_cap_from_output_cap():
+    """The clip-proposal seed bodies use {{max_proposals}} so the "up to N"
+    instruction stays in sync with clipper._OUTPUT_CAP_PER_KIND. A future
+    cap bump (e.g. to 12) updates the prompt at the same time, instead
+    of having Claude propose 12 while the validator still drops past 8."""
+    from yt_scheduler.services import templates
+    from yt_scheduler.services.prompts import _SEEDS_BY_KEY
+    from yt_scheduler.services.clipper import (
+        _OUTPUT_CAP_PER_KIND, _PER_KIND_BOUNDS,
+    )
+
+    expected = f"up to {_OUTPUT_CAP_PER_KIND}"
+    for kind, key in [
+        ("hook", "promo_clip_proposals_hook"),
+        ("short", "promo_clip_proposals_short"),
+        ("segment", "promo_clip_proposals_segment"),
+    ]:
+        mn, mx = _PER_KIND_BOUNDS[kind]
+        rendered = templates.render(
+            _SEEDS_BY_KEY[key].body,
+            {
+                "parent_title": "X", "parent_duration_human": "1h",
+                "existing_ranges_block": "", "crop_constraints": "",
+                "min_seconds": str(int(mn)),
+                "max_seconds": str(int(mx)) if mx is not None else "",
+                "max_proposals": str(_OUTPUT_CAP_PER_KIND),
+            },
+        )
+        assert expected in rendered, (
+            f"Rendered {kind} prompt does not contain {expected!r}"
+        )
+
+
 def test_seed_prompts_render_bounds_from_per_kind_bounds():
     """The clip-proposal seed bodies use {{min_seconds}} / {{max_seconds}}
     so the duration band stays in sync with clipper._PER_KIND_BOUNDS.
@@ -139,6 +172,7 @@ def test_seed_prompts_render_bounds_from_per_kind_bounds():
                 "crop_constraints": "",
                 "min_seconds": str(int(mn)),
                 "max_seconds": str(int(mx)) if mx is not None else "",
+                "max_proposals": "8",
             },
         )
         assert expected_phrase in rendered, (
