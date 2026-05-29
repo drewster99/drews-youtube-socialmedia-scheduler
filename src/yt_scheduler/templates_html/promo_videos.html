@@ -871,6 +871,15 @@ const GENERATE_KIND_LABELS = { hook: 'Hook', short: 'Short', segment: 'Segment' 
 let generatePreviewData = null;     // last /preview response
 let generatePollHandle = null;      // setTimeout for polling
 let generatePreviewCropSelection = {}; // per-kind crop_vertical at preview time
+// AbortController for in-flight Generate fetches (/preview, /jobs/{id}).
+// Closing the modal mid-poll has to abort the request so a slow response
+// can't resolve into the next modal session and render stale proposals.
+let generateAbortController = null;
+// Generation token bumped on every modal open. Stale fetches that
+// somehow escape the AbortController (e.g. the response arrived while
+// the abort was racing) check this against the token they were
+// dispatched on; mismatch = drop the response.
+let generateGenerationToken = 0;
 
 function fmtSeconds(s) {
     if (s == null || isNaN(s)) return '?';
@@ -890,6 +899,11 @@ document.getElementById('generate-modal').addEventListener('cancel', (ev) => {
 });
 
 function openGenerateModal() {
+    generateGenerationToken += 1;
+    if (generateAbortController) {
+        try { generateAbortController.abort(); } catch (e) { /* already done */ }
+    }
+    generateAbortController = new AbortController();
     document.getElementById('generate-parent-line').textContent = 'Cutting from this primary video.';
     document.getElementById('generate-warnings').style.display = 'none';
     document.getElementById('generate-warnings').innerHTML = '';
@@ -907,6 +921,14 @@ function openGenerateModal() {
 
 function closeGenerateModal() {
     if (generatePollHandle) { clearTimeout(generatePollHandle); generatePollHandle = null; }
+    if (generateAbortController) {
+        try { generateAbortController.abort(); } catch (e) { /* already done */ }
+        generateAbortController = null;
+    }
+    // Bump the token too — even if a fetch result resolves between the
+    // abort and the next openGenerateModal, the result-handlers compare
+    // against the snapshot they captured at request time.
+    generateGenerationToken += 1;
     generatePreviewData = null;
     document.getElementById('generate-modal').close();
 }
@@ -933,19 +955,26 @@ document.getElementById('generate-go').addEventListener('click', async () => {
     document.getElementById('generate-progress-text').textContent = 'Starting…';
     document.getElementById('generate-error').style.display = 'none';
 
+    const dispatchToken = generateGenerationToken;
+    const controller = generateAbortController;
     let resp, body;
     try {
         resp = await fetch(`/api/projects/${projectSlug}/videos/${parentId}/promos/generate/preview`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ kinds, crop_vertical: cropVertical }),
+            signal: controller ? controller.signal : undefined,
         });
         body = await resp.json();
     } catch (e) {
+        if (e.name === 'AbortError') return;  // modal was closed
         showGenerateError('Could not reach the server.');
         document.getElementById('generate-go').disabled = false;
         return;
     }
+    // Modal was reopened while this fetch was in flight — drop the
+    // response so it doesn't paint into the new session.
+    if (dispatchToken !== generateGenerationToken) return;
     if (!resp.ok) {
         showGenerateError(body.detail || `HTTP ${resp.status}`);
         document.getElementById('generate-go').disabled = false;
@@ -983,14 +1012,22 @@ function showGenerateError(text) {
 }
 
 async function pollGenerateJob(jobId) {
+    const dispatchToken = generateGenerationToken;
+    const controller = generateAbortController;
     let resp, body;
     try {
-        resp = await fetch(`/api/projects/${projectSlug}/videos/${parentId}/promos/generate/jobs/${jobId}`);
+        resp = await fetch(
+            `/api/projects/${projectSlug}/videos/${parentId}/promos/generate/jobs/${jobId}`,
+            { signal: controller ? controller.signal : undefined },
+        );
         body = await resp.json();
     } catch (e) {
+        if (e.name === 'AbortError') return;  // modal was closed
         showGenerateError('Lost connection while polling.');
         return;
     }
+    // Modal was reopened between dispatch and resolve — drop the result.
+    if (dispatchToken !== generateGenerationToken) return;
     if (!resp.ok) {
         showGenerateError(body.detail || `HTTP ${resp.status}`);
         return;
