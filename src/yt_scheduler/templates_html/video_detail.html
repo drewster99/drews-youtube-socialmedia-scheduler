@@ -175,7 +175,7 @@
                 </div>
                 <div class="form-group" id="schedule-spacing-row" style="margin-bottom: 0.5rem; display:none; align-items:center; gap:0.4rem;">
                     <label for="schedule-spacing-value" style="margin-right:0.4rem;">Space posts by</label>
-                    <input type="number" min="0" step="1" id="schedule-spacing-value" style="width: 5rem;">
+                    <input type="number" min="1" step="1" id="schedule-spacing-value" style="width: 5rem;">
                     <select id="schedule-spacing-unit">
                         <option value="minutes">minutes</option>
                         <option value="hours">hours</option>
@@ -486,16 +486,39 @@ function _spacingMinutesToControl(totalMin) {
 }
 
 // Read the inline spacing control back into minutes (the unit the
-// backend / project settings store).
+// backend / project settings store). Returns null for an empty / blank
+// input — Number("") is 0, which the backend would happily accept and
+// then fire every approved post at the same instant, so we must NOT
+// silently coerce an empty field into 0.
 function _readSpacingControlMinutes() {
     const valueInput = document.getElementById('schedule-spacing-value');
     const unitSelect = document.getElementById('schedule-spacing-unit');
     if (!valueInput || !unitSelect) return null;
-    const raw = Number(valueInput.value);
-    if (!Number.isFinite(raw) || raw < 0) return null;
+    const rawStr = (valueInput.value ?? '').trim();
+    if (rawStr === '') return null;
+    const raw = Number(rawStr);
+    if (!Number.isFinite(raw) || raw < 1) return null;
     const factor = unitSelect.value === 'days' ? 60 * 24
                  : unitSelect.value === 'hours' ? 60 : 1;
-    return Math.round(raw * factor);
+    const minutes = Math.round(raw * factor);
+    return minutes >= 1 ? minutes : null;
+}
+
+// Track whether the user has interacted with the schedule-datetime
+// input so loadVideo() refreshes don't clobber an in-progress edit.
+// (Spacing has the same need — handled inline in seedSpacingControlIfEmpty.)
+function _bindScheduleDatetimeUserTouched() {
+    const dtInput = document.getElementById('schedule-datetime');
+    if (!dtInput || dtInput.dataset.changeBound === '1') return;
+    dtInput.addEventListener('input', () => {
+        dtInput.dataset.userTouched = '1';
+    });
+    dtInput.dataset.changeBound = '1';
+}
+
+function _scheduleDatetimeUserTouched() {
+    const dtInput = document.getElementById('schedule-datetime');
+    return !!(dtInput && dtInput.dataset.userTouched === '1');
 }
 
 // Pre-populate the spacing input from the project setting only on first
@@ -864,12 +887,17 @@ async function loadVideo() {
             + 'Adjust those in Project Settings to change the cadence.';
         spacingRow.style.display = 'none';
     }
+    _bindScheduleDatetimeUserTouched();
     if (video.status === 'scheduled' && video.publish_at && !ytIsPublic) {
         const pubDate = new Date(_ensureUtc(video.publish_at));
         scheduleInfo.innerHTML = `<span class="badge badge-scheduled">Scheduled</span>
             <span style="margin-left: 0.5rem;">${pubDate.toLocaleString()}</span>`;
         cancelBtn.style.display = 'inline-flex';
-        document.getElementById('schedule-datetime').value = toLocalInputValue(pubDate);
+        // Don't clobber an in-progress edit when loadVideo is fired by
+        // an unrelated side-effect (metadata save, periodic refresh).
+        if (!_scheduleDatetimeUserTouched()) {
+            document.getElementById('schedule-datetime').value = toLocalInputValue(pubDate);
+        }
         scheduleReveal();
         // videoData was just assigned earlier in loadVideo; refresh the
         // preview now that the input has its value so the button picks
@@ -895,8 +923,10 @@ async function loadVideo() {
             const firstLabel = new Date(firstAt).toLocaleString();
             scheduleInfo.innerHTML += ` · <span class="badge badge-scheduled">${scheduledPosts.length} post${scheduledPosts.length === 1 ? '' : 's'} scheduled</span> <span style="margin-left:0.5rem;">first at ${firstLabel}</span>`;
             cancelBtn.style.display = 'inline-flex';
-            document.getElementById('schedule-datetime').value = toLocalInputValue(new Date(firstAt));
-            scheduleReveal();
+            if (!_scheduleDatetimeUserTouched()) {
+                document.getElementById('schedule-datetime').value = toLocalInputValue(new Date(firstAt));
+                scheduleReveal();
+            }
             renderSchedulePostPreview();
         } else {
             cancelBtn.style.display = 'none';
@@ -2621,15 +2651,31 @@ async function schedulePublish() {
     });
     const result = await resp.json();
     if (resp.ok) {
+        // Schedule committed — release the user-touched lock so the
+        // next loadVideo() refresh shows the new server-side state.
+        const dtInput = document.getElementById('schedule-datetime');
+        if (dtInput) delete dtInput.dataset.userTouched;
         if (isPublished) {
             const n = result.scheduled || 0;
+            const errs = (result.errors || []).length;
             const when = new Date(_ensureUtc(result.first_post_at)).toLocaleString();
-            showToast(
-                n
-                    ? `Scheduled ${n} post${n === 1 ? '' : 's'} starting ${when}`
-                    : 'No approved posts to schedule',
-                n ? 'success' : 'error',
-            );
+            if (errs) {
+                // Partial failure: some posts didn't re-attach. The old
+                // schedule for those is already gone, so the user needs
+                // an explicit retry path — surface this rather than
+                // claiming full success.
+                showToast(
+                    `Scheduled ${n} post${n === 1 ? '' : 's'} starting ${when}; ${errs} failed — retry to re-attach.`,
+                    'error',
+                );
+            } else {
+                showToast(
+                    n
+                        ? `Scheduled ${n} post${n === 1 ? '' : 's'} starting ${when}`
+                        : 'No approved posts to schedule',
+                    n ? 'success' : 'error',
+                );
+            }
         } else {
             const approved = socialPostsCache.filter(p => p.status === 'approved').length;
             const when = new Date(_ensureUtc(result.publish_at)).toLocaleString();
@@ -2661,6 +2707,8 @@ async function cancelSchedule() {
     const resp = await fetch(endpoint, {method: 'DELETE'});
     if (resp.ok) {
         showToast('Schedule cancelled', 'success');
+        const dtInput = document.getElementById('schedule-datetime');
+        if (dtInput) delete dtInput.dataset.userTouched;
         loadVideo();
         loadSocialPosts();
     } else {

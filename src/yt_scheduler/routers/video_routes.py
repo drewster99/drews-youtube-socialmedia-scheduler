@@ -1293,18 +1293,26 @@ async def schedule_social_only(video_id: str, data: dict):
             spacing_minutes = int(spacing_minutes)
         except (TypeError, ValueError) as exc:
             raise HTTPException(400, "spacing_minutes must be an integer") from exc
-        if spacing_minutes < 0:
-            raise HTTPException(400, "spacing_minutes must be ≥ 0")
+        # 0 (or negative) would land every post on the same DateTrigger
+        # and fire them all simultaneously — never what the user wanted.
+        if spacing_minutes < 1:
+            raise HTTPException(400, "spacing_minutes must be ≥ 1")
 
-    try:
-        count = await schedule_approved_social_posts_only(
-            video_id, when, spacing_minutes=spacing_minutes,
-        )
-    except ValueError as exc:
-        raise HTTPException(404, str(exc)) from exc
+    # Existence check up-front so we can return a clean 404 here — the
+    # service raises ValueError for several reasons (bad project_id,
+    # malformed spacing, etc.) and conflating them all as 404 hides bugs.
+    db = await get_db()
+    cursor = await db.execute("SELECT id FROM videos WHERE id = ?", (video_id,))
+    if await cursor.fetchone() is None:
+        raise HTTPException(404, f"Video {video_id} not found")
+
+    count, errors = await schedule_approved_social_posts_only(
+        video_id, when, spacing_minutes=spacing_minutes,
+    )
     return {
         "status": "ok",
         "scheduled": count,
+        "errors": errors,
         "first_post_at": when.isoformat(),
         "spacing_minutes": spacing_minutes,
     }

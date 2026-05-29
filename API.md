@@ -876,11 +876,11 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 
 **Purpose** — Stagger this video's approved social posts on a chosen timeline **without** touching the video itself. For use when the video is already public and only the social fan-out needs scheduling.
 
-**Request body** — `{"first_post_at": "2026-04-25T14:00:00-07:00", "spacing_minutes": 60}`. `first_post_at` is ISO 8601, must be in the future, naive datetimes treated as UTC. `spacing_minutes` is optional (≥ 0, integer); when omitted, the project's `inter_post_spacing_minutes` setting is used. The override is per-batch — the project setting is not mutated.
+**Request body** — `{"first_post_at": "2026-04-25T14:00:00-07:00", "spacing_minutes": 60}`. `first_post_at` is ISO 8601, must be in the future, naive datetimes treated as UTC. `spacing_minutes` is optional (≥ 1, integer); when omitted, the project's `inter_post_spacing_minutes` setting is used. The override is per-batch — the project setting is not mutated. `0` is rejected because it would land every approved post on the same `DateTrigger` and fan-out simultaneously.
 
-**Response 200** — `{"status": "ok", "scheduled": <int>, "first_post_at": "<iso>", "spacing_minutes": <int|null>}`. `scheduled` is the number of approved posts a job was registered for; `0` means there were no approved posts. `spacing_minutes` echoes the override the caller sent (or `null` when it wasn't supplied).
+**Response 200** — `{"status": "ok", "scheduled": <int>, "errors": [{"post_id", "error"}, ...], "first_post_at": "<iso>", "spacing_minutes": <int|null>}`. `scheduled` counts approved posts a fresh job was registered for; `errors` carries one entry per post whose re-attach raised. The endpoint cancels pending jobs **before** re-scheduling, so a non-empty `errors` means those posts have no schedule at all — callers must surface the partial failure so the user can retry. `spacing_minutes` echoes the override (or `null` when none was supplied).
 
-**Errors** — `400` on missing/invalid `first_post_at`, a past time, or a non-integer / negative `spacing_minutes`; `404` if the video doesn't exist.
+**Errors** — `400` on missing/invalid `first_post_at`, a past time, or a non-integer / `< 1` `spacing_minutes`; `404` if the video doesn't exist.
 
 **Behavior** — Cancels every pre-existing pending per-post job for this video (rows with `scheduler_job_id IS NOT NULL`) via `cancel_scheduled_post()`, then re-schedules every `approved` post anchored at `first_post_at` and spaced by either the supplied `spacing_minutes` or the project's `inter_post_spacing_minutes`. Unlike the video-level `POST /api/videos/{video_id}/schedule` flow, **`post_video_delay_minutes` is intentionally ignored** here — "wait X minutes after the video goes live" has no meaning once the video is already live, so the picked time IS when the first approved post fires.
 

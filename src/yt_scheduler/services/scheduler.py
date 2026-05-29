@@ -738,7 +738,7 @@ async def schedule_approved_social_posts_only(
     first_post_at: datetime,
     *,
     spacing_minutes: int | None = None,
-) -> int:
+) -> tuple[int, list[dict]]:
     """Stagger a video's approved social posts starting at ``first_post_at``,
     spaced by ``spacing_minutes`` (falls back to the project's
     ``inter_post_spacing_minutes`` setting). Cancels any pending per-post
@@ -757,7 +757,13 @@ async def schedule_approved_social_posts_only(
     its cadence from project settings again unless the caller
     specifies another override.
 
-    Returns the number of posts actually scheduled.
+    Returns ``(attached, errors)`` where ``attached`` is the count of
+    posts a fresh DateTrigger was registered for and ``errors`` is a
+    list of ``{"post_id", "error"}`` for each post the re-attach raised
+    on. We cancel pending jobs BEFORE re-scheduling so a partial failure
+    can lose the prior schedule for the failing post(s); callers must
+    surface ``errors`` so the user can retry rather than silently
+    believing every post is on the timeline.
     """
     if first_post_at.tzinfo is None:
         first_post_at = first_post_at.replace(tzinfo=timezone.utc)
@@ -769,7 +775,14 @@ async def schedule_approved_social_posts_only(
     row = await cursor.fetchone()
     if not row:
         raise ValueError(f"Video {video_id} not found")
-    project_id = int(row["project_id"]) if row["project_id"] is not None else 1
+    if row["project_id"] is None:
+        # Don't silently pick project 1 — pulling posting defaults from
+        # an unrelated project would fan posts out at the wrong cadence
+        # without surfacing the corrupt state.
+        raise ValueError(
+            f"Video {video_id} has no project_id; refusing to guess a default"
+        )
+    project_id = int(row["project_id"])
 
     pending = await db.execute_fetchall(
         "SELECT id FROM social_posts "
@@ -781,11 +794,19 @@ async def schedule_approved_social_posts_only(
 
     from datetime import timedelta
     if spacing_minutes is not None:
-        spacing_min = max(0, int(spacing_minutes))
+        spacing_min = int(spacing_minutes)
     else:
         from yt_scheduler.services import project_settings as _ps
         posting = await _ps.get_posting_settings(project_id)
         spacing_min = int(posting.get("inter_post_spacing_minutes", 5) or 0)
+    # Spacing < 1 would land every post on the same DateTrigger and fan
+    # them all out simultaneously — never what the user wanted. Surface
+    # the bad config instead of silently clamping or burying it in 0-min
+    # arithmetic.
+    if spacing_min < 1:
+        raise ValueError(
+            f"inter-post spacing must be at least 1 minute (got {spacing_min})"
+        )
 
     approved = await db.execute_fetchall(
         "SELECT id FROM social_posts "
@@ -794,12 +815,14 @@ async def schedule_approved_social_posts_only(
         (video_id,),
     )
     attached = 0
+    errors: list[dict] = []
     for i, r in enumerate(approved):
         when = first_post_at + timedelta(minutes=i * spacing_min)
         try:
             await schedule_social_post(int(r["id"]), when)
             attached += 1
         except Exception as exc:
+            errors.append({"post_id": int(r["id"]), "error": str(exc)})
             logger.error(
                 "Failed to schedule post %s for video %s: %s",
                 r["id"], video_id, exc,
@@ -809,7 +832,7 @@ async def schedule_approved_social_posts_only(
             "Scheduled %d social post(s) for video %s starting %s (spacing=%dm)",
             attached, video_id, first_post_at.isoformat(), spacing_min,
         )
-    return attached
+    return attached, errors
 
 
 async def cancel_video_social_post_schedule(video_id: str) -> int:
@@ -1647,10 +1670,16 @@ def _public_parent(
     already_published: bool = False,
 ) -> dict:
     ready, missing = is_ready_for_schedule(parent)
+    # ``publish_at`` is the effective time the chain anchors against
+    # (caller-supplied parent_publish_at overrides the existing row).
+    # ``existing_publish_at`` is the raw row value, so callers can tell
+    # "parent already had a time before this call" — needed to decide
+    # whether the parent should be (re-)scheduled in this batch.
     return {
         "id": parent.get("id"),
         "title": parent.get("title") or "",
         "publish_at": parent_publish.isoformat() if parent_publish else None,
+        "existing_publish_at": parent.get("publish_at"),
         "status": parent.get("status"),
         "already_published": already_published,
         "ready": ready,
@@ -1899,10 +1928,25 @@ async def schedule_promo_batch(
             + ", ".join(parent_info.get("missing") or [])
         )
 
+    # Per the API contract, parent_publish_at is only honoured when the
+    # parent has no publish_at and isn't already published. Without this
+    # guard, a retry that re-sends the previous preview's parent time
+    # would re-schedule the parent and clobber publish_at_manual=1.
+    will_schedule_parent = (
+        parent_publish_at is not None
+        and not parent_info.get("already_published")
+        and not parent_info.get("existing_publish_at")
+    )
+    if not to_write and not will_schedule_parent:
+        raise ValueError(
+            "Nothing to schedule — every promo is already scheduled and "
+            "the parent has no pending change."
+        )
+
     db = await get_db()
 
     scheduled: list[dict] = []
-    if parent_publish_at is not None and not parent_info.get("already_published"):
+    if will_schedule_parent:
         await schedule_publish(parent_id, parent_publish_at)
         # Schedule-all batches are auto-anchored; mark the parent so a
         # future cascade still moves it.
