@@ -11,9 +11,28 @@ from __future__ import annotations
 
 import importlib
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+
+
+def _days_ago(n: int) -> str:
+    """SQLite-friendly UTC timestamp ``n`` days before now.
+
+    Tests originally hard-coded ``2026-04-26 12:00:00`` for "recent" and
+    ``2026-01-01 12:00:00`` for "old". Those went stale once wall-clock
+    passed the 30-day lookback window — the suite started failing for a
+    pure clock reason. Computing the dates dynamically keeps the
+    "recent" cases inside the lookback and the "old" cases outside it
+    no matter when the suite runs.
+    """
+    when = datetime.now(timezone.utc) - timedelta(days=n)
+    return when.strftime("%Y-%m-%d %H:%M:%S")
+
+
+_RECENT = _days_ago(2)   # well inside the 30-day lookback
+_OLD = _days_ago(120)    # well outside it
 
 
 @pytest.fixture
@@ -77,7 +96,7 @@ async def test_finds_exact_duplicate(app_db) -> None:
     social, db = app_db
     pid = await _seed_posted(
         db, platform="mastodon", account_id=1, content="hello",
-        posted_at="2026-04-26 12:00:00",
+        posted_at=_RECENT,
     )
     result = await social.find_recent_duplicate_post(
         platform="mastodon", social_account_id=1, content="hello",
@@ -91,7 +110,7 @@ async def test_excludes_self(app_db) -> None:
     social, db = app_db
     pid = await _seed_posted(
         db, platform="mastodon", account_id=1, content="hello",
-        posted_at="2026-04-26 12:00:00",
+        posted_at=_RECENT,
     )
     result = await social.find_recent_duplicate_post(
         platform="mastodon", social_account_id=1, content="hello",
@@ -105,7 +124,7 @@ async def test_different_account_is_not_duplicate(app_db) -> None:
     social, db = app_db
     await _seed_posted(
         db, platform="mastodon", account_id=1, content="hello",
-        posted_at="2026-04-26 12:00:00",
+        posted_at=_RECENT,
     )
     result = await social.find_recent_duplicate_post(
         platform="mastodon", social_account_id=2, content="hello",
@@ -117,7 +136,7 @@ async def test_different_platform_is_not_duplicate(app_db) -> None:
     social, db = app_db
     await _seed_posted(
         db, platform="mastodon", account_id=1, content="hello",
-        posted_at="2026-04-26 12:00:00",
+        posted_at=_RECENT,
     )
     result = await social.find_recent_duplicate_post(
         platform="twitter", social_account_id=1, content="hello",
@@ -132,7 +151,7 @@ async def test_outside_lookback_window_is_not_duplicate(app_db) -> None:
     social, db = app_db
     await _seed_posted(
         db, platform="mastodon", account_id=1, content="hello",
-        posted_at="2026-01-01 12:00:00",
+        posted_at=_OLD,
     )
     result = await social.find_recent_duplicate_post(
         platform="mastodon", social_account_id=1, content="hello",
@@ -145,7 +164,7 @@ async def test_whitespace_is_normalised(app_db) -> None:
     social, db = app_db
     pid = await _seed_posted(
         db, platform="mastodon", account_id=1, content="hello",
-        posted_at="2026-04-26 12:00:00",
+        posted_at=_RECENT,
     )
     result = await social.find_recent_duplicate_post(
         platform="mastodon", social_account_id=1, content="  hello\n",
@@ -158,7 +177,7 @@ async def test_empty_content_never_matches(app_db) -> None:
     social, db = app_db
     await _seed_posted(
         db, platform="mastodon", account_id=1, content="",
-        posted_at="2026-04-26 12:00:00",
+        posted_at=_RECENT,
     )
     result = await social.find_recent_duplicate_post(
         platform="mastodon", social_account_id=1, content="",
@@ -172,7 +191,7 @@ async def test_same_text_different_media_is_not_duplicate(app_db) -> None:
     social, db = app_db
     await _seed_posted(
         db, platform="mastodon", account_id=1, content="hello",
-        posted_at="2026-04-26 12:00:00",
+        posted_at=_RECENT,
         media_path="/uploads/vidA/thumb1.jpg",
     )
     result = await social.find_recent_duplicate_post(
@@ -186,7 +205,7 @@ async def test_same_text_same_media_is_duplicate(app_db) -> None:
     social, db = app_db
     pid = await _seed_posted(
         db, platform="mastodon", account_id=1, content="hello",
-        posted_at="2026-04-26 12:00:00",
+        posted_at=_RECENT,
         media_path="/uploads/vidA/thumb1.jpg",
     )
     result = await social.find_recent_duplicate_post(
@@ -204,7 +223,7 @@ async def test_text_only_vs_text_with_media_is_not_duplicate(app_db) -> None:
     # Previously sent: text only (no media)
     await _seed_posted(
         db, platform="mastodon", account_id=1, content="hello",
-        posted_at="2026-04-26 12:00:00",
+        posted_at=_RECENT,
         media_path=None,
     )
     # New attempt: same text but with a thumbnail attached
@@ -221,7 +240,7 @@ async def test_null_and_empty_media_treated_as_same_no_media(app_db) -> None:
     social, db = app_db
     pid = await _seed_posted(
         db, platform="mastodon", account_id=1, content="hello",
-        posted_at="2026-04-26 12:00:00",
+        posted_at=_RECENT,
         media_path=None,  # stored as NULL
     )
     # Caller passes empty string as the no-media sentinel
