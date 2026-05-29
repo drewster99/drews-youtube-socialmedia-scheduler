@@ -81,6 +81,21 @@ def upload_video(
     return response
 
 
+def sanitize_youtube_description(text: str) -> str:
+    """Replace characters YouTube rejects in a video description.
+
+    YouTube's videos.update API rejects descriptions containing literal
+    ``<`` or ``>`` (reason ``invalidDescription`` at
+    ``body.snippet.description``) — it treats them as embedded markup.
+    AI-generated descriptions for technical content can easily slip
+    those in while referencing code symbols (``<NSObject>``,
+    ``<UIView>``, ``<MyComponent>``). Swap them for the visually
+    similar single guillemets so the symbol convention survives the
+    push without information loss.
+    """
+    return text.replace("<", "‹").replace(">", "›")
+
+
 def update_video_metadata(
     video_id: str,
     title: str | None = None,
@@ -108,7 +123,7 @@ def update_video_metadata(
     if title is not None:
         snippet["title"] = title
     if description is not None:
-        snippet["description"] = description
+        snippet["description"] = sanitize_youtube_description(description)
     if tags is not None:
         snippet["tags"] = tags
     if category_id is not None:
