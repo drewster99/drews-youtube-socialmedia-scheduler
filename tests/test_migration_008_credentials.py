@@ -14,7 +14,7 @@ from pathlib import Path
 import aiosqlite
 import pytest
 
-from yt_scheduler.migrations import MIGRATIONS_DIR, apply_migrations
+from yt_scheduler.migrations import apply_migrations
 
 
 async def _seed_pre_008(conn: aiosqlite.Connection) -> None:

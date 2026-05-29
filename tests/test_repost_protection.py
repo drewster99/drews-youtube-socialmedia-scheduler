@@ -321,7 +321,9 @@ async def test_send_post_returns_409_on_duplicate(
 
     app_module = importlib.import_module("yt_scheduler.app")
     creds_mod = importlib.import_module("yt_scheduler.services.social_credentials")
-    social_mod = importlib.import_module("yt_scheduler.services.social")
+    # social module needs to be imported so its module-level registrations
+    # happen before the TestClient lifespan triggers them indirectly.
+    importlib.import_module("yt_scheduler.services.social")
 
     from fastapi.testclient import TestClient
 
