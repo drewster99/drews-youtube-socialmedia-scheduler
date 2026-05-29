@@ -188,23 +188,45 @@ function renderChildCard(child) {
     const state = child.auto_action_state;
     const ready = state === 'ready' || state == null;
     const editable = ready ? '' : ' promo-card-locked';
+    const failed = typeof state === 'string' && state.startsWith('failed:');
     const thumb = child.thumbnail_url
         ? `<img src="${escapeHtml(child.thumbnail_url)}" alt="${escapeHtml(child.title)}">`
         : '<div class="thumb-placeholder">No thumbnail</div>';
-    // Whole card is the link (matches the dashboard) so a click anywhere
-    // on the thumbnail or the info pane opens the detail page. The Retry
-    // button inside stops propagation so it doesn't also navigate.
+    const href = `/projects/${escapeHtml(projectSlug)}/videos/${escapeHtml(child.id)}`;
+    const meta = `
+        <div class="video-meta">
+            <span class="badge badge-type-${escapeHtml(child.item_type || 'short')}">${escapeHtml(child.item_type || 'short')}</span>
+            ${child.tier ? `<span class="badge badge-tier-${escapeHtml(child.tier)}">${escapeHtml(child.tier)}</span>` : ''}
+        </div>
+    `;
+    // Failed cards must NOT wrap the whole card in <a> — the Retry
+    // <button> would then be a button-in-anchor (invalid HTML that
+    // browsers handle inconsistently; WebKit in particular routes the
+    // click to the outer anchor regardless of stopPropagation, so the
+    // Retry never fires). Split the card so only the thumbnail and the
+    // title are individual <a>s; the Retry button sits as a sibling.
+    if (failed) {
+        return `
+            <div class="video-card promo-card${editable}" data-child-id="${escapeHtml(child.id)}">
+                <a href="${href}" class="video-thumb promo-thumb-link">${thumb}</a>
+                <div class="video-info">
+                    <h3><a href="${href}" class="promo-title-link">${escapeHtml(child.title)}</a></h3>
+                    ${statusStripFor(child)}
+                    ${meta}
+                </div>
+            </div>
+        `;
+    }
+    // Whole card is the link (matches the dashboard) when there's no
+    // inner button to compete for the click.
     return `
-        <a href="/projects/${escapeHtml(projectSlug)}/videos/${escapeHtml(child.id)}"
+        <a href="${href}"
            class="video-card promo-card${editable}" data-child-id="${escapeHtml(child.id)}">
             <div class="video-thumb">${thumb}</div>
             <div class="video-info">
                 <h3>${escapeHtml(child.title)}</h3>
                 ${statusStripFor(child)}
-                <div class="video-meta">
-                    <span class="badge badge-type-${escapeHtml(child.item_type || 'short')}">${escapeHtml(child.item_type || 'short')}</span>
-                    ${child.tier ? `<span class="badge badge-tier-${escapeHtml(child.tier)}">${escapeHtml(child.tier)}</span>` : ''}
-                </div>
+                ${meta}
             </div>
         </a>
     `;
@@ -788,6 +810,18 @@ scheduleAllForm.addEventListener('submit', async (e) => {
 .promo-drop-active { border-color: var(--accent, #4a90e2); background: rgba(74,144,226,0.05); }
 .promo-card-locked { opacity: 0.85; pointer-events: none; }
 .promo-card-locked .video-thumb { pointer-events: none; }
+/* Locked cards block navigation while the chain is processing, but
+   terminal states (failed:*) still need the Retry / Dismiss buttons
+   to be clickable — without this re-enable, pointer-events: none on
+   the parent card silently swallows the button click. */
+.promo-card-locked .promo-progress-failed { pointer-events: auto; }
+/* Failed cards split the wrapper into a div with inner thumb/title
+   links (button-in-anchor is invalid HTML and breaks the Retry click
+   in WebKit). Style those inner links so they still look like the
+   non-failed flat card. */
+.promo-thumb-link { display: block; text-decoration: none; color: inherit; }
+.promo-title-link { text-decoration: none; color: inherit; }
+.promo-title-link:hover { text-decoration: underline; }
 .promo-progress { margin: 0.4rem 0; font-size: 0.85em; padding: 0.35rem 0.5rem; border-radius: 4px; }
 .promo-progress-active { background: rgba(74,144,226,0.12); color: var(--accent, #4a90e2); }
 .promo-progress-ready { background: rgba(60,180,75,0.12); color: var(--success, #3cb44b); }
