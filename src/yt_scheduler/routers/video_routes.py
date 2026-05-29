@@ -1525,9 +1525,22 @@ _MAX_SOURCE_FILE_BYTES = 10 * 1024**3  # 10 GiB; defense against pathological up
 # Per-video locks: serialize concurrent POST /source-file calls for the
 # same video so we can't race the SELECT-row → write-file → UPDATE-row
 # sequence into producing orphans. Different videos still proceed in
-# parallel. Locks live for the process lifetime; in single-user usage
-# the dict stays tiny.
-_source_file_locks: dict[str, asyncio.Lock] = {}
+# parallel.
+#
+# Stored as ``WeakValueDictionary`` so an idle lock — one nobody is
+# currently holding or awaiting — gets garbage-collected on the first
+# minor sweep after :func:`_source_file_lock` last returned it. That
+# bounds the dict to ~one entry per actively-uploading video instead
+# of growing forever (one entry per video_id ever uploaded against).
+import weakref
+
+_source_file_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+# Strong refs are taken transiently inside _source_file_lock so the
+# lock object survives long enough for the caller's `async with` to
+# acquire it. Once the lock is held, the caller's stack frame keeps
+# it alive; we drop our strong ref immediately.
 
 
 def _source_file_lock(video_id: str) -> asyncio.Lock:
