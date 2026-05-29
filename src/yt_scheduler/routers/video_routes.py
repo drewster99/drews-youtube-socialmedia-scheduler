@@ -1674,32 +1674,66 @@ async def replace_video_source_file(
         incoming_name = f"source_{secrets.token_hex(8)}{safe_upload_ext(file.filename)}"
         incoming_path = UPLOAD_DIR / incoming_name
 
-        def _copy_to_disk_capped(src, target: Path, cap: int) -> bool:
-            """Stream ``src`` to ``target`` up to ``cap`` bytes. Returns
-            True on success, False if the cap was exceeded — in which case
-            the partial file has already been deleted before the return."""
+        def _copy_to_disk_capped(
+            src, target: Path, cap: int, expected: int | None,
+        ) -> tuple[bool, int]:
+            """Stream ``src`` to ``target`` up to ``cap`` bytes.
+
+            Returns ``(ok, bytes_written)``. ``ok=False`` means the cap
+            was exceeded — the partial file has already been deleted
+            before the return. ``ok=True`` does NOT guarantee the body
+            was complete: ``bytes_written`` is the actual count and the
+            caller compares it to ``expected`` (Content-Length) to
+            detect a client-side abort that produced a short read.
+            """
             written = 0
             chunk_size = 1024 * 1024
             with open(target, "wb") as fh:
                 while True:
                     chunk = src.read(chunk_size)
                     if not chunk:
-                        return True
+                        return True, written
                     written += len(chunk)
                     if written > cap:
                         fh.close()
                         target.unlink(missing_ok=True)
-                        return False
+                        return False, written
                     fh.write(chunk)
 
-        ok = await asyncio.to_thread(
-            _copy_to_disk_capped, file.file, incoming_path, _MAX_SOURCE_FILE_BYTES
+        expected_bytes = (
+            int(content_length)
+            if content_length is not None and content_length > 0
+            else None
+        )
+        ok, bytes_written = await asyncio.to_thread(
+            _copy_to_disk_capped,
+            file.file, incoming_path, _MAX_SOURCE_FILE_BYTES,
+            expected_bytes,
         )
         if not ok:
             raise HTTPException(
                 413,
                 f"File too large: exceeds {_MAX_SOURCE_FILE_BYTES} byte cap.",
             )
+
+        # Client-abort detector. When the browser cancels the XHR mid-
+        # upload, Starlette's UploadFile typically returns short on the
+        # underlying SpooledTemporaryFile (the body terminated early)
+        # but we'd otherwise treat it as a clean close and persist the
+        # truncated file. Comparing against Content-Length catches it.
+        # Allow a small slack for multipart framing overhead.
+        if expected_bytes is not None:
+            # multipart-framed Content-Length is larger than the raw
+            # file bytes (boundaries, headers); a short read by more
+            # than 64KB is unambiguous truncation.
+            if expected_bytes - bytes_written > 64 * 1024:
+                incoming_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    400,
+                    "Upload was truncated before the full body arrived "
+                    f"(got {bytes_written} of {expected_bytes} bytes). "
+                    "Try again.",
+                )
 
         incoming_probe = await asyncio.to_thread(
             media_service.probe_video_file, incoming_path
