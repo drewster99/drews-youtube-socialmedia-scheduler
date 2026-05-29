@@ -135,6 +135,23 @@ def test_evaluate_replacement_skips_resolution_for_youtube_download(client):
     assert issues == []
 
 
+def test_evaluate_replacement_skips_resolution_for_generated_clip(client):
+    """A 9:16 generated short is always 1080×1920 by construction.
+    Attaching the original landscape master is a real, intended action
+    — the resolution-downgrade warning would be a false positive."""
+    from yt_scheduler.routers.video_routes import _evaluate_replacement
+
+    # Generated clip = 1080×1920 vertical. Master = 1920×1080 landscape.
+    # Height of master (1080) < height of clip (1920), so a naive check
+    # would fire resolution_downgrade — the skip prevents that.
+    issues = _evaluate_replacement(
+        incoming=_make_probe(duration_seconds=20.0, width=1920, height=1080),
+        row={"duration_seconds": 20.0, "source_file_origin": "generated_clip"},
+        current=_make_probe(duration_seconds=20.0, width=1080, height=1920),
+    )
+    assert issues == []
+
+
 def test_evaluate_replacement_skips_when_only_one_dim_smaller(client):
     """1920x1080 → 2160x1080 (wider) shouldn't fire; needs BOTH smaller."""
     from yt_scheduler.routers.video_routes import _evaluate_replacement
