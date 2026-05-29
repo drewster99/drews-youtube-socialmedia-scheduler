@@ -513,6 +513,31 @@ def _format_ffmpeg_timestamp(seconds: float) -> str:
 # almost certainly inside the model's noise floor. Default to center.
 _MIN_SHIFT_TO_APPLY: float = 0.15
 
+# Cap on concurrent vision-pass Claude calls. A Generate with crops on
+# for hooks + shorts can produce up to 16 proposals; firing all of
+# them simultaneously trips Anthropic's per-minute rate limits in
+# practice. 4 in flight matches what the propose_clips fan-out does
+# implicitly (one call per kind, 3 kinds max) and keeps the dominant
+# input prompt cached across consecutive calls.
+_VISION_CONCURRENCY: int = 4
+_VISION_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(_VISION_CONCURRENCY)
+
+
+class _NullAsyncContext:
+    """async-with-style no-op context manager. Used to keep
+    ``assess_crop_for_proposal``'s ``async with lane`` shape uniform
+    when no semaphore was supplied."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _null_async_context() -> _NullAsyncContext:
+    return _NullAsyncContext()
+
 _CROP_ASSESSMENT_TOOL = {
     "name": "assess_crop",
     "description": (
@@ -599,6 +624,7 @@ async def assess_crop_for_proposal(
     parent_video_path: Path,
     project_id: int,
     frame_count: int = 3,
+    semaphore: asyncio.Semaphore | None = None,
 ) -> CropAssessment:
     """Run the vision pass for a single proposal.
 
@@ -606,6 +632,11 @@ async def assess_crop_for_proposal(
     missing frames, Claude unreachable, malformed tool response. The
     point of this pass is to *improve* the crop when it can; "no
     information" should never block a proposal.
+
+    ``semaphore`` is honoured around the actual Claude call so the
+    caller can rate-limit a fan-out (the refinement step in
+    :func:`_run_generate_job` uses :data:`_VISION_SEMAPHORE`). When not
+    supplied, the call runs ungated — appropriate for one-off use.
     """
     import base64
     from yt_scheduler.services import prompts as prompt_service
@@ -619,6 +650,7 @@ async def assess_crop_for_proposal(
     )
     if not frames:
         return _NEUTRAL_ASSESSMENT
+    lane = semaphore if semaphore is not None else _null_async_context()
 
     prompt = await prompt_service.get_prompt_with_fallback(
         "promo_clip_crop_refinement", project_id=project_id,
@@ -647,8 +679,9 @@ async def assess_crop_for_proposal(
         kwargs["system"] = prompt["system"]
 
     try:
-        client = ai.get_client()
-        message = await asyncio.to_thread(client.messages.create, **kwargs)
+        async with lane:
+            client = ai.get_client()
+            message = await asyncio.to_thread(client.messages.create, **kwargs)
     except Exception as exc:
         logger.warning(
             "Crop-assessment vision call failed for %.1f-%.1f: %s",
@@ -1020,6 +1053,7 @@ async def _run_generate_job(job_id: str) -> None:
                         proposal=prop,
                         parent_video_path=Path(job["parent_video_path"]),
                         project_id=int(job["project_id"]),
+                        semaphore=_VISION_SEMAPHORE,
                     )
                 )
                 refinement_tasks.append((k, idx, task))
