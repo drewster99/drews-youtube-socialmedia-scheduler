@@ -1,4 +1,5 @@
 """Promo Videos API — bulk upload children under a primary, list them,
+
 and (in commit 3) schedule the whole batch.
 
 Endpoints:
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import secrets
 import shutil
 
@@ -550,6 +552,11 @@ async def generate_confirm(
             start = float(entry["start_seconds"])
             end = float(entry["end_seconds"])
         except (KeyError, TypeError, ValueError):
+            continue
+        # Defense against non-finite values (NaN / inf): they compare
+        # False to every numeric guard below and would crash the
+        # ffmpeg-timestamp formatter in the cut step.
+        if not (math.isfinite(start) and math.isfinite(end)):
             continue
         title = str(entry.get("title") or "").strip()
         if not title or end <= start:

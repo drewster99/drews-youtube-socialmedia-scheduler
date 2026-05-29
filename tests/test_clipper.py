@@ -113,6 +113,24 @@ def test_validate_drops_out_of_parent_bounds():
     assert titles == ["ok"]
 
 
+def test_validate_drops_nan_and_inf():
+    """NaN compares False to every numeric bound, would slip past the
+    range guards and crash _format_ffmpeg_timestamp downstream."""
+    from yt_scheduler.services.clipper import _validate_proposals
+
+    nan = float("nan")
+    inf = float("inf")
+    raw = [
+        {"start_seconds": nan, "end_seconds": 20.0, "title": "nan", "reason": ""},
+        {"start_seconds": 10.0, "end_seconds": inf, "title": "inf", "reason": ""},
+        {"start_seconds": 10.0, "end_seconds": 25.0, "title": "ok", "reason": ""},
+    ]
+    result = _validate_proposals(
+        raw, kind="hook", parent_duration_seconds=600.0, existing_ranges=[],
+    )
+    assert [p.title for p in result] == ["ok"]
+
+
 def test_validate_drops_empty_title():
     from yt_scheduler.services.clipper import _validate_proposals
 

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
@@ -190,6 +191,16 @@ def _validate_proposals(
             reason = str(entry.get("reason") or "").strip()
         except (KeyError, TypeError, ValueError):
             logger.info("Dropping clip proposal with malformed fields: %r", entry)
+            continue
+
+        # NaN / infinity slip past every numeric comparison below (IEEE
+        # 754: any comparison with NaN is False). They'd then crash
+        # _format_ffmpeg_timestamp(NaN) at cut time with a useless
+        # 'cannot convert float NaN to integer' error. Reject up front.
+        if not (math.isfinite(start) and math.isfinite(end)):
+            logger.info(
+                "Dropping clip proposal with non-finite times: %r", entry,
+            )
             continue
 
         if not title:
