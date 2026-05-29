@@ -83,6 +83,11 @@ const parentId = "{{ parent_id }}";
 // label for the per-card progress strip. Keeps the polling code dumb:
 // it just reads the state and looks up the label.
 const PROMO_STATE_LABELS = {
+    // Client-only sentinel — the browser is uploading the file bytes
+    // to our server. There's no DB row or server-side job yet; the
+    // placeholder card just gives instant feedback so the user doesn't
+    // think the click was ignored during a slow multipart POST.
+    transferring: 'Sending to server…',
     pending: 'Queued…',
     generating_title: 'Generating title…',
     uploading: 'Uploading to YouTube…',
@@ -300,6 +305,10 @@ async function pollUploadJobs() {
     const toDelete = [];
     let anyStateChange = false;
     for (const [jobId, job] of activeJobs) {
+        // Placeholder entries are client-only; the server doesn't know
+        // about them yet, so polling /upload-jobs/<tmp> would 404 and
+        // erase the card before the real POST resolves.
+        if (job._placeholder) continue;
         // Failed jobs don't change server-side — no point re-fetching.
         if (typeof job.state === 'string' && job.state.startsWith('failed:')) {
             continue;
@@ -343,25 +352,55 @@ async function pollUploadJobs() {
 
 async function uploadFiles(files, forcedItemType) {
     if (!files || !files.length) return;
+
+    const banner = document.getElementById('upload-error-banner');
+    banner.style.display = 'none';
+    const expectedTier = forcedItemType || 'short';
+
+    // Optimistic placeholder cards. The POST below blocks until the
+    // browser has finished sending the file bytes — for a multi-GB
+    // clip that's several seconds where nothing visibly happens. Drop
+    // a "Sending to server…" card immediately so the user gets instant
+    // feedback; we replace it with the real job entry when the response
+    // lands, or evict it on failure.
+    const placeholderIds = [];
+    const rng = window.crypto && crypto.randomUUID
+        ? () => crypto.randomUUID()
+        : () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+    for (const f of files) {
+        const tmpId = `tmp_${rng()}`;
+        activeJobs.set(tmpId, {
+            job_id: tmpId,
+            filename: f.name,
+            state: 'transferring',
+            last_error: null,
+            video_id: null,
+            title: null,
+            expectedTier,
+            _placeholder: true,
+        });
+        placeholderIds.push(tmpId);
+    }
+    await loadPromos();
+
     const fd = new FormData();
     for (const f of files) fd.append('files', f);
     if (forcedItemType) fd.append('item_type', forcedItemType);
 
-    const banner = document.getElementById('upload-error-banner');
-    banner.style.display = 'none';
     try {
         const resp = await fetch(
             `/api/projects/${projectSlug}/videos/${parentId}/promos/upload`,
             {method: 'POST', body: fd},
         );
+        for (const id of placeholderIds) activeJobs.delete(id);
         if (!resp.ok) {
+            await loadPromos();
             const err = await resp.text();
             banner.textContent = `Upload failed: ${err}`;
             banner.style.display = '';
             return;
         }
         const out = await resp.json();
-        const expectedTier = forcedItemType || 'short';
         for (const j of out.jobs || []) {
             activeJobs.set(j.job_id, {
                 job_id: j.job_id,
@@ -375,6 +414,8 @@ async function uploadFiles(files, forcedItemType) {
         }
         await loadPromos();
     } catch (e) {
+        for (const id of placeholderIds) activeJobs.delete(id);
+        await loadPromos();
         banner.textContent = `Upload failed: ${e}`;
         banner.style.display = '';
     }

@@ -210,6 +210,16 @@ async def upload_promos(
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     jobs_out: list[dict] = []
+
+    def _copy_to_disk(src, target) -> None:
+        # shutil.copyfileobj is sync I/O; running it directly on the
+        # event loop stalls every other coroutine (timing middleware,
+        # other API polls, the promo activity refresh) for the duration
+        # of the copy — easily seconds for a multi-GB clip. The thread
+        # offload keeps the loop responsive.
+        with open(target, "wb") as f:
+            shutil.copyfileobj(src, f)
+
     for upload in files:
         if not upload.filename:
             continue
@@ -221,8 +231,7 @@ async def upload_promos(
         # video_file_original_name.
         disk_name = f"promo_{secrets.token_hex(8)}{safe_upload_ext(upload.filename)}"
         target = UPLOAD_DIR / disk_name
-        with open(target, "wb") as f:
-            shutil.copyfileobj(upload.file, f)
+        await asyncio.to_thread(_copy_to_disk, upload.file, target)
         job_id = await auto_actions.start_promo_upload(
             local_path=target,
             original_filename=upload.filename,
