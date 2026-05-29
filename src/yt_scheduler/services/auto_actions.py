@@ -162,7 +162,26 @@ async def _maybe_download_video_file(video_id: str) -> None:
     PrivateVideoError surfaces as 'unavailable' (retrying won't help
     without the user flipping privacy on YouTube); anything else
     surfaces as 'failed' and gets logged so a manual Transcribe-button
-    retry will pick up the same code path."""
+    retry will pick up the same code path.
+
+    No-op when the row already has a user_attached master — the YouTube
+    re-download is always lossy versus a master, and clobbering the
+    user's deliberate Replace-source choice silently would be a real
+    surprise.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT source_file_origin, video_file_path FROM videos WHERE id = ?",
+        (video_id,),
+    )
+    if rows:
+        existing = dict(rows[0])
+        if existing.get("source_file_origin") == "user_attached" and existing.get("video_file_path"):
+            logger.info(
+                "Skipping YouTube re-download for %s — user-attached master "
+                "is already on disk.", video_id,
+            )
+            return
     await _set_download_state(video_id, "in_progress")
     try:
         downloaded = await asyncio.to_thread(
