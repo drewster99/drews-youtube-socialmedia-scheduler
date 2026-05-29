@@ -1007,12 +1007,14 @@ async def restore_pending_auto_actions() -> None:
     promo_restored = 0
     for row in promo_rows:
         state = row["auto_action_state"]
-        # ``probing`` / ``uploading`` / ``generating_title`` happen
-        # before or during the INSERT and shouldn't be reachable from
-        # the videos table (no row exists yet for pre-INSERT states).
-        # If we see one of those, treat it as "transcribing" so the
-        # row gets its chain finished.
-        if state in {"generating_title", "uploading", "probing"}:
+        # ``cutting`` / ``probing`` / ``uploading`` / ``generating_title``
+        # all happen before or during the INSERT and shouldn't be
+        # reachable from the videos table (no row exists yet for pre-
+        # INSERT states). If we see one of those, treat it as
+        # "transcribing" so the row gets its chain finished defensively
+        # — symmetric with PROMO_STEP_ORDER carrying ``cutting`` for
+        # retry-step lookups.
+        if state in {"cutting", "generating_title", "uploading", "probing"}:
             state = PROMO_STATE_TRANSCRIBING
         try:
             await retry_promo_step(row["id"], state)

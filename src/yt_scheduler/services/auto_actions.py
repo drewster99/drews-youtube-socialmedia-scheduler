@@ -545,8 +545,15 @@ PROMO_STATE_PUSHING_METADATA = "pushing_metadata"
 PROMO_STATE_READY = "ready"
 
 # Ordered. ``_resume_from`` walks this list to determine which steps to
-# (re-)run on a Retry. Names match the persisted state column.
+# (re-)run on a Retry. Names match the persisted state column. CUTTING
+# is the Generate-from-source pre-step (job.has_cut_request) that runs
+# before INSERT — it's listed first for symmetry so retry_promo_step
+# accepts it. In practice no videos row carries 'cutting' as state
+# (the failure path sets state in _UPLOAD_JOBS only), but the symmetry
+# means future code that hands a 'cutting' step to the retry endpoint
+# won't ValueError.
 PROMO_STEP_ORDER: tuple[str, ...] = (
+    PROMO_STATE_CUTTING,
     PROMO_STATE_GENERATING_TITLE,
     PROMO_STATE_UPLOADING,
     PROMO_STATE_PROBING,
