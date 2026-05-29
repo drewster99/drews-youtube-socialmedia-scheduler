@@ -541,6 +541,30 @@ async def generate_confirm(
         )
     parent_duration = float(parent.get("duration_seconds") or 0.0)
 
+    # Optional cross-check against the generate job's preview-time crop
+    # selection. When present, the per-entry vertical_crop is clamped to
+    # what the preview said for that kind — a hand-crafted client body
+    # can't sneak crop=true on a kind whose preview toggle was off (and
+    # therefore had no vision pass). Missing job_id is allowed (a
+    # legitimate non-Generate caller wouldn't have one) but logs a
+    # debug breadcrumb so the legitimate-path-without-job-id case is
+    # observable.
+    job_crop_snapshot: dict[str, bool] | None = None
+    job_id_in = payload.get("job_id")
+    if job_id_in:
+        job = clipper.get_generate_job(str(job_id_in))
+        if job is None:
+            raise HTTPException(
+                400,
+                "Generate job_id supplied but is unknown or expired. "
+                "Re-run /generate/preview before confirming.",
+            )
+        raw = job.get("crop_vertical") or {}
+        if isinstance(raw, dict):
+            job_crop_snapshot = {
+                str(k): bool(v) for k, v in raw.items()
+            }
+
     jobs_out: list[dict] = []
     for entry in accepted:
         if not isinstance(entry, dict):
@@ -576,6 +600,22 @@ async def generate_confirm(
         # Clamp to the same range extract_clip clamps to so logs and
         # event records match what actually runs.
         x_shift = max(-1.0, min(1.0, x_shift))
+
+        # Cross-check against the preview snapshot when we have one. A
+        # client-supplied vertical_crop=true on a kind whose preview
+        # toggle was off gets forced back to false (and any shift
+        # zeroed), because the vision pass that informs a meaningful
+        # x_shift never ran for those proposals.
+        if job_crop_snapshot is not None:
+            preview_crop = job_crop_snapshot.get(kind, False)
+            if vertical_crop and not preview_crop:
+                logger.info(
+                    "Generate confirm: overriding client-supplied "
+                    "vertical_crop=true on %s — preview snapshot had "
+                    "crop off for this kind.", kind,
+                )
+                vertical_crop = False
+                x_shift = 0.0
 
         job_id = await auto_actions.start_promo_from_cut(
             parent_video_path=Path(parent_path),

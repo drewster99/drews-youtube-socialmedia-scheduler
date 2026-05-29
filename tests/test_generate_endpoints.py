@@ -195,6 +195,92 @@ def test_confirm_400_no_local_file(client: TestClient):
     assert resp.status_code == 400
 
 
+def test_confirm_overrides_crop_against_preview_snapshot(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """When the client supplies a job_id, the server cross-checks
+    vertical_crop against the preview snapshot. A tampered request
+    that flips a non-crop kind's vertical_crop to True gets forced
+    back to False before reaching start_promo_from_cut."""
+    from yt_scheduler.services import auto_actions, clipper
+
+    captured: list[dict] = []
+
+    async def fake_start(**kwargs):
+        captured.append(kwargs)
+        return f"job_fake_{len(captured)}"
+
+    monkeypatch.setattr(auto_actions, "start_promo_from_cut", fake_start)
+    _insert_parent("PARENTOOOOX", duration=600.0)
+
+    # Stage a generate job in clipper._GENERATE_JOBS where 'segment'
+    # had crop OFF in the preview.
+    clipper._GENERATE_JOBS["gen_test"] = {
+        "job_id": "gen_test",
+        "state": "done",
+        "crop_vertical": {"hook": True, "short": True, "segment": False},
+    }
+    try:
+        payload = {
+            "job_id": "gen_test",
+            "accepted": [
+                # Legit: hook with crop=true matches snapshot → stays true.
+                {"kind": "hook", "start_seconds": 5, "end_seconds": 20,
+                 "title": "h1", "vertical_crop": True,
+                 "x_shift_normalized": 0.4},
+                # Tampered: segment with crop=true but preview said off.
+                {"kind": "segment", "start_seconds": 100, "end_seconds": 200,
+                 "title": "seg1", "vertical_crop": True,
+                 "x_shift_normalized": 0.6},
+            ],
+        }
+        resp = client.post(
+            "/api/projects/default/videos/PARENTOOOOX/promos/generate/confirm",
+            json=payload,
+        )
+        assert resp.status_code == 200, resp.text
+        # Both jobs created.
+        assert len(captured) == 2
+        # Hook: crop kept on with its shift.
+        hook_call = next(c for c in captured if c["item_type"] == "hook")
+        assert hook_call["vertical_crop"] is True
+        assert hook_call["x_shift_normalized"] == 0.4
+        # Segment: crop forced off + shift zeroed despite the request.
+        seg_call = next(c for c in captured if c["item_type"] == "segment")
+        assert seg_call["vertical_crop"] is False
+        assert seg_call["x_shift_normalized"] == 0.0
+    finally:
+        clipper._GENERATE_JOBS.pop("gen_test", None)
+
+
+def test_confirm_400_when_job_id_unknown(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """A supplied job_id that doesn't exist (e.g. server restart,
+    TTL expired) must reject — silently dropping back to "no
+    cross-check" would defeat the security improvement."""
+    from yt_scheduler.services import auto_actions
+
+    async def fake_start(**kwargs):
+        return "job_fake_1"
+
+    monkeypatch.setattr(auto_actions, "start_promo_from_cut", fake_start)
+    _insert_parent("PARENTOOOOY", duration=600.0)
+
+    resp = client.post(
+        "/api/projects/default/videos/PARENTOOOOY/promos/generate/confirm",
+        json={
+            "job_id": "gen_does_not_exist",
+            "accepted": [
+                {"kind": "hook", "start_seconds": 5, "end_seconds": 20,
+                 "title": "h1"},
+            ],
+        },
+    )
+    assert resp.status_code == 400
+    assert "expired" in resp.json()["detail"]
+
+
 def test_confirm_filters_invalid_entries(
     client: TestClient, monkeypatch: pytest.MonkeyPatch,
 ):

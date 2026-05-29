@@ -1178,7 +1178,13 @@ async function confirmAccepted(allProposals) {
         const resp = await fetch(`/api/projects/${projectSlug}/videos/${parentId}/promos/generate/confirm`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ accepted }),
+            // job_id lets the server cross-check that each accepted
+            // entry's vertical_crop matches what the preview pass set
+            // for its kind — defense against a tampered client body.
+            body: JSON.stringify({
+                accepted,
+                job_id: generatePreviewData ? generatePreviewData.job_id : null,
+            }),
         });
         const body = await resp.json();
         if (!resp.ok) {
