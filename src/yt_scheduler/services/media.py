@@ -502,6 +502,64 @@ def get_video_duration(video_path: str | Path) -> float:
     return float(result.stdout.strip())
 
 
+def extract_keyframes_in_range(
+    video_path: str | Path,
+    *,
+    start_seconds: float,
+    end_seconds: float,
+    count: int = 3,
+    max_width: int = 1024,
+) -> list[bytes]:
+    """Sample ``count`` JPEG keyframes evenly across a time range.
+
+    Used by the 3d vision pass: Claude looks at a handful of frames from
+    each proposed clip range to judge whether the subject is centered
+    enough for a 9:16 vertical crop, and how far to shift if not.
+    ``max_width`` is the encoded JPEG width — kept small (1024) so the
+    multimodal token bill stays bounded; vision can read center-of-
+    frame composition fine at that size.
+
+    Returns ``[]`` when the range is empty, the file is missing, or
+    ffmpeg refused — the caller treats that as "couldn't assess, accept
+    as center" rather than as an error condition.
+    """
+    video_path = Path(video_path)
+    if count < 1 or end_seconds <= start_seconds or not video_path.exists():
+        return []
+
+    span = end_seconds - start_seconds
+    # Sample inside the range, not at the exact edges — clips often
+    # start on a hard cut and the very first frame can be a black frame.
+    pad = min(0.5, span * 0.1)
+    if count == 1:
+        timestamps = [start_seconds + span / 2]
+    else:
+        usable = max(span - 2 * pad, 0.1)
+        step = usable / (count - 1)
+        timestamps = [start_seconds + pad + i * step for i in range(count)]
+
+    frames: list[bytes] = []
+    for ts in timestamps:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-ss", f"{ts:.3f}",
+                "-i", str(video_path),
+                "-frames:v", "1",
+                "-vf", f"scale='min({max_width},iw)':-2",
+                "-q:v", "3",
+                "-f", "image2pipe",
+                "-vcodec", "mjpeg",
+                "-",
+            ],
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode == 0 and result.stdout:
+            frames.append(result.stdout)
+    return frames
+
+
 def extract_keyframes(
     video_path: str | Path,
     count: int = 6,

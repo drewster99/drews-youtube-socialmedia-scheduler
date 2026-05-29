@@ -316,6 +316,40 @@ SEED_CLIP_PROPOSALS_SHORT_PROMPT = SeedPrompt(
     ),
 )
 
+SEED_CLIP_CROP_REFINEMENT_PROMPT = SeedPrompt(
+    key="promo_clip_crop_refinement",
+    name="Promo clip crop refinement",
+    body=(
+        "You're judging whether a proposed clip range will crop well to 9:16 "
+        "vertical by taking a column from the source frame. The frames "
+        "below are sampled evenly across the proposed range.\n\n"
+        "Decide one of:\n"
+        "* 'centered' — the subject sits in the center third throughout; a "
+        "plain center crop works.\n"
+        "* 'off_center' — the subject is consistently in one side third (not "
+        "moving back and forth). Estimate ``x_shift_normalized`` in "
+        "[-1.0, 1.0] where -1.0 fully shifts the crop column left and +1.0 "
+        "fully shifts it right. Be conservative — small offsets should map "
+        "to small shifts.\n"
+        "* 'drift' — the subject moves between thirds across the frames; "
+        "no single crop window will follow them. Returned 0 for shift.\n"
+        "* 'multi_face' — multiple distinct subjects in different thirds; "
+        "no single crop holds them all. Returned 0 for shift.\n"
+        "* 'no_face' — no person/subject is clearly visible (b-roll, "
+        "graphics, screen recording). Return 0 for shift.\n\n"
+        "Return your judgment via the assess_crop tool. Be conservative "
+        "with both shift magnitude and 'off_center' classification: a "
+        "false positive forces a bad reframe, a false negative just gives "
+        "the user a center crop they were probably going to accept."
+    ),
+    variables=(),
+    system=(
+        "You assess whether a video clip frames its subject well for a 9:16 "
+        "vertical crop, and how much to shift the crop window if needed. "
+        "You output your assessment via the assess_crop tool, never as prose."
+    ),
+)
+
 SEED_CLIP_PROPOSALS_SEGMENT_PROMPT = SeedPrompt(
     key="promo_clip_proposals_segment",
     name="Promo clip proposals — Segment",
@@ -363,6 +397,7 @@ _SEEDS_BY_KEY: dict[str, SeedPrompt] = {
     SEED_CLIP_PROPOSALS_HOOK_PROMPT.key: SEED_CLIP_PROPOSALS_HOOK_PROMPT,
     SEED_CLIP_PROPOSALS_SHORT_PROMPT.key: SEED_CLIP_PROPOSALS_SHORT_PROMPT,
     SEED_CLIP_PROPOSALS_SEGMENT_PROMPT.key: SEED_CLIP_PROPOSALS_SEGMENT_PROMPT,
+    SEED_CLIP_CROP_REFINEMENT_PROMPT.key: SEED_CLIP_CROP_REFINEMENT_PROMPT,
 }
 
 

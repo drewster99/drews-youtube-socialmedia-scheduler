@@ -1000,6 +1000,7 @@ async function pollGenerateJob(jobId) {
         pending: 'Queued…',
         transcribing: 'Transcribing parent video…',
         proposing: 'Asking Claude to propose clips…',
+        refining_crops: 'Checking framing for vertical crops…',
         done: 'Done.',
         failed: 'Failed.',
     })[state] || state;
@@ -1053,12 +1054,34 @@ function buildProposalCard(id, p) {
     const card = document.createElement('div');
     card.className = 'generate-proposal-card card';
     const previewHtml = buildProposalPreview(p);
+
+    // Crop-classification badge from the 3d vision pass. Only show
+    // anything when the kind was cropped AND the vision call returned
+    // useful information. "Uncertain" means the model couldn't pick a
+    // single crop window (drift / multi-face); the user should expect
+    // a center crop and consider editing the range.
+    let cropBadge = '';
+    if (p.vertical_crop) {
+        if (p.crop_uncertain) {
+            cropBadge = `<span class="generate-crop-badge generate-crop-uncertain"
+                              title="Crop framing is uncertain — center crop will be used; consider editing the range.">
+                          ⚠ Uncertain crop
+                        </span>`;
+        } else if (Math.abs(Number(p.x_shift_normalized || 0)) >= 0.15) {
+            const dir = Number(p.x_shift_normalized) > 0 ? 'right' : 'left';
+            cropBadge = `<span class="generate-crop-badge generate-crop-shifted"
+                              title="Subject is off-center; crop will shift ${dir}.">
+                          Shifted ${dir}
+                        </span>`;
+        }
+    }
+
     card.innerHTML = `
         <label class="generate-proposal-accept">
             <input type="checkbox" id="${id}-accept" checked>
             Include
         </label>
-        <div class="generate-proposal-title">${escapeHtml(p.title || '(untitled)')}</div>
+        <div class="generate-proposal-title">${escapeHtml(p.title || '(untitled)')}${cropBadge}</div>
         <div class="form-hint">
             ${fmtSeconds(p.start_seconds)} – ${fmtSeconds(p.end_seconds)}
             · ${fmtSeconds(p.duration_seconds)}
@@ -1260,5 +1283,26 @@ async function confirmAccepted(allProposals) {
 .generate-proposal-title { font-weight: 600; }
 .generate-proposal-preview video,
 .generate-proposal-preview iframe { display: block; width: 100%; }
+.generate-crop-badge {
+    display: inline-block;
+    margin-left: 0.4rem;
+    padding: 0.05rem 0.4rem;
+    border-radius: var(--radius-sm);
+    font-size: 0.7em;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    vertical-align: middle;
+}
+.generate-crop-uncertain {
+    background: rgba(255, 170, 60, 0.18);
+    color: var(--warning, #b76e00);
+    border: 1px solid rgba(255, 170, 60, 0.45);
+}
+.generate-crop-shifted {
+    background: rgba(70, 170, 255, 0.16);
+    color: var(--info, #1c6dd0);
+    border: 1px solid rgba(70, 170, 255, 0.45);
+}
 </style>
 {% endblock %}

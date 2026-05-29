@@ -452,6 +452,188 @@ def _format_ffmpeg_timestamp(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
+# --- 3d: vision-based crop refinement -----------------------------------
+#
+# After the per-kind proposal calls land, any kind toggled for vertical
+# crop in the modal gets a second pass: we sample ~3 keyframes per
+# proposal and ask Claude vision whether the subject is centered enough
+# for a plain center crop, or whether the crop window should shift, or
+# whether the range should be flagged as "uncertain". The vision call's
+# output is a structured assessment via the assess_crop tool.
+
+# Cautious threshold for actually applying a shift. Below this, the
+# vision pass might say "off_center, shift +0.05" — a near-zero offset
+# almost certainly inside the model's noise floor. Default to center.
+_MIN_SHIFT_TO_APPLY: float = 0.15
+
+_CROP_ASSESSMENT_TOOL = {
+    "name": "assess_crop",
+    "description": (
+        "Submit your assessment of whether this clip range crops well to "
+        "9:16 vertical, and how far to shift the crop column off center."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "classification": {
+                "type": "string",
+                "enum": [
+                    "centered", "off_center", "drift", "multi_face", "no_face",
+                ],
+                "description": (
+                    "centered: subject in center third throughout. "
+                    "off_center: subject consistently in a side third. "
+                    "drift: subject moves between thirds. "
+                    "multi_face: multiple separated subjects. "
+                    "no_face: no clear subject (b-roll / graphics)."
+                ),
+            },
+            "x_shift_normalized": {
+                "type": "number",
+                "description": (
+                    "Where to shift the 9:16 column from center, in "
+                    "[-1.0, 1.0]. Negative = left, positive = right. "
+                    "Set 0 for any classification other than off_center."
+                ),
+            },
+            "confidence": {
+                "type": "number",
+                "description": "0–1 confidence in the classification.",
+            },
+        },
+        "required": ["classification", "x_shift_normalized", "confidence"],
+    },
+}
+
+
+@dataclass(frozen=True)
+class CropAssessment:
+    """Result of the vision pass on a single proposal range."""
+
+    classification: Literal[
+        "centered", "off_center", "drift", "multi_face", "no_face",
+    ]
+    x_shift_normalized: float
+    confidence: float
+
+    @property
+    def uncertain(self) -> bool:
+        """Show the 'uncertain crop' badge in the preview UI when set."""
+        return self.classification in ("drift", "multi_face")
+
+
+_NEUTRAL_ASSESSMENT = CropAssessment(
+    classification="no_face", x_shift_normalized=0.0, confidence=0.0,
+)
+
+
+def _apply_assessment_shift(assessment: CropAssessment) -> float:
+    """Map a vision assessment to the x_shift_normalized we actually
+    feed ffmpeg.
+
+    Only ``off_center`` proposals with a shift magnitude above
+    :data:`_MIN_SHIFT_TO_APPLY` produce a non-zero result — everything
+    else (centered / drift / multi_face / no_face) falls back to a
+    plain center crop. This is the "cautious" behaviour the user asked
+    for: better to give the user a center crop they can manually shift
+    later than to reframe a shot they wanted as-is.
+    """
+    if assessment.classification != "off_center":
+        return 0.0
+    shift = assessment.x_shift_normalized
+    if abs(shift) < _MIN_SHIFT_TO_APPLY:
+        return 0.0
+    return max(-1.0, min(1.0, shift))
+
+
+async def assess_crop_for_proposal(
+    *,
+    proposal: ProposedClip,
+    parent_video_path: Path,
+    project_id: int,
+    frame_count: int = 3,
+) -> CropAssessment:
+    """Run the vision pass for a single proposal.
+
+    Returns ``_NEUTRAL_ASSESSMENT`` (== center crop) on any failure:
+    missing frames, Claude unreachable, malformed tool response. The
+    point of this pass is to *improve* the crop when it can; "no
+    information" should never block a proposal.
+    """
+    import base64
+    from yt_scheduler.services import prompts as prompt_service
+
+    frames = await asyncio.to_thread(
+        media_service.extract_keyframes_in_range,
+        parent_video_path,
+        start_seconds=proposal.start_seconds,
+        end_seconds=proposal.end_seconds,
+        count=frame_count,
+    )
+    if not frames:
+        return _NEUTRAL_ASSESSMENT
+
+    prompt = await prompt_service.get_prompt_with_fallback(
+        "promo_clip_crop_refinement", project_id=project_id,
+    )
+
+    content: list[dict] = []
+    for jpeg in frames:
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": base64.b64encode(jpeg).decode("ascii"),
+            },
+        })
+    content.append({"type": "text", "text": prompt["body"]})
+
+    kwargs: dict[str, object] = {
+        "model": await ai._resolve_model(),
+        "max_tokens": 512,
+        "messages": [{"role": "user", "content": content}],
+        "tools": [_CROP_ASSESSMENT_TOOL],
+        "tool_choice": {"type": "tool", "name": "assess_crop"},
+    }
+    if prompt["system"]:
+        kwargs["system"] = prompt["system"]
+
+    try:
+        client = ai.get_client()
+        message = await asyncio.to_thread(client.messages.create, **kwargs)
+    except Exception as exc:
+        logger.warning(
+            "Crop-assessment vision call failed for %.1f-%.1f: %s",
+            proposal.start_seconds, proposal.end_seconds, exc,
+        )
+        return _NEUTRAL_ASSESSMENT
+
+    for block in getattr(message, "content", []) or []:
+        if getattr(block, "type", None) == "tool_use" and getattr(block, "name", "") == "assess_crop":
+            tool_input = getattr(block, "input", None) or {}
+            classification = tool_input.get("classification")
+            if classification not in (
+                "centered", "off_center", "drift", "multi_face", "no_face",
+            ):
+                logger.info(
+                    "Crop assessment returned unknown classification %r; "
+                    "falling back to neutral.", classification,
+                )
+                return _NEUTRAL_ASSESSMENT
+            try:
+                shift = float(tool_input.get("x_shift_normalized", 0.0))
+                confidence = float(tool_input.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                return _NEUTRAL_ASSESSMENT
+            return CropAssessment(
+                classification=classification,
+                x_shift_normalized=shift,
+                confidence=confidence,
+            )
+    return _NEUTRAL_ASSESSMENT
+
+
 async def cut_clip_from_parent(
     *,
     parent_video_path: Path,
@@ -543,16 +725,42 @@ async def propose_all_clips(
     return dict(results)
 
 
-def proposal_to_public_dict(p: ProposedClip) -> dict:
-    """JSON-safe representation of a proposal for the preview response."""
-    return {
+def proposal_to_public_dict(
+    p: ProposedClip,
+    *,
+    crop_vertical: bool = False,
+    assessment: CropAssessment | None = None,
+) -> dict:
+    """JSON-safe representation of a proposal for the preview response.
+
+    When the kind was toggled for vertical crop and the vision pass ran,
+    the resulting :class:`CropAssessment` is attached so the UI can:
+
+    * Show the actual ``x_shift_normalized`` that will be applied at
+      cut time (after the cautious-shift threshold).
+    * Render the "uncertain crop" badge for drift / multi-face cases.
+
+    For kinds without crop, or when vision wasn't run, ``assessment`` is
+    ``None`` and the only crop-related field on the dict is the inert
+    ``vertical_crop`` mirror of the kind setting.
+    """
+    out: dict[str, object] = {
         "kind": p.kind,
         "start_seconds": p.start_seconds,
         "end_seconds": p.end_seconds,
         "duration_seconds": p.duration_seconds,
         "title": p.title,
         "reason": p.reason,
+        "vertical_crop": crop_vertical,
     }
+    if assessment is not None:
+        out["x_shift_normalized"] = _apply_assessment_shift(assessment)
+        out["crop_classification"] = assessment.classification
+        out["crop_confidence"] = assessment.confidence
+        out["crop_uncertain"] = assessment.uncertain
+    else:
+        out["x_shift_normalized"] = 0.0
+    return out
 
 
 async def start_generate_job(
@@ -695,8 +903,56 @@ async def _run_generate_job(job_id: str) -> None:
             project_id=int(job["project_id"]),
         )
 
+        # Refinement — for kinds the user toggled for vertical crop,
+        # sample keyframes and ask Claude vision whether the subject is
+        # centered enough for a plain center crop. Run in parallel
+        # across all (kind, proposal) pairs that need it; per-call
+        # failure falls back to a neutral assessment (centered, no
+        # shift) so we never block a proposal on a flaky vision call.
+        crop_for_kind = job["crop_vertical"]
+        refinement_tasks: list[tuple[str, int, asyncio.Task]] = []
+        for k, props in proposals.items():
+            if not crop_for_kind.get(k, False):
+                continue
+            for idx, prop in enumerate(props):
+                task = asyncio.create_task(
+                    assess_crop_for_proposal(
+                        proposal=prop,
+                        parent_video_path=Path(job["parent_video_path"]),
+                        project_id=int(job["project_id"]),
+                    )
+                )
+                refinement_tasks.append((k, idx, task))
+
+        assessments: dict[tuple[str, int], CropAssessment | None] = {}
+        if refinement_tasks:
+            job["state"] = "refining_crops"
+            job["progress_message"] = (
+                f"Checking framing on {len(refinement_tasks)} "
+                f"crop{'s' if len(refinement_tasks) != 1 else ''}…"
+            )
+            results = await asyncio.gather(
+                *(t for _, _, t in refinement_tasks),
+                return_exceptions=True,
+            )
+            for (k, idx, _), res in zip(refinement_tasks, results):
+                if isinstance(res, Exception):
+                    logger.warning(
+                        "Vision pass crashed for %s[%d]: %s", k, idx, res,
+                    )
+                    assessments[(k, idx)] = None
+                else:
+                    assessments[(k, idx)] = res
+
         job["proposals"] = {
-            k: [proposal_to_public_dict(p) for p in v]
+            k: [
+                proposal_to_public_dict(
+                    p,
+                    crop_vertical=crop_for_kind.get(k, False),
+                    assessment=assessments.get((k, idx)),
+                )
+                for idx, p in enumerate(v)
+            ]
             for k, v in proposals.items()
         }
         job["state"] = "done"
