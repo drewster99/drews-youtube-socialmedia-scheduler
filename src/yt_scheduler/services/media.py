@@ -11,6 +11,17 @@ from typing import Literal
 from yt_scheduler.config import UPLOAD_DIR
 
 
+# Generous cap on a single ffmpeg invocation. Precise (sample-accurate)
+# re-encode of a multi-minute clip on slow software path can take a few
+# minutes; longer than this is almost always a hang. A hung ffmpeg
+# permanently pins one of the cut-semaphore slots, so without this cap
+# a handful of corrupt inputs would starve the whole Generate-from-
+# source flow with no recovery short of a process restart.
+_FFMPEG_TIMEOUT_SECONDS: int = 30 * 60  # 30 minutes
+# Tighter cap for one-frame keyframe extraction — should be sub-second.
+_FFMPEG_FRAME_TIMEOUT_SECONDS: int = 30
+
+
 @dataclass(frozen=True)
 class VideoProbe:
     """Summary of an on-disk video file as seen by ffprobe.
@@ -429,7 +440,17 @@ def extract_clip(
             str(output),
         ])
 
-    subprocess.run(cmd, check=True, capture_output=True)
+    try:
+        subprocess.run(
+            cmd, check=True, capture_output=True,
+            timeout=_FFMPEG_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        # Belt-and-braces cleanup of the half-written output so it doesn't
+        # masquerade as a usable file. The caller will see the exception
+        # and treat the cut as failed.
+        Path(output).unlink(missing_ok=True)
+        raise
 
     return output
 
@@ -463,6 +484,7 @@ def extract_gif(
         ],
         check=True,
         capture_output=True,
+        timeout=_FFMPEG_TIMEOUT_SECONDS,
     )
 
     # Pass 2: create GIF with palette
@@ -477,6 +499,7 @@ def extract_gif(
         ],
         check=True,
         capture_output=True,
+        timeout=_FFMPEG_TIMEOUT_SECONDS,
     )
 
     # Clean up palette
@@ -540,21 +563,28 @@ def extract_keyframes_in_range(
 
     frames: list[bytes] = []
     for ts in timestamps:
-        result = subprocess.run(
-            [
-                "ffmpeg",
-                "-ss", f"{ts:.3f}",
-                "-i", str(video_path),
-                "-frames:v", "1",
-                "-vf", f"scale='min({max_width},iw)':-2",
-                "-q:v", "3",
-                "-f", "image2pipe",
-                "-vcodec", "mjpeg",
-                "-",
-            ],
-            check=False,
-            capture_output=True,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-ss", f"{ts:.3f}",
+                    "-i", str(video_path),
+                    "-frames:v", "1",
+                    "-vf", f"scale='min({max_width},iw)':-2",
+                    "-q:v", "3",
+                    "-f", "image2pipe",
+                    "-vcodec", "mjpeg",
+                    "-",
+                ],
+                check=False,
+                capture_output=True,
+                timeout=_FFMPEG_FRAME_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            # A hung single-frame extract is almost certainly a corrupt
+            # source. Skip that timestamp and try the next; the vision
+            # pass tolerates fewer frames.
+            continue
         if result.returncode == 0 and result.stdout:
             frames.append(result.stdout)
     return frames
@@ -596,21 +626,25 @@ def extract_keyframes(
     frames: list[bytes] = []
     for ts in timestamps:
         # Use -ss before -i for fast seek, then a single frame to stdout.
-        result = subprocess.run(
-            [
-                "ffmpeg",
-                "-ss", f"{ts:.3f}",
-                "-i", str(video_path),
-                "-frames:v", "1",
-                "-vf", f"scale='min({max_width},iw)':-2",
-                "-q:v", "3",
-                "-f", "image2pipe",
-                "-vcodec", "mjpeg",
-                "-",
-            ],
-            check=False,
-            capture_output=True,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-ss", f"{ts:.3f}",
+                    "-i", str(video_path),
+                    "-frames:v", "1",
+                    "-vf", f"scale='min({max_width},iw)':-2",
+                    "-q:v", "3",
+                    "-f", "image2pipe",
+                    "-vcodec", "mjpeg",
+                    "-",
+                ],
+                check=False,
+                capture_output=True,
+                timeout=_FFMPEG_FRAME_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            continue
         if result.returncode == 0 and result.stdout:
             frames.append(result.stdout)
     return frames
@@ -639,6 +673,7 @@ def generate_thumbnail(
         ],
         check=True,
         capture_output=True,
+        timeout=_FFMPEG_FRAME_TIMEOUT_SECONDS,
     )
 
     return output
