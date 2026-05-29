@@ -802,16 +802,17 @@ async def _run_promo_chain_inner(job_id: str) -> None:
     if project_row:
         set_active_project(project_row["slug"])
 
-    parent_ctx = await _load_parent_context(job.get("parent_id"))
-
     # Step 1 — generate title. Skipped when a title was supplied by the
     # caller (Generate-from-source flow: Claude already proposed one
     # during preview, so re-running title-from-filename would just throw
-    # that away in favour of a worse guess).
+    # that away in favour of a worse guess). _load_parent_context is
+    # only needed for the AI prompt context, so defer the SELECT into
+    # the else branch — Generate cuts skip it.
     pre_supplied_title = job.get("pre_supplied_title")
     if pre_supplied_title:
         title = pre_supplied_title
     else:
+        parent_ctx = await _load_parent_context(job.get("parent_id"))
         job["state"] = PROMO_STATE_GENERATING_TITLE
         try:
             title = await ai.generate_title_from_filename(

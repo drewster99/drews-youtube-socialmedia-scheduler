@@ -424,10 +424,6 @@ async def propose_clips_for_kind(
 _SOFTWARE_CUT_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(8)
 _HARDWARE_CUT_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(4)
 
-# Back-compat name for tests written against the pre-3c API. New code
-# should use _SOFTWARE_CUT_SEMAPHORE / _HARDWARE_CUT_SEMAPHORE directly.
-_CUT_SEMAPHORE = _SOFTWARE_CUT_SEMAPHORE
-
 
 # In-flight Generate-from-source preview jobs. Same pattern as
 # auto_actions._UPLOAD_JOBS — keyed by job_id, fields read by the

@@ -263,7 +263,12 @@ def _detect_hardware_encoders() -> frozenset[str]:
     return frozenset(found)
 
 
-_HARDWARE_ENCODERS: frozenset[str] = _detect_hardware_encoders()
+# Lazy module-global so test runs that just import services.media don't
+# all pay the subprocess at import time. First call to
+# ``hardware_encoder_available`` populates it; subsequent calls hit the
+# cached value. Tests that need to override it monkey-patch the global
+# directly (matches the pattern used in tests/test_vertical_crop.py).
+_HARDWARE_ENCODERS: frozenset[str] | None = None
 
 
 def hardware_encoder_available(codec: str = "h264") -> bool:
@@ -272,6 +277,9 @@ def hardware_encoder_available(codec: str = "h264") -> bool:
     ``codec`` is the bare codec name (``h264`` / ``hevc``); the function
     appends ``_videotoolbox`` to match what ffmpeg lists.
     """
+    global _HARDWARE_ENCODERS
+    if _HARDWARE_ENCODERS is None:
+        _HARDWARE_ENCODERS = _detect_hardware_encoders()
     return f"{codec}_videotoolbox" in _HARDWARE_ENCODERS
 
 
