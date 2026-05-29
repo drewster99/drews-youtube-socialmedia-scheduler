@@ -686,17 +686,25 @@ async def cut_clip_from_parent(
     async with semaphore:
         out_name = f"clip_{proposal.kind}_{secrets.token_hex(6)}.mp4"
         out_path = UPLOAD_DIR / out_name
-        await asyncio.to_thread(
-            media_service.extract_clip,
-            parent_video_path,
-            _format_ffmpeg_timestamp(proposal.start_seconds),
-            _format_ffmpeg_timestamp(proposal.end_seconds),
-            output_name=out_name,
-            precise=True,
-            vertical_crop=vertical_crop,
-            x_shift_normalized=x_shift_normalized,
-            encoder="auto",
-        )
+        try:
+            await asyncio.to_thread(
+                media_service.extract_clip,
+                parent_video_path,
+                _format_ffmpeg_timestamp(proposal.start_seconds),
+                _format_ffmpeg_timestamp(proposal.end_seconds),
+                output_name=out_name,
+                precise=True,
+                vertical_crop=vertical_crop,
+                x_shift_normalized=x_shift_normalized,
+                encoder="auto",
+            )
+        except Exception:
+            # ffmpeg can leave a partial mp4 behind on non-zero exit /
+            # timeout. Without this cleanup the file leaks into
+            # UPLOAD_DIR forever — visible to nothing (no row points
+            # at it) and slowly fills disk on a flaky parent.
+            out_path.unlink(missing_ok=True)
+            raise
         return out_path
 
 
