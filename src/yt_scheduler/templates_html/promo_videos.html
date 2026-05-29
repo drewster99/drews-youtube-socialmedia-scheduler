@@ -1063,8 +1063,11 @@ function buildProposalCard(id, p) {
     let cropBadge = '';
     if (p.vertical_crop) {
         if (p.crop_uncertain) {
+            const tooltip = p.crop_classification === 'vision_error'
+                ? 'Vision crop check failed — center crop will be used. Consider re-running Generate or excluding this proposal.'
+                : 'Crop framing is uncertain — center crop will be used; consider editing the range.';
             cropBadge = `<span class="generate-crop-badge generate-crop-uncertain"
-                              title="Crop framing is uncertain — center crop will be used; consider editing the range.">
+                              title="${escapeAttr(tooltip)}">
                           ⚠ Uncertain crop
                         </span>`;
         } else if (Math.abs(Number(p.x_shift_normalized || 0)) >= 0.15) {

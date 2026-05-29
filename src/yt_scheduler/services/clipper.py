@@ -741,6 +741,7 @@ def proposal_to_public_dict(
     *,
     crop_vertical: bool = False,
     assessment: CropAssessment | None = None,
+    vision_crashed: bool = False,
 ) -> dict:
     """JSON-safe representation of a proposal for the preview response.
 
@@ -750,6 +751,12 @@ def proposal_to_public_dict(
     * Show the actual ``x_shift_normalized`` that will be applied at
       cut time (after the cautious-shift threshold).
     * Render the "uncertain crop" badge for drift / multi-face cases.
+
+    ``vision_crashed=True`` marks proposals whose vision call raised an
+    unhandled exception — the UI badges them as "uncertain" with a
+    distinct ``crop_classification = 'vision_error'`` so the user sees
+    the same warning as drift / multi-face rather than silently
+    assuming a clean center crop.
 
     For kinds without crop, or when vision wasn't run, ``assessment`` is
     ``None`` and the only crop-related field on the dict is the inert
@@ -764,7 +771,12 @@ def proposal_to_public_dict(
         "reason": p.reason,
         "vertical_crop": crop_vertical,
     }
-    if assessment is not None:
+    if vision_crashed:
+        out["x_shift_normalized"] = 0.0
+        out["crop_classification"] = "vision_error"
+        out["crop_confidence"] = 0.0
+        out["crop_uncertain"] = True
+    elif assessment is not None:
         out["x_shift_normalized"] = _apply_assessment_shift(assessment)
         out["crop_classification"] = assessment.classification
         out["crop_confidence"] = assessment.confidence
@@ -936,6 +948,11 @@ async def _run_generate_job(job_id: str) -> None:
                 refinement_tasks.append((k, idx, task))
 
         assessments: dict[tuple[str, int], CropAssessment | None] = {}
+        # Crashes are distinct from neutral assessments — the UI flags
+        # the former with the same "uncertain crop" badge it uses for
+        # drift / multi-face, so the user can see "vision had no
+        # opinion" rather than silently assuming a clean center crop.
+        crashed: set[tuple[str, int]] = set()
         if refinement_tasks:
             job["state"] = "refining_crops"
             job["progress_message"] = (
@@ -952,6 +969,7 @@ async def _run_generate_job(job_id: str) -> None:
                         "Vision pass crashed for %s[%d]: %s", k, idx, res,
                     )
                     assessments[(k, idx)] = None
+                    crashed.add((k, idx))
                 else:
                     assessments[(k, idx)] = res
 
@@ -961,6 +979,7 @@ async def _run_generate_job(job_id: str) -> None:
                     p,
                     crop_vertical=crop_for_kind.get(k, False),
                     assessment=assessments.get((k, idx)),
+                    vision_crashed=(k, idx) in crashed,
                 )
                 for idx, p in enumerate(v)
             ]

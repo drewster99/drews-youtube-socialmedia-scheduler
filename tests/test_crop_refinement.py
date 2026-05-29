@@ -109,6 +109,23 @@ def test_public_dict_with_uncertain_assessment_keeps_zero_shift_but_flags():
     assert d["crop_classification"] == "drift"
 
 
+def test_public_dict_marks_vision_crash_as_uncertain():
+    """A crashed vision call must surface as 'uncertain' so the user sees a
+    badge — silently treating it as a clean center crop would hide failures."""
+    from yt_scheduler.services.clipper import ProposedClip, proposal_to_public_dict
+
+    p = ProposedClip(
+        kind="hook", start_seconds=10, end_seconds=25,
+        title="t", reason="r",
+    )
+    d = proposal_to_public_dict(
+        p, crop_vertical=True, assessment=None, vision_crashed=True,
+    )
+    assert d["crop_uncertain"] is True
+    assert d["crop_classification"] == "vision_error"
+    assert d["x_shift_normalized"] == 0.0
+
+
 def test_public_dict_with_off_center_above_threshold():
     from yt_scheduler.services.clipper import (
         CropAssessment, ProposedClip, proposal_to_public_dict,
