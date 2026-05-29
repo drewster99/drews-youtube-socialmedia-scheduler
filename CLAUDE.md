@@ -59,7 +59,8 @@ CLI (main.py) → FastAPI app (app.py) → Routers → Services → External API
 ### Routers (`routers/`)
 
 Each router owns a domain of API endpoints under `/api/`:
-- **`video_routes`** — Upload, list, update metadata, generate descriptions, publish/schedule
+- **`video_routes`** — Upload, list, update metadata, generate descriptions, publish/schedule. Also Replace-source / Attach-source flow with codec + quality reporting on `/file-info`.
+- **`promo_routes`** — Per-parent promo videos, schedule-all, and Generate-from-source (preview → poll → confirm cuts proposed clips and inserts them as promos through the existing chain).
 - **`social_routes`** — Generate posts from templates, edit/approve/send to platforms
 - **`template_routes`** — CRUD for post templates
 - **`settings_routes`** — Credential management, blocklist, YouTube auth status
@@ -78,7 +79,8 @@ Business logic layer, each service wraps one concern:
 - **`scheduler.py`** — APScheduler background jobs (scheduled publish, caption polling, comment moderation)
 - **`moderation.py`** — Comment filtering against blocklist (supports plain text and regex)
 - **`transcription.py`** — On-device transcription with multiple backends (MLX Whisper, whisper.cpp, macOS SFSpeechRecognizer)
-- **`media.py`** — FFmpeg clip/GIF extraction
+- **`media.py`** — FFmpeg clip/GIF extraction; ffprobe-based video probing; hardware-encoder (videotoolbox) detection; browser-codec allowlist + source-quality warnings; 9:16 vertical crop filter
+- **`clipper.py`** — Generate-from-source: per-kind Claude tool_use calls proposing clip ranges from a parent's SRT transcript, optional Claude-vision pass refining crop position, ffmpeg cut execution gated by separate hardware (4) and software (8) semaphores
 - **`keychain.py`** — macOS Keychain wrapper via `security` CLI
 - **`daemon.py`** — Service installation (launchd on macOS, systemd on Linux)
 
@@ -98,6 +100,8 @@ Native SwiftUI app that embeds a Python runtime and manages the server as a subp
 - **Template syntax** — `{{variable}}` for metadata substitution, `{{ai: prompt}}` for Claude generation; variables inside AI blocks are resolved first
 - **Video lifecycle** — `draft → uploaded → captioned → ready → published`; captions polled every 15 min via background job
 - **Scheduled publishing** — Sets `publish_at` on video, APScheduler fires at that time to flip privacy to public and send all approved social posts
+- **Promo source-file provenance** — `videos.source_file_origin` (migration 026) tracks where the local file came from: `uploaded` (manual upload), `youtube_download` (re-fetched from YouTube, lossy), `user_attached` (Replace-source master), or `generated_clip` (Generate-from-source cut). Replace-source and the YouTube re-download path both honour this enum so a user-attached master can't be silently clobbered.
+- **Generate-from-source** — On the Promo screen, "Generate from source" runs three parallel Claude tool_use calls (hook / short / segment) over the parent's SRT transcript, proposes ranges, optionally runs a Claude-vision pass on 3 keyframes per range to refine 9:16 crop position, then cuts and inserts the accepted ranges through the existing promo chain. Concurrency: 4 hardware-encoder cuts, 8 software cuts, 4 promo chains, 4 vision calls — all gated by per-purpose `asyncio.Semaphore`s.
 
 ## Configuration
 
