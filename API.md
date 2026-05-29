@@ -2021,19 +2021,28 @@ Bulk-upload promo children under a primary video. Each upload runs through the m
 
 **Purpose** — Poll a generate preview job.
 
-**Response 200** — `{"job_id", "parent_id", "project_id", "kinds", "crop_vertical", "state", "last_error", "progress_message", "proposals"}`. `state` transitions `pending → transcribing? → proposing → done | failed`. `transcribing` only appears when the parent had no usable timestamped transcript at job start; the inline whisper run upserts back into the transcripts table when complete so future Generates on the same parent skip it. When `state == "done"`, `proposals` is a `{kind: [{start_seconds, end_seconds, duration_seconds, title, reason, kind}]}` map ready for the modal's proposal cards.
+**Response 200** — `{"job_id", "parent_id", "project_id", "kinds", "crop_vertical", "state", "last_error", "progress_message", "proposals"}`. `state` transitions `pending → transcribing? → proposing → refining_crops? → done | failed`. `transcribing` only appears when the parent had no usable timestamped transcript at job start; the inline whisper run upserts back into the transcripts table when complete so future Generates on the same parent skip it. `refining_crops` only appears when at least one kind has `crop_vertical=True` — that's when the Claude-vision pass runs (gated by a 4-wide semaphore in `services/clipper`). When `state == "done"`, `proposals` is a `{kind: [{...}]}` map; each proposal carries:
+
+- `kind`, `start_seconds`, `end_seconds`, `duration_seconds`, `title`, `reason` — straight from the proposal call.
+- `vertical_crop` (bool) — mirror of the kind's crop toggle at preview time; the confirm endpoint relies on this to know whether to apply the crop filter.
+- `x_shift_normalized` (float in `[-1.0, 1.0]`) — actual shift the cut step will use after the cautious-shift threshold (0.15) is applied. Always 0 when the kind had crop off, when vision wasn't run, or when the classification wasn't `off_center` with a magnitude past threshold.
+- `crop_classification` (str, only when vision ran) — one of `centered | off_center | drift | multi_face | no_face | vision_error`. `vision_error` is set when the vision call raised, distinguishing it from a model-returned neutral assessment.
+- `crop_confidence` (float, only when vision ran) — model-reported 0–1 confidence in the classification.
+- `crop_uncertain` (bool, only when vision ran) — `True` for `drift`, `multi_face`, and `vision_error`. The UI badges these so the user can see the difference between "vision said it's fine" and "vision wasn't sure / didn't answer".
+
+Terminal jobs (`done` / `failed`) are evicted from the in-memory job dict 5 minutes past terminal state — long enough for slow polling clients to land at least one final read, short enough that the dict can't grow unboundedly.
 
 **Errors** — `404` (job not found / dropped from memory after a process restart).
 
 ### `POST /api/projects/{slug}/videos/{parent_id}/promos/generate/confirm`
 
-**Purpose** — Cut and insert the user-accepted proposals. Each accepted entry spawns a promo chain job: ffmpeg cut (gated by an 8-wide semaphore in `services/clipper`), YouTube upload, then the regular probe → transcribe → describe → tag → push-metadata steps (the chain itself is gated by a 4-wide semaphore in `services/auto_actions` so a 16-clip burst queues rather than thrashes the box). The new rows have `cut_start_seconds` / `cut_end_seconds` populated so the next Generate run on the same parent can skip those ranges.
+**Purpose** — Cut and insert the user-accepted proposals. Each accepted entry spawns a promo chain job: ffmpeg cut (gated by a per-encoder semaphore in `services/clipper` — 4-wide for hardware/videotoolbox cuts, 8-wide for software/libx264), YouTube upload, then the regular probe → transcribe → describe → tag → push-metadata steps (the chain itself is gated by a 4-wide semaphore in `services/auto_actions` so a 16-clip burst queues rather than thrashes the box). The new rows have `cut_start_seconds` / `cut_end_seconds` populated so the next Generate run on the same parent can skip those ranges. Generated rows are stamped `source_file_origin='generated_clip'` (not `'uploaded'`) so Replace-source's resolution-downgrade warning skips them the way it skips `youtube_download`.
 
-**Request body** — `{"accepted": [{"kind": "hook" | "short" | "segment", "start_seconds": float, "end_seconds": float, "title": str}, ...]}`.
+**Request body** — `{"accepted": [{"kind": "hook" | "short" | "segment", "start_seconds": float, "end_seconds": float, "title": str, "vertical_crop"?: bool, "x_shift_normalized"?: float}, ...]}`. `vertical_crop` defaults to false; `x_shift_normalized` to 0. When set, the cut step pulls a 9:16 (1080×1920) column centered at `(iw - crop_width)/2 + x_shift_normalized * (iw - crop_width)/2` — i.e. shift +1.0 fully aligns the crop with the right edge, -1.0 with the left, 0 is dead-center. Both fields are clamped to their respective bounds server-side.
 
 **Response 200** — `{"jobs": [{"job_id", "kind", "title"}, ...]}`. Each `job_id` is polled via the existing `/upload-jobs/{job_id}` endpoint; the initial state is `cutting`.
 
-**Errors** — `400` (empty `accepted`, no usable entries after defensive filtering, or parent has no local file), `404` (project / parent missing).
+**Errors** — `400` (empty `accepted`, no usable entries after defensive filtering, or parent has no local file), `404` (project / parent missing). Defensive filter drops entries with non-finite `start_seconds` / `end_seconds`, wrong kind, end before start, range outside parent bounds, or empty title.
 
 ### `POST /api/projects/{slug}/videos/{parent_id}/promos/schedule-all/preview`
 
