@@ -253,6 +253,49 @@ def test_confirm_overrides_crop_against_preview_snapshot(
         clipper._GENERATE_JOBS.pop("gen_test", None)
 
 
+def test_confirm_client_can_opt_out_of_crop_when_preview_had_it_on(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """Cross-check is one-directional: it forces vertical_crop=false
+    when the preview said off, but a client choosing to send false
+    for a kind whose preview was on is honoured — useful if the user
+    decides to skip vertical reframing on a specific clip after seeing
+    the preview."""
+    from yt_scheduler.services import auto_actions, clipper
+
+    captured: list[dict] = []
+
+    async def fake_start(**kwargs):
+        captured.append(kwargs)
+        return f"job_fake_{len(captured)}"
+
+    monkeypatch.setattr(auto_actions, "start_promo_from_cut", fake_start)
+    _insert_parent("PARENTOOOOZ", duration=600.0)
+
+    clipper._GENERATE_JOBS["gen_optout"] = {
+        "job_id": "gen_optout",
+        "state": "done",
+        "crop_vertical": {"hook": True, "short": True, "segment": False},
+    }
+    try:
+        resp = client.post(
+            "/api/projects/default/videos/PARENTOOOOZ/promos/generate/confirm",
+            json={
+                "job_id": "gen_optout",
+                "accepted": [
+                    {"kind": "hook", "start_seconds": 5, "end_seconds": 20,
+                     "title": "h1", "vertical_crop": False,
+                     "x_shift_normalized": 0.0},
+                ],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert len(captured) == 1
+        assert captured[0]["vertical_crop"] is False
+    finally:
+        clipper._GENERATE_JOBS.pop("gen_optout", None)
+
+
 def test_confirm_400_when_job_id_unknown(
     client: TestClient, monkeypatch: pytest.MonkeyPatch,
 ):
