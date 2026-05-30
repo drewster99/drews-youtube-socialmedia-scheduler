@@ -813,6 +813,9 @@ async function loadVideo() {
         } else if (video.source_file_origin === 'user_attached') {
             originTag = ` <span class="file-pill-tag file-pill-tag-master">master</span>`;
             originTitle = 'User-attached master. Click for details.';
+        } else if (video.source_file_origin === 'generated_clip') {
+            originTag = ` <span class="file-pill-tag file-pill-tag-generated">cut</span>`;
+            originTitle = 'Generated from parent video. Click for details.';
         }
         fileHtml = `<button type="button" class="badge badge-published file-pill" id="local-file-pill" title="${originTitle}">🎬 local file: ${escapeHtml(shown)}${originTag}</button>`;
     } else if (dlState === 'in_progress') {

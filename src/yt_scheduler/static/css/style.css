@@ -1460,6 +1460,7 @@ dialog.modal-xwide {
 }
 .file-pill-tag-yt { background: rgba(0, 0, 0, 0.28); }
 .file-pill-tag-master { background: rgba(255, 255, 255, 0.32); }
+.file-pill-tag-generated { background: rgba(88, 166, 255, 0.32); }
 .fi-warnings {
     margin: 0;
     padding-left: 1.1rem;
