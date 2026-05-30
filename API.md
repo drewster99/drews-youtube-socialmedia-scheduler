@@ -2030,7 +2030,7 @@ Bulk-upload promo children under a primary video. Each upload runs through the m
 - `crop_confidence` (float, only when vision ran) — model-reported 0–1 confidence in the classification.
 - `crop_uncertain` (bool, only when vision ran) — `True` for `drift`, `multi_face`, and `vision_error`. The UI badges these so the user can see the difference between "vision said it's fine" and "vision wasn't sure / didn't answer".
 
-Terminal jobs (`done` / `failed`) are evicted from the in-memory job dict 5 minutes past terminal state — long enough for slow polling clients to land at least one final read, short enough that the dict can't grow unboundedly.
+Terminal jobs (`done` / `failed`) are evicted from the in-memory job dict 30 minutes past terminal state. Long enough that a user reviewing 24 proposals at a leisurely pace doesn't have the job evict under them (the confirm endpoint's `vertical_crop` cross-check goes away when the job is gone), short enough that the dict can't grow unboundedly on a long-running install.
 
 **Errors** — `404` (job not found / dropped from memory after a process restart).
 
@@ -2042,7 +2042,7 @@ Terminal jobs (`done` / `failed`) are evicted from the in-memory job dict 5 minu
 
 **Response 200** — `{"jobs": [{"job_id", "kind", "title"}, ...]}`. Each `job_id` is polled via the existing `/upload-jobs/{job_id}` endpoint; the initial state is `cutting`.
 
-**Errors** — `400` (empty `accepted`, no usable entries after defensive filtering, parent has no local file, or supplied `job_id` is unknown / expired — the in-memory generate-job dict TTL-evicts 5 minutes past terminal), `404` (project / parent missing). Defensive filter drops entries with non-finite `start_seconds` / `end_seconds`, wrong kind, end before start, range outside parent bounds, or empty title.
+**Errors** — `400` (empty `accepted`, no usable entries after defensive filtering, parent has no local file, or supplied `job_id` is unknown / expired — the in-memory generate-job dict TTL-evicts 30 minutes past terminal), `404` (project / parent missing). Defensive filter drops entries with non-finite `start_seconds` / `end_seconds`, wrong kind, end before start, range outside parent bounds, or empty title.
 
 ### `POST /api/projects/{slug}/videos/{parent_id}/promos/schedule-all/preview`
 

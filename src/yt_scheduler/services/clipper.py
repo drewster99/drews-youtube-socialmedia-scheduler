@@ -445,13 +445,26 @@ _HARDWARE_CUT_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(4)
 # which the client renders.
 #
 # Terminal jobs (``done`` / ``failed``) live for ``_GENERATE_JOB_TTL_SECONDS``
-# past the moment they entered the terminal state — long enough that a
-# slow client polling at 1.5 s intervals will land at least one final
-# read, short enough that the dict can't grow unboundedly on a long-
-# running install. _evict_stale_generate_jobs runs on every read/write
-# of the dict, so no separate timer is needed.
+# past the moment they entered the terminal state.
+#
+# The TTL has to cover two competing pressures:
+#
+# * Long enough that a user reviewing 24 proposals at a leisurely pace
+#   (dismissing some, re-watching previews) doesn't have the job evict
+#   underneath them — the confirm endpoint cross-checks vertical_crop
+#   against the job's crop snapshot, so a missing job downgrades the
+#   security posture (the confirm endpoint forces vertical_crop=false
+#   for the missing-job case to avoid a tampered crop request slipping
+#   through).
+# * Short enough that the dict can't grow unboundedly on a long-running
+#   install. With single-user usage and one Generate per parent video,
+#   even a one-hour TTL keeps the dict to maybe a dozen entries.
+#
+# 30 minutes is the compromise: covers slow review without bloating
+# memory. _evict_stale_generate_jobs runs on every read/write of the
+# dict, so no separate timer is needed.
 _GENERATE_JOBS: dict[str, dict] = {}
-_GENERATE_JOB_TTL_SECONDS: float = 5 * 60  # 5 minutes
+_GENERATE_JOB_TTL_SECONDS: float = 30 * 60  # 30 minutes
 
 
 def _evict_stale_generate_jobs() -> None:
