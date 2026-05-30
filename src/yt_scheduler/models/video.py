@@ -36,5 +36,16 @@ class Video(BaseModel):
     transcript_updated_at: datetime | None = None
     description_generated_at: datetime | None = None
     imported_from_youtube: bool = False
+    # Provenance of the on-disk file referenced by ``video_file_path``
+    # (migration 026 + the generated_clip extension). One of:
+    # 'uploaded' | 'youtube_download' | 'user_attached' | 'generated_clip'.
+    # ``None`` for pre-026 rows or rows with no local file at all.
+    source_file_origin: str | None = None
+    # Range cut from the parent's local file when this row was produced
+    # by the Generate-from-source flow (migration 027). ``None`` for
+    # everything else — manual uploads, imports, the parent itself.
+    # Used by Generate's same-kind overlap filter on subsequent runs.
+    cut_start_seconds: float | None = None
+    cut_end_seconds: float | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
