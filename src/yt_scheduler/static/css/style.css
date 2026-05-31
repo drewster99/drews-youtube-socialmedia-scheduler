@@ -1461,6 +1461,72 @@ dialog.modal-xwide {
 .file-pill-tag-yt { background: rgba(0, 0, 0, 0.28); }
 .file-pill-tag-master { background: rgba(255, 255, 255, 0.32); }
 .file-pill-tag-generated { background: rgba(88, 166, 255, 0.32); }
+
+/* Generate-from-source review page (and any future reuse). Lifted out
+   of promo_videos.html when the modal was replaced by the dedicated
+   /generate page so the styles are reachable from both contexts. */
+.generate-kind-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.2rem 0;
+    flex-wrap: wrap;
+}
+.generate-kind-crop {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    margin-left: auto;
+    font-size: 0.85em;
+    color: var(--text-muted, #888);
+}
+.generate-kind-crop input { margin: 0; }
+
+.generate-proposal-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+    gap: 0.6rem;
+    margin-top: 0.3rem;
+}
+.generate-proposal-card {
+    padding: 0.6rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-card, transparent);
+}
+.generate-proposal-accept {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.85rem;
+    color: var(--text-muted, #888);
+    margin-bottom: 0.3rem;
+}
+.generate-proposal-title { font-weight: 600; }
+.generate-proposal-preview video,
+.generate-proposal-preview iframe { display: block; width: 100%; }
+
+.generate-crop-badge {
+    display: inline-block;
+    margin-left: 0.4rem;
+    padding: 0.05rem 0.4rem;
+    border-radius: var(--radius-sm);
+    font-size: 0.7em;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    vertical-align: middle;
+}
+.generate-crop-uncertain {
+    background: rgba(255, 170, 60, 0.18);
+    color: var(--warning, #b76e00);
+    border: 1px solid rgba(255, 170, 60, 0.45);
+}
+.generate-crop-shifted {
+    background: rgba(70, 170, 255, 0.16);
+    color: var(--info, #1c6dd0);
+    border: 1px solid rgba(70, 170, 255, 0.45);
+}
 .fi-warnings {
     margin: 0;
     padding-left: 1.1rem;

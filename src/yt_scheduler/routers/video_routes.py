@@ -9,6 +9,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import weakref
 from pathlib import Path
 
 from fastapi import APIRouter, Form, Header, UploadFile, File, HTTPException, Query
@@ -1532,8 +1533,6 @@ _MAX_SOURCE_FILE_BYTES = 10 * 1024**3  # 10 GiB; defense against pathological up
 # minor sweep after :func:`_source_file_lock` last returned it. That
 # bounds the dict to ~one entry per actively-uploading video instead
 # of growing forever (one entry per video_id ever uploaded against).
-import weakref
-
 _source_file_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )

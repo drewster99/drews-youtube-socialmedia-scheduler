@@ -2038,7 +2038,23 @@ Terminal jobs (`done` / `failed`) are evicted from the in-memory job dict 30 min
 
 **Purpose** — Cut and insert the user-accepted proposals. Each accepted entry spawns a promo chain job: ffmpeg cut (gated by a per-encoder semaphore in `services/clipper` — 4-wide for hardware/videotoolbox cuts, 8-wide for software/libx264), YouTube upload, then the regular probe → transcribe → describe → tag → push-metadata steps (the chain itself is gated by a 4-wide semaphore in `services/auto_actions` so a 16-clip burst queues rather than thrashes the box). The new rows have `cut_start_seconds` / `cut_end_seconds` populated so the next Generate run on the same parent can skip those ranges. Generated rows are stamped `source_file_origin='generated_clip'` (not `'uploaded'`) so Replace-source's resolution-downgrade warning skips them the way it skips `youtube_download`.
 
-**Request body** — `{"accepted": [{"kind": "hook" | "short" | "segment", "start_seconds": float, "end_seconds": float, "title": str, "vertical_crop"?: bool, "x_shift_normalized"?: float}, ...], "job_id"?: str}`. `vertical_crop` defaults to false; `x_shift_normalized` to 0. When set, the cut step pulls a 9:16 (1080×1920) column centered at `(iw - crop_width)/2 + x_shift_normalized * (iw - crop_width)/2` — i.e. shift +1.0 fully aligns the crop with the right edge, -1.0 with the left, 0 is dead-center. Both fields are clamped to their respective bounds server-side. The optional `job_id` ties the call back to the `/generate/preview` job that produced these proposals; when supplied, the server cross-checks each entry's `vertical_crop` against the preview-time `crop_vertical[kind]` snapshot and forces it to false (with `x_shift_normalized=0`) on any kind whose preview toggle was off — defense against a tampered client body requesting a crop the vision pass never assessed.
+**Request body** — `{"accepted": [{"kind": "hook" | "short" | "segment", "start_seconds": float, "end_seconds": float, "title": str, "vertical_crop"?: bool, "x_shift_normalized"?: float}, ...], "rejected"?: [{"kind", "start_seconds", "end_seconds", "title"?, "reason"?, "x_shift_normalized"?, "crop_classification"?, "crop_confidence"?}, ...], "job_id"?: str}`. `vertical_crop` defaults to false; `x_shift_normalized` to 0. When set, the cut step pulls a 9:16 (1080×1920) column centered at `(iw - crop_width)/2 + x_shift_normalized * (iw - crop_width)/2` — i.e. shift +1.0 fully aligns the crop with the right edge, -1.0 with the left, 0 is dead-center. Both fields are clamped to their respective bounds server-side. The optional `job_id` ties the call back to the `/generate/preview` job that produced these proposals; when supplied, the server cross-checks each entry's `vertical_crop` against the preview-time `crop_vertical[kind]` snapshot and forces it to false (with `x_shift_normalized=0`) on any kind whose preview toggle was off — defense against a tampered client body requesting a crop the vision pass never assessed. The optional `rejected` array persists into the `generate_rejections` table (migration 028) so a subsequent visit to the review page can show those entries in a "Previously dismissed" section with Restore buttons; rejections are *not* fed into the next Claude proposal call.
+
+### `GET /api/projects/{slug}/videos/{parent_id}/promos/generate/rejections`
+
+**Purpose** — List proposals the user has previously dismissed for this parent. Backs the "Previously dismissed" section of the Generate review page.
+
+**Response 200** — `{"rejections": [{"id": int, "kind": str, "start_seconds": float, "end_seconds": float, "duration_seconds": float, "title": str|null, "reason": str|null, "x_shift_normalized": float|null, "crop_classification": str|null, "crop_confidence": float|null, "rejected_at": str}, ...]}`. Sorted newest first. Survives process restart (unlike the in-memory generate-job dict).
+
+**Errors** — `404` (project / parent missing or parent is itself a child).
+
+### `DELETE /api/projects/{slug}/videos/{parent_id}/promos/generate/rejections/{rejection_id}`
+
+**Purpose** — Restore a previously-dismissed proposal — drops the row from `generate_rejections`. The review page calls this when the user clicks Restore on a dismissed card; the UI then re-renders the card as an active proposal.
+
+**Response 200** — `{"deleted": bool}`. `false` when the id doesn't exist *or* belongs to a different parent (defense against slug-confused cross-tab requests) — the caller can treat both as "the row is gone, refresh the list".
+
+**Errors** — `404` (project / parent missing).
 
 **Response 200** — `{"jobs": [{"job_id", "kind", "title"}, ...]}`. Each `job_id` is polled via the existing `/upload-jobs/{job_id}` endpoint; the initial state is `cutting`.
 

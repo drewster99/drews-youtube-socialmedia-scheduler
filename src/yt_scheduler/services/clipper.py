@@ -831,6 +831,152 @@ async def propose_all_clips(
     return dict(results)
 
 
+# --- Rejection persistence (migration 028) -----------------------------
+#
+# Generate-from-source rejection memory. When the user un-checks a
+# proposal on the review page and clicks "Cut & insert selected", the
+# unchecked entries are persisted here so the next visit to the review
+# page can show a "Previously dismissed" section with Restore buttons.
+#
+# Not fed into Claude's prompt — these are pure UI memory.
+
+
+async def store_rejections(
+    *,
+    parent_id: str,
+    project_id: int,
+    rejected: list[dict],
+) -> int:
+    """Insert (or replace) the given rejected proposals for a parent.
+
+    Each entry should look like the public proposal dict but is only
+    required to carry ``kind`` / ``start_seconds`` / ``end_seconds``.
+    Optional fields are stored when present so Restore brings the
+    original assessment back without re-running vision.
+
+    Returns the count of entries actually written (rows where the
+    required fields were valid).
+    """
+    from yt_scheduler.database import get_db
+
+    if not rejected:
+        return 0
+    db = await get_db()
+    written = 0
+    for entry in rejected:
+        if not isinstance(entry, dict):
+            continue
+        kind = entry.get("kind")
+        if kind not in ("hook", "short", "segment"):
+            continue
+        try:
+            start = float(entry["start_seconds"])
+            end = float(entry["end_seconds"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        # Same defensive non-finite guard the cut path uses.
+        if not (math.isfinite(start) and math.isfinite(end)):
+            continue
+        if end <= start:
+            continue
+
+        await db.execute(
+            """INSERT INTO generate_rejections (
+                parent_id, project_id, kind, start_seconds, end_seconds,
+                title, reason, x_shift_normalized,
+                crop_classification, crop_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(parent_id, project_id, kind, start_seconds, end_seconds)
+            DO UPDATE SET
+                title = excluded.title,
+                reason = excluded.reason,
+                x_shift_normalized = excluded.x_shift_normalized,
+                crop_classification = excluded.crop_classification,
+                crop_confidence = excluded.crop_confidence,
+                rejected_at = datetime('now')""",
+            (
+                parent_id, project_id, kind, start, end,
+                str(entry.get("title") or "").strip() or None,
+                str(entry.get("reason") or "").strip() or None,
+                _maybe_float(entry.get("x_shift_normalized")),
+                _maybe_str(entry.get("crop_classification")),
+                _maybe_float(entry.get("crop_confidence")),
+            ),
+        )
+        written += 1
+    if written:
+        await db.commit()
+    return written
+
+
+async def list_rejections(
+    *,
+    parent_id: str,
+    project_id: int,
+) -> list[dict]:
+    """Return every rejection for a parent as public-dict-shaped rows.
+
+    Newest first so the UI can show "you last dismissed this 2 minutes
+    ago" implicitly via order. Each row is shaped like
+    :func:`proposal_to_public_dict` output minus the ``vertical_crop``
+    flag (which is a per-Generate selection, not a property of the
+    rejection itself — the review page applies the current selection
+    when a rejection is Restored).
+    """
+    from yt_scheduler.database import get_db
+
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id, kind, start_seconds, end_seconds, title, reason, "
+        "x_shift_normalized, crop_classification, crop_confidence, "
+        "rejected_at "
+        "FROM generate_rejections "
+        "WHERE parent_id = ? AND project_id = ? "
+        "ORDER BY rejected_at DESC, id DESC",
+        (parent_id, project_id),
+    )
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        d["duration_seconds"] = float(d["end_seconds"]) - float(d["start_seconds"])
+        out.append(d)
+    return out
+
+
+async def delete_rejection(*, rejection_id: int) -> bool:
+    """Restore a rejected proposal — i.e. drop its row.
+
+    Returns True when a row was actually deleted (the rejection
+    existed); False when the id was unknown. The caller's HTTP layer
+    can map that to a 404 if it wants strictness, or just shrug.
+    """
+    from yt_scheduler.database import get_db
+
+    db = await get_db()
+    cursor = await db.execute(
+        "DELETE FROM generate_rejections WHERE id = ?", (int(rejection_id),),
+    )
+    await db.commit()
+    return bool(cursor.rowcount)
+
+
+def _maybe_float(value: object) -> float | None:
+    try:
+        if value is None:
+            return None
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _maybe_str(value: object) -> str | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s or None
+
+
 def proposal_to_public_dict(
     p: ProposedClip,
     *,

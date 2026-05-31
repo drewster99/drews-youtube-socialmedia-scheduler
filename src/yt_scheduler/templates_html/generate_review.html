@@ -1,0 +1,512 @@
+{% extends "base.html" %}
+{% block title %}Generate from source — {{ current_video.title or "Video" }} — Drew's Video + Socials Scheduler{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h2 class="page-breadcrumb">
+        <a href="/projects/{{ current_project.slug }}" class="crumb crumb-project">{{ current_project.name }}</a>
+        <span class="crumb-sep">/</span>
+        <a href="/projects/{{ current_project.slug }}/videos/{{ parent_id }}" class="crumb">{{ current_video.title or parent_id }}</a>
+        <span class="crumb-sep">/</span>
+        <a href="/projects/{{ current_project.slug }}/videos/{{ parent_id }}/promos" class="crumb">Promo videos</a>
+        <span class="crumb-sep">/</span>
+        <span class="crumb crumb-page">Generate from source</span>
+    </h2>
+</div>
+
+<div id="gen-warnings" style="display:none; margin: 0.6rem 0;"></div>
+
+<section id="gen-picker" class="card">
+    <h3 style="margin-top: 0;">Pick what to propose</h3>
+    <p class="form-hint">Cutting from this primary video. Claude looks at the transcript and proposes ranges; for vertical-crop kinds, a vision pass refines the crop position per proposal.</p>
+    <fieldset id="gen-kinds-fieldset" style="padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: var(--radius-sm); margin: 0.6rem 0;">
+        <legend>Kinds to propose</legend>
+        <label class="generate-kind-row">
+            <input type="checkbox" id="gen-kind-hook" checked>
+            Hooks (5–30 s)
+            <span class="generate-kind-crop">
+                <input type="checkbox" id="gen-crop-hook" checked>
+                <span>9:16 vertical crop</span>
+            </span>
+        </label>
+        <label class="generate-kind-row">
+            <input type="checkbox" id="gen-kind-short" checked>
+            Shorts (45–75 s)
+            <span class="generate-kind-crop">
+                <input type="checkbox" id="gen-crop-short" checked>
+                <span>9:16 vertical crop</span>
+            </span>
+        </label>
+        <label class="generate-kind-row">
+            <input type="checkbox" id="gen-kind-segment" checked>
+            Segments (60 s+)
+            <span class="generate-kind-crop">
+                <input type="checkbox" id="gen-crop-segment">
+                <span>9:16 vertical crop</span>
+            </span>
+        </label>
+        <p class="form-hint" id="gen-eligibility-hint" style="margin: 0.4rem 0 0;"></p>
+    </fieldset>
+    <div style="display:flex; gap: 0.5rem;">
+        <button type="button" class="btn btn-primary" id="gen-go">Generate</button>
+    </div>
+</section>
+
+<section id="gen-progress" class="card" style="display:none;">
+    <h3 style="margin-top: 0;">Generating…</h3>
+    <div id="gen-progress-text" class="form-hint"></div>
+</section>
+
+<section id="gen-error" class="card" style="display:none; border-color: var(--danger);">
+    <h3 style="margin-top: 0; color: var(--danger);">Couldn't generate</h3>
+    <div id="gen-error-text"></div>
+    <button type="button" class="btn" id="gen-error-retry" style="margin-top: 0.6rem;">Back to picker</button>
+</section>
+
+<section id="gen-proposals-wrap" class="card" style="display:none;">
+    <h3 style="margin-top: 0;">Proposals</h3>
+    <p class="form-hint" id="gen-proposals-summary"></p>
+    <div id="gen-proposals"></div>
+    <div class="modal-actions" style="margin-top: 0.8rem;">
+        <a href="/projects/{{ current_project.slug }}/videos/{{ parent_id }}/promos" class="btn">Cancel</a>
+        <button type="button" class="btn btn-primary" id="gen-confirm">Cut & insert selected</button>
+    </div>
+</section>
+
+<section id="gen-rejected-wrap" class="card" style="display:none;">
+    <h3 style="margin-top: 0; cursor: pointer;" id="gen-rejected-toggle">
+        <span id="gen-rejected-caret">▶</span>
+        Previously dismissed (<span id="gen-rejected-count">0</span>)
+    </h3>
+    <p class="form-hint">These didn't make the cut last time. Restore to bring one back into the active proposal list.</p>
+    <div id="gen-rejected" style="display:none;"></div>
+</section>
+
+<script>
+const projectSlug = "{{ current_project.slug }}";
+const parentId = "{{ parent_id }}";
+
+const KIND_LABELS = { hook: 'Hook', short: 'Short', segment: 'Segment' };
+const SHIFT_THRESHOLD = 0.15;  // mirror of clipper._MIN_SHIFT_TO_APPLY
+
+// State -----------------------------------------------------------------
+let previewData = null;        // last /preview response
+let pollHandle = null;
+let abortController = null;
+let dispatchToken = 0;
+let activeProposals = {};      // {kind: [public-dict, ...]}; restored items appended here
+let restoredIds = new Set();   // rejection_ids of items the user restored this session
+
+function bumpToken() { dispatchToken += 1; return dispatchToken; }
+
+// Helpers ---------------------------------------------------------------
+function escapeHtml(s) {
+    return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function escapeAttr(s) {
+    return String(s ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+}
+function fmtSeconds(s) {
+    if (s == null || isNaN(s)) return '?';
+    const total = Math.floor(s);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const sec = total % 60;
+    if (h) return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+    return `${m}:${String(sec).padStart(2, '0')}`;
+}
+
+function showSection(id) {
+    for (const s of ['gen-picker', 'gen-progress', 'gen-error', 'gen-proposals-wrap']) {
+        document.getElementById(s).style.display = (s === id) ? '' : 'none';
+    }
+}
+
+function showError(text) {
+    document.getElementById('gen-error-text').textContent = text;
+    showSection('gen-error');
+}
+
+document.getElementById('gen-error-retry').addEventListener('click', () => {
+    showSection('gen-picker');
+    document.getElementById('gen-go').disabled = false;
+    // Strip ?job_id= so reload returns to picker
+    history.replaceState(null, '', window.location.pathname);
+});
+
+// Toggle for the rejected section --------------------------------------
+document.getElementById('gen-rejected-toggle').addEventListener('click', () => {
+    const body = document.getElementById('gen-rejected');
+    const caret = document.getElementById('gen-rejected-caret');
+    const open = body.style.display !== 'none';
+    body.style.display = open ? 'none' : '';
+    caret.textContent = open ? '▶' : '▼';
+});
+
+// Initial load: fetch any rejection history; check for ?job_id= ---------
+window.addEventListener('DOMContentLoaded', async () => {
+    await loadRejections();
+    const params = new URLSearchParams(window.location.search);
+    const jobId = params.get('job_id');
+    if (jobId) {
+        // Resume a poll on a previously-kicked-off job.
+        document.getElementById('gen-go').disabled = true;
+        showSection('gen-progress');
+        document.getElementById('gen-progress-text').textContent = 'Resuming…';
+        pollJob(jobId, bumpToken());
+    }
+});
+
+async function loadRejections() {
+    let resp, body;
+    try {
+        resp = await fetch(`/api/projects/${projectSlug}/videos/${parentId}/promos/generate/rejections`);
+        body = await resp.json();
+    } catch (e) {
+        return;  // non-fatal — section just stays hidden
+    }
+    if (!resp.ok) return;
+    const rejected = (body && body.rejections) || [];
+    const wrap = document.getElementById('gen-rejected-wrap');
+    const list = document.getElementById('gen-rejected');
+    const count = document.getElementById('gen-rejected-count');
+    if (!rejected.length) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+    // Filter out any the user has Restored this session.
+    const live = rejected.filter(r => !restoredIds.has(r.id));
+    count.textContent = String(live.length);
+    list.innerHTML = '';
+    for (const r of live) {
+        list.appendChild(buildRejectionCard(r));
+    }
+}
+
+function buildRejectionCard(r) {
+    const card = document.createElement('div');
+    card.className = 'generate-proposal-card card';
+    card.style.opacity = '0.85';
+    card.innerHTML = `
+        <div class="generate-proposal-title">
+            ${escapeHtml(r.title || '(untitled)')}
+            <span class="generate-crop-badge" style="background: rgba(255,255,255,0.12); color: var(--text-muted, #888); text-transform: none;">
+                ${escapeHtml(KIND_LABELS[r.kind] || r.kind)}
+            </span>
+        </div>
+        <div class="form-hint">
+            ${fmtSeconds(r.start_seconds)} – ${fmtSeconds(r.end_seconds)}
+            · ${fmtSeconds(r.duration_seconds)}
+            · dismissed ${escapeHtml(r.rejected_at || '')}
+        </div>
+        ${r.reason ? `<div class="form-hint" style="margin-top:0.25rem;">${escapeHtml(r.reason)}</div>` : ''}
+        <div style="margin-top: 0.4rem;">
+            <button type="button" class="btn btn-sm" data-restore="${r.id}">Restore</button>
+        </div>
+    `;
+    card.querySelector('button[data-restore]').addEventListener('click',
+        () => restoreRejection(r));
+    return card;
+}
+
+async function restoreRejection(r) {
+    // Delete on the server, then add the rejection to the active proposal
+    // list for this kind. If the user hasn't Generate'd this session,
+    // the proposals section opens to host it.
+    let resp;
+    try {
+        resp = await fetch(
+            `/api/projects/${projectSlug}/videos/${parentId}/promos/generate/rejections/${r.id}`,
+            { method: 'DELETE' },
+        );
+    } catch (e) {
+        showError('Restore failed: network error.');
+        return;
+    }
+    if (!resp.ok) {
+        showError('Restore failed: HTTP ' + resp.status);
+        return;
+    }
+    restoredIds.add(r.id);
+    // Synthesize a proposal-shaped entry from the rejection. vertical_crop
+    // honours the current picker's toggle for this kind so the user's
+    // latest choice wins, per spec.
+    const proposal = {
+        kind: r.kind,
+        start_seconds: r.start_seconds,
+        end_seconds: r.end_seconds,
+        duration_seconds: r.duration_seconds,
+        title: r.title,
+        reason: r.reason,
+        vertical_crop: cropFromPickerForKind(r.kind),
+        x_shift_normalized: r.x_shift_normalized || 0,
+        crop_classification: r.crop_classification || null,
+        crop_confidence: r.crop_confidence || 0,
+        crop_uncertain: r.crop_classification === 'drift'
+                     || r.crop_classification === 'multi_face'
+                     || r.crop_classification === 'vision_error',
+        _restored: true,
+    };
+    if (!activeProposals[r.kind]) activeProposals[r.kind] = [];
+    activeProposals[r.kind].push(proposal);
+    renderProposals();
+    showSection('gen-proposals-wrap');
+    document.getElementById('gen-proposals-wrap').style.display = '';
+    await loadRejections();  // rebuild list without the restored entry
+}
+
+function cropFromPickerForKind(kind) {
+    const el = document.getElementById(`gen-crop-${kind}`);
+    return el ? el.checked : false;
+}
+
+// Generate flow --------------------------------------------------------
+document.getElementById('gen-go').addEventListener('click', async () => {
+    const kinds = ['hook', 'short', 'segment'].filter(
+        k => document.getElementById(`gen-kind-${k}`).checked
+    );
+    if (!kinds.length) {
+        showError('Pick at least one kind.');
+        return;
+    }
+    const cropVertical = {
+        hook: document.getElementById('gen-crop-hook').checked,
+        short: document.getElementById('gen-crop-short').checked,
+        segment: document.getElementById('gen-crop-segment').checked,
+    };
+    document.getElementById('gen-go').disabled = true;
+    showSection('gen-progress');
+    document.getElementById('gen-progress-text').textContent = 'Starting…';
+
+    if (abortController) { try { abortController.abort(); } catch (e) {} }
+    abortController = new AbortController();
+    const myToken = bumpToken();
+
+    let resp, body;
+    try {
+        resp = await fetch(`/api/projects/${projectSlug}/videos/${parentId}/promos/generate/preview`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kinds, crop_vertical: cropVertical }),
+            signal: abortController.signal,
+        });
+        body = await resp.json();
+    } catch (e) {
+        if (e.name === 'AbortError') return;
+        showError('Could not reach the server.');
+        return;
+    }
+    if (myToken !== dispatchToken) return;
+    if (!resp.ok) {
+        showError(body.detail || `HTTP ${resp.status}`);
+        return;
+    }
+
+    previewData = body;
+    if (body.ineligible_kinds && body.ineligible_kinds.length) {
+        document.getElementById('gen-eligibility-hint').textContent =
+            `Skipping ${body.ineligible_kinds.join(', ')} — parent too short.`;
+    }
+    renderWarnings(body.parent_warnings || []);
+
+    // Reflect job_id in the URL for refresh / share / back-button.
+    const url = new URL(window.location);
+    url.searchParams.set('job_id', body.job_id);
+    history.replaceState(null, '', url);
+
+    pollJob(body.job_id, myToken);
+});
+
+function renderWarnings(warnings) {
+    const el = document.getElementById('gen-warnings');
+    if (!warnings.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+    el.style.display = '';
+    el.innerHTML = `<ul class="fi-warnings">${
+        warnings.map(w => `<li>${escapeHtml(w.message)}</li>`).join('')
+    }</ul>`;
+}
+
+async function pollJob(jobId, myToken) {
+    let resp, body;
+    try {
+        resp = await fetch(
+            `/api/projects/${projectSlug}/videos/${parentId}/promos/generate/jobs/${jobId}`,
+            { signal: abortController ? abortController.signal : undefined },
+        );
+        body = await resp.json();
+    } catch (e) {
+        if (e.name === 'AbortError') return;
+        showError('Lost connection while polling.');
+        return;
+    }
+    if (myToken !== dispatchToken) return;
+    if (!resp.ok) {
+        showError(body.detail || `HTTP ${resp.status}`);
+        return;
+    }
+    const labels = {
+        pending: 'Queued…',
+        transcribing: 'Transcribing parent video…',
+        proposing: 'Asking Claude to propose clips…',
+        refining_crops: 'Checking framing for vertical crops…',
+        done: 'Done.',
+        failed: 'Failed.',
+    };
+    document.getElementById('gen-progress-text').textContent =
+        body.progress_message || labels[body.state] || body.state;
+
+    if (body.state === 'done') {
+        // Seed activeProposals from the new job (preserve any restored
+        // items the user already added in this session).
+        for (const k of ['hook', 'short', 'segment']) {
+            const fresh = (body.proposals && body.proposals[k]) || [];
+            const restored = (activeProposals[k] || []).filter(p => p._restored);
+            activeProposals[k] = [...fresh, ...restored];
+        }
+        renderProposals();
+        showSection('gen-proposals-wrap');
+        return;
+    }
+    if (body.state === 'failed') {
+        showError(body.last_error || 'Generate job failed.');
+        return;
+    }
+    pollHandle = setTimeout(() => pollJob(jobId, myToken), 1500);
+}
+
+function renderProposals() {
+    const container = document.getElementById('gen-proposals');
+    container.innerHTML = '';
+    let total = 0;
+    for (const kind of ['hook', 'short', 'segment']) {
+        const list = activeProposals[kind] || [];
+        if (!list.length) continue;
+        total += list.length;
+        const section = document.createElement('div');
+        section.style.margin = '0.6rem 0';
+        section.innerHTML = `<h4>${KIND_LABELS[kind]}s · ${list.length}</h4>`;
+        const grid = document.createElement('div');
+        grid.className = 'generate-proposal-grid';
+        list.forEach((p, idx) => {
+            const id = `prop-${kind}-${idx}`;
+            grid.appendChild(buildProposalCard(id, p));
+        });
+        section.appendChild(grid);
+        container.appendChild(section);
+    }
+    const summary = document.getElementById('gen-proposals-summary');
+    summary.textContent = total
+        ? `${total} proposal${total === 1 ? '' : 's'}. Uncheck anything you don't want, then Cut & insert.`
+        : 'Claude returned no proposals for this video.';
+    document.getElementById('gen-confirm').disabled = !total;
+}
+
+function buildProposalCard(id, p) {
+    const card = document.createElement('div');
+    card.className = 'generate-proposal-card card';
+    let cropBadge = '';
+    if (p.vertical_crop) {
+        if (p.crop_uncertain) {
+            const tip = p.crop_classification === 'vision_error'
+                ? 'Vision crop check failed — center crop will be used.'
+                : 'Crop framing is uncertain — center crop will be used.';
+            cropBadge = `<span class="generate-crop-badge generate-crop-uncertain" title="${escapeAttr(tip)}">⚠ Uncertain crop</span>`;
+        } else if (Math.abs(Number(p.x_shift_normalized || 0)) >= SHIFT_THRESHOLD) {
+            const dir = Number(p.x_shift_normalized) > 0 ? 'right' : 'left';
+            cropBadge = `<span class="generate-crop-badge generate-crop-shifted">Shifted ${dir}</span>`;
+        }
+    }
+    const restoredBadge = p._restored
+        ? `<span class="generate-crop-badge" style="background: rgba(88,166,255,0.18); color: var(--info);">Restored</span>`
+        : '';
+    card.innerHTML = `
+        <label class="generate-proposal-accept">
+            <input type="checkbox" id="${id}-accept" checked>
+            Include
+        </label>
+        <div class="generate-proposal-title">
+            ${escapeHtml(p.title || '(untitled)')}${cropBadge}${restoredBadge}
+        </div>
+        <div class="form-hint">
+            ${fmtSeconds(p.start_seconds)} – ${fmtSeconds(p.end_seconds)}
+            · ${fmtSeconds(p.duration_seconds)}
+        </div>
+        ${p.reason ? `<div class="form-hint" style="margin-top:0.25rem;">${escapeHtml(p.reason)}</div>` : ''}
+        <div class="generate-proposal-preview" style="margin-top:0.4rem;">${buildProposalPreview(p)}</div>
+    `;
+    return card;
+}
+
+function buildProposalPreview(p) {
+    if (!previewData) return '';
+    if (previewData.parent_browser_playable && previewData.parent_video_file_url) {
+        const url = `${previewData.parent_video_file_url}#t=${p.start_seconds},${p.end_seconds}`;
+        return `<video src="${escapeAttr(url)}" controls preload="metadata" style="width:100%; max-height:300px;"></video>`;
+    }
+    if (previewData.parent_youtube_id) {
+        const start = Math.floor(p.start_seconds);
+        const end = Math.ceil(p.end_seconds);
+        const url = `https://www.youtube.com/embed/${encodeURIComponent(previewData.parent_youtube_id)}?start=${start}&end=${end}`;
+        return `<div class="form-hint" style="margin-bottom:0.2rem;">Preview from YouTube</div>`
+             + `<iframe width="100%" height="260" src="${escapeAttr(url)}" frameborder="0" allowfullscreen></iframe>`;
+    }
+    return `<div class="form-hint">Preview unavailable for this parent.</div>`;
+}
+
+// Confirm ---------------------------------------------------------------
+document.getElementById('gen-confirm').addEventListener('click', async () => {
+    const accepted = [];
+    const rejected = [];
+    for (const kind of ['hook', 'short', 'segment']) {
+        const list = activeProposals[kind] || [];
+        list.forEach((p, idx) => {
+            const id = `prop-${kind}-${idx}`;
+            const cb = document.getElementById(`${id}-accept`);
+            const target = (cb && cb.checked) ? accepted : rejected;
+            target.push({
+                kind: p.kind,
+                start_seconds: p.start_seconds,
+                end_seconds: p.end_seconds,
+                title: p.title,
+                reason: p.reason || '',
+                vertical_crop: cropFromPickerForKind(p.kind),
+                x_shift_normalized: Number(p.x_shift_normalized || 0),
+                crop_classification: p.crop_classification || null,
+                crop_confidence: Number(p.crop_confidence || 0),
+            });
+        });
+    }
+    if (!accepted.length) {
+        showError('Select at least one proposal to cut. Use Cancel if you want to keep nothing.');
+        return;
+    }
+    const btn = document.getElementById('gen-confirm');
+    btn.disabled = true;
+    btn.textContent = 'Cutting…';
+    let resp, body;
+    try {
+        resp = await fetch(`/api/projects/${projectSlug}/videos/${parentId}/promos/generate/confirm`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                accepted, rejected,
+                job_id: previewData ? previewData.job_id : null,
+            }),
+        });
+        body = await resp.json();
+    } catch (e) {
+        showError('Network error submitting.');
+        btn.disabled = false;
+        btn.textContent = 'Cut & insert selected';
+        return;
+    }
+    if (!resp.ok) {
+        showError(body.detail || `HTTP ${resp.status}`);
+        btn.disabled = false;
+        btn.textContent = 'Cut & insert selected';
+        return;
+    }
+    // Back to the Promos page so the user sees the new placeholder cards.
+    window.location.href = `/projects/${projectSlug}/videos/${parentId}/promos`;
+});
+</script>
+{% endblock %}

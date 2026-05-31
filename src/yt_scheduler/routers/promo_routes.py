@@ -632,7 +632,70 @@ async def generate_confirm(
 
     if not jobs_out:
         raise HTTPException(400, "No usable entries in 'accepted'.")
+
+    # Persist any explicitly-rejected proposals so the next visit to
+    # the review page can show them in the "Previously dismissed"
+    # section. Best-effort: a malformed rejection entry is dropped by
+    # store_rejections, not surfaced as an error — the user clicked
+    # Cut & insert, they care about the accepts going through.
+    rejected_in = payload.get("rejected") or []
+    if isinstance(rejected_in, list) and rejected_in:
+        try:
+            await clipper.store_rejections(
+                parent_id=parent_id,
+                project_id=int(project["id"]),
+                rejected=rejected_in,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Persisting Generate rejections for parent %s failed: %r",
+                parent_id, exc,
+            )
+
     return {"jobs": jobs_out}
+
+
+@router.get("/generate/rejections")
+async def list_generate_rejections(slug: str, parent_id: str) -> dict:
+    """List proposals the user has previously dismissed for this parent.
+
+    Read straight off ``generate_rejections`` — these survive process
+    restart, unlike the in-memory ``_GENERATE_JOBS``. The review page
+    renders them in the "Previously dismissed" section with a Restore
+    button per entry; Restore calls ``DELETE
+    /generate/rejections/{id}`` to drop the row.
+    """
+    project, _parent = await _ensure_primary(slug, parent_id)
+    rows = await clipper.list_rejections(
+        parent_id=parent_id, project_id=int(project["id"]),
+    )
+    return {"rejections": rows}
+
+
+@router.delete("/generate/rejections/{rejection_id}")
+async def delete_generate_rejection(
+    slug: str, parent_id: str, rejection_id: int,
+) -> dict:
+    """Restore = drop the rejection row. The user can then re-include
+    it in their next Cut & insert.
+
+    Returns ``{"deleted": bool}`` so the client can decide whether to
+    optimistically remove the card or leave it (in case of a stale
+    delete from another tab).
+    """
+    # Validate the rejection actually belongs to this parent + project
+    # so a slug-confused client can't delete a row from somewhere else.
+    project, _parent = await _ensure_primary(slug, parent_id)
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id FROM generate_rejections "
+        "WHERE id = ? AND parent_id = ? AND project_id = ?",
+        (rejection_id, parent_id, int(project["id"])),
+    )
+    if not rows:
+        return {"deleted": False}
+    deleted = await clipper.delete_rejection(rejection_id=rejection_id)
+    return {"deleted": deleted}
 
 
 @router.post("/schedule-all/preview")

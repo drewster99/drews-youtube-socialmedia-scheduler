@@ -311,6 +311,38 @@ async def project_promo_videos_page(request: Request, slug: str, parent_id: str)
     )
 
 
+@app.get(
+    "/projects/{slug}/videos/{parent_id}/promos/generate",
+    response_class=HTMLResponse,
+)
+async def project_generate_from_source_page(
+    request: Request, slug: str, parent_id: str,
+):
+    """Full-screen Generate-from-source review page.
+
+    The picker + Generate button + proposal grid + Previously-dismissed
+    section all live here — replaces the old in-page modal. URL gains
+    ``?job_id=…`` when a Generate is in flight so the page is
+    refreshable and browser-back-friendly.
+    """
+    project = await _project_context(slug)
+    from yt_scheduler.database import get_db
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id, title FROM videos WHERE id = ?", (parent_id,)
+    )
+    current_video = dict(rows[0]) if rows else None
+    return html_templates.TemplateResponse(
+        request,
+        "generate_review.html",
+        context={
+            "current_project": project,
+            "parent_id": parent_id,
+            "current_video": current_video,
+        },
+    )
+
+
 @app.get("/projects/{slug}/templates", response_class=HTMLResponse)
 async def project_templates_page(request: Request, slug: str):
     project = await _project_context(slug)
