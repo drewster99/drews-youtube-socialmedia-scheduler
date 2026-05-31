@@ -326,12 +326,45 @@ async def project_generate_from_source_page(
     refreshable and browser-back-friendly.
     """
     project = await _project_context(slug)
+    from yt_scheduler.config import media_url
     from yt_scheduler.database import get_db
+    from yt_scheduler.routers.video_routes import _resolve_video_file
+    from yt_scheduler.services import media as media_service
+    import asyncio as _asyncio
+
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT id, title FROM videos WHERE id = ?", (parent_id,)
+        "SELECT id, title, video_file_path FROM videos WHERE id = ?",
+        (parent_id,),
     )
     current_video = dict(rows[0]) if rows else None
+
+    # Render the parent's preview-friendly metadata into the page so the
+    # proposal cards can show their inline <video> / YouTube-iframe
+    # previews even in the resume-via-?job_id= path and the Restore-
+    # without-fresh-Generate path. Without this, the in-flight previewData
+    # would be the only source — and that's only set after a /preview
+    # call lands inside the page session.
+    parent_meta: dict = {
+        "video_file_url": None, "browser_playable": None, "youtube_id": "",
+    }
+    if current_video:
+        parent_path = _resolve_video_file(current_video.get("video_file_path"))
+        if parent_path is not None and parent_path.exists():
+            probe = await _asyncio.to_thread(
+                media_service.probe_video_file, parent_path,
+            )
+            parent_meta["video_file_url"] = media_url(
+                current_video.get("video_file_path")
+            )
+            parent_meta["browser_playable"] = media_service.is_browser_playable(
+                probe.codec_name if probe else None,
+                probe.container if probe else None,
+            )
+        # 11-char id is the YouTube convention used elsewhere in the app.
+        if len(parent_id) == 11:
+            parent_meta["youtube_id"] = parent_id
+
     return html_templates.TemplateResponse(
         request,
         "generate_review.html",
@@ -339,6 +372,7 @@ async def project_generate_from_source_page(
             "current_project": project,
             "parent_id": parent_id,
             "current_video": current_video,
+            "parent_meta": parent_meta,
         },
     )
 

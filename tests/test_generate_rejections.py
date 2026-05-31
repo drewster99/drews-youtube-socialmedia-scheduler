@@ -263,3 +263,26 @@ def test_review_page_renders(client: TestClient):
     assert "gen-confirm" in body  # confirm button id rendered
     # Rejection section is in the markup (hidden until populated).
     assert "gen-rejected-wrap" in body
+    # PARENT_META is rendered server-side so resume / restore-without-
+    # Generate paths still get inline previews. parent_id is 11 chars
+    # so the youtube_id branch fires.
+    assert "PARENT_META" in body
+    assert "PARENTRJ0006" in body  # rendered into parent_youtube_id
+
+
+def test_review_page_renders_meta_without_youtube_id_for_non11(
+    client: TestClient,
+):
+    """A parent whose id isn't 11 chars (non-YouTube-backed item) gets
+    an empty youtube_id — server falls back to local file preview only."""
+    _insert_parent("STANDALONE-LONGER-ID-XX")
+    resp = client.get(
+        "/projects/default/videos/STANDALONE-LONGER-ID-XX/promos/generate",
+    )
+    assert resp.status_code == 200
+    body = resp.text
+    # PARENT_META rendered; youtube_id is empty string for non-11-char ids.
+    # The template emits a JS object literal (not JSON), so the key isn't
+    # quoted but the empty-string value is.
+    assert "PARENT_META" in body
+    assert 'parent_youtube_id: ""' in body

@@ -199,7 +199,8 @@ async def test_run_generate_job_skips_vision_for_crop_off_kinds(
         async def fetchall(self): return self._rows
         def __aiter__(self): return self
         async def __anext__(self):
-            if not self._rows: raise StopAsyncIteration
+            if not self._rows:
+                raise StopAsyncIteration
             return self._rows.pop(0)
 
     class _FakeDB:

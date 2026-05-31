@@ -679,23 +679,25 @@ async def delete_generate_rejection(
     """Restore = drop the rejection row. The user can then re-include
     it in their next Cut & insert.
 
-    Returns ``{"deleted": bool}`` so the client can decide whether to
-    optimistically remove the card or leave it (in case of a stale
-    delete from another tab).
+    Returns ``{"deleted": bool}``: ``true`` when this call deleted the
+    row, ``false`` when the row was already gone OR didn't belong to
+    this parent (the client can treat both as 'the row isn't there
+    anymore, refresh the list').
+
+    Ownership is baked into the WHERE clause so the query is atomic —
+    a slug-confused / cross-tab DELETE never touches a row it doesn't
+    own, and there's no SELECT-then-DELETE window for the row to
+    disappear between checks.
     """
-    # Validate the rejection actually belongs to this parent + project
-    # so a slug-confused client can't delete a row from somewhere else.
     project, _parent = await _ensure_primary(slug, parent_id)
     db = await get_db()
-    rows = await db.execute_fetchall(
-        "SELECT id FROM generate_rejections "
+    cursor = await db.execute(
+        "DELETE FROM generate_rejections "
         "WHERE id = ? AND parent_id = ? AND project_id = ?",
         (rejection_id, parent_id, int(project["id"])),
     )
-    if not rows:
-        return {"deleted": False}
-    deleted = await clipper.delete_rejection(rejection_id=rejection_id)
-    return {"deleted": deleted}
+    await db.commit()
+    return {"deleted": bool(cursor.rowcount)}
 
 
 @router.post("/schedule-all/preview")
