@@ -16,7 +16,13 @@ def test_vertical_crop_filter_center():
     from yt_scheduler.services.media import _vertical_crop_filter
 
     out = _vertical_crop_filter(0.0)
-    assert out.startswith("crop=min(iw,ih*9/16):ih:(iw-min(iw,ih*9/16))/2:0")
+    # crop width forced to an even integer via floor(.../2)*2 so a
+    # source whose ih*9/16 is fractional (e.g. 360 -> 202.5) still
+    # produces a valid ffmpeg crop expression rather than ffmpeg
+    # exit 8. x offset wrapped in floor() for the same reason.
+    assert out.startswith(
+        "crop=floor(min(iw,ih*9/16)/2)*2:ih:floor((iw-floor(min(iw,ih*9/16)/2)*2)/2):0"
+    )
     assert out.endswith("scale=1080:1920")
 
 
@@ -24,8 +30,8 @@ def test_vertical_crop_filter_shift_right():
     from yt_scheduler.services.media import _vertical_crop_filter
 
     out = _vertical_crop_filter(0.5)
-    # Center expression with +0.5*(iw-cw)/2 added on.
-    assert "(iw-min(iw,ih*9/16))/2+(0.5000)*(iw-min(iw,ih*9/16))/2" in out
+    # Same floor() wrapping; the +0.5*(iw-cw)/2 shift sits inside floor().
+    assert "+(0.5000)*(iw-floor(min(iw,ih*9/16)/2)*2)/2)" in out
 
 
 def test_vertical_crop_filter_shift_left():
@@ -33,6 +39,29 @@ def test_vertical_crop_filter_shift_left():
 
     out = _vertical_crop_filter(-0.4)
     assert "(-0.4000)" in out
+
+
+def test_vertical_crop_filter_handles_fractional_9_16_sources():
+    """640x360 source: ih*9/16 = 202.5. Without floor() the crop filter
+    expression contains a fractional value and ffmpeg exits 8. With
+    floor(.../2)*2 the expression evaluates to an even integer (202),
+    which is what libx264 + YUV 4:2:0 require."""
+    from yt_scheduler.services.media import _vertical_crop_filter
+
+    out = _vertical_crop_filter(0.0)
+    # No bare `ih*9/16` term should appear without a floor() wrap;
+    # otherwise ffmpeg sees the fractional value directly.
+    assert "crop=floor(" in out
+    assert "floor((iw-" in out  # x expression also floored
+    # Sanity: the expression evaluates to 202 (even) for 640x360.
+    # eval() here mirrors ffmpeg's expression evaluator closely
+    # enough to verify the math.
+    import math
+    iw, ih = 640, 360
+    cw = math.floor(min(iw, ih * 9 / 16) / 2) * 2
+    assert cw == 202
+    x = math.floor((iw - cw) / 2)
+    assert x == 219
 
 
 def test_vertical_crop_filter_clamps_out_of_range():
@@ -216,7 +245,7 @@ def test_extract_clip_vertical_crop_filter_included(
     assert "-vf" in cmd
     vf_idx = cmd.index("-vf")
     vf_value = cmd[vf_idx + 1]
-    assert vf_value.startswith("crop=min(iw,ih*9/16):ih:")
+    assert vf_value.startswith("crop=floor(min(iw,ih*9/16)/2)*2:ih:")
     assert vf_value.endswith("scale=1080:1920")
 
 

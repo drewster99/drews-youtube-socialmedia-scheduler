@@ -814,6 +814,9 @@ def _preview_filename(job_id: str, kind: str, idx: int) -> str:
     return f"{_PREVIEW_PREFIX}{job_id}_{kind}_{idx}.mp4"
 
 
+_PREVIEW_MAX_SECONDS = 25.0
+
+
 async def cut_preview_for_proposal(
     *,
     job_id: str,
@@ -827,17 +830,32 @@ async def cut_preview_for_proposal(
     show the actual clip (with crop applied) instead of seeking into
     the parent video.
 
-    Same framing the final cut will use: ``precise=True`` and the same
-    ``vertical_crop`` + ``x_shift_normalized`` so what the user sees is
-    what they'll get. Always uses the software lane — previews share
-    the event loop with everything else and shouldn't compete with the
-    hardware lane the final cuts will want when the user clicks
-    Confirm.
+    Tuned for throughput, not fidelity. The user is scanning a grid
+    of proposals — they need to see *enough* to judge the framing and
+    content, not the full 5-minute segment. We cap the cut at
+    :data:`_PREVIEW_MAX_SECONDS`, use ``precise=False`` (fast
+    container-level seek; may land up to one GOP early), and pass
+    ``-preset ultrafast`` to libx264. Segment previews drop from
+    minutes to seconds.
+
+    Same ``vertical_crop`` + ``x_shift_normalized`` the final cut will
+    use, so what the user sees is what they'll get for framing — the
+    final cut from the Confirm step is the one with ``precise=True``
+    + default preset, so length and quality match expectations there.
+
+    Always uses the software lane (``encoder="software"``); the
+    hardware lane stays reserved for the final cuts so the user
+    doesn't see Confirm queue up behind preview work.
 
     Filename pattern (``gen_preview_<job_id>_<kind>_<idx>.mp4``) is
     deterministic so cleanup can glob them without bookkeeping per
     proposal on the job dict.
     """
+    # Cap the cut window. The proposal's start is preserved; the end
+    # is the earlier of the proposal end and start+MAX.
+    duration = max(0.0, float(proposal.end_seconds) - float(proposal.start_seconds))
+    preview_end = float(proposal.start_seconds) + min(duration, _PREVIEW_MAX_SECONDS)
+
     out_name = _preview_filename(job_id, proposal.kind, idx)
     out_path = UPLOAD_DIR / out_name
     async with _SOFTWARE_CUT_SEMAPHORE:
@@ -852,12 +870,13 @@ async def cut_preview_for_proposal(
                 media_service.extract_clip,
                 parent_video_path,
                 _format_ffmpeg_timestamp(proposal.start_seconds),
-                _format_ffmpeg_timestamp(proposal.end_seconds),
+                _format_ffmpeg_timestamp(preview_end),
                 output_name=out_name,
-                precise=True,
+                precise=False,
                 vertical_crop=vertical_crop,
                 x_shift_normalized=x_shift_normalized,
                 encoder="software",
+                preset="ultrafast",
             )
             ok = True
         finally:
@@ -1396,10 +1415,17 @@ async def _run_generate_job(job_id: str) -> None:
             )
             for (k, idx, _), res in zip(preview_tasks, preview_results):
                 if isinstance(res, Exception):
+                    # Stash the error on the proposal so the UI can
+                    # surface it instead of silently falling back to a
+                    # misleading parent-with-#t= preview (which for a
+                    # vertical-crop kind would render the landscape
+                    # source and look "fine" while hiding the failure).
+                    msg = f"{type(res).__name__}: {res}"[:400]
                     logger.warning(
                         "Preview cut failed for %s[%d] in job %s: %s",
-                        k, idx, job_id, res,
+                        k, idx, job_id, msg,
                     )
+                    public_per_kind[k][idx]["preview_error"] = msg
                     continue
                 from yt_scheduler.config import media_url
                 public_per_kind[k][idx]["preview_url"] = media_url(str(res))

@@ -97,6 +97,7 @@ const PARENT_META = {
     parent_video_file_url: {{ parent_meta.video_file_url|tojson if parent_meta else 'null' }},
     parent_browser_playable: {{ parent_meta.browser_playable|tojson if parent_meta else 'null' }},
     parent_youtube_id: {{ parent_meta.youtube_id|tojson if parent_meta else '""' }},
+    parent_warnings: {{ parent_meta.warnings|tojson if parent_meta else '[]' }},
 };
 
 const KIND_LABELS = { hook: 'Hook', short: 'Short', segment: 'Segment' };
@@ -159,6 +160,10 @@ document.getElementById('gen-rejected-toggle').addEventListener('click', () => {
 
 // Initial load: fetch any rejection history; check for ?job_id= ---------
 window.addEventListener('DOMContentLoaded', async () => {
+    // Show source-quality warnings BEFORE the user clicks Generate so
+    // they can swap to a higher-resolution source before spending
+    // Claude tokens on a soft source. Server-rendered in PARENT_META.
+    renderWarnings(PARENT_META.parent_warnings || []);
     await loadRejections();
     const params = new URLSearchParams(window.location.search);
     const jobId = params.get('job_id');
@@ -332,6 +337,36 @@ document.getElementById('gen-go').addEventListener('click', async () => {
 function renderWarnings(warnings) {
     const el = document.getElementById('gen-warnings');
     if (!warnings.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+    // low_resolution is the warning the user has to see before they
+    // spend time on a Generate run that'll produce soft phone-screen
+    // clips. Render it as a prominent banner with an explicit
+    // recommendation rather than a small bullet they can miss.
+    const hasLowRes = warnings.some(w => w.code === 'low_resolution');
+    if (hasLowRes) {
+        const lowRes = warnings.find(w => w.code === 'low_resolution');
+        const other = warnings.filter(w => w.code !== 'low_resolution');
+        const otherHtml = other.length
+            ? `<ul class="fi-warnings" style="margin-top:0.6rem;">${
+                other.map(w => `<li>${escapeHtml(w.message)}</li>`).join('')
+              }</ul>`
+            : '';
+        el.style.display = '';
+        el.innerHTML = `
+            <div style="padding:0.75rem 1rem; border:2px solid var(--warning);
+                        border-radius:8px; background:rgba(210,153,34,0.12);
+                        color:var(--text-primary); font-size:0.95rem;">
+              <div style="font-weight:600; font-size:1rem; margin-bottom:0.3rem;">
+                ⚠ Low-resolution source: ${escapeHtml(lowRes.width + '×' + lowRes.height)}
+              </div>
+              <div>${escapeHtml(lowRes.message)}</div>
+              <div style="margin-top:0.5rem; font-size:0.88rem; opacity:0.85;">
+                Recommended: cancel, attach a higher-resolution master via the
+                Replace source button on the parent video, then come back here.
+              </div>
+              ${otherHtml}
+            </div>`;
+        return;
+    }
     el.style.display = '';
     el.innerHTML = `<ul class="fi-warnings">${
         warnings.map(w => `<li>${escapeHtml(w.message)}</li>`).join('')
@@ -451,20 +486,43 @@ function buildProposalCard(id, p) {
 }
 
 function buildProposalPreview(p) {
-    // Prefer the per-proposal preview file the server cut after the
-    // proposals were settled — that's the actual clip with the crop
-    // applied. Falls back to the parent video with a media fragment
-    // (#t=) for legacy / partial-failure cases, then to the YouTube
-    // embed when no local file exists at all.
+    // Order: explicit error from the server > per-proposal preview
+    // file > parent-with-#t= fallback > YouTube embed. We do NOT
+    // fall back to the parent for a failed vertical-crop preview —
+    // that would show the landscape source and silently misrepresent
+    // the framing the final cut will use.
+    if (p.preview_error) {
+        const errMsg = escapeHtml(String(p.preview_error));
+        return `<div class="gen-preview-error" style="`
+             + `padding:0.6rem 0.75rem; border:1px solid var(--danger);`
+             + `border-radius:6px; background:rgba(248,81,73,0.08);`
+             + `color:var(--danger); font-size:0.85rem;">`
+             + `<strong>Preview cut failed.</strong> The proposal can `
+             + `still be cut at Confirm time — the final-cut path uses a `
+             + `different code path that may succeed even when the preview `
+             + `couldn't.<br><span style="font-family:monospace; word-break:break-all;">${errMsg}</span>`
+             + `</div>`;
+    }
     if (p.preview_url) {
-        return `<video src="${escapeAttr(p.preview_url)}" controls preload="metadata" `
+        // The preview is capped to ~25s for throughput; warn the user
+        // when their actual range is longer so they don't think the
+        // final cut will be truncated.
+        const truncated = (p.duration_seconds || 0) > 25.5;
+        const note = truncated
+            ? `<div class="form-hint" style="margin-bottom:0.2rem;">Preview shows the first ~25s — full clip cuts on Confirm.</div>`
+            : '';
+        // preload="auto" so Safari/Chrome fetch enough of the freshly-
+        // cut mp4 to render a first-frame poster. With "metadata" the
+        // segment preview tiles came up as black boxes.
+        return note
+             + `<video src="${escapeAttr(p.preview_url)}" controls preload="auto" `
              + `style="width:100%; max-height:360px;"></video>`;
     }
     const data = previewData || PARENT_META;
     if (!data) return '';
     if (data.parent_browser_playable && data.parent_video_file_url) {
         const url = `${data.parent_video_file_url}#t=${p.start_seconds},${p.end_seconds}`;
-        return `<video src="${escapeAttr(url)}" controls preload="metadata" style="width:100%; max-height:300px;"></video>`;
+        return `<video src="${escapeAttr(url)}" controls preload="auto" style="width:100%; max-height:300px;"></video>`;
     }
     if (data.parent_youtube_id) {
         const start = Math.floor(p.start_seconds);

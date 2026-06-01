@@ -332,16 +332,16 @@ def _vertical_crop_filter(x_shift_normalized: float) -> str:
     """
     # Clamp the shift so the crop never walks off the source frame.
     shift = max(-1.0, min(1.0, float(x_shift_normalized)))
-    # Build the x-offset expression. ``(iw - cw) / 2`` is center;
-    # ``shift * (iw - cw) / 2`` adds up to a full half-frame in either
-    # direction. ``cw`` is the min(iw, ih*9/16) value above; reuse the
-    # same sub-expression to keep ffmpeg parsing happy without a
-    # named alias.
-    cw = "min(iw,ih*9/16)"
+    # Force the crop width to an even integer ≤ the ideal 9:16 width.
+    # ffmpeg's crop filter rejects non-integer dims, and libx264 (the
+    # YUV 4:2:0 default) needs both width and height even. A 640×360
+    # source would otherwise compute ih*9/16 = 202.5 → ffmpeg exits 8.
+    # floor(.../2)*2 rounds down to the nearest even integer.
+    cw = "floor(min(iw,ih*9/16)/2)*2"
     if shift == 0.0:
-        x_expr = f"(iw-{cw})/2"
+        x_expr = f"floor((iw-{cw})/2)"
     else:
-        x_expr = f"(iw-{cw})/2+({shift:.4f})*(iw-{cw})/2"
+        x_expr = f"floor((iw-{cw})/2+({shift:.4f})*(iw-{cw})/2)"
     return (
         f"crop={cw}:ih:{x_expr}:0,"
         f"scale={_VERTICAL_OUTPUT_WIDTH}:{_VERTICAL_OUTPUT_HEIGHT}"
@@ -358,6 +358,7 @@ def extract_clip(
     vertical_crop: bool = False,
     x_shift_normalized: float = 0.0,
     encoder: Literal["auto", "hardware", "software"] = "auto",
+    preset: str | None = None,
 ) -> Path:
     """Extract a video clip from ``start`` to ``end``.
 
@@ -388,6 +389,11 @@ def extract_clip(
     * ``"hardware"`` — force ``h264_videotoolbox``. Raises if the
       detection at module-import said it's not available.
     * ``"software"`` — force ``libx264``.
+
+    ``preset`` is libx264-only — pass e.g. ``"ultrafast"`` to trade
+    encode quality for throughput (used by the preview-cut path so
+    16 software cuts don't burn minutes). Ignored when ``encoder``
+    resolves to videotoolbox (which has its own speed model).
 
     Callers wrap the call in the appropriate semaphore in
     ``services/clipper`` so concurrent cuts queue rather than fight.
@@ -441,8 +447,10 @@ def extract_clip(
             str(output),
         ])
     else:
+        cmd.extend(["-c:v", "libx264"])
+        if preset:
+            cmd.extend(["-preset", preset])
         cmd.extend([
-            "-c:v", "libx264",
             "-c:a", "aac",
             "-movflags", "+faststart",
             str(output),

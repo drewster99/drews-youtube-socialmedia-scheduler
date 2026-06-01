@@ -432,7 +432,7 @@ async def project_generate_from_source_page(
 
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT id, title, video_file_path FROM videos "
+        "SELECT id, title, video_file_path, source_file_origin FROM videos "
         "WHERE id = ? AND project_id = ?",
         (parent_id, int(project["id"])),
     )
@@ -448,6 +448,12 @@ async def project_generate_from_source_page(
     # call lands inside the page session.
     parent_meta: dict = {
         "video_file_url": None, "browser_playable": None, "youtube_id": "",
+        # Pre-computed so a low-resolution / lossy source is visible
+        # before the user clicks Generate. Without this the warnings
+        # only render after /preview returns — by which time Claude
+        # has already burned tokens proposing clips from a source the
+        # user might have wanted to swap first.
+        "warnings": [],
     }
     if current_video:
         parent_path = _resolve_video_file(current_video.get("video_file_path"))
@@ -461,6 +467,11 @@ async def project_generate_from_source_page(
             parent_meta["browser_playable"] = media_service.is_browser_playable(
                 probe.codec_name if probe else None,
                 probe.container if probe else None,
+            )
+            parent_meta["warnings"] = media_service.source_quality_warnings(
+                width=probe.width if probe else None,
+                height=probe.height if probe else None,
+                source_origin=current_video.get("source_file_origin"),
             )
         # 11-char id is the YouTube convention used elsewhere in the app.
         if len(parent_id) == 11:
