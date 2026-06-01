@@ -71,6 +71,8 @@ async def upsert_project_variable(slug: str, key: str, payload: dict) -> dict:
         "WHERE project_id = ? AND key = ?",
         (project_id, key),
     )
+    if not rows:
+        raise HTTPException(500, "Variable row vanished after upsert")
     return dict(rows[0])
 
 

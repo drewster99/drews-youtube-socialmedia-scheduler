@@ -22,6 +22,7 @@ import os
 import platform
 import urllib.parse
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -176,6 +177,58 @@ def get_anthropic_api_key() -> str:
 # Server
 HOST = os.getenv("DYS_HOST") or os.getenv("YTP_HOST", "127.0.0.1")
 PORT = int(os.getenv("DYS_PORT") or os.getenv("YTP_PORT", "8008"))
+
+
+def allowed_oauth_origins() -> list[str]:
+    """The set of HTTP origins the OAuth /start endpoints will accept.
+
+    The client posts ``{"origin": ...}`` and we build ``redirect_uri``
+    from it, so this list is the security boundary that prevents a
+    forged POST from diverting the OAuth ``code``/``state`` to an
+    attacker-controlled host. Defaults cover loopback access; extend
+    via the ``DYS_OAUTH_ALLOWED_ORIGINS`` env var (comma-separated
+    fully-qualified ``http(s)://host[:port]`` values) for HTTPS
+    tunnels or alternative reverse proxies.
+    """
+    extras = [
+        o.strip().rstrip("/")
+        for o in (os.getenv("DYS_OAUTH_ALLOWED_ORIGINS") or "").split(",")
+        if o.strip()
+    ]
+    hosts: list[str] = []
+    if HOST not in {"0.0.0.0", "::", "", "127.0.0.1", "localhost"}:
+        hosts.append(HOST)
+    hosts.extend(["127.0.0.1", "localhost"])
+    base = [f"http://{h}:{PORT}" for h in hosts]
+    # dict-from-keys to dedupe while preserving order
+    return list(dict.fromkeys([*base, *extras]))
+
+
+def resolve_oauth_origin(client_origin: str) -> str:
+    """Validate and canonicalize an inbound OAuth ``origin`` value.
+
+    Raises ``HTTPException(400)`` if the origin is missing, malformed,
+    or not in the allowlist.
+    """
+    from fastapi import HTTPException
+
+    raw = (client_origin or "").strip().rstrip("/")
+    if not raw:
+        raise HTTPException(400, "origin is required")
+    parsed = urlparse(raw)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username:
+        raise HTTPException(
+            400, "origin must be a plain http(s)://host[:port] URL",
+        )
+    canonical = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+    allowed = {o.lower() for o in allowed_oauth_origins()}
+    if canonical not in allowed:
+        raise HTTPException(
+            400,
+            f"origin {canonical!r} is not allowed; set "
+            "DYS_OAUTH_ALLOWED_ORIGINS to permit it",
+        )
+    return canonical
 
 # Public HTTPS "bounce" URL used as the OAuth ``redirect_uri`` for Threads.
 # Meta refuses to register/redirect to plain ``http://`` URIs, so when the

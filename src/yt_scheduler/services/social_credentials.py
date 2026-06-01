@@ -19,10 +19,11 @@ import logging
 import uuid as uuidlib
 
 from yt_scheduler.database import get_db
+from yt_scheduler.services._keyed_locks import KeyedLocks
 from yt_scheduler.services.keychain import (
-    delete_secret,
-    load_secret,
-    store_secret,
+    delete_secret_async,
+    load_secret_async,
+    store_secret_async,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,16 +35,13 @@ CREDENTIAL_KEY_PREFIX = "cred."
 # (single-use, rotating) refresh token concurrently — which would otherwise
 # fail one of them and spuriously flag the credential as needing re-auth.
 # Process-wide; the scheduler and the request handlers share the event loop.
-_credential_locks: dict[str, asyncio.Lock] = {}
+# WeakValueDictionary-backed so old credential UUIDs don't pile up forever.
+_credential_locks: KeyedLocks[str] = KeyedLocks()
 
 
 def get_credential_lock(uuid: str) -> asyncio.Lock:
     """Return the shared refresh lock for a credential UUID (created on first use)."""
-    lock = _credential_locks.get(uuid)
-    if lock is None:
-        lock = asyncio.Lock()
-        _credential_locks[uuid] = lock
-    return lock
+    return _credential_locks.get(uuid)
 
 PLATFORM_DISPLAY_NAMES: dict[str, str] = {
     "twitter": "X",
@@ -151,9 +149,9 @@ async def get_first_active_credential(platform: str) -> dict | None:
     return _row_to_dict(row) if row else None
 
 
-def load_bundle(platform: str, uuid: str) -> dict | None:
+async def load_bundle(platform: str, uuid: str) -> dict | None:
     """Load and JSON-parse the Keychain bundle for a credential."""
-    raw = load_secret(platform, f"{CREDENTIAL_KEY_PREFIX}{uuid}")
+    raw = await load_secret_async(platform, f"{CREDENTIAL_KEY_PREFIX}{uuid}")
     if not raw:
         return None
     try:
@@ -163,9 +161,11 @@ def load_bundle(platform: str, uuid: str) -> dict | None:
         return None
 
 
-def save_bundle(platform: str, uuid: str, bundle: dict) -> None:
+async def save_bundle(platform: str, uuid: str, bundle: dict) -> None:
     bundle["uuid"] = uuid
-    store_secret(platform, f"{CREDENTIAL_KEY_PREFIX}{uuid}", json.dumps(bundle))
+    await store_secret_async(
+        platform, f"{CREDENTIAL_KEY_PREFIX}{uuid}", json.dumps(bundle),
+    )
 
 
 async def upsert_credential(
@@ -208,7 +208,10 @@ async def upsert_credential(
             (username, display_name, 1 if is_nickname else 0, verified_type, existing_id),
         )
         await db.commit()
-        save_bundle(platform, existing_uuid, dict(bundle, provider_account_id=provider_account_id, username=username))
+        await save_bundle(
+            platform, existing_uuid,
+            dict(bundle, provider_account_id=provider_account_id, username=username),
+        )
         return await get_credential_by_id(existing_id)  # type: ignore[return-value]
 
     new_uuid = uuidlib.uuid4().hex
@@ -224,7 +227,7 @@ async def upsert_credential(
     )
     await db.commit()
     new_id = int(cursor.lastrowid)
-    save_bundle(
+    await save_bundle(
         platform, new_uuid,
         dict(bundle, provider_account_id=provider_account_id, username=username),
     )
@@ -281,7 +284,7 @@ async def soft_delete_credential(uuid: str) -> dict | None:
         (cred["id"],),
     )
     await db.commit()
-    delete_secret(cred["platform"], f"{CREDENTIAL_KEY_PREFIX}{uuid}")
+    await delete_secret_async(cred["platform"], f"{CREDENTIAL_KEY_PREFIX}{uuid}")
     return await get_credential_by_uuid(uuid)
 
 

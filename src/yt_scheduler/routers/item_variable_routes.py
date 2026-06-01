@@ -73,6 +73,8 @@ async def upsert_item_variable(video_id: str, key: str, payload: dict) -> dict:
         "WHERE video_id = ? AND key = ?",
         (video_id, key),
     )
+    if not rows:
+        raise HTTPException(500, "Variable row vanished after upsert")
     return dict(rows[0])
 
 

@@ -397,7 +397,7 @@
         <div id="fi-original" class="fi-value">—</div>
     </div>
     <div class="form-group">
-        <label>File on this computer</label>
+        <label>Local filename</label>
         <div id="fi-path" class="fi-value fi-path">—</div>
         <div id="fi-missing" class="form-hint" style="display:none; color: var(--danger);">
             ⚠ This file is no longer on disk.
@@ -422,7 +422,6 @@
     </p>
     <input type="file" id="fi-replace-input" accept="video/*" style="display:none;">
     <div class="modal-actions">
-        <button type="button" class="btn" id="fi-copy">Copy path</button>
         <button type="button" class="btn" id="fi-reveal">Reveal in Finder</button>
         <button type="button" class="btn btn-secondary" id="fi-replace">Replace source</button>
         <button type="button" class="btn btn-primary" id="fi-close">Close</button>
@@ -3070,9 +3069,8 @@ async function addItemVariable() {
 // --- Local-file info popup ---------------------------------------------
 // Opened from the local-file pill above the player (or the "Attach source"
 // button when there's no file yet). Shows where the local file came from,
-// the name it was uploaded with, its current path on this machine, its
-// technical shape, and offers copy-path + reveal-in-Finder + replace.
-let fileInfoPath = '';
+// the name it was uploaded with, its on-disk filename, its technical shape,
+// and offers reveal-in-Finder + replace.
 let fileInfoHasFile = false;
 
 const FI_ORIGIN_LABELS = {
@@ -3118,7 +3116,6 @@ async function openFileInfoModal() {
     document.getElementById('fi-tech').textContent = '';
     document.getElementById('fi-missing').style.display = 'none';
     document.getElementById('fi-replace-status').style.display = 'none';
-    fileInfoPath = '';
     fileInfoHasFile = false;
     modal.showModal();
     await refreshFileInfo();
@@ -3152,7 +3149,8 @@ async function refreshFileInfo() {
         document.getElementById('fi-origin').textContent = originLabel;
         document.getElementById('fi-original').textContent =
             info.original_name || info.disk_name || '—';
-        document.getElementById('fi-path').textContent = info.server_path || '—';
+        document.getElementById('fi-path').textContent =
+            info.disk_name || info.original_name || '—';
         document.getElementById('fi-missing').style.display = info.has_file && !info.exists ? '' : 'none';
         document.getElementById('fi-tech').textContent = formatTechnicalLine(info);
 
@@ -3184,11 +3182,8 @@ async function refreshFileInfo() {
 
         document.getElementById('fi-reveal').style.display =
             info.can_reveal && info.exists ? '' : 'none';
-        document.getElementById('fi-copy').style.display =
-            info.has_file ? '' : 'none';
         document.getElementById('fi-replace').textContent =
             info.has_file ? 'Replace source' : 'Attach source';
-        fileInfoPath = info.server_path || '';
     } catch (e) {
         document.getElementById('fi-origin').textContent = 'Could not load file info.';
     }
@@ -3213,16 +3208,6 @@ document.getElementById('fi-close').addEventListener('click', closeFileInfoModal
 document.getElementById('file-info-modal').addEventListener('cancel', (ev) => {
     ev.preventDefault();
     closeFileInfoModal();
-});
-
-document.getElementById('fi-copy').addEventListener('click', async () => {
-    if (!fileInfoPath) return;
-    try {
-        await navigator.clipboard.writeText(fileInfoPath);
-        showToast('Path copied', 'success');
-    } catch (e) {
-        showToast('Could not copy path', 'error');
-    }
 });
 
 document.getElementById('fi-reveal').addEventListener('click', async () => {

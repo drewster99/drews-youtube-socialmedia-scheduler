@@ -155,6 +155,23 @@ def test_media_route_supports_range(client: TestClient) -> None:
 
 
 def test_video_detail_page_renders(client: TestClient) -> None:
+    import asyncio
+    from yt_scheduler.database import get_db
+
+    async def _seed():
+        db = await get_db()
+        proj = await db.execute_fetchall(
+            "SELECT id FROM projects WHERE slug = ?", ("default",)
+        )
+        await db.execute(
+            "INSERT INTO videos (id, project_id, title, status) "
+            "VALUES (?, ?, ?, 'draft')",
+            ("vidX", int(proj[0]["id"]), "Smoke Test Video"),
+        )
+        await db.commit()
+
+    asyncio.run(_seed())
+
     resp = client.get("/projects/default/videos/vidX")
     assert resp.status_code == 200
     assert "Update to YouTube" in resp.text
@@ -163,3 +180,34 @@ def test_video_detail_page_renders(client: TestClient) -> None:
     # Removed: top "Generate Description" button + "Generated Description" tab
     assert "Generate Description</button>" not in resp.text
     assert "Generated Description" not in resp.text
+
+
+def test_video_detail_page_404_for_wrong_project(client: TestClient) -> None:
+    """A video that exists in project A must not render under project B's
+    chrome — CSRF-driven popups could otherwise trick the user into
+    acting against the wrong project's credentials."""
+    import asyncio
+    from yt_scheduler.database import get_db
+
+    async def _seed():
+        db = await get_db()
+        # Create a second project and a video belonging only to it.
+        await db.execute(
+            "INSERT INTO projects (slug, name) VALUES (?, ?)",
+            ("other", "Other"),
+        )
+        other = await db.execute_fetchall(
+            "SELECT id FROM projects WHERE slug = ?", ("other",)
+        )
+        await db.execute(
+            "INSERT INTO videos (id, project_id, title, status) "
+            "VALUES (?, ?, ?, 'draft')",
+            ("otherVid01", int(other[0]["id"]), "Other Project Video"),
+        )
+        await db.commit()
+
+    asyncio.run(_seed())
+
+    # Hitting the default-project URL for the other-project video must 404.
+    resp = client.get("/projects/default/videos/otherVid01")
+    assert resp.status_code == 404

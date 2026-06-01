@@ -63,6 +63,8 @@ async def upsert_global(key: str, payload: dict) -> dict:
         "WHERE key = ?",
         (key,),
     )
+    if not rows:
+        raise HTTPException(500, "Variable row vanished after upsert")
     return dict(rows[0])
 
 

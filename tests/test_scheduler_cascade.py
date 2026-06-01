@@ -36,7 +36,7 @@ def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 
     calls: list[tuple[str, datetime]] = []
 
-    async def fake_schedule_publish(video_id, publish_at):
+    async def fake_schedule_publish(video_id, publish_at, *, manual=None):
         # Mirror the column writes schedule_publish does so cascade
         # helpers see the new publish_at on the next SELECT.
         from yt_scheduler.config import DB_PATH
@@ -44,11 +44,19 @@ def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         if publish_at.tzinfo is None:
             publish_at = publish_at.replace(tzinfo=timezone.utc)
         with sqlite3.connect(str(DB_PATH)) as conn:
-            conn.execute(
-                "UPDATE videos SET publish_at = ?, status = 'scheduled', "
-                "updated_at = datetime('now') WHERE id = ?",
-                (publish_at.isoformat(), video_id),
-            )
+            if manual is None:
+                conn.execute(
+                    "UPDATE videos SET publish_at = ?, status = 'scheduled', "
+                    "updated_at = datetime('now') WHERE id = ?",
+                    (publish_at.isoformat(), video_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE videos SET publish_at = ?, publish_at_manual = ?, "
+                    "status = 'scheduled', updated_at = datetime('now') "
+                    "WHERE id = ?",
+                    (publish_at.isoformat(), 1 if manual else 0, video_id),
+                )
             conn.commit()
         calls.append((video_id, publish_at))
         return f"publish_{video_id}"

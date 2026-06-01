@@ -43,6 +43,7 @@ from typing import Literal
 
 from yt_scheduler.config import UPLOAD_DIR
 from yt_scheduler.services import ai, media as media_service
+from yt_scheduler.services.background import spawn_background
 
 logger = logging.getLogger(__name__)
 
@@ -347,7 +348,7 @@ async def propose_clips_for_kind(
     # Segments have no fixed max; we render an empty string so the
     # prompt's "No fixed maximum" prose still reads cleanly.
     min_s, max_s = _PER_KIND_BOUNDS[kind]
-    rendered_body = ai._render_template_body(
+    rendered_body = await ai._render_template_body(
         prompt["body"],
         {
             "parent_title": parent_title,
@@ -1067,15 +1068,8 @@ async def start_generate_job(
         "progress_message": None,
         "proposals": None,
     }
-    task = asyncio.create_task(_run_generate_job(job_id))
-    _generate_tasks.add(task)
-    task.add_done_callback(_generate_tasks.discard)
+    spawn_background(_run_generate_job(job_id), name=f"generate-from-source:{job_id}")
     return job_id
-
-
-# Keep a strong ref to background tasks so the asyncio GC doesn't reap
-# them before they complete.
-_generate_tasks: set[asyncio.Task] = set()
 
 
 async def _run_generate_job(job_id: str) -> None:

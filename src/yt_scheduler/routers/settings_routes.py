@@ -15,9 +15,9 @@ from yt_scheduler.database import get_db
 from yt_scheduler.services import moderation
 from yt_scheduler.services import oauth_clients
 from yt_scheduler.services.keychain import (
-    delete_secret,
+    delete_secret_async,
     get_storage_type,
-    store_secret,
+    store_secret_async,
 )
 from yt_scheduler.services.social import (
     ALL_PLATFORMS,
@@ -93,7 +93,7 @@ async def update_anthropic_key(data: dict):
     api_key = (data.get("api_key") or "").strip()
     model = (data.get("model") or "").strip()
     if api_key:
-        store_secret(ANTHROPIC_NAMESPACE, ANTHROPIC_API_KEY_FIELD, api_key)
+        await store_secret_async(ANTHROPIC_NAMESPACE, ANTHROPIC_API_KEY_FIELD, api_key)
     if model:
         db = await get_db()
         await db.execute(
@@ -114,7 +114,7 @@ async def update_anthropic_key(data: dict):
 @router.delete("/anthropic")
 async def delete_anthropic_key():
     """Remove Anthropic API key from Keychain/secrets."""
-    delete_secret(ANTHROPIC_NAMESPACE, ANTHROPIC_API_KEY_FIELD)
+    await delete_secret_async(ANTHROPIC_NAMESPACE, ANTHROPIC_API_KEY_FIELD)
     return {"status": "ok"}
 
 
@@ -181,7 +181,7 @@ async def list_oauth_clients():
     """
     out = {}
     for platform in oauth_clients.SUPPORTED_PLATFORMS:
-        cid, csec = oauth_clients.get_oauth_client(platform)
+        cid, csec = await oauth_clients.get_oauth_client_async(platform)
         help_blob = OAUTH_CLIENT_HELP.get(platform, {})
         out[platform] = {
             "configured": bool(cid),
@@ -217,7 +217,7 @@ async def update_oauth_client(platform: str, data: dict):
         raise HTTPException(
             400, f"{OAUTH_CLIENT_DISPLAY.get(platform, platform)} requires a client_secret"
         )
-    oauth_clients.store_oauth_client(platform, client_id, client_secret)
+    await oauth_clients.store_oauth_client_async(platform, client_id, client_secret)
     return {"status": "ok", "storage": get_storage_type()}
 
 
@@ -226,7 +226,7 @@ async def delete_oauth_client(platform: str):
     """Remove the stored OAuth client credentials for a platform."""
     if platform not in oauth_clients.SUPPORTED_PLATFORMS:
         raise HTTPException(400, f"Unsupported platform: {platform}")
-    oauth_clients.clear_oauth_client(platform)
+    await oauth_clients.clear_oauth_client_async(platform)
     return {"status": "ok"}
 
 
@@ -261,7 +261,7 @@ async def _bundle_view_for_platform(platform: str) -> dict:
     cred = await get_first_active_credential(platform)
     if cred is None:
         return {}
-    return load_bundle(platform, cred["uuid"]) or {}
+    return (await load_bundle(platform, cred["uuid"])) or {}
 
 
 def _stored_view(bundle: dict, fields: list[dict]) -> dict:
@@ -372,9 +372,9 @@ async def update_social_config(platform: str, data: dict):
 
     cred = await get_first_active_credential(platform)
     if cred is not None:
-        bundle = load_bundle(platform, cred["uuid"]) or {}
+        bundle = (await load_bundle(platform, cred["uuid"])) or {}
         bundle.update(fresh_values)
-        save_bundle(platform, cred["uuid"], bundle)
+        await save_bundle(platform, cred["uuid"], bundle)
         return {
             "status": "ok",
             "storage": get_storage_type(),

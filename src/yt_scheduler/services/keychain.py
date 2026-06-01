@@ -19,6 +19,8 @@ import os
 import platform
 import stat
 import subprocess
+import tempfile
+import threading
 
 from yt_scheduler.config import DATA_DIR
 
@@ -27,6 +29,11 @@ logger = logging.getLogger(__name__)
 KEYCHAIN_SERVICE_PREFIX = "com.nuclearcyborg.drews-socialmedia-scheduler"
 LEGACY_KEYCHAIN_SERVICE_PREFIX = "com.youtube-publisher"
 SECRETS_FILE = DATA_DIR / "secrets.json"
+
+# Guards the read-modify-write cycle on the on-disk index. We don't
+# hold this across the `security` subprocess call — it wraps just the
+# index file mutations inside the public helpers.
+_secrets_file_lock = threading.Lock()
 
 
 # --- macOS Keychain ---
@@ -121,20 +128,44 @@ def _load_secrets_file() -> dict:
 
 
 def _save_secrets_file(data: dict) -> None:
-    """Save the secrets JSON file with restrictive permissions."""
+    """Save the secrets JSON file with restrictive permissions.
+
+    Writes via tempfile + ``os.replace`` so the file is never visible
+    in an incomplete state (no half-written JSON survives a crash mid-
+    write) and is owner-only from the moment it exists (``mkstemp``
+    creates with mode 0o600, closing the brief window where the old
+    ``write_text`` + ``chmod`` pair left the file 0o644).
+    """
     SECRETS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SECRETS_FILE.write_text(json.dumps(data, indent=2))
-    # Set file permissions to owner-only read/write
-    os.chmod(SECRETS_FILE, stat.S_IRUSR | stat.S_IWUSR)
+    payload = json.dumps(data, indent=2)
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        prefix=".secrets.", suffix=".tmp", dir=str(SECRETS_FILE.parent),
+    )
+    try:
+        # mkstemp already creates with 0o600; this is belt-and-braces
+        # for platforms where the default may differ.
+        os.fchmod(tmp_fd, stat.S_IRUSR | stat.S_IWUSR)
+        with os.fdopen(tmp_fd, "w") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, SECRETS_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _file_set(service: str, account: str, value: str) -> None:
     """Store a value in the secrets file."""
-    data = _load_secrets_file()
-    if service not in data:
-        data[service] = {}
-    data[service][account] = value
-    _save_secrets_file(data)
+    with _secrets_file_lock:
+        data = _load_secrets_file()
+        if service not in data:
+            data[service] = {}
+        data[service][account] = value
+        _save_secrets_file(data)
 
 
 def _file_get(service: str, account: str) -> str | None:
@@ -145,12 +176,13 @@ def _file_get(service: str, account: str) -> str | None:
 
 def _file_delete(service: str, account: str) -> None:
     """Delete a value from the secrets file."""
-    data = _load_secrets_file()
-    if service in data and account in data[service]:
-        del data[service][account]
-        if not data[service]:
-            del data[service]
-        _save_secrets_file(data)
+    with _secrets_file_lock:
+        data = _load_secrets_file()
+        if service in data and account in data[service]:
+            del data[service][account]
+            if not data[service]:
+                del data[service]
+            _save_secrets_file(data)
 
 
 def _file_list_accounts(service: str) -> list[str]:
@@ -185,11 +217,12 @@ def store_secret(namespace: str, key: str, value: str) -> None:
     if _is_macos():
         if _keychain_set(service, key, value):
             # Also store key name in file index (not the value) for listing
-            data = _load_secrets_file()
-            if service not in data:
-                data[service] = {}
-            data[service][key] = "__keychain__"
-            _save_secrets_file(data)
+            with _secrets_file_lock:
+                data = _load_secrets_file()
+                if service not in data:
+                    data[service] = {}
+                data[service][key] = "__keychain__"
+                _save_secrets_file(data)
             return
         logger.warning(f"Keychain store failed for {namespace}/{key}, using file fallback")
 
@@ -222,9 +255,10 @@ def load_secret(namespace: str, key: str) -> str | None:
         legacy_value = _keychain_get(legacy_service, key)
         if legacy_value is not None:
             if _keychain_set(service, key, legacy_value):
-                data = _load_secrets_file()
-                data.setdefault(service, {})[key] = "__keychain__"
-                _save_secrets_file(data)
+                with _secrets_file_lock:
+                    data = _load_secrets_file()
+                    data.setdefault(service, {})[key] = "__keychain__"
+                    _save_secrets_file(data)
                 logger.info("Migrated %s/%s from legacy Keychain ID", namespace, key)
             return legacy_value
 
@@ -240,10 +274,11 @@ def load_secret(namespace: str, key: str) -> str | None:
         # Migrate to Keychain if on macOS
         if _is_macos():
             if _keychain_set(service, key, value):
-                data = _load_secrets_file()
-                if service in data and key in data[service]:
-                    data[service][key] = "__keychain__"
-                    _save_secrets_file(data)
+                with _secrets_file_lock:
+                    data = _load_secrets_file()
+                    if service in data and key in data[service]:
+                        data[service][key] = "__keychain__"
+                        _save_secrets_file(data)
                 logger.info(f"Migrated {namespace}/{key} to Keychain")
         return value
 
@@ -333,3 +368,45 @@ def import_all_secrets(data: dict[str, dict[str, str]]) -> int:
             store_secret(namespace, key, value)
             count += 1
     return count
+
+
+# --- Async wrappers for use from FastAPI / scheduler paths --------------
+# The sync helpers above shell out to the macOS `security` CLI per call
+# (~100ms-1s each) and do blocking file I/O on the fallback path. Calling
+# them directly from async code freezes the event loop for every other
+# request. Wrap with `asyncio.to_thread` at every async call site.
+
+
+async def store_secret_async(namespace: str, key: str, value: str) -> None:
+    import asyncio as _asyncio
+    await _asyncio.to_thread(store_secret, namespace, key, value)
+
+
+async def load_secret_async(namespace: str, key: str) -> str | None:
+    import asyncio as _asyncio
+    return await _asyncio.to_thread(load_secret, namespace, key)
+
+
+async def delete_secret_async(namespace: str, key: str) -> None:
+    import asyncio as _asyncio
+    await _asyncio.to_thread(delete_secret, namespace, key)
+
+
+async def load_all_secrets_async(namespace: str) -> dict[str, str]:
+    import asyncio as _asyncio
+    return await _asyncio.to_thread(load_all_secrets, namespace)
+
+
+async def delete_all_secrets_async(namespace: str) -> None:
+    import asyncio as _asyncio
+    await _asyncio.to_thread(delete_all_secrets, namespace)
+
+
+async def export_all_secrets_async() -> dict[str, dict[str, str]]:
+    import asyncio as _asyncio
+    return await _asyncio.to_thread(export_all_secrets)
+
+
+async def import_all_secrets_async(data: dict[str, dict[str, str]]) -> int:
+    import asyncio as _asyncio
+    return await _asyncio.to_thread(import_all_secrets, data)

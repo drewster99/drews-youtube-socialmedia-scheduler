@@ -45,6 +45,7 @@ from yt_scheduler.services import (
     youtube,
 )
 from yt_scheduler.services.auth import set_active_project
+from yt_scheduler.services.background import spawn_background
 from yt_scheduler.services.projects import get_project_by_id
 
 logger = logging.getLogger(__name__)
@@ -52,17 +53,12 @@ logger = logging.getLogger(__name__)
 Source = Literal["upload", "import"]
 
 
-# Holding strong references to scheduled tasks so the asyncio loop's GC
-# doesn't collect them before they finish — see the warning in
-# https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
-_pending_tasks: set[asyncio.Task] = set()
-
-
 async def run_post_create_actions(video_id: str, project_id: int, source: Source) -> None:
     """Schedule the auto-action chain. Returns immediately; work runs in tasks."""
-    task = asyncio.create_task(_run_chain(video_id, project_id, source))
-    _pending_tasks.add(task)
-    task.add_done_callback(_pending_tasks.discard)
+    spawn_background(
+        _run_chain(video_id, project_id, source),
+        name=f"auto-actions:{video_id}",
+    )
 
 
 async def _run_chain(video_id: str, project_id: int, source: Source) -> None:
@@ -481,9 +477,9 @@ async def _maybe_generate_socials(
                 images=ctx["images"],
             )
             slot_vars = {**ctx["variables"], "max_chars": str(slot_max)}
-            rendered = tmpl.render(
+            rendered = (await tmpl.async_render(
                 cleaned, slot_vars, default_system_prompt=default_ai_system,
-            ).strip()
+            )).strip()
         except Exception as exc:
             logger.warning("auto-social render failed for %s: %s", platform, exc)
             continue
@@ -654,9 +650,7 @@ async def start_promo_upload(
         "last_error": None,
         "title": None,
     }
-    task = asyncio.create_task(_run_promo_chain(job_id))
-    _pending_tasks.add(task)
-    task.add_done_callback(_pending_tasks.discard)
+    spawn_background(_run_promo_chain(job_id), name=f"promo-upload:{job_id}")
     return job_id
 
 
@@ -715,9 +709,7 @@ async def start_promo_from_cut(
         "vertical_crop": bool(vertical_crop),
         "x_shift_normalized": float(x_shift_normalized),
     }
-    task = asyncio.create_task(_run_promo_chain(job_id))
-    _pending_tasks.add(task)
-    task.add_done_callback(_pending_tasks.discard)
+    spawn_background(_run_promo_chain(job_id), name=f"promo-from-cut:{job_id}")
     return job_id
 
 
@@ -747,9 +739,7 @@ async def retry_promo_step(video_id: str, step: str) -> None:
         async with _PROMO_CHAIN_SEMAPHORE:
             await _resume_promo_chain(video_id, project_id, start_step=step)
 
-    task = asyncio.create_task(_gated_resume())
-    _pending_tasks.add(task)
-    task.add_done_callback(_pending_tasks.discard)
+    spawn_background(_gated_resume(), name=f"promo-retry:{video_id}:{step}")
 
 
 async def _set_promo_state(

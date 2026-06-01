@@ -201,16 +201,24 @@ async def apply_migrations(
 
         logger.info("Applying migration %03d_%s", migration.version, migration.name)
         try:
-            await conn.executescript(migration.sql)
-            await conn.execute(
-                "INSERT INTO schema_migrations (version, name, checksum) "
-                "VALUES (?, ?, ?)",
-                (migration.version, migration.name, migration.checksum),
-            )
-            await conn.commit()
-        except Exception:
-            await conn.rollback()
-            raise
+            try:
+                await conn.executescript(migration.sql)
+                await conn.execute(
+                    "INSERT INTO schema_migrations (version, name, checksum) "
+                    "VALUES (?, ?, ?)",
+                    (migration.version, migration.name, migration.checksum),
+                )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        finally:
+            # `PRAGMA foreign_keys` is per-connection and NOT transactional,
+            # so rollback() doesn't restore it. Any migration that toggles
+            # FKs off mid-script (002_projects.sql does, around the table
+            # rebuilds) would otherwise leave them off for the process
+            # lifetime if its tail failed — silently disabling cascades.
+            await conn.execute("PRAGMA foreign_keys = ON")
         newly_applied.append(migration.version)
 
     return newly_applied

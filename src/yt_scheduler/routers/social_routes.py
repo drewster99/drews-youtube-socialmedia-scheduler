@@ -801,16 +801,17 @@ async def shorten_post(post_id: int, data: dict | None = None):
         "target_chars": str(target),
         "post_text": old,
     }
-    user_prompt = tmpl.render(seed["body"], variables)
+    user_prompt = await tmpl.async_render(seed["body"], variables)
     system_prompt = (
-        tmpl.render(seed["system"], variables) if seed["system"] else None
+        await tmpl.async_render(seed["system"], variables) if seed["system"] else None
     )
     try:
-        new = ai.call_ai_block(
+        new = (await asyncio.to_thread(
+            ai.call_ai_block,
             user_prompt,
             system=system_prompt,
             max_tokens=512,
-        ).strip()
+        )).strip()
     except Exception as e:
         raise HTTPException(502, f"Couldn't shorten the post: {e}")
     if not new:

@@ -19,7 +19,7 @@ from typing import Callable
 
 import httpx
 
-from yt_scheduler.services.keychain import load_all_secrets
+from yt_scheduler.services.keychain import load_all_secrets_async
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 async def resolve_twitter() -> str | None:
     """OAuth 2.0 user lookup via ``GET /2/users/me``. Returns the @handle
     without the leading @, or None when the API can't tell us."""
-    creds = load_all_secrets("twitter")
+    creds = await load_all_secrets_async("twitter")
     bearer = creds.get("bearer_token")
     if not bearer:
         return None
@@ -46,7 +46,7 @@ async def resolve_twitter() -> str | None:
 
 
 async def resolve_mastodon() -> str | None:
-    creds = load_all_secrets("mastodon")
+    creds = await load_all_secrets_async("mastodon")
     token = creds.get("access_token")
     instance = creds.get("instance_url")
     if not token or not instance:
@@ -75,7 +75,7 @@ async def resolve_mastodon() -> str | None:
 
 
 async def resolve_linkedin() -> str | None:
-    creds = load_all_secrets("linkedin")
+    creds = await load_all_secrets_async("linkedin")
     token = creds.get("access_token")
     if not token:
         return None
@@ -94,12 +94,12 @@ async def resolve_linkedin() -> str | None:
 
 
 async def resolve_threads() -> str | None:
-    creds = load_all_secrets("threads")
+    creds = await load_all_secrets_async("threads")
     return creds.get("username")
 
 
 async def resolve_bluesky() -> str | None:
-    creds = load_all_secrets("bluesky")
+    creds = await load_all_secrets_async("bluesky")
     return creds.get("handle")
 
 

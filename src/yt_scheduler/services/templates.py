@@ -234,6 +234,30 @@ def extract_media_directives(
     return cleaned, media_paths, alt_texts
 
 
+async def async_render(
+    template_text: str,
+    variables: dict[str, object] | None = None,
+    *,
+    default_system_prompt: str | None = DEFAULT_AI_SYSTEM_PROMPT,
+    model: str | None = None,
+    max_tokens: int = 512,
+    trace: list[dict] | None = None,
+) -> str:
+    """Async-safe wrapper around :func:`render`.
+
+    Runs the synchronous renderer (which can fire blocking Anthropic
+    SDK calls via ``{{ai: ...}}`` blocks) in a worker thread so the
+    event loop doesn't stall. Use this from every async caller; sync
+    ``render`` is kept for tests / CLI / true off-loop paths.
+    """
+    import asyncio as _asyncio
+    return await _asyncio.to_thread(
+        render, template_text, variables,
+        default_system_prompt=default_system_prompt,
+        model=model, max_tokens=max_tokens, trace=trace,
+    )
+
+
 def render(
     template_text: str,
     variables: dict[str, object] | None = None,

@@ -61,7 +61,7 @@ async def test_upsert_inserts_fresh_credential(app_db) -> None:
     assert row["deleted_at"] is None
     assert row["label"] == "@someone @X"
 
-    bundle = creds.load_bundle("twitter", row["uuid"])
+    bundle = await creds.load_bundle("twitter", row["uuid"])
     assert bundle is not None
     assert bundle["bearer_token"] == "tok-abc"
     assert bundle["provider_account_id"] == "123456"
@@ -86,7 +86,7 @@ async def test_upsert_updates_existing_provider_pair(app_db) -> None:
     assert first["uuid"] == second["uuid"]
     assert second["username"] == "newname"
 
-    bundle = creds.load_bundle("twitter", second["uuid"])
+    bundle = await creds.load_bundle("twitter", second["uuid"])
     assert bundle["bearer_token"] == "tok2"
 
 
@@ -111,7 +111,7 @@ async def test_upsert_undeletes_soft_deleted(app_db) -> None:
     )
     assert revived["id"] == row["id"]
     assert revived["deleted_at"] is None
-    assert creds.load_bundle("bluesky", revived["uuid"])["app_password"] == "yyy"
+    assert (await creds.load_bundle("bluesky", revived["uuid"]))["app_password"] == "yyy"
 
 
 async def test_list_filters_deleted_by_default(app_db) -> None:
@@ -145,7 +145,7 @@ async def test_soft_delete_removes_bundle_and_clears_default(app_db) -> None:
     assert deleted is not None
     assert deleted["deleted_at"] is not None
 
-    assert creds.load_bundle("linkedin", row["uuid"]) is None
+    assert await creds.load_bundle("linkedin", row["uuid"]) is None
 
     cursor = await db.execute(
         "SELECT social_account_id FROM project_social_defaults "

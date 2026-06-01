@@ -1367,7 +1367,12 @@ async def list_comments(video_id: str, max_results: int = 50):
 async def set_thumbnail(video_id: str, file: UploadFile = File(...)):
     """Upload and set a video thumbnail."""
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    path = UPLOAD_DIR / file.filename
+    thumb_ext = safe_upload_ext(file.filename, default=".jpg")
+    path = UPLOAD_DIR / f"{video_id}_thumb{thumb_ext}"
+    # Defense in depth: the basename pattern can't escape, but assert it.
+    resolved = path.resolve()
+    if UPLOAD_DIR.resolve() not in resolved.parents:
+        raise HTTPException(400, "Invalid thumbnail path")
     with open(path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
@@ -1501,7 +1506,6 @@ async def video_file_info(video_id: str) -> dict:
         "has_file": bool(raw_path),
         "original_name": rows[0]["video_file_original_name"],
         "disk_name": media_filename(raw_path),
-        "server_path": str(resolved) if resolved else raw_path,
         "exists": exists,
         "can_reveal": sys.platform == "darwin",
         "source_origin": rows[0]["source_file_origin"],
@@ -1852,7 +1856,6 @@ async def replace_video_source_file(
 
     return {
         "status": "ok",
-        "server_path": str(incoming_path),
         "original_name": new_original,
         "duration_seconds": new_duration,
         "width": new_width,

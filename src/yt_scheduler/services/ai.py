@@ -23,6 +23,60 @@ def get_client() -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=api_key)
 
 
+class ClaudeEmptyResponseError(RuntimeError):
+    """Raised when a Claude response carried no usable text block.
+
+    Surfaces ``stop_reason`` (so a refusal looks different from a
+    tool-use turn looks different from an empty completion) and the
+    sequence of content types we did see — invaluable for grepping logs
+    when the model starts misbehaving.
+    """
+
+    def __init__(self, message) -> None:
+        self.stop_reason = getattr(message, "stop_reason", None)
+        self.content_types = [
+            getattr(b, "type", type(b).__name__) for b in (message.content or [])
+        ]
+        self.usage = getattr(message, "usage", None)
+        if self.stop_reason == "refusal":
+            super().__init__(
+                f"Claude declined to respond (refusal; blocks={self.content_types})"
+            )
+        else:
+            super().__init__(
+                f"Claude returned no text block "
+                f"(stop_reason={self.stop_reason!r}, blocks={self.content_types})"
+            )
+
+
+def _extract_text(message) -> str:
+    """Return the first text block on a Claude response, or raise.
+
+    Walks ``message.content`` instead of assuming index 0: the SDK can
+    legitimately put a ``thinking`` / ``tool_use`` block first, and
+    neither has a ``.text`` attribute. ``IndexError`` and
+    ``AttributeError`` from blind indexing were a recurring crash
+    vector before this helper existed.
+
+    Prefers ``type == "text"`` for the modern SDK, but falls back to
+    "any block with a ``.text`` string attribute" so test fixtures that
+    use plain mock objects (no ``type`` discriminator) keep working.
+    """
+    blocks = list(message.content or ())
+    # Modern SDK: TextBlock has a discriminator.
+    for block in blocks:
+        if getattr(block, "type", None) == "text":
+            return getattr(block, "text", "") or ""
+    # Fallback: any block whose .text is a string (skips ToolUseBlock
+    # and ThinkingBlock — neither carries a text str — but matches the
+    # plain MagicMock / type(...) shapes used in tests).
+    for block in blocks:
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            return text
+    raise ClaudeEmptyResponseError(message)
+
+
 # Module-level cache for the Anthropic model name. Both async (description /
 # tags) and sync (template ``{{ai: ...}}`` blocks) code paths read through
 # this so the user's Settings → Model selection applies everywhere. Settings
@@ -69,16 +123,21 @@ async def _resolve_model() -> str:
     return _resolve_model_sync()
 
 
-def _render_template_body(body: str, variables: dict[str, str]) -> str:
+async def _render_template_body(body: str, variables: dict[str, str]) -> str:
     """Substitute placeholders in a prompt body using the unified renderer
     (`services/templates.render`). Prompt-template authors who want a
     silent fallback for an optional variable should write
     ``{{user_message??}}`` (or ``{{user_message??default text}}``) so the
     fallback is explicit at the template site rather than implicit in
-    the renderer."""
+    the renderer.
+
+    Async because ``templates.render`` is synchronous but can fire a
+    blocking ``{{ai: ...}}`` round-trip — let the worker thread own
+    that wait instead of the event loop.
+    """
     from yt_scheduler.services import templates  # avoid import cycle at module load
 
-    return templates.render(body, variables)
+    return await templates.async_render(body, variables)
 
 
 async def compare_thumbnails(a_bytes: bytes, b_bytes: bytes) -> str:
@@ -133,7 +192,7 @@ async def compare_thumbnails(a_bytes: bytes, b_bytes: bytes) -> str:
             "and nothing else."
         ),
     )
-    raw = message.content[0].text.strip().lower()
+    raw = _extract_text(message).strip().lower()
     return "same" if raw.startswith("same") else "different"
 
 
@@ -200,7 +259,7 @@ async def generate_seo_description(
     prompt = await prompt_service.get_prompt_with_fallback(
         "description_from_transcript_prompt", project_id=project_id
     )
-    rendered = _render_template_body(
+    rendered = await _render_template_body(
         prompt["body"],
         {
             "title": title,
@@ -222,7 +281,7 @@ async def generate_seo_description(
 
     client = get_client()
     message = await asyncio.to_thread(client.messages.create, **kwargs)
-    return message.content[0].text.strip()
+    return _extract_text(message).strip()
 
 
 async def generate_seo_description_from_frames(
@@ -252,7 +311,7 @@ async def generate_seo_description_from_frames(
         f"\n\nAdditional instructions:\n{extra_instructions}\n"
         if extra_instructions else ""
     )
-    instructions = _render_template_body(
+    instructions = await _render_template_body(
         prompt["body"],
         {
             "title": title,
@@ -284,7 +343,7 @@ async def generate_seo_description_from_frames(
 
     client = get_client()
     message = await asyncio.to_thread(client.messages.create, **kwargs)
-    return message.content[0].text.strip()
+    return _extract_text(message).strip()
 
 
 async def generate_tags_from_frames(
@@ -311,7 +370,7 @@ async def generate_tags_from_frames(
     prompt = await prompt_service.get_prompt_with_fallback(
         "tags_from_frames_prompt", project_id=project_id
     )
-    instructions = _render_template_body(
+    instructions = await _render_template_body(
         prompt["body"],
         {
             "title": title,
@@ -341,7 +400,7 @@ async def generate_tags_from_frames(
 
     client = get_client()
     message = await asyncio.to_thread(client.messages.create, **kwargs)
-    return _clean_tags(message.content[0].text.strip())
+    return _clean_tags(_extract_text(message).strip())
 
 
 async def generate_tags_from_metadata(
@@ -361,7 +420,7 @@ async def generate_tags_from_metadata(
     prompt = await prompt_service.get_prompt_with_fallback(
         "tags_from_metadata_prompt", project_id=project_id
     )
-    rendered = _render_template_body(
+    rendered = await _render_template_body(
         prompt["body"],
         {
             "title": title,
@@ -381,7 +440,7 @@ async def generate_tags_from_metadata(
 
     client = get_client()
     message = await asyncio.to_thread(client.messages.create, **kwargs)
-    return _clean_tags(message.content[0].text.strip())
+    return _clean_tags(_extract_text(message).strip())
 
 
 def _build_parent_context_block(
@@ -440,7 +499,7 @@ async def generate_title_from_filename(
     parent_context_block = _build_parent_context_block(
         parent_title, parent_url, parent_description, parent_tags
     )
-    rendered = _render_template_body(
+    rendered = await _render_template_body(
         prompt["body"],
         {
             "filename": filename,
@@ -462,7 +521,7 @@ async def generate_title_from_filename(
 
     client = get_client()
     message = await asyncio.to_thread(client.messages.create, **kwargs)
-    raw = message.content[0].text.strip()
+    raw = _extract_text(message).strip()
     # Some models still wrap output in quotes despite the system prompt.
     if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
         raw = raw[1:-1].strip()
@@ -562,7 +621,7 @@ def call_ai_block(
     start = time.monotonic()
     message = client.messages.create(**kwargs)
     elapsed_ms = int((time.monotonic() - start) * 1000)
-    result = message.content[0].text.strip()
+    result = _extract_text(message).strip()
     if trace is not None:
         trace.append({
             "kind": "ai_call",

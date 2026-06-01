@@ -106,6 +106,8 @@ async def upload_item_image(
         "FROM item_images WHERE id = ?",
         (cursor.lastrowid,),
     )
+    if not rows:
+        raise HTTPException(500, "Image row vanished after insert")
     return _image_public(dict(rows[0]))
 
 

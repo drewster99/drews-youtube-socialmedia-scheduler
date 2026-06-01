@@ -30,7 +30,7 @@ async def app_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     await projects.ensure_default_project()
 
     transport = ASGITransport(app=app_module.app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         yield client
 
     await database.close_db()

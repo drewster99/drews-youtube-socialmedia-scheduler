@@ -20,8 +20,11 @@ from __future__ import annotations
 
 from yt_scheduler.services.keychain import (
     delete_secret,
+    delete_secret_async,
     load_secret,
+    load_secret_async,
     store_secret,
+    store_secret_async,
 )
 
 CLIENT_ID_KEY = "oauth_client_id"
@@ -60,3 +63,28 @@ def clear_oauth_client(platform: str) -> None:
 
 def has_client_id(platform: str) -> bool:
     return bool(load_secret(platform, CLIENT_ID_KEY))
+
+
+# Async siblings used from FastAPI route handlers so the `security` CLI
+# call doesn't block the event loop for every other request in flight.
+
+
+async def get_oauth_client_async(platform: str) -> tuple[str, str]:
+    cid = (await load_secret_async(platform, CLIENT_ID_KEY)) or ""
+    csec = (await load_secret_async(platform, CLIENT_SECRET_KEY)) or ""
+    return cid, csec
+
+
+async def store_oauth_client_async(
+    platform: str, client_id: str, client_secret: str | None
+) -> None:
+    await store_secret_async(platform, CLIENT_ID_KEY, client_id)
+    if client_secret:
+        await store_secret_async(platform, CLIENT_SECRET_KEY, client_secret)
+    else:
+        await delete_secret_async(platform, CLIENT_SECRET_KEY)
+
+
+async def clear_oauth_client_async(platform: str) -> None:
+    await delete_secret_async(platform, CLIENT_ID_KEY)
+    await delete_secret_async(platform, CLIENT_SECRET_KEY)

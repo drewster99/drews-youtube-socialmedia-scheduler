@@ -13,8 +13,8 @@ from pathlib import Path
 import httpx
 
 from yt_scheduler.services.keychain import (
-    load_all_secrets,
-    store_secret,
+    load_all_secrets_async,
+    store_secret_async,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,11 +69,11 @@ async def _twitter_refresh_bearer(creds: dict[str, str]) -> str | None:
 
     cred_uuid = creds.get("uuid")
     if cred_uuid:
-        store_secret("twitter", f"cred.{cred_uuid}", json.dumps(creds))
+        await store_secret_async("twitter", f"cred.{cred_uuid}", json.dumps(creds))
     else:
-        store_secret("twitter", "bearer_token", new_bearer)
+        await store_secret_async("twitter", "bearer_token", new_bearer)
         if new_refresh:
-            store_secret("twitter", "refresh_token", new_refresh)
+            await store_secret_async("twitter", "refresh_token", new_refresh)
     return new_bearer
 
 
@@ -275,13 +275,13 @@ class SocialPoster:
     def __init__(self, bundle: dict | None = None) -> None:
         self._bundle: dict | None = bundle
 
-    def _get_creds(self) -> dict[str, str]:
+    async def _get_creds(self) -> dict[str, str]:
         """Return the bundle this poster is bound to, falling back to the
         first active credential bundle for the platform when none is set.
         """
         if self._bundle is not None:
             return self._bundle
-        secrets = load_all_secrets(self.platform)
+        secrets = await load_all_secrets_async(self.platform)
         for key, value in secrets.items():
             if key.startswith("cred."):
                 try:
@@ -358,7 +358,7 @@ class SocialPoster:
 
     async def is_configured(self) -> bool:
         """Check if this poster's credentials are complete."""
-        creds = self._get_creds()
+        creds = await self._get_creds()
         return all(creds.get(k) for k in self.required_keys)
 
     async def refresh_if_stale(self, *, window_secs: int = 0) -> bool:
@@ -381,7 +381,7 @@ class TwitterPoster(SocialPoster):
     required_keys: list[str] = ["bearer_token"]
 
     async def refresh_if_stale(self, *, window_secs: int = 0) -> bool:
-        creds = self._get_creds()
+        creds = await self._get_creds()
         uuid = creds.get("uuid")
         # Need the rotating refresh token + the OAuth client id to refresh.
         if not (uuid and creds.get("refresh_token") and creds.get("client_id")):
@@ -399,7 +399,7 @@ class TwitterPoster(SocialPoster):
             load_bundle,
         )
         async with get_credential_lock(uuid):
-            fresh = load_bundle("twitter", uuid)
+            fresh = await load_bundle("twitter", uuid)
             if fresh:
                 creds.update(fresh)
             expires_at = int(creds.get("expires_at") or 0)
@@ -423,7 +423,7 @@ class TwitterPoster(SocialPoster):
         alt_texts: list[str] | None = None,
     ) -> dict:
         text = (text or "").strip()
-        creds = self._get_creds()
+        creds = await self._get_creds()
         bearer = creds.get("bearer_token")
         if not bearer:
             raise CredentialAuthError(
@@ -656,7 +656,7 @@ class BlueskyPoster(SocialPoster):
 
         text = (text or "").strip()
 
-        creds = self._get_creds()
+        creds = await self._get_creds()
         if creds.get("auth_method") != "oauth":
             raise CredentialAuthError(
                 creds.get("uuid"),
@@ -773,7 +773,7 @@ class BlueskyPoster(SocialPoster):
                 f"Bluesky createRecord failed: HTTP {resp.status_code} {resp.text}"
             )
 
-        self._stash_pds_nonce(creds, resp, save_bundle)
+        await self._stash_pds_nonce(creds, resp, save_bundle)
 
         body = resp.json() or {}
         uri = body.get("uri", "")
@@ -806,11 +806,11 @@ class BlueskyPoster(SocialPoster):
         return parts[-1]
 
     @staticmethod
-    def _stash_pds_nonce(creds: dict, resp, save_bundle) -> None:
+    async def _stash_pds_nonce(creds: dict, resp, save_bundle) -> None:
         new_nonce = resp.headers.get("DPoP-Nonce")
         if new_nonce and new_nonce != creds.get("dpop_nonce_pds"):
             creds["dpop_nonce_pds"] = new_nonce
-            save_bundle("bluesky", creds["uuid"], creds)
+            await save_bundle("bluesky", creds["uuid"], creds)
 
     async def _handle_dpop_or_token_error(
         self,
@@ -834,7 +834,7 @@ class BlueskyPoster(SocialPoster):
             nonce = resp.headers.get("DPoP-Nonce")
             if nonce:
                 creds["dpop_nonce_pds"] = nonce
-                save_bundle("bluesky", creds["uuid"], creds)
+                await save_bundle("bluesky", creds["uuid"], creds)
                 return True
         if resp.status_code == 401 or err in ("invalid_token", "expired_token"):
             await self._refresh_access_token(creds, bluesky_oauth, save_bundle)
@@ -868,7 +868,7 @@ class BlueskyPoster(SocialPoster):
 
         async def _do() -> bool:
             if uuid:
-                fresh = load_bundle("bluesky", uuid)
+                fresh = await load_bundle("bluesky", uuid)
                 if fresh:
                     creds.update(fresh)
             expires_at = int(creds.get("expires_at") or 0)
@@ -900,7 +900,7 @@ class BlueskyPoster(SocialPoster):
         )
 
     async def refresh_if_stale(self, *, window_secs: int = 0) -> bool:
-        creds = self._get_creds()
+        creds = await self._get_creds()
         if not creds.get("refresh_token"):
             return False
         expires_at = int(creds.get("expires_at") or 0)
@@ -928,7 +928,7 @@ class BlueskyPoster(SocialPoster):
             creds["expires_at"] = int(time.time()) + int(result["expires_in"])
         if result.get("dpop_nonce_as"):
             creds["dpop_nonce_as"] = result["dpop_nonce_as"]
-        save_bundle("bluesky", creds["uuid"], creds)
+        await save_bundle("bluesky", creds["uuid"], creds)
 
     async def _upload_blob(
         self, creds: dict, path: Path, bluesky_oauth, save_bundle,
@@ -978,7 +978,7 @@ class BlueskyPoster(SocialPoster):
                 f"Bluesky uploadBlob failed: HTTP {resp.status_code} {resp.text}"
             )
 
-        self._stash_pds_nonce(creds, resp, save_bundle)
+        await self._stash_pds_nonce(creds, resp, save_bundle)
         body = resp.json() or {}
         blob = body.get("blob")
         if not isinstance(blob, dict):
@@ -1005,7 +1005,7 @@ class MastodonPoster(SocialPoster):
         alt_texts: list[str] | None = None,
     ) -> dict:
         text = (text or "").strip()
-        creds = self._get_creds()
+        creds = await self._get_creds()
 
         paths, _alts = self._resolve_media_inputs(media_path, media_paths, alt_texts)
         self._require_paths_exist(paths, "Mastodon")
@@ -1016,7 +1016,13 @@ class MastodonPoster(SocialPoster):
 
         try:
             from mastodon import Mastodon
-            from mastodon.errors import MastodonUnauthorizedError
+            from mastodon.errors import (
+                MastodonGatewayTimeoutError,
+                MastodonNetworkError,
+                MastodonReadTimeout,
+                MastodonServerError,
+                MastodonUnauthorizedError,
+            )
 
             client = Mastodon(
                 access_token=creds["access_token"],
@@ -1035,17 +1041,28 @@ class MastodonPoster(SocialPoster):
                         mid = media["id"]
                         # Video / large uploads come back still processing
                         # (``url`` is null); attaching one to a status 422s
-                        # with "files that have not finished processing". Poll
-                        # until the server reports it's done (best-effort —
-                        # if polling fails or times out we let status_post try
-                        # anyway, which behaves the same as before).
+                        # with "files that have not finished processing".
+                        # Retry transient network / 5xx errors with a small
+                        # consecutive-failure cap so one blip doesn't
+                        # abort the post the way the old bare-except did.
+                        # Auth errors propagate to the outer handler.
                         if media.get("url") is None:
-                            for _ in range(60):  # up to ~60s
+                            consecutive_failures = 0
+                            for _ in range(60):  # up to ~60s total wait
                                 await asyncio.sleep(1)
                                 try:
                                     media = await asyncio.to_thread(client.media, mid)
-                                except Exception:
-                                    break
+                                except (
+                                    MastodonNetworkError,
+                                    MastodonReadTimeout,
+                                    MastodonServerError,
+                                    MastodonGatewayTimeoutError,
+                                ):
+                                    consecutive_failures += 1
+                                    if consecutive_failures >= 5:
+                                        break
+                                    continue
+                                consecutive_failures = 0
                                 if media.get("url") is not None:
                                     break
                         media_ids.append(mid)
@@ -1094,7 +1111,7 @@ class LinkedInPoster(SocialPoster):
         the live doc if a higher cap matters).
         """
         text = (text or "").strip()
-        creds = self._get_creds()
+        creds = await self._get_creds()
         token = creds.get("access_token")
         owner_urn = creds.get("person_urn")
         if not token or not owner_urn:
@@ -1276,7 +1293,7 @@ class ThreadsPoster(SocialPoster):
         # still carry media_paths — refuse to post it silently text-only;
         # surface it so the user removes the attachment and retries.
         text = (text or "").strip()
-        creds = self._get_creds()
+        creds = await self._get_creds()
         if self._resolve_media_inputs(media_path, media_paths, alt_texts)[0]:
             raise MediaUploadError(
                 "Threads can't attach media — its API is text-only. Remove the "
@@ -1548,7 +1565,7 @@ async def get_poster_for_account(social_account_id: int) -> SocialPoster:
     if not cls:
         raise ValueError(f"Unknown platform: {cred['platform']}")
 
-    bundle = load_bundle(cred["platform"], cred["uuid"])
+    bundle = await load_bundle(cred["platform"], cred["uuid"])
     if bundle is None:
         raise ValueError(
             f"No bundle stored for credential {social_account_id} "
@@ -1565,7 +1582,7 @@ async def get_poster_for_uuid(platform: str, uuid: str) -> SocialPoster:
     cls = _POSTERS.get(platform)
     if not cls:
         raise ValueError(f"Unknown platform: {platform}. Available: {ALL_PLATFORMS}")
-    bundle = load_bundle(platform, uuid)
+    bundle = await load_bundle(platform, uuid)
     if bundle is None:
         raise ValueError(f"No bundle stored at {platform}:cred.{uuid}")
     return cls(bundle=bundle)

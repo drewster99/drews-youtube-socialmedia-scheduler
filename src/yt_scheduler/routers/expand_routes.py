@@ -75,7 +75,7 @@ async def expand_text(data: dict) -> dict:
         kwargs["max_tokens"] = int(data["max_tokens"])
 
     try:
-        rendered = tmpl.render(template_text, merged, **kwargs)
+        rendered = await tmpl.async_render(template_text, merged, **kwargs)
         return {"rendered": rendered}
     except tmpl.MissingRequiredVariable as exc:
         raise HTTPException(400, {"missing_required": exc.name}) from exc

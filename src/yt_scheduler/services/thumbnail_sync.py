@@ -77,9 +77,23 @@ def schedule_refresh(video_id: str, yt_data: dict | None) -> None:
     existing = _in_flight.get(video_id)
     if existing is not None and not existing.done():
         return
-    task = asyncio.create_task(_run(video_id, yt_data))
+    task = asyncio.create_task(_run(video_id, yt_data), name=f"thumbnail-sync:{video_id}")
     _in_flight[video_id] = task
-    task.add_done_callback(lambda _t: _in_flight.pop(video_id, None))
+
+    def _done(t: asyncio.Task) -> None:
+        # Two callbacks merged: drop the dedupe entry, then surface any
+        # exception that escaped _run's try/except (programming errors,
+        # not the network-blip path _run already swallows).
+        _in_flight.pop(video_id, None)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.error(
+                "thumbnail-sync %s raised", video_id, exc_info=exc,
+            )
+
+    task.add_done_callback(_done)
 
 
 async def _run(video_id: str, yt_data: dict | None) -> None:

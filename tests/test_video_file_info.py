@@ -55,8 +55,8 @@ def test_file_info_returns_original_and_path(client: TestClient) -> None:
     data = resp.json()
     assert data["has_file"] is True
     assert data["original_name"] == "My Original Clip.mov"
-    assert data["server_path"] == str(f.resolve())
     assert data["disk_name"] == "VID11char01.mp4"
+    assert "server_path" not in data
     assert data["exists"] is True
 
 

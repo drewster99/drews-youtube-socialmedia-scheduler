@@ -21,7 +21,11 @@ import httpx
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 
-from yt_scheduler.config import THREADS_REDIRECT_URL, YOUTUBE_SCOPES
+from yt_scheduler.config import (
+    THREADS_REDIRECT_URL,
+    YOUTUBE_SCOPES,
+    resolve_oauth_origin,
+)
 from yt_scheduler.database import get_db
 from yt_scheduler.services.auth import (
     channel_id_from_credentials,
@@ -80,10 +84,10 @@ async def linkedin_start(data: dict):
     """
     client_id = (data.get("client_id") or "").strip()
     client_secret = (data.get("client_secret") or "").strip()
-    origin = (data.get("origin") or "").rstrip("/")
+    origin = resolve_oauth_origin(data.get("origin") or "")
     project_slug = (data.get("project_slug") or "").strip() or None
     if not client_id or not client_secret:
-        stored_id, stored_secret = oauth_clients.get_oauth_client("linkedin")
+        stored_id, stored_secret = await oauth_clients.get_oauth_client_async("linkedin")
         client_id = client_id or stored_id
         client_secret = client_secret or stored_secret
     if not client_id or not client_secret:
@@ -92,8 +96,6 @@ async def linkedin_start(data: dict):
             "LinkedIn OAuth client is not configured. Open Settings → "
             "OAuth client credentials and add a Client ID and Client Secret.",
         )
-    if not origin:
-        raise HTTPException(400, "origin is required")
 
     _gc_pending()
     state = secrets.token_urlsafe(24)
@@ -204,10 +206,10 @@ async def threads_start(data: dict):
     """
     client_id = (data.get("client_id") or "").strip()
     client_secret = (data.get("client_secret") or "").strip()
-    origin = (data.get("origin") or "").rstrip("/")
+    origin = resolve_oauth_origin(data.get("origin") or "")
     project_slug = (data.get("project_slug") or "").strip() or None
     if not client_id or not client_secret:
-        stored_id, stored_secret = oauth_clients.get_oauth_client("threads")
+        stored_id, stored_secret = await oauth_clients.get_oauth_client_async("threads")
         client_id = client_id or stored_id
         client_secret = client_secret or stored_secret
     if not client_id or not client_secret:
@@ -216,8 +218,6 @@ async def threads_start(data: dict):
             "Threads OAuth client is not configured. Open Settings → "
             "OAuth client credentials and add a Client ID and Client Secret.",
         )
-    if not origin:
-        raise HTTPException(400, "origin is required")
 
     # Meta only redirects to (and only lets you register) HTTPS URIs. When
     # ``DYS_THREADS_REDIRECT_URL`` is set we use that public bounce page —
@@ -375,7 +375,7 @@ async def threads_exchange(data: dict):
     app_secret = (data.get("app_secret") or "").strip()
     short_token = (data.get("short_lived_token") or "").strip()
     if not app_secret:
-        _, stored_secret = oauth_clients.get_oauth_client("threads")
+        _, stored_secret = await oauth_clients.get_oauth_client_async("threads")
         app_secret = stored_secret
     if not short_token:
         raise HTTPException(400, "short_lived_token is required")
@@ -487,7 +487,7 @@ async def threads_paste_token(data: dict):
     bundle = {"access_token": access_token, "user_id": str(user_id)}
     # Carry the stored app secret along so a future token refresh has it; the
     # poster itself only needs access_token + user_id.
-    _, app_secret = oauth_clients.get_oauth_client("threads")
+    _, app_secret = await oauth_clients.get_oauth_client_async("threads")
     if app_secret:
         bundle["client_secret"] = app_secret
     if username:
@@ -531,10 +531,10 @@ async def twitter_start(data: dict):
     """
     client_id = (data.get("client_id") or "").strip()
     client_secret = (data.get("client_secret") or "").strip()
-    origin = (data.get("origin") or "").rstrip("/")
+    origin = resolve_oauth_origin(data.get("origin") or "")
     project_slug = (data.get("project_slug") or "").strip() or None
     if not client_id:
-        stored_id, stored_secret = oauth_clients.get_oauth_client("twitter")
+        stored_id, stored_secret = await oauth_clients.get_oauth_client_async("twitter")
         client_id = stored_id
         if not client_secret:
             client_secret = stored_secret
@@ -544,8 +544,6 @@ async def twitter_start(data: dict):
             "X / Twitter OAuth client is not configured. Open Settings → "
             "OAuth client credentials and add a Client ID.",
         )
-    if not origin:
-        raise HTTPException(400, "origin is required")
 
     _gc_pending()
     state = secrets.token_urlsafe(24)
@@ -699,16 +697,21 @@ async def mastodon_start(data: dict):
     ``POST /api/v1/apps`` (no admin needed) and then redirect to the auth URL.
     """
     instance_raw = (data.get("instance_url") or "").strip().rstrip("/")
-    origin = (data.get("origin") or "").rstrip("/")
+    if not instance_raw:
+        raise HTTPException(400, "instance_url is required")
+    origin = resolve_oauth_origin(data.get("origin") or "")
     project_slug = (data.get("project_slug") or "").strip() or None
-    if not instance_raw or not origin:
-        raise HTTPException(400, "instance_url and origin are required")
     parsed = urlparse(instance_raw if "://" in instance_raw else f"https://{instance_raw}")
     instance = f"{parsed.scheme or 'https'}://{parsed.netloc or parsed.path}"
 
     _gc_pending()
     state = secrets.token_urlsafe(24)
     redirect_uri = f"{origin}{MASTODON_REDIRECT_PATH}"
+    # PKCE: Mastodon 4.3+ supports it on the authorize / token endpoints.
+    # Older instances ignore the unknown params, so adding it is
+    # backwards-compatible and gives modern instances proof-of-possession
+    # for the auth code.
+    code_verifier, code_challenge = _pkce_pair()
 
     try:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -738,6 +741,7 @@ async def mastodon_start(data: dict):
         "client_id": client_id,
         "client_secret": client_secret,
         "redirect_uri": redirect_uri,
+        "code_verifier": code_verifier,
         "project_slug": project_slug,
         "ts": time.time(),
     }
@@ -748,6 +752,8 @@ async def mastodon_start(data: dict):
         "redirect_uri": redirect_uri,
         "scope": MASTODON_SCOPES,
         "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
     })
     return {"auth_url": auth_url, "redirect_uri": redirect_uri}
 
@@ -768,18 +774,21 @@ async def mastodon_callback(
         return _result_page(False, "Unknown or expired state.", platform="mastodon")
 
     instance = pending["instance"]
+    token_body = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": pending["client_id"],
+        "client_secret": pending["client_secret"],
+        "redirect_uri": pending["redirect_uri"],
+        "scope": MASTODON_SCOPES,
+    }
+    if pending.get("code_verifier"):
+        token_body["code_verifier"] = pending["code_verifier"]
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             token_resp = await client.post(
                 f"{instance}/oauth/token",
-                data={
-                    "grant_type": "authorization_code",
-                    "code": code,
-                    "client_id": pending["client_id"],
-                    "client_secret": pending["client_secret"],
-                    "redirect_uri": pending["redirect_uri"],
-                    "scope": MASTODON_SCOPES,
-                },
+                data=token_body,
             )
     except Exception as exc:
         return _result_page(False, f"Network error: {exc}", platform="mastodon")
@@ -875,9 +884,7 @@ async def youtube_start(data: dict):
     (see ``openOAuthPopup`` helper in app.js) so the browser preserves
     the user gesture.
     """
-    origin = (data.get("origin") or "").rstrip("/")
-    if not origin:
-        raise HTTPException(400, "origin is required")
+    origin = resolve_oauth_origin(data.get("origin") or "")
     if not has_client_secret():
         raise HTTPException(
             400,
@@ -1182,12 +1189,21 @@ def _result_page(
     message: str,
     platform: str = "linkedin",
     payload: dict | None = None,
+    nonce: str | None = None,
 ) -> HTMLResponse:
     """Small self-contained HTML page shown in the popup/tab after callback.
 
     ``payload`` is merged into the postMessage body so the opener (settings
     page or new-project wizard) can refresh its dropdowns from the
     credential id without a separate fetch.
+
+    The postMessage targets ``window.location.origin`` (the server's own
+    origin) instead of ``'*'`` so any other tab that happened to call
+    ``window.open`` on us can't intercept the OAuth bundle (which
+    includes the new ``social_account_id`` / ``uuid`` / ``username``).
+    The opener also gets a ``nonce`` it can verify before trusting the
+    message — defense in depth against a stale popup from a previous
+    flow being co-opted.
     """
     color = "#3fb950" if ok else "#f85149"
     icon = "✓" if ok else "✕"
@@ -1195,6 +1211,8 @@ def _result_page(
     message_payload = {"source": "oauth", "platform": platform, "ok": ok}
     if payload:
         message_payload.update(payload)
+    if nonce:
+        message_payload["nonce"] = nonce
     payload_json = json.dumps(message_payload)
     body = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>{title}</title>
@@ -1215,7 +1233,7 @@ def _result_page(
 </div>
 <script>
   if (window.opener) {{
-    try {{ window.opener.postMessage({payload_json}, '*'); }} catch (_) {{}}
+    try {{ window.opener.postMessage({payload_json}, window.location.origin); }} catch (_) {{}}
   }}
 </script>
 </body></html>"""
@@ -1306,12 +1324,10 @@ async def bluesky_start(data: dict):
     Caller pre-opens a popup and redirects it to ``auth_url``.
     """
     handle = bluesky_oauth.normalise_handle(data.get("handle") or "")
-    origin = (data.get("origin") or "").rstrip("/")
-    project_slug = (data.get("project_slug") or "").strip() or None
     if not handle:
         raise HTTPException(400, "A valid Bluesky handle is required (e.g. alice.bsky.social)")
-    if not origin:
-        raise HTTPException(400, "origin is required")
+    origin = resolve_oauth_origin(data.get("origin") or "")
+    project_slug = (data.get("project_slug") or "").strip() or None
 
     redirect_uri = f"{origin}{BLUESKY_REDIRECT_PATH}"
     code_verifier, _challenge = bluesky_oauth.make_pkce_pair()

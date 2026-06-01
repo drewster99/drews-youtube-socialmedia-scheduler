@@ -12,6 +12,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from yt_scheduler.config import CAPTION_CHECK_INTERVAL_MINUTES, COMMENT_CHECK_INTERVAL_MINUTES
 from yt_scheduler.database import get_db
 from yt_scheduler.services import events, moderation, transcripts as transcript_service, youtube
+from yt_scheduler.services._keyed_locks import KeyedLocks
 from yt_scheduler.services.auth import set_active_project
 from yt_scheduler.services.projects import get_project_by_id
 
@@ -19,15 +20,42 @@ logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler()
 
-# Prevents concurrent publish + post regeneration from racing
-_publish_locks: dict[str, asyncio.Lock] = {}
+# Prevents concurrent publish + post regeneration from racing.
+# WeakValueDictionary-backed so a long-running server doesn't accumulate
+# one lock per video_id forever; callers must hold a strong reference
+# across their critical section (the `async with` form does this).
+_publish_locks: KeyedLocks[str] = KeyedLocks()
 
 
 def get_publish_lock(video_id: str) -> asyncio.Lock:
     """Get or create a per-video lock to prevent concurrent publish/regenerate races."""
-    if video_id not in _publish_locks:
-        _publish_locks[video_id] = asyncio.Lock()
-    return _publish_locks[video_id]
+    return _publish_locks.get(video_id)
+
+
+def _parse_iso_datetime(value) -> datetime | None:
+    """Lenient ISO-8601 parser used to read ``videos.publish_at`` /
+    inbound ``parent_publish_at`` parameters. Returns ``None`` on any
+    parse failure so the caller can fall back to "not scheduled"
+    behaviour rather than crashing the batch."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    # ``datetime.fromisoformat`` accepts trailing ``Z`` only in 3.11+.
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 async def _claim_post_for_send(post_id: int) -> bool:
@@ -321,13 +349,11 @@ async def publish_video_job(video_id: str) -> dict:
 
 # --- Per-post social scheduling (Phase 10) ---------------------------------
 
-_post_locks: dict[int, asyncio.Lock] = {}
+_post_locks: KeyedLocks[int] = KeyedLocks()
 
 
 def _post_lock(post_id: int) -> asyncio.Lock:
-    if post_id not in _post_locks:
-        _post_locks[post_id] = asyncio.Lock()
-    return _post_locks[post_id]
+    return _post_locks.get(post_id)
 
 
 async def _send_scheduled_post(post_id: int) -> None:
@@ -561,7 +587,12 @@ async def schedule_social_post(post_id: int, when: datetime) -> str:
             args=[post_id],
             id=job_id,
             replace_existing=True,
-            misfire_grace_time=300,
+            # Tight grace + coalesce: the real safety against duplicate
+            # sends is _claim_post_for_send (atomic 'approved' → 'sending'
+            # UPDATE). Grace is just for an event-loop blip; widening it
+            # only invites a confusing re-fire after a restart.
+            misfire_grace_time=60,
+            coalesce=True,
         )
 
         await db.execute(
@@ -613,10 +644,14 @@ async def restore_scheduled_posts() -> None:
     )
     now = datetime.now(timezone.utc)
     for row in rows:
+        when = _parse_iso_datetime(row["scheduled_at"])
+        if when is None:
+            logger.warning(
+                "restore_scheduled_posts: skipping post %s — unparseable "
+                "scheduled_at %r", row["id"], row["scheduled_at"],
+            )
+            continue
         try:
-            when = datetime.fromisoformat(row["scheduled_at"])
-            if when.tzinfo is None:
-                when = when.replace(tzinfo=timezone.utc)
             if when > now:
                 await schedule_social_post(int(row["id"]), when)
             else:
@@ -626,7 +661,9 @@ async def restore_scheduled_posts() -> None:
             logger.error("Failed to restore scheduled post %s: %s", row["id"], exc)
 
 
-async def schedule_publish(video_id: str, publish_at: datetime) -> str:
+async def schedule_publish(
+    video_id: str, publish_at: datetime, *, manual: bool | None = None,
+) -> str:
     """Schedule a video and all its approved social posts.
 
     For each approved social post on the video, register a per-post
@@ -644,6 +681,13 @@ async def schedule_publish(video_id: str, publish_at: datetime) -> str:
     at fire time as a safety net (e.g. user approved a new post after
     scheduling). The atomic claim prevents double-sends when both
     paths target the same post.
+
+    ``manual`` folds the ``publish_at_manual`` stamp into the same
+    UPDATE/commit as ``publish_at`` so concurrent readers can't observe
+    a new ``publish_at`` with stale ``publish_at_manual=0`` (which
+    would let a sibling-cascade sweep it as auto-anchored). ``None``
+    (default) leaves the column untouched, matching the pre-existing
+    behaviour for the cascade callers that set the flag themselves.
     """
     if publish_at.tzinfo is None:
         publish_at = publish_at.replace(tzinfo=timezone.utc)
@@ -682,13 +726,25 @@ async def schedule_publish(video_id: str, publish_at: datetime) -> str:
         args=[video_id],
         id=job_id,
         replace_existing=True,
-        misfire_grace_time=300,
+        # See note on the social-post job: actual idempotency comes from
+        # the row status checks in publish_video_job; this grace is just
+        # for an event-loop blip.
+        misfire_grace_time=60,
+        coalesce=True,
     )
 
-    await db.execute(
-        "UPDATE videos SET publish_at = ?, status = 'scheduled', updated_at = datetime('now') WHERE id = ?",
-        (publish_at.isoformat(), video_id),
-    )
+    if manual is None:
+        await db.execute(
+            "UPDATE videos SET publish_at = ?, status = 'scheduled', "
+            "updated_at = datetime('now') WHERE id = ?",
+            (publish_at.isoformat(), video_id),
+        )
+    else:
+        await db.execute(
+            "UPDATE videos SET publish_at = ?, publish_at_manual = ?, "
+            "status = 'scheduled', updated_at = datetime('now') WHERE id = ?",
+            (publish_at.isoformat(), 1 if manual else 0, video_id),
+        )
     await db.commit()
 
     # Stagger using the project's posting settings. Same math the
@@ -914,11 +970,14 @@ async def restore_scheduled_jobs() -> None:
 
     now = datetime.now(timezone.utc)
     for row in rows:
+        publish_at = _parse_iso_datetime(row["publish_at"])
+        if publish_at is None:
+            logger.warning(
+                "restore_scheduled_jobs: skipping video %s — unparseable "
+                "publish_at %r", row["id"], row["publish_at"],
+            )
+            continue
         try:
-            publish_at = datetime.fromisoformat(row["publish_at"])
-            if publish_at.tzinfo is None:
-                publish_at = publish_at.replace(tzinfo=timezone.utc)
-
             if publish_at > now:
                 await schedule_publish(row["id"], publish_at)
                 logger.info(f"Restored scheduled publish for {row['id']} at {publish_at}")
@@ -1430,32 +1489,6 @@ def is_ready_for_schedule(video: dict) -> tuple[bool, list[str]]:
     return (not missing, missing)
 
 
-def _parse_iso_datetime(value) -> datetime | None:
-    """Lenient ISO-8601 parser used to read ``videos.publish_at`` /
-    inbound ``parent_publish_at`` parameters. Returns ``None`` on any
-    parse failure so the caller can fall back to "not scheduled"
-    behaviour rather than crashing the batch."""
-    if not value:
-        return None
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if not isinstance(value, str):
-        return None
-    candidate = value.strip()
-    if not candidate:
-        return None
-    # ``datetime.fromisoformat`` accepts trailing ``Z`` only in 3.11+.
-    if candidate.endswith("Z"):
-        candidate = candidate[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(candidate)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
-
-
 async def compute_promo_batch_preview(
     parent_id: str,
     *,
@@ -1850,12 +1883,10 @@ async def apply_user_reschedule(
     old_publish_at = _parse_iso_datetime(row.get("publish_at"))
     parent_item_id = row.get("parent_item_id")
 
-    await schedule_publish(video_id, new_publish_at)
-    await db.execute(
-        "UPDATE videos SET publish_at_manual = 1 WHERE id = ?",
-        (video_id,),
-    )
-    await db.commit()
+    # Stamp publish_at + publish_at_manual atomically so a concurrent
+    # cascade can't observe the new publish_at with stale
+    # publish_at_manual=0 and re-sweep this row as auto-anchored.
+    await schedule_publish(video_id, new_publish_at, manual=True)
 
     cascaded_children: list[str] = []
     cascaded_siblings: list[str] = []

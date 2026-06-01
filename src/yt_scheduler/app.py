@@ -7,14 +7,17 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from urllib.parse import urlparse
+
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from yt_scheduler import build_info
-from yt_scheduler.config import ensure_dirs
+from yt_scheduler.config import HOST, PORT, ensure_dirs
 from yt_scheduler.database import close_db, get_db
 from yt_scheduler.routers import (
     auth_routes,
@@ -79,6 +82,53 @@ class BuildIdentityMiddleware(BaseHTTPMiddleware):
         return response
 
 
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+class SameOriginCSRFMiddleware(BaseHTTPMiddleware):
+    """Reject state-changing requests whose Origin/Referer doesn't match Host.
+
+    The app has no user auth and binds to localhost — any browser tab the
+    user has open at a malicious page could otherwise issue a POST to
+    127.0.0.1:8008 and act on their data. Modern browsers attach ``Origin``
+    on every cross-origin non-safe request; if that origin's host doesn't
+    match the Host header we're answering on, drop the request.
+
+    Requests with no Origin and no Referer are accepted: non-browser
+    clients (curl, CLI tooling) can't be tricked by a malicious page
+    and a script run locally can already do anything anyway. Paired
+    with ``TrustedHostMiddleware`` so a DNS-rebinding attacker can't
+    forge a same-origin ``Origin: http://evil.com`` + ``Host: evil.com``.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        if request.method in _SAFE_METHODS:
+            return await call_next(request)
+
+        host = request.headers.get("host", "")
+        origin = request.headers.get("origin")
+        referer = request.headers.get("referer")
+        source = origin or referer
+        if source is None:
+            return await call_next(request)
+
+        try:
+            source_host = urlparse(source).netloc
+        except ValueError:
+            source_host = ""
+
+        if source_host != host:
+            logger.warning(
+                "CSRF: rejecting %s %s — Origin/Referer host %r != Host %r",
+                request.method, request.url.path, source_host, host,
+            )
+            return JSONResponse(
+                {"detail": "Cross-origin request blocked."},
+                status_code=403,
+            )
+        return await call_next(request)
+
+
 # Anything slower than this gets logged at WARNING so it stands out when
 # scanning logs for "what's making the UI feel sluggish." Tuned to surface
 # the kind of half-second-plus stalls that block other requests sharing
@@ -123,23 +173,38 @@ class TimingMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown."""
+    """Startup and shutdown.
+
+    DB open + schema migrations + the per-credential keychain migration +
+    ensure_default_project are critical: a failure there must crash boot
+    rather than serve a half-broken app. Backfills, per-project template
+    seeding, and restore_scheduled_jobs are best-effort — a bad row in
+    one shouldn't keep the app from coming up.
+    """
     db = await get_db()
     await migrate_to_per_credential_bundles()
     await ensure_default_project()
-    await backfill_channel_ids()
-    await backfill_channel_assets()
+
+    try:
+        await backfill_channel_ids()
+    except Exception:
+        logger.exception("backfill_channel_ids failed at startup; continuing")
+    try:
+        await backfill_channel_assets()
+    except Exception:
+        logger.exception("backfill_channel_assets failed at startup; continuing")
+
     # Seed the built-in templates into EVERY project that doesn't have
-    # them yet. Earlier installs (and the create-project route before
-    # we wired template seeding into create_project) could leave a
-    # project with an empty templates table, breaking the Templates
-    # page and the posting-settings defaults that point at
-    # 'announce_video'. Cheap startup pass — the per-project
-    # ensure_default_template skips when both built-in names already
-    # exist in that project.
+    # them yet. Per-project so one bad project doesn't skip the rest.
     project_rows = await db.execute_fetchall("SELECT id FROM projects")
     for project_row in project_rows:
-        await ensure_default_template(project_id=int(project_row["id"]))
+        try:
+            await ensure_default_template(project_id=int(project_row["id"]))
+        except Exception:
+            logger.exception(
+                "ensure_default_template failed for project %s; continuing",
+                project_row["id"],
+            )
 
     # Read scheduler intervals from DB settings (saved via Settings UI), fall back to config defaults
     settings_rows = await db.execute_fetchall(
@@ -162,7 +227,13 @@ async def lifespan(app: FastAPI):
         logger.warning("Invalid comment_check_interval in settings, using default")
 
     start_scheduler(caption_interval=caption_interval, comment_interval=comment_interval)
-    await restore_scheduled_jobs()
+    try:
+        await restore_scheduled_jobs()
+    except Exception:
+        logger.exception(
+            "restore_scheduled_jobs failed; scheduler is running but pre-"
+            "existing jobs were not restored. New scheduling works.",
+        )
     yield
     stop_scheduler()
     await close_db()
@@ -173,10 +244,20 @@ app = FastAPI(
     version=build_info.VERSION,
     lifespan=lifespan,
 )
+app.add_middleware(SameOriginCSRFMiddleware)
 app.add_middleware(BuildIdentityMiddleware)
-# Added LAST so it wraps everything else — the duration we log includes
-# the build-identity middleware and any future middleware so the number
-# matches what the client actually waited for.
+# Starlette runs middleware in reverse-add order: TrustedHost first
+# (outermost) rejects DNS-rebinding before CSRF even sees it, then
+# CSRF, then BuildIdentity stamps headers, then Timing wraps everything
+# so the duration we log includes every other middleware too.
+_trusted_hosts = [
+    "127.0.0.1", f"127.0.0.1:{PORT}",
+    "localhost", f"localhost:{PORT}",
+    "testserver",  # Starlette TestClient default Host
+]
+if HOST not in {"0.0.0.0", "::", "", "127.0.0.1", "localhost"}:
+    _trusted_hosts.extend([HOST, f"{HOST}:{PORT}"])
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=_trusted_hosts)
 app.add_middleware(TimingMiddleware)
 
 # Make sure the data directories exist before anything tries to use them.
@@ -269,16 +350,17 @@ async def project_dashboard(request: Request, slug: str):
 @app.get("/projects/{slug}/videos/{video_id}", response_class=HTMLResponse)
 async def project_video_detail_page(request: Request, slug: str, video_id: str):
     project = await _project_context(slug)
-    # Pull the video title for the sidebar's "current video" entry so
-    # the user has a "you are here" marker without having to read the
-    # page header. Missing row → no sidebar entry; the page itself
-    # surfaces the 404 once the JS fetch fails.
+    # Filter by project so a CSRF-driven popup can't trick the user into
+    # acting on another project's video through this project's chrome.
     from yt_scheduler.database import get_db
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT id, title FROM videos WHERE id = ?", (video_id,)
+        "SELECT id, title FROM videos WHERE id = ? AND project_id = ?",
+        (video_id, int(project["id"])),
     )
-    current_video = dict(rows[0]) if rows else None
+    if not rows:
+        raise HTTPException(404, f"Video '{video_id}' not found in project '{slug}'")
+    current_video = dict(rows[0])
     return html_templates.TemplateResponse(
         request,
         "video_detail.html",
@@ -297,9 +379,12 @@ async def project_promo_videos_page(request: Request, slug: str, parent_id: str)
     from yt_scheduler.database import get_db
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT id, title FROM videos WHERE id = ?", (parent_id,)
+        "SELECT id, title FROM videos WHERE id = ? AND project_id = ?",
+        (parent_id, int(project["id"])),
     )
-    current_video = dict(rows[0]) if rows else None
+    if not rows:
+        raise HTTPException(404, f"Video '{parent_id}' not found in project '{slug}'")
+    current_video = dict(rows[0])
     return html_templates.TemplateResponse(
         request,
         "promo_videos.html",
@@ -334,10 +419,13 @@ async def project_generate_from_source_page(
 
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT id, title, video_file_path FROM videos WHERE id = ?",
-        (parent_id,),
+        "SELECT id, title, video_file_path FROM videos "
+        "WHERE id = ? AND project_id = ?",
+        (parent_id, int(project["id"])),
     )
-    current_video = dict(rows[0]) if rows else None
+    if not rows:
+        raise HTTPException(404, f"Video '{parent_id}' not found in project '{slug}'")
+    current_video = dict(rows[0])
 
     # Render the parent's preview-friendly metadata into the page so the
     # proposal cards can show their inline <video> / YouTube-iframe
