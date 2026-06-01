@@ -841,6 +841,12 @@ async def cut_preview_for_proposal(
     out_name = _preview_filename(job_id, proposal.kind, idx)
     out_path = UPLOAD_DIR / out_name
     async with _SOFTWARE_CUT_SEMAPHORE:
+        # try/finally with a success flag so a CancelledError (which
+        # inherits from BaseException, not Exception, in 3.11+) also
+        # triggers the partial-file unlink. The plain `except Exception`
+        # we'd otherwise want would skip past it and leak the half-
+        # written mp4.
+        ok = False
         try:
             await asyncio.to_thread(
                 media_service.extract_clip,
@@ -853,17 +859,19 @@ async def cut_preview_for_proposal(
                 x_shift_normalized=x_shift_normalized,
                 encoder="software",
             )
-        except Exception:
-            out_path.unlink(missing_ok=True)
-            raise
+            ok = True
+        finally:
+            if not ok:
+                out_path.unlink(missing_ok=True)
     return out_path
 
 
 def cleanup_generate_previews(job_id: str) -> None:
     """Delete every preview file for ``job_id``. Safe to call repeatedly
     (missing files are ignored). Logged at debug since cleanup runs on
-    Confirm, Cancel, and job eviction — three legitimate paths for
-    the same files."""
+    Confirm + job eviction (and the startup-sweep wildcard variant on
+    server boot) — multiple legitimate paths for the same files.
+    """
     try:
         for path in UPLOAD_DIR.glob(f"{_PREVIEW_PREFIX}{job_id}_*.mp4"):
             try:
@@ -872,6 +880,28 @@ def cleanup_generate_previews(job_id: str) -> None:
                 logger.debug("Could not remove preview %s: %s", path, exc)
     except OSError as exc:
         logger.debug("Preview cleanup for %s failed: %s", job_id, exc)
+
+
+def cleanup_orphan_generate_previews() -> int:
+    """Delete every ``gen_preview_*.mp4`` file in UPLOAD_DIR regardless
+    of job_id. Run on startup so previews that survived a previous
+    process being killed (``_GENERATE_JOBS`` is in-memory; restart
+    wipes the dict and there's no list of job_ids to glob against)
+    don't accumulate on disk forever.
+
+    Returns the number of files removed (for logging).
+    """
+    removed = 0
+    try:
+        for path in UPLOAD_DIR.glob(f"{_PREVIEW_PREFIX}*.mp4"):
+            try:
+                path.unlink()
+                removed += 1
+            except OSError as exc:
+                logger.debug("Could not remove orphan preview %s: %s", path, exc)
+    except OSError as exc:
+        logger.debug("Orphan preview sweep failed: %s", exc)
+    return removed
 
 
 async def propose_all_clips(
@@ -1383,3 +1413,15 @@ async def _run_generate_job(job_id: str) -> None:
         job["state"] = "failed"
         job["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
         _mark_terminal(job)
+    finally:
+        # Cancellation (server shutdown / task.cancel()) propagates a
+        # BaseException that neither `except Exception` branch catches.
+        # Without this finally, the job would stay non-terminal forever
+        # and eviction (which only fires on done/failed) would never
+        # reclaim the preview files. Mark + cleanup ourselves so
+        # cancellation behaves like any other terminal state.
+        if job.get("state") not in ("done", "failed"):
+            job["state"] = "failed"
+            job.setdefault("last_error", "Job was cancelled")
+            _mark_terminal(job)
+            cleanup_generate_previews(job_id)

@@ -234,6 +234,19 @@ async def lifespan(app: FastAPI):
             "restore_scheduled_jobs failed; scheduler is running but pre-"
             "existing jobs were not restored. New scheduling works.",
         )
+
+    # Sweep preview files left behind by a Generate job that was running
+    # when the server was killed — the _GENERATE_JOBS dict is in-memory,
+    # so on restart we have no list of job_ids to clean per-job. Without
+    # this, those files accumulate on disk forever.
+    try:
+        from yt_scheduler.services import clipper as _clipper
+        removed = _clipper.cleanup_orphan_generate_previews()
+        if removed:
+            logger.info("Swept %d orphan Generate preview file(s) on startup", removed)
+    except Exception:
+        logger.exception("Orphan-preview sweep failed at startup; continuing")
+
     yield
     stop_scheduler()
     await close_db()

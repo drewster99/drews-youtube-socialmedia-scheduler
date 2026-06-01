@@ -353,3 +353,76 @@ async def test_propose_all_clips_skips_ineligible_kinds(monkeypatch: pytest.Monk
     # this test is to verify the gather wiring, not the gate (covered
     # elsewhere) — so we confirm all three were dispatched.
     assert set(calls) == {"hook", "short", "segment"}
+
+
+# --- Generate preview cleanup ---------------------------------------------
+
+
+def test_cleanup_generate_previews_removes_only_matching(tmp_path, monkeypatch):
+    """Globs the preview filename pattern and unlinks; never touches
+    unrelated files in UPLOAD_DIR."""
+    from yt_scheduler.services import clipper
+
+    monkeypatch.setattr(clipper, "UPLOAD_DIR", tmp_path)
+    job_id = "gen_abcdef0123456789"
+    keep = tmp_path / "regular_clip.mp4"
+    other_job = tmp_path / f"{clipper._PREVIEW_PREFIX}gen_other_hook_0.mp4"
+    ours = [
+        tmp_path / clipper._preview_filename(job_id, "hook", 0),
+        tmp_path / clipper._preview_filename(job_id, "short", 1),
+        tmp_path / clipper._preview_filename(job_id, "segment", 2),
+    ]
+    for p in [keep, other_job, *ours]:
+        p.write_bytes(b"stub")
+
+    clipper.cleanup_generate_previews(job_id)
+
+    assert keep.exists()       # untouched
+    assert other_job.exists()  # different job_id: untouched
+    for p in ours:
+        assert not p.exists()  # gone
+
+
+def test_cleanup_orphan_generate_previews_removes_every_preview(tmp_path, monkeypatch):
+    """Startup sweep — wipes every `gen_preview_*.mp4`, regardless of
+    job_id, since a restart loses the in-memory job dict."""
+    from yt_scheduler.services import clipper
+
+    monkeypatch.setattr(clipper, "UPLOAD_DIR", tmp_path)
+    keep = tmp_path / "regular_clip.mp4"
+    keep.write_bytes(b"stub")
+    previews = [
+        tmp_path / clipper._preview_filename("gen_a", "hook", 0),
+        tmp_path / clipper._preview_filename("gen_b", "short", 1),
+        tmp_path / clipper._preview_filename("gen_c", "segment", 0),
+    ]
+    for p in previews:
+        p.write_bytes(b"stub")
+
+    removed = clipper.cleanup_orphan_generate_previews()
+
+    assert removed == 3
+    assert keep.exists()
+    for p in previews:
+        assert not p.exists()
+
+
+def test_evict_stale_generate_jobs_calls_preview_cleanup(tmp_path, monkeypatch):
+    """A terminal-state job whose TTL has elapsed should both be popped
+    from _GENERATE_JOBS and have its preview files cleaned up."""
+    from yt_scheduler.services import clipper
+
+    monkeypatch.setattr(clipper, "UPLOAD_DIR", tmp_path)
+    # Fast-expire by setting _terminal_at far in the past.
+    job_id = "gen_evict001"
+    clipper._GENERATE_JOBS[job_id] = {
+        "state": "done",
+        "_terminal_at": -1e9,  # ~32 years ago in monotonic seconds
+    }
+    leftover = tmp_path / clipper._preview_filename(job_id, "hook", 0)
+    leftover.write_bytes(b"stub")
+
+    clipper._evict_stale_generate_jobs()
+
+    assert job_id not in clipper._GENERATE_JOBS
+    assert not leftover.exists()
