@@ -1414,7 +1414,11 @@ async def _run_generate_job(job_id: str) -> None:
                 return_exceptions=True,
             )
             for (k, idx, _), res in zip(preview_tasks, preview_results):
-                if isinstance(res, Exception):
+                # BaseException catches CancelledError too — in 3.11+
+                # it's not an Exception, so a per-task cancel would
+                # otherwise fall through to the success branch and
+                # produce a media_url() from the exception object.
+                if isinstance(res, BaseException):
                     # Stash the error on the proposal so the UI can
                     # surface it instead of silently falling back to a
                     # misleading parent-with-#t= preview (which for a
