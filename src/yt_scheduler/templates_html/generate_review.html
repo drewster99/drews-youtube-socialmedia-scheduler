@@ -361,6 +361,7 @@ async function pollJob(jobId, myToken) {
         transcribing: 'Transcribing parent video…',
         proposing: 'Asking Claude to propose clips…',
         refining_crops: 'Checking framing for vertical crops…',
+        cutting_previews: 'Cutting preview clips…',
         done: 'Done.',
         failed: 'Failed.',
     };
@@ -450,10 +451,15 @@ function buildProposalCard(id, p) {
 }
 
 function buildProposalPreview(p) {
-    // previewData wins when it's set (live Generate session) — it carries
-    // the latest server-side probe. Fall back to PARENT_META, which the
-    // server renders into every page load, so resume/Restore-without-
-    // Generate paths still preview correctly.
+    // Prefer the per-proposal preview file the server cut after the
+    // proposals were settled — that's the actual clip with the crop
+    // applied. Falls back to the parent video with a media fragment
+    // (#t=) for legacy / partial-failure cases, then to the YouTube
+    // embed when no local file exists at all.
+    if (p.preview_url) {
+        return `<video src="${escapeAttr(p.preview_url)}" controls preload="metadata" `
+             + `style="width:100%; max-height:360px;"></video>`;
+    }
     const data = previewData || PARENT_META;
     if (!data) return '';
     if (data.parent_browser_playable && data.parent_video_file_url) {

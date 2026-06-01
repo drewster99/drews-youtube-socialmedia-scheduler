@@ -487,6 +487,14 @@ def _evict_stale_generate_jobs() -> None:
     ]
     for job_id in stale:
         _GENERATE_JOBS.pop(job_id, None)
+        # Function is defined later in the module — Python resolves it
+        # at call time, so the forward reference is fine. Wrapped to
+        # tolerate the case where the cleanup function isn't reachable
+        # for any reason; eviction is best-effort.
+        try:
+            cleanup_generate_previews(job_id)
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            pass
 
 
 def _mark_terminal(job: dict) -> None:
@@ -794,6 +802,76 @@ async def cut_clip_from_parent(
             out_path.unlink(missing_ok=True)
             raise
         return out_path
+
+
+# Deterministic prefix so review-page cleanups (eviction, Cancel,
+# Confirm) can find every preview file for a job by glob without
+# tracking each path on the job dict.
+_PREVIEW_PREFIX = "gen_preview_"
+
+
+def _preview_filename(job_id: str, kind: str, idx: int) -> str:
+    return f"{_PREVIEW_PREFIX}{job_id}_{kind}_{idx}.mp4"
+
+
+async def cut_preview_for_proposal(
+    *,
+    job_id: str,
+    parent_video_path: Path,
+    proposal: ProposedClip,
+    idx: int,
+    vertical_crop: bool = False,
+    x_shift_normalized: float = 0.0,
+) -> Path:
+    """Cut a small .mp4 preview of a proposal so the review page can
+    show the actual clip (with crop applied) instead of seeking into
+    the parent video.
+
+    Same framing the final cut will use: ``precise=True`` and the same
+    ``vertical_crop`` + ``x_shift_normalized`` so what the user sees is
+    what they'll get. Always uses the software lane — previews share
+    the event loop with everything else and shouldn't compete with the
+    hardware lane the final cuts will want when the user clicks
+    Confirm.
+
+    Filename pattern (``gen_preview_<job_id>_<kind>_<idx>.mp4``) is
+    deterministic so cleanup can glob them without bookkeeping per
+    proposal on the job dict.
+    """
+    out_name = _preview_filename(job_id, proposal.kind, idx)
+    out_path = UPLOAD_DIR / out_name
+    async with _SOFTWARE_CUT_SEMAPHORE:
+        try:
+            await asyncio.to_thread(
+                media_service.extract_clip,
+                parent_video_path,
+                _format_ffmpeg_timestamp(proposal.start_seconds),
+                _format_ffmpeg_timestamp(proposal.end_seconds),
+                output_name=out_name,
+                precise=True,
+                vertical_crop=vertical_crop,
+                x_shift_normalized=x_shift_normalized,
+                encoder="software",
+            )
+        except Exception:
+            out_path.unlink(missing_ok=True)
+            raise
+    return out_path
+
+
+def cleanup_generate_previews(job_id: str) -> None:
+    """Delete every preview file for ``job_id``. Safe to call repeatedly
+    (missing files are ignored). Logged at debug since cleanup runs on
+    Confirm, Cancel, and job eviction — three legitimate paths for
+    the same files."""
+    try:
+        for path in UPLOAD_DIR.glob(f"{_PREVIEW_PREFIX}{job_id}_*.mp4"):
+            try:
+                path.unlink()
+            except OSError as exc:
+                logger.debug("Could not remove preview %s: %s", path, exc)
+    except OSError as exc:
+        logger.debug("Preview cleanup for %s failed: %s", job_id, exc)
 
 
 async def propose_all_clips(
@@ -1242,7 +1320,9 @@ async def _run_generate_job(job_id: str) -> None:
                 else:
                     assessments[(k, idx)] = res
 
-        job["proposals"] = {
+        # Build public dicts first so we have the same crop +
+        # x_shift_normalized values the preview cuts must use.
+        public_per_kind: dict[str, list[dict]] = {
             k: [
                 proposal_to_public_dict(
                     p,
@@ -1254,6 +1334,47 @@ async def _run_generate_job(job_id: str) -> None:
             ]
             for k, v in proposals.items()
         }
+
+        # Cut a small preview file per proposal so the review page can
+        # show the actual clip (with crop) instead of seeking into the
+        # full parent. Concurrent within the software-lane semaphore.
+        # One failure doesn't kill the rest — the UI falls back to the
+        # full-parent #t= preview when preview_url is missing.
+        job["state"] = "cutting_previews"
+        total = sum(len(v) for v in proposals.values())
+        job["progress_message"] = f"Cutting {total} preview clip{'s' if total != 1 else ''}…"
+        parent_path = Path(job["parent_video_path"])
+        preview_tasks: list[tuple[str, int, asyncio.Task]] = []
+        for k, v in proposals.items():
+            kind_crop = crop_for_kind.get(k, False)
+            for idx, p in enumerate(v):
+                pub = public_per_kind[k][idx]
+                preview_tasks.append((k, idx, asyncio.create_task(
+                    cut_preview_for_proposal(
+                        job_id=job_id,
+                        parent_video_path=parent_path,
+                        proposal=p,
+                        idx=idx,
+                        vertical_crop=kind_crop,
+                        x_shift_normalized=float(pub.get("x_shift_normalized") or 0.0),
+                    ),
+                )))
+        if preview_tasks:
+            preview_results = await asyncio.gather(
+                *(t for _, _, t in preview_tasks),
+                return_exceptions=True,
+            )
+            for (k, idx, _), res in zip(preview_tasks, preview_results):
+                if isinstance(res, Exception):
+                    logger.warning(
+                        "Preview cut failed for %s[%d] in job %s: %s",
+                        k, idx, job_id, res,
+                    )
+                    continue
+                from yt_scheduler.config import media_url
+                public_per_kind[k][idx]["preview_url"] = media_url(str(res))
+
+        job["proposals"] = public_per_kind
         job["state"] = "done"
         job["progress_message"] = None
         _mark_terminal(job)

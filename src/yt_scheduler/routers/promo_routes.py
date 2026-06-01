@@ -652,6 +652,12 @@ async def generate_confirm(
                 parent_id, exc,
             )
 
+    # Preview files were only useful for the review screen; the final
+    # cuts go through the regular promo chain which writes its own
+    # files. Drop the previews so they don't linger in UPLOAD_DIR.
+    if job_id_in:
+        clipper.cleanup_generate_previews(str(job_id_in))
+
     return {"jobs": jobs_out}
 
 
