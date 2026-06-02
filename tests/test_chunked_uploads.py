@@ -283,3 +283,32 @@ def test_http_empty_chunk_rejected(client: TestClient):
     uid = info["upload_id"]
     r = _chunk(client, uid, 0, b"")
     assert r.status_code == 400
+
+
+def test_http_chunk_409_distinguishes_from_404(client: TestClient):
+    """An out-of-order offset for a known upload returns 409 (conflict),
+    not 404. Lets a client tell "this upload is gone" from "this chunk
+    is the wrong one" — they take different recovery paths."""
+    info = _init(client, size=10)
+    uid = info["upload_id"]
+    _chunk(client, uid, 0, b"AAAAA")
+    # Same offset again — would overlap.
+    r = _chunk(client, uid, 0, b"BBBBB")
+    assert r.status_code == 409
+    # An unknown id is still 404.
+    r = _chunk(client, "nope", 0, b"BBBBB")
+    assert r.status_code == 404
+
+
+def test_chunked_upload_handles_exact_size_boundary(client: TestClient):
+    """A size that is an exact multiple of CHUNK_SIZE_BYTES must
+    finalize cleanly (no off-by-one on the last-chunk check). Use a
+    tiny "chunk" via the python API rather than 8 MB to keep the test
+    fast — the API doesn't enforce a minimum chunk size."""
+    info = _init(client, size=8)
+    uid = info["upload_id"]
+    _chunk(client, uid, 0, b"AAAA")
+    _chunk(client, uid, 4, b"BBBB")
+    r = client.post(f"/api/uploads/{uid}/finalize")
+    assert r.status_code == 200
+    assert r.json()["size"] == 8

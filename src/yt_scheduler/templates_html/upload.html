@@ -191,7 +191,14 @@ document.getElementById('upload-form').addEventListener('submit', async (e) => {
         if (progressText) progressText.textContent = txt;
     };
     const setProgressPct = (pct) => {
-        if (progressFill) progressFill.style.width = `${pct}%`;
+        if (progressFill) {
+            // The base .progress-fill CSS has an indeterminate keyframe
+            // animation; disable it once we have real numbers to drive
+            // the width with, otherwise the keyframe overrides our
+            // inline width.
+            progressFill.style.animation = 'none';
+            progressFill.style.width = `${pct}%`;
+        }
     };
 
     try {

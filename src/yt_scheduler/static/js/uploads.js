@@ -30,12 +30,20 @@
 
         // 1) Reserve a slot. Server picks the chunk size so we don't
         //    have to coordinate the tuning knob.
-        const initResp = await fetch('/api/uploads/init', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ filename: file.name, size: file.size }),
-            signal,
-        });
+        let initResp;
+        try {
+            initResp = await fetch('/api/uploads/init', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: file.name, size: file.size }),
+                signal,
+            });
+        } catch (e) {
+            if (e && (e.name === 'AbortError' || (signal && signal.aborted))) {
+                throw new ChunkedUploadError('cancelled', 0, true);
+            }
+            throw new ChunkedUploadError(e.message || 'network', 0);
+        }
         if (!initResp.ok) {
             const body = await safeJson(initResp);
             throw new ChunkedUploadError(
@@ -73,10 +81,19 @@
         }
 
         // 3) Finalize. Returns {upload_id, size, filename}.
-        const finResp = await fetch(`/api/uploads/${encodeURIComponent(upload_id)}/finalize`, {
-            method: 'POST',
-            signal,
-        });
+        let finResp;
+        try {
+            finResp = await fetch(`/api/uploads/${encodeURIComponent(upload_id)}/finalize`, {
+                method: 'POST',
+                signal,
+            });
+        } catch (e) {
+            if (e && (e.name === 'AbortError' || (signal && signal.aborted))) {
+                await cancel(upload_id);
+                throw new ChunkedUploadError('cancelled', 0, true);
+            }
+            throw new ChunkedUploadError(e.message || 'network', 0);
+        }
         if (!finResp.ok) {
             const body = await safeJson(finResp);
             throw new ChunkedUploadError(
@@ -121,11 +138,21 @@
                 lastError = new ChunkedUploadError(`HTTP ${resp.status}`, resp.status);
             } catch (e) {
                 if (e instanceof ChunkedUploadError) throw e;
+                // AbortError from fetch when the AbortController fires —
+                // propagate as cancellation, don't retry.
+                if (e && (e.name === 'AbortError' || (signal && signal.aborted))) {
+                    throw new ChunkedUploadError('cancelled', 0, true);
+                }
                 // Network error: retriable.
                 lastError = new ChunkedUploadError(e.message || 'network', 0);
             }
             if (attempt < RETRY_DELAYS_MS.length) {
-                await sleep(RETRY_DELAYS_MS[attempt]);
+                // Sleep interruptibly so a cancel during the backoff
+                // doesn't have to wait the full delay before exiting.
+                await sleepInterruptible(RETRY_DELAYS_MS[attempt], signal);
+                if (signal && signal.aborted) {
+                    throw new ChunkedUploadError('cancelled', 0, true);
+                }
             }
         }
         throw lastError;
@@ -147,6 +174,21 @@
 
     function sleep(ms) {
         return new Promise(r => setTimeout(r, ms));
+    }
+
+    function sleepInterruptible(ms, signal) {
+        return new Promise((resolve) => {
+            const t = setTimeout(() => {
+                if (signal) signal.removeEventListener('abort', onAbort);
+                resolve();
+            }, ms);
+            function onAbort() {
+                clearTimeout(t);
+                if (signal) signal.removeEventListener('abort', onAbort);
+                resolve();
+            }
+            if (signal) signal.addEventListener('abort', onAbort, { once: true });
+        });
     }
 
     function ChunkedUploadError(message, status, cancelled) {
