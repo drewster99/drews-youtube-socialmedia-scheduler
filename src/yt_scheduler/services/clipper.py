@@ -814,9 +814,6 @@ def _preview_filename(job_id: str, kind: str, idx: int) -> str:
     return f"{_PREVIEW_PREFIX}{job_id}_{kind}_{idx}.mp4"
 
 
-_PREVIEW_MAX_SECONDS = 25.0
-
-
 async def cut_preview_for_proposal(
     *,
     job_id: str,
@@ -826,39 +823,36 @@ async def cut_preview_for_proposal(
     vertical_crop: bool = False,
     x_shift_normalized: float = 0.0,
 ) -> Path:
-    """Cut a small .mp4 preview of a proposal so the review page can
-    show the actual clip (with crop applied) instead of seeking into
-    the parent video.
+    """Cut a proposal to a .mp4 so the review page can play the actual
+    clip the user will import.
 
-    Tuned for throughput, not fidelity. The user is scanning a grid
-    of proposals — they need to see *enough* to judge the framing and
-    content, not the full 5-minute segment. We cap the cut at
-    :data:`_PREVIEW_MAX_SECONDS`, use ``precise=False`` (fast
-    container-level seek; may land up to one GOP early), and pass
-    ``-preset ultrafast`` to libx264. Segment previews drop from
-    minutes to seconds.
+    Same parameters the final cut uses: ``precise=True`` (sample-
+    accurate), ``encoder="auto"`` (videotoolbox when ffmpeg has it
+    built in and ``vertical_crop=True``, libx264 otherwise), full
+    duration. The file Confirm hands to the promo chain is THIS one
+    — there is no re-cut. Calling it "preview" is a historical
+    naming choice, kept because the filename pattern is what cleanup
+    globs.
 
-    Same ``vertical_crop`` + ``x_shift_normalized`` the final cut will
-    use, so what the user sees is what they'll get for framing — the
-    final cut from the Confirm step is the one with ``precise=True``
-    + default preset, so length and quality match expectations there.
-
-    Always uses the software lane (``encoder="software"``); the
-    hardware lane stays reserved for the final cuts so the user
-    doesn't see Confirm queue up behind preview work.
+    Lane choice mirrors ``cut_clip_from_parent`` so the two paths
+    never compete for the same encoder — they're the same code.
 
     Filename pattern (``gen_preview_<job_id>_<kind>_<idx>.mp4``) is
-    deterministic so cleanup can glob them without bookkeeping per
-    proposal on the job dict.
+    deterministic so the Confirm endpoint can look up the file for an
+    accepted proposal and rename it for the promo chain, and the
+    cleanup sweep can glob the unadopted (rejected / failed)
+    remainder without bookkeeping per proposal on the job dict.
     """
-    # Cap the cut window. The proposal's start is preserved; the end
-    # is the earlier of the proposal end and start+MAX.
-    duration = max(0.0, float(proposal.end_seconds) - float(proposal.start_seconds))
-    preview_end = float(proposal.start_seconds) + min(duration, _PREVIEW_MAX_SECONDS)
-
+    will_use_hardware = (
+        vertical_crop and media_service.hardware_encoder_available("h264")
+    )
+    semaphore = (
+        _HARDWARE_CUT_SEMAPHORE if will_use_hardware
+        else _SOFTWARE_CUT_SEMAPHORE
+    )
     out_name = _preview_filename(job_id, proposal.kind, idx)
     out_path = UPLOAD_DIR / out_name
-    async with _SOFTWARE_CUT_SEMAPHORE:
+    async with semaphore:
         # try/finally with a success flag so a CancelledError (which
         # inherits from BaseException, not Exception, in 3.11+) also
         # triggers the partial-file unlink. The plain `except Exception`
@@ -870,13 +864,12 @@ async def cut_preview_for_proposal(
                 media_service.extract_clip,
                 parent_video_path,
                 _format_ffmpeg_timestamp(proposal.start_seconds),
-                _format_ffmpeg_timestamp(preview_end),
+                _format_ffmpeg_timestamp(proposal.end_seconds),
                 output_name=out_name,
-                precise=False,
+                precise=True,
                 vertical_crop=vertical_crop,
                 x_shift_normalized=x_shift_normalized,
-                encoder="software",
-                preset="ultrafast",
+                encoder="auto",
             )
             ok = True
         finally:
@@ -1384,14 +1377,14 @@ async def _run_generate_job(job_id: str) -> None:
             for k, v in proposals.items()
         }
 
-        # Cut a small preview file per proposal so the review page can
-        # show the actual clip (with crop) instead of seeking into the
-        # full parent. Concurrent within the software-lane semaphore.
-        # One failure doesn't kill the rest — the UI falls back to the
-        # full-parent #t= preview when preview_url is missing.
+        # Cut a file per proposal so the review page plays the actual
+        # clip the user will import. Same params as the final cut —
+        # Confirm reuses these files instead of re-cutting. One
+        # failure stashes preview_error on that proposal; the rest
+        # still produce files via asyncio.gather(return_exceptions=True).
         job["state"] = "cutting_previews"
         total = sum(len(v) for v in proposals.values())
-        job["progress_message"] = f"Cutting {total} preview clip{'s' if total != 1 else ''}…"
+        job["progress_message"] = f"Cutting {total} clip{'s' if total != 1 else ''}…"
         parent_path = Path(job["parent_video_path"])
         preview_tasks: list[tuple[str, int, asyncio.Task]] = []
         for k, v in proposals.items():

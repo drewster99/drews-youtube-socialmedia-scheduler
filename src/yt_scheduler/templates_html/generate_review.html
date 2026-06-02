@@ -396,7 +396,7 @@ async function pollJob(jobId, myToken) {
         transcribing: 'Transcribing parent video…',
         proposing: 'Asking Claude to propose clips…',
         refining_crops: 'Checking framing for vertical crops…',
-        cutting_previews: 'Cutting preview clips…',
+        cutting_previews: 'Cutting clips…',
         done: 'Done.',
         failed: 'Failed.',
     };
@@ -497,25 +497,17 @@ function buildProposalPreview(p) {
              + `padding:0.6rem 0.75rem; border:1px solid var(--danger);`
              + `border-radius:6px; background:rgba(248,81,73,0.08);`
              + `color:var(--danger); font-size:0.85rem;">`
-             + `<strong>Preview cut failed.</strong> The proposal can `
-             + `still be cut at Confirm time — the final-cut path uses a `
-             + `different code path that may succeed even when the preview `
-             + `couldn't.<br><span style="font-family:monospace; word-break:break-all;">${errMsg}</span>`
+             + `<strong>Cut failed.</strong> Confirm will retry with the `
+             + `same parameters and is likely to hit the same error. Pick `
+             + `a different range or fix the source.`
+             + `<br><span style="font-family:monospace; word-break:break-all;">${errMsg}</span>`
              + `</div>`;
     }
     if (p.preview_url) {
-        // The preview is capped to ~25s for throughput; warn the user
-        // when their actual range is longer so they don't think the
-        // final cut will be truncated.
-        const truncated = (p.duration_seconds || 0) > 25.5;
-        const note = truncated
-            ? `<div class="form-hint" style="margin-bottom:0.2rem;">Preview shows the first ~25s — full clip cuts on Confirm.</div>`
-            : '';
         // preload="auto" so Safari/Chrome fetch enough of the freshly-
         // cut mp4 to render a first-frame poster. With "metadata" the
         // segment preview tiles came up as black boxes.
-        return note
-             + `<video src="${escapeAttr(p.preview_url)}" controls preload="auto" `
+        return `<video src="${escapeAttr(p.preview_url)}" controls preload="auto" `
              + `style="width:100%; max-height:360px;"></video>`;
     }
     const data = previewData || PARENT_META;

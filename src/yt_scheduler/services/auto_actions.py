@@ -665,6 +665,7 @@ async def start_promo_from_cut(
     cut_end_seconds: float,
     vertical_crop: bool = False,
     x_shift_normalized: float = 0.0,
+    existing_cut_path: Path | None = None,
 ) -> str:
     """Queue a Promo chain for a clip cut from a parent video.
 
@@ -680,6 +681,11 @@ async def start_promo_from_cut(
       videos row at INSERT so the next Generate run on the same parent
       can avoid re-proposing the same ranges.
 
+    ``existing_cut_path``: when the cut already exists (the Generate
+    review flow cuts the proposal up-front with the same parameters
+    the chain would use), pass the path to skip step 0. The chain
+    takes ownership of the file — caller must not delete it.
+
     Same return contract as :func:`start_promo_upload` — a ``job_id`` the
     UI polls until the YouTube upload step lands and a real video_id is
     available. The job's initial state is ``cutting``.
@@ -694,7 +700,9 @@ async def start_promo_from_cut(
     _UPLOAD_JOBS[job_id] = {
         "job_id": job_id,
         "filename": pretty_name,
-        "local_path": None,  # written after the cut step completes
+        # local_path is set if the caller provided an existing cut;
+        # otherwise the chain's step 0 writes it after running ffmpeg.
+        "local_path": str(existing_cut_path) if existing_cut_path else None,
         "parent_id": parent_id,
         "project_id": project_id,
         "forced_item_type": item_type,

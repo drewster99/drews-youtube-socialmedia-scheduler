@@ -549,7 +549,14 @@ async def generate_confirm(
     # legitimate non-Generate caller wouldn't have one) but logs a
     # debug breadcrumb so the legitimate-path-without-job-id case is
     # observable.
+    #
+    # Also build an idx lookup so we can hand the existing preview cut
+    # straight to the promo chain (the preview IS the final cut now —
+    # same params, same output, no re-cut needed). Match on
+    # (kind, start_seconds, end_seconds): those round-trip JSON
+    # losslessly because they came from the server-side ProposedClip.
     job_crop_snapshot: dict[str, bool] | None = None
+    preview_idx_by_range: dict[tuple[str, float, float], int] = {}
     job_id_in = payload.get("job_id")
     if job_id_in:
         job = clipper.get_generate_job(str(job_id_in))
@@ -564,6 +571,20 @@ async def generate_confirm(
             job_crop_snapshot = {
                 str(k): bool(v) for k, v in raw.items()
             }
+        proposals_by_kind = job.get("proposals") or {}
+        if isinstance(proposals_by_kind, dict):
+            for k, lst in proposals_by_kind.items():
+                if not isinstance(lst, list):
+                    continue
+                for i, p in enumerate(lst):
+                    if not isinstance(p, dict):
+                        continue
+                    try:
+                        s = float(p.get("start_seconds"))
+                        e = float(p.get("end_seconds"))
+                    except (TypeError, ValueError):
+                        continue
+                    preview_idx_by_range[(str(k), s, e)] = i
 
     jobs_out: list[dict] = []
     for entry in accepted:
@@ -617,6 +638,36 @@ async def generate_confirm(
                 vertical_crop = False
                 x_shift = 0.0
 
+        # If the preview cut already exists for this proposal, rename
+        # it to a fresh non-preview filename and hand it to the chain
+        # so step 0 (the cut) is skipped — the preview file already
+        # is the final cut (same params, same encoder, same crop).
+        # When the preview is absent (cut failed / job evicted / a
+        # non-Generate caller hand-crafted the body) the chain falls
+        # back to running ffmpeg itself.
+        existing_cut: Path | None = None
+        if job_id_in:
+            idx = preview_idx_by_range.get((kind, start, end))
+            if idx is not None:
+                candidate = (
+                    UPLOAD_DIR
+                    / clipper._preview_filename(str(job_id_in), kind, idx)
+                )
+                if candidate.exists():
+                    # Move to a fresh name so the trailing
+                    # cleanup_generate_previews() (rejected-files
+                    # sweep) doesn't catch the file we just adopted.
+                    final_name = f"clip_{kind}_{secrets.token_hex(6)}.mp4"
+                    final_path = UPLOAD_DIR / final_name
+                    try:
+                        candidate.rename(final_path)
+                        existing_cut = final_path
+                    except OSError as exc:
+                        logger.warning(
+                            "Could not adopt preview cut %s: %s; "
+                            "chain will re-cut.", candidate, exc,
+                        )
+
         job_id = await auto_actions.start_promo_from_cut(
             parent_video_path=Path(parent_path),
             parent_id=parent_id,
@@ -627,6 +678,7 @@ async def generate_confirm(
             cut_end_seconds=end,
             vertical_crop=vertical_crop,
             x_shift_normalized=x_shift,
+            existing_cut_path=existing_cut,
         )
         jobs_out.append({"job_id": job_id, "kind": kind, "title": title})
 
