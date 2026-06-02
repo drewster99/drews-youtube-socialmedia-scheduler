@@ -958,7 +958,9 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 
 **Query params** — `force` (int, default `0`): set to `1` to bypass the 422 sanity checks below in a single round-trip. The browser UI does **not** use this — it lets the server keep the upload and confirms via `/source-file/finalize` so multi-GB sources don't have to be re-uploaded. `force=1` remains supported for direct API callers and tests.
 
-**Request body** — `multipart/form-data` with a single `file` field (the new source file).
+**Headers** — `X-Original-Filename` (required): the source filename URL-encoded for 7-bit safety (`encodeURIComponent` on the client). The server decodes it via `urllib.parse.unquote`, derives a safe extension via `safe_upload_ext`, and uses the result for the stored "uploaded as" label. The on-disk name is server-chosen — the header is never trusted for filesystem paths.
+
+**Request body** — `application/octet-stream` raw file bytes. **Not** multipart: FastAPI's `UploadFile` would otherwise buffer the entire body into a `SpooledTemporaryFile` in `$TMPDIR` first, doubling disk I/O on multi-GB sources. The raw-body shape lets the server stream the bytes straight to `UPLOAD_DIR/source_pending_<hex>.<ext>` in a single pass.
 
 **Response 200** — `{"status": "ok", "original_name": str, "duration_seconds": float|null, "width": int|null, "height": int|null, "bitrate_bps": int|null, "size_bytes": int|null, "source_origin": "user_attached", "transcript_cleared": bool}`. `transcript_cleared` is `true` when the call also blanked the row's transcript columns because the user forced past a `duration_mismatch`.
 
@@ -968,7 +970,7 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 
 **Errors**:
 
-- `400` — no file in the request, or ffprobe ran on the upload and found no video stream (the user picked a non-video file). Not overridable.
+- `400` — missing/empty `X-Original-Filename` header, empty body, truncated body (got fewer bytes than `Content-Length`), or ffprobe ran on the upload and found no video stream (the user picked a non-video file). Not overridable.
 - `404` — video row not found.
 - `413` — file exceeds the 10 GiB cap (checked from `Content-Length` upfront and again as a streaming counter during the copy, so a lying header still gets caught). Not overridable.
 - `422` — sanity check failed. Body is `{"detail": {"issues": [{...}], "pending_token": str}}`. The uploaded file is **kept on disk** (not deleted on 422) and `pending_token` references it; the client POSTs the token to `/source-file/finalize` after the user confirms, or DELETEs `/source-file/pending/{token}` if the user cancels. Each issue is one of:

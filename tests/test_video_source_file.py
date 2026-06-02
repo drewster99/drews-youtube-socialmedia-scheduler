@@ -84,6 +84,22 @@ def _make_probe(**kwargs):
     return VideoProbe(**defaults)
 
 
+def _post_source_file(
+    client: TestClient, url: str, filename: str, body: bytes,
+    *, extra_headers: dict[str, str] | None = None,
+):
+    """Replace-source uploads use a raw octet-stream body + filename header
+    (NOT multipart) so the server can stream straight to disk in a
+    single pass. Tests mirror that wire format."""
+    headers = {
+        "Content-Type": "application/octet-stream",
+        "X-Original-Filename": filename,
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    return client.post(url, content=body, headers=headers)
+
+
 # --- evaluate_replacement unit coverage -----------------------------------
 
 def test_evaluate_replacement_no_issues_within_tolerance(client):
@@ -284,9 +300,8 @@ def test_attach_source_first_time_no_validation_issues(
             bitrate_bps=80_000_000, size_bytes=1_000_000,
         ),
     })
-    resp = client.post(
-        "/api/videos/ATTACH00001/source-file",
-        files={"file": ("master.mov", b"\x00" * 64, "video/quicktime")},
+    resp = _post_source_file(
+        client, "/api/videos/ATTACH00001/source-file", "master.mov", b"\x00" * 64,
     )
     assert resp.status_code == 200, resp.text
     data = resp.json()
@@ -304,13 +319,16 @@ def test_duration_mismatch_rejected_with_422(
     _stub_probe(monkeypatch, {
         "__default__": _make_probe(duration_seconds=90.0, width=1920, height=1080),
     })
-    resp = client.post(
-        "/api/videos/DURMISS0001/source-file",
-        files={"file": ("wrong.mp4", b"\x00" * 64, "video/mp4")},
+    resp = _post_source_file(
+        client, "/api/videos/DURMISS0001/source-file", "wrong.mp4", b"\x00" * 64,
     )
     assert resp.status_code == 422
-    issues = resp.json()["detail"]["issues"]
+    detail = resp.json()["detail"]
+    issues = detail["issues"]
     assert any(i["code"] == "duration_mismatch" for i in issues)
+    # New flow returns a pending_token so the client can finalize without
+    # re-uploading the multi-GB body.
+    assert detail["pending_token"]
     # Row untouched.
     assert _row("DURMISS0001")["source_file_origin"] is None
 
@@ -329,9 +347,9 @@ def test_force_past_duration_clears_transcript(
     _stub_probe(monkeypatch, {
         "__default__": _make_probe(duration_seconds=90.0, width=1920, height=1080),
     })
-    resp = client.post(
-        "/api/videos/FORCEDUR001/source-file?force=1",
-        files={"file": ("wrong.mp4", b"\x00" * 64, "video/mp4")},
+    resp = _post_source_file(
+        client, "/api/videos/FORCEDUR001/source-file?force=1", "wrong.mp4",
+        b"\x00" * 64,
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["transcript_cleared"] is True
@@ -360,9 +378,9 @@ def test_resolution_downgrade_skipped_for_youtube_download_current(
         current.name: _make_probe(width=1920, height=1080, duration_seconds=60.0),
         "__default__": _make_probe(width=1280, height=720, duration_seconds=60.2),
     })
-    resp = client.post(
-        "/api/videos/YTDLD000001/source-file",
-        files={"file": ("smaller.mp4", b"\x00" * 64, "video/mp4")},
+    resp = _post_source_file(
+        client, "/api/videos/YTDLD000001/source-file", "smaller.mp4",
+        b"\x00" * 64,
     )
     assert resp.status_code == 200, resp.text
 
@@ -384,9 +402,9 @@ def test_resolution_downgrade_blocked_for_uploaded_current(
         current.name: _make_probe(width=3840, height=2160, duration_seconds=60.0),
         "__default__": _make_probe(width=1920, height=1080, duration_seconds=60.0),
     })
-    resp = client.post(
-        "/api/videos/UPLD0000001/source-file",
-        files={"file": ("smaller.mp4", b"\x00" * 64, "video/mp4")},
+    resp = _post_source_file(
+        client, "/api/videos/UPLD0000001/source-file", "smaller.mp4",
+        b"\x00" * 64,
     )
     assert resp.status_code == 422
     issues = resp.json()["detail"]["issues"]
@@ -399,9 +417,9 @@ def test_corrupt_or_non_video_rejected_with_400(
     """ffprobe ran but the file isn't a video — even force=1 can't attach garbage."""
     _insert("BADFILE0001", duration_seconds=60.0)
     _stub_probe(monkeypatch, {"__default__": _make_probe()})  # all-None
-    resp = client.post(
-        "/api/videos/BADFILE0001/source-file?force=1",
-        files={"file": ("notes.txt", b"hello", "text/plain")},
+    resp = _post_source_file(
+        client, "/api/videos/BADFILE0001/source-file?force=1", "notes.txt",
+        b"hello",
     )
     assert resp.status_code == 400
 
@@ -412,11 +430,9 @@ def test_oversize_upload_rejected_via_content_length(
     """A Content-Length over the cap fails fast before we copy anything."""
     _insert("OVERSIZE001", duration_seconds=60.0)
     _stub_probe(monkeypatch, {"__default__": _make_probe(duration_seconds=60.0)})
-    huge = str(11 * 1024**3)
-    resp = client.post(
-        "/api/videos/OVERSIZE001/source-file",
-        files={"file": ("big.mp4", b"\x00" * 64, "video/mp4")},
-        headers={"Content-Length-Hint": huge},  # client headers aren't trusted, see below
+    resp = _post_source_file(
+        client, "/api/videos/OVERSIZE001/source-file", "big.mp4",
+        b"\x00" * 64,
     )
     # The TestClient computes the real Content-Length, which is far under the
     # cap — so the header-based pre-check passes. The endpoint should still
@@ -433,9 +449,9 @@ def test_replace_works_when_ffprobe_unavailable(
     `assert incoming_probe is not None`."""
     _insert("NOPROBE0001", duration_seconds=60.0)
     _stub_probe(monkeypatch, {"__default__": None})
-    resp = client.post(
-        "/api/videos/NOPROBE0001/source-file",
-        files={"file": ("master.mp4", b"\x00" * 64, "video/mp4")},
+    resp = _post_source_file(
+        client, "/api/videos/NOPROBE0001/source-file", "master.mp4",
+        b"\x00" * 64,
     )
     assert resp.status_code == 200, resp.text
     data = resp.json()
@@ -446,8 +462,115 @@ def test_replace_works_when_ffprobe_unavailable(
 
 
 def test_unknown_video_404(client: TestClient):
-    resp = client.post(
-        "/api/videos/NOPE0000001/source-file",
-        files={"file": ("x.mp4", b"\x00", "video/mp4")},
+    resp = _post_source_file(
+        client, "/api/videos/NOPE0000001/source-file", "x.mp4", b"\x00",
     )
     assert resp.status_code == 404
+
+
+def test_missing_original_filename_header_rejected(client: TestClient):
+    """Without X-Original-Filename the server can't derive a safe
+    extension — refuse the upload rather than fall back to a guess."""
+    _insert("NOFNAME0001", duration_seconds=60.0)
+    resp = client.post(
+        "/api/videos/NOFNAME0001/source-file",
+        content=b"\x00" * 64,
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert resp.status_code == 400
+    assert "X-Original-Filename" in resp.json()["detail"]
+
+
+def test_finalize_pending_completes_without_reupload(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """The 422 path keeps the file on disk and returns pending_token;
+    the finalize endpoint then commits the swap without a second
+    upload. End-to-end: one POST + one small JSON POST = full
+    replacement, even when the user has to confirm past a
+    duration_mismatch on a multi-GB source."""
+    from yt_scheduler.config import UPLOAD_DIR
+
+    _insert(
+        "PENDFIN0001", imported_from_youtube=1, duration_seconds=60.0,
+        transcript="00:00:00,000 --> 00:00:05,000\nhello\n",
+        transcript_source="youtube",
+    )
+    _stub_probe(monkeypatch, {
+        "__default__": _make_probe(
+            duration_seconds=90.0, width=1920, height=1080,
+        ),
+    })
+    # First POST: duration mismatch → 422 with pending_token, file stays.
+    resp = _post_source_file(
+        client, "/api/videos/PENDFIN0001/source-file", "longer.mp4",
+        b"\x00" * 64,
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    token = detail["pending_token"]
+    assert token
+    pending_files = list(UPLOAD_DIR.glob("source_pending_*"))
+    assert len(pending_files) == 1, (
+        "The 422 path must keep the upload on disk so finalize can re-use it."
+    )
+
+    # Finalize: no body bytes re-sent, just the token.
+    resp2 = client.post(
+        "/api/videos/PENDFIN0001/source-file/finalize",
+        json={"pending_token": token},
+    )
+    assert resp2.status_code == 200, resp2.text
+    body = resp2.json()
+    assert body["transcript_cleared"] is True
+    assert body["duration_seconds"] == 90.0
+    # Pending file is gone — it was renamed to its permanent name.
+    assert list(UPLOAD_DIR.glob("source_pending_*")) == []
+    assert list(UPLOAD_DIR.glob("source_*.mp4")), "Renamed source_*.mp4 missing."
+    row = _row("PENDFIN0001")
+    assert row["source_file_origin"] == "user_attached"
+    assert row["transcript"] is None
+
+    # Finalize is one-shot: the token is consumed.
+    resp3 = client.post(
+        "/api/videos/PENDFIN0001/source-file/finalize",
+        json={"pending_token": token},
+    )
+    assert resp3.status_code == 404
+
+
+def test_cancel_pending_removes_disk_file(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """User dismisses the confirm prompt → DELETE the pending entry so
+    the on-disk file goes away immediately rather than waiting for
+    the 30-minute TTL."""
+    from yt_scheduler.config import UPLOAD_DIR
+
+    _insert("PENDCAN0001", imported_from_youtube=1, duration_seconds=60.0)
+    _stub_probe(monkeypatch, {
+        "__default__": _make_probe(
+            duration_seconds=120.0, width=1920, height=1080,
+        ),
+    })
+    resp = _post_source_file(
+        client, "/api/videos/PENDCAN0001/source-file", "longer.mp4",
+        b"\x00" * 64,
+    )
+    assert resp.status_code == 422
+    token = resp.json()["detail"]["pending_token"]
+    assert list(UPLOAD_DIR.glob("source_pending_*"))
+
+    resp2 = client.delete(
+        f"/api/videos/PENDCAN0001/source-file/pending/{token}",
+    )
+    assert resp2.status_code == 200
+    assert resp2.json()["status"] == "cancelled"
+    assert list(UPLOAD_DIR.glob("source_pending_*")) == []
+
+    # Idempotent: deleting an already-gone token returns 'gone', not 404.
+    resp3 = client.delete(
+        f"/api/videos/PENDCAN0001/source-file/pending/{token}",
+    )
+    assert resp3.status_code == 200
+    assert resp3.json()["status"] == "gone"
