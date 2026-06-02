@@ -3397,7 +3397,14 @@ async function uploadReplacementSource(file) {
 
     if (result.status < 200 || result.status >= 300) {
         status.style.color = 'var(--danger)';
-        const detail = result.body && result.body.detail;
+        // FastAPI puts the error string under .detail for HTTPException;
+        // structured details (e.g. the 422 issues array) live there too.
+        // Render whatever we got so the user sees something more useful
+        // than "HTTP 500".
+        let detail = result.body && result.body.detail;
+        if (detail && typeof detail === 'object') {
+            try { detail = JSON.stringify(detail); } catch (e) { /* keep as-is */ }
+        }
         status.textContent = `Upload failed: ${detail || ('HTTP ' + result.status)}`;
         return;
     }

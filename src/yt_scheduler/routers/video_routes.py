@@ -2007,15 +2007,39 @@ async def replace_video_source_file(
 
         # Promote the temp file to its permanent ``source_*`` name so a
         # startup sweep can't mistake it for an orphan pending upload.
-        final_path = _promote_pending_to_source(incoming_path)
-        result = await _apply_source_swap(
-            video_id=video_id,
-            row=row,
-            incoming_path=final_path,
-            incoming_probe=incoming_probe,
-            new_original=new_original,
-            issues=issues,
-        )
+        # Wrap the rename + DB-commit in a try/except so we can log the
+        # actual traceback when something explodes after the body is
+        # already on disk — FastAPI's default 500 surfaces nothing
+        # useful and we end up debugging blind.
+        try:
+            final_path = _promote_pending_to_source(incoming_path)
+            result = await _apply_source_swap(
+                video_id=video_id,
+                row=row,
+                incoming_path=final_path,
+                incoming_probe=incoming_probe,
+                new_original=new_original,
+                issues=issues,
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "Replace-source: post-upload swap failed for %s (%s)",
+                video_id, incoming_path,
+            )
+            # Drop the on-disk file rather than leave an unreferenced
+            # orphan. (rename may have already moved it — try both
+            # names.)
+            for p in (incoming_path, UPLOAD_DIR / incoming_path.name.replace("source_pending_", "source_", 1)):
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise HTTPException(
+                500,
+                f"Replace-source: upload completed but the swap failed: {exc}",
+            )
     return result
 
 
