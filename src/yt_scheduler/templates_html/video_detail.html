@@ -3285,8 +3285,14 @@ function promptForceReplacement(issues) {
 // buffer the entire body into a temp file first, doubling disk I/O on
 // multi-GB sources. The filename is carried in X-Original-Filename
 // (URL-encoded for non-ASCII safety; HTTP header values must be 7-bit).
+//
+// Callbacks (all optional):
+//   onPreparing(): browser is preparing the request; on Safari this
+//     can take a long time for multi-GB files because the engine
+//     buffers the whole Blob before opening the TCP connection.
+//   onProgress(loaded, total): bytes pushed so far / Content-Length.
 // xhrPromise resolves to {status, body} or rejects on network error / abort.
-function xhrUpload(url, file, onProgress) {
+function xhrUpload(url, file, onProgress, onPreparing) {
     return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         fiReplaceXhr = xhr;
@@ -3294,6 +3300,12 @@ function xhrUpload(url, file, onProgress) {
         xhr.responseType = 'text';
         xhr.setRequestHeader('Content-Type', 'application/octet-stream');
         xhr.setRequestHeader('X-Original-Filename', encodeURIComponent(file.name));
+        // loadstart fires right after send() schedules the request but
+        // BEFORE bytes start hitting the wire — useful to acknowledge
+        // that the upload is queued while Safari buffers the body.
+        xhr.upload.addEventListener('loadstart', () => {
+            if (onPreparing) onPreparing();
+        });
         xhr.upload.addEventListener('progress', (ev) => {
             if (ev.lengthComputable) onProgress(ev.loaded, ev.total);
         });
@@ -3320,21 +3332,35 @@ async function uploadReplacementSource(file) {
     const progress = document.getElementById('fi-replace-progress');
     status.style.display = '';
     status.style.color = '';
-    status.textContent = `Uploading ${file.name}… 0%`;
+    // Initial status — replaced once the browser starts pushing bytes.
+    // Safari buffers multi-GB Blob bodies before opening the TCP
+    // connection so the very first second of an 8 GB upload can sit
+    // here for a long time; we tell the user that's expected rather
+    // than letting it look like the upload is hung at 0%.
+    const sizeMb = (file.size / (1024 * 1024)).toFixed(0);
+    status.textContent = `Preparing ${file.name} (${sizeMb} MB)… large files may sit here for a minute before bytes start flowing.`;
     progress.style.display = '';
     progress.value = 0;
 
+    let firstProgressSeen = false;
     let result;
     try {
         result = await xhrUpload(
             `/api/videos/${videoId}/source-file`,
             file,
             (loaded, total) => {
+                firstProgressSeen = true;
                 const pct = Math.floor((loaded / total) * 100);
                 progress.value = pct;
                 const mb = (n) => (n / (1024 * 1024)).toFixed(1);
                 status.textContent = `Uploading ${file.name}… ${pct}% (${mb(loaded)} / ${mb(total)} MB)`;
-            }
+            },
+            () => {
+                // loadstart — XHR queued, browser is preparing the body.
+                if (!firstProgressSeen) {
+                    status.textContent = `Preparing ${file.name} (${sizeMb} MB)…`;
+                }
+            },
         );
     } catch (e) {
         progress.style.display = 'none';
