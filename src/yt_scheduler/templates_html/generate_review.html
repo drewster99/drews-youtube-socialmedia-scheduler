@@ -485,10 +485,11 @@ function buildProposalCard(id, p) {
     card.className = 'generate-proposal-card card';
     let cropBadge = '';
     if (p.vertical_crop) {
-        if (p.crop_uncertain) {
-            const tip = p.crop_classification === 'vision_error'
-                ? 'Vision crop check failed — center crop will be used.'
-                : 'Crop framing is uncertain — center crop will be used.';
+        if (p.crop_classification === 'vision_error') {
+            const tip = 'Vision crop check failed — center crop will be used.';
+            cropBadge = `<span class="generate-crop-badge generate-crop-vision-error" title="${escapeAttr(tip)}">⚠ Vision check failed</span>`;
+        } else if (p.crop_uncertain) {
+            const tip = 'Crop framing is uncertain — center crop will be used.';
             cropBadge = `<span class="generate-crop-badge generate-crop-uncertain" title="${escapeAttr(tip)}">⚠ Uncertain crop</span>`;
         } else if (Math.abs(Number(p.x_shift_normalized || 0)) >= SHIFT_THRESHOLD) {
             const dir = Number(p.x_shift_normalized) > 0 ? 'right' : 'left';

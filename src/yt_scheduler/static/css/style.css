@@ -1529,6 +1529,11 @@ dialog.modal-xwide {
     color: var(--warning, #b76e00);
     border: 1px solid rgba(255, 170, 60, 0.45);
 }
+.generate-crop-vision-error {
+    background: rgba(220, 60, 60, 0.18);
+    color: var(--danger, #c62828);
+    border: 1px solid rgba(220, 60, 60, 0.5);
+}
 .generate-crop-shifted {
     background: rgba(70, 170, 255, 0.16);
     color: var(--info, #1c6dd0);
