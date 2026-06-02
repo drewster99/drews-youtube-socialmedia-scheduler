@@ -147,23 +147,27 @@
 
     // Send the chunk body as an ArrayBuffer, NOT a Blob.
     //
-    // Safari/WebKit raises "request body stream exhausted" whenever
-    // an XHR / fetch body is a Blob — the engine internally reads
-    // the Blob's one-shot stream once during a pre-send pass and the
-    // actual send sees an empty stream. The bug fires on small
-    // sliced Blobs and on whole Files alike; "small slices avoid it"
-    // (my last guess) was wrong. ArrayBuffer is plain bytes with no
-    // stream semantics, so Safari has nothing to exhaust.
+    // Safari/WebKit has two separate bugs in this area:
+    //   1. xhr.send(blob) / fetch(body: blob) → "request body stream
+    //      exhausted" before the request leaves the browser. The
+    //      engine reads the Blob's one-shot stream once during a
+    //      pre-send pass and the actual send sees empty bytes. Fires
+    //      on whole Files and on small sliced Blobs alike.
+    //   2. blob.arrayBuffer() routes through WebKit's internal
+    //      resource-loader machinery and fails with
+    //      "WebKitBlobResource error 4" on File slices.
     //
-    // Memory: we hold one chunk's worth of bytes (~8 MB) in RAM while
-    // the request is in flight, then release it. Bounded.
+    // We need an ArrayBuffer (defeats bug #1) but we have to materialise
+    // it via the older FileReader API (defeats bug #2). FileReader has
+    // been around since the original File API draft and has its own
+    // code path in WebKit that doesn't go through the resource loader.
+    //
+    // Memory: one chunk (~8 MB) in RAM during flight, then GC'd.
     async function postBlobXhr(url, blob, signal) {
         if (signal && signal.aborted) {
             throw new ChunkedUploadError('cancelled', 0, true);
         }
-        // Materialise the Blob into a single ArrayBuffer once, BEFORE
-        // calling xhr.send. arrayBuffer() returns a Promise.
-        const buffer = await blob.arrayBuffer();
+        const buffer = await readBlobAsArrayBuffer(blob, signal);
         return new Promise((resolve, reject) => {
             const xhr = new XMLHttpRequest();
             xhr.open('POST', url);
@@ -215,6 +219,42 @@
 
     function sleep(ms) {
         return new Promise(r => setTimeout(r, ms));
+    }
+
+    // Read a Blob's bytes into an ArrayBuffer via the FileReader API.
+    // Equivalent to ``await blob.arrayBuffer()`` for our purposes but
+    // doesn't route through the WebKit resource loader, so it avoids
+    // "WebKitBlobResource error 4" on File slices.
+    function readBlobAsArrayBuffer(blob, signal) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            function onAbort() {
+                try { reader.abort(); } catch (e) {}
+            }
+            if (signal) {
+                if (signal.aborted) {
+                    reject(new ChunkedUploadError('cancelled', 0, true));
+                    return;
+                }
+                signal.addEventListener('abort', onAbort, { once: true });
+            }
+            reader.onload = () => {
+                if (signal) signal.removeEventListener('abort', onAbort);
+                resolve(reader.result);
+            };
+            reader.onerror = () => {
+                if (signal) signal.removeEventListener('abort', onAbort);
+                const err = reader.error;
+                reject(new Error(
+                    (err && err.message) ? `read failed: ${err.message}` : 'read failed',
+                ));
+            };
+            reader.onabort = () => {
+                if (signal) signal.removeEventListener('abort', onAbort);
+                reject(new ChunkedUploadError('cancelled', 0, true));
+            };
+            reader.readAsArrayBuffer(blob);
+        });
     }
 
     function sleepInterruptible(ms, signal) {
