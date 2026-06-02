@@ -88,16 +88,17 @@ def _post_source_file(
     client: TestClient, url: str, filename: str, body: bytes,
     *, extra_headers: dict[str, str] | None = None,
 ):
-    """Replace-source uploads use a raw octet-stream body + filename header
-    (NOT multipart) so the server can stream straight to disk in a
-    single pass. Tests mirror that wire format."""
-    headers = {
-        "Content-Type": "application/octet-stream",
-        "X-Original-Filename": filename,
-    }
-    if extra_headers:
-        headers.update(extra_headers)
-    return client.post(url, content=body, headers=headers)
+    """Replace-source uploads use ``multipart/form-data`` with a single
+    ``file`` field — same wire format the browser UI sends. Safari's
+    raw-body XHR bug makes a single-pass octet-stream path unworkable
+    in the browser, so the server speaks multipart and the tests
+    mirror that.
+    """
+    return client.post(
+        url,
+        files={"file": (filename, body, "application/octet-stream")},
+        headers=(extra_headers or None),
+    )
 
 
 # --- evaluate_replacement unit coverage -----------------------------------
@@ -466,19 +467,6 @@ def test_unknown_video_404(client: TestClient):
         client, "/api/videos/NOPE0000001/source-file", "x.mp4", b"\x00",
     )
     assert resp.status_code == 404
-
-
-def test_missing_original_filename_header_rejected(client: TestClient):
-    """Without X-Original-Filename the server can't derive a safe
-    extension — refuse the upload rather than fall back to a guess."""
-    _insert("NOFNAME0001", duration_seconds=60.0)
-    resp = client.post(
-        "/api/videos/NOFNAME0001/source-file",
-        content=b"\x00" * 64,
-        headers={"Content-Type": "application/octet-stream"},
-    )
-    assert resp.status_code == 400
-    assert "X-Original-Filename" in resp.json()["detail"]
 
 
 def test_finalize_pending_completes_without_reupload(

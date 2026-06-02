@@ -3279,17 +3279,17 @@ function promptForceReplacement(issues) {
     });
 }
 
-// Upload via XHR (fetch can't report upload progress). Sends the file
-// as the raw request body (NOT multipart) so the server can stream it
-// straight to disk in one pass — multipart would force Starlette to
-// buffer the entire body into a temp file first, doubling disk I/O on
-// multi-GB sources. The filename is carried in X-Original-Filename
-// (URL-encoded for non-ASCII safety; HTTP header values must be 7-bit).
+// Upload via XHR (fetch can't report upload progress). Uses multipart
+// FormData rather than a raw octet-stream body even though raw-stream
+// would let the server skip its temp-file buffering pass: Safari's
+// WebKit has a bug where ``xhr.send(file)`` combined with custom
+// request headers consumes the file's body stream twice, raising
+// "request body stream exhausted" before any bytes hit the wire. The
+// FormData path doesn't trigger that bug, so we eat the server-side
+// double-disk-write cost until we have a chunked-upload protocol.
 //
 // Callbacks (all optional):
-//   onPreparing(): browser is preparing the request; on Safari this
-//     can take a long time for multi-GB files because the engine
-//     buffers the whole Blob before opening the TCP connection.
+//   onPreparing(): browser is preparing the request.
 //   onProgress(loaded, total): bytes pushed so far / Content-Length.
 // xhrPromise resolves to {status, body} or rejects on network error / abort.
 function xhrUpload(url, file, onProgress, onPreparing) {
@@ -3298,11 +3298,6 @@ function xhrUpload(url, file, onProgress, onPreparing) {
         fiReplaceXhr = xhr;
         xhr.open('POST', url);
         xhr.responseType = 'text';
-        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-        xhr.setRequestHeader('X-Original-Filename', encodeURIComponent(file.name));
-        // loadstart fires right after send() schedules the request but
-        // BEFORE bytes start hitting the wire — useful to acknowledge
-        // that the upload is queued while Safari buffers the body.
         xhr.upload.addEventListener('loadstart', () => {
             if (onPreparing) onPreparing();
         });
@@ -3323,7 +3318,9 @@ function xhrUpload(url, file, onProgress, onPreparing) {
             if (fiReplaceXhr === xhr) fiReplaceXhr = null;
             reject(new Error('aborted'));
         };
-        xhr.send(file);
+        const form = new FormData();
+        form.append('file', file);
+        xhr.send(form);
     });
 }
 

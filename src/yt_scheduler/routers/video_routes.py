@@ -10,12 +10,10 @@ import shutil
 import subprocess
 import sys
 import time
-import urllib.parse
 import weakref
 from pathlib import Path
 
-from fastapi import APIRouter, Body, Form, Header, Request, UploadFile, File, HTTPException, Query
-from starlette.requests import ClientDisconnect
+from fastapi import APIRouter, Body, Form, Header, UploadFile, File, HTTPException, Query
 
 from yt_scheduler.config import (
     UPLOAD_DIR,
@@ -1782,11 +1780,10 @@ def _evaluate_replacement(
 
 @router.post("/{video_id}/source-file")
 async def replace_video_source_file(
-    request: Request,
     video_id: str,
+    file: UploadFile = File(...),
     force: int = Query(0),
     content_length: int | None = Header(default=None),
-    x_original_filename: str | None = Header(default=None),
 ) -> dict:
     """Attach or replace the local high-fidelity source file for a video.
 
@@ -1795,13 +1792,13 @@ async def replace_video_source_file(
     swaps the local file the app uses for clip extraction and other
     on-device tasks.
 
-    Wire format: ``application/octet-stream`` raw body — NOT multipart.
-    The browser XHR sends the file bytes directly so we can stream them
-    into ``UPLOAD_DIR`` in a single pass. FastAPI's ``UploadFile`` would
-    otherwise buffer the entire body to a ``SpooledTemporaryFile`` in
-    ``$TMPDIR`` first, doubling disk I/O for multi-GB sources. The
-    original filename is carried in the ``X-Original-Filename`` header
-    (URL-encoded if it contains non-ASCII).
+    Wire format: ``multipart/form-data`` with a single ``file`` field.
+    A raw octet-stream body would let us stream directly to disk in
+    one pass (skipping FastAPI's ``SpooledTemporaryFile``), but
+    Safari/WebKit has a bug where ``xhr.send(file)`` with custom
+    request headers exhausts the file body stream before the bytes
+    hit the wire ("request body stream exhausted"). Until we have a
+    chunked-upload protocol, multipart is the compatibility floor.
 
     Sanity checks (override with ``?force=1``, or with the pending-token
     finalize flow):
@@ -1817,9 +1814,8 @@ async def replace_video_source_file(
 
     Hard rejects (no force override):
 
-    * 400 — empty upload, missing filename header, or ffprobe ran on
-      the file and produced no recognisable video stream (the user
-      picked, say, a text file).
+    * 400 — no file in the request, or ffprobe ran on the upload and
+      found no video stream (the user picked a non-video file).
     * 413 — file larger than ``_MAX_SOURCE_FILE_BYTES``.
 
     On 422 the body contains ``issues: [{code, ...details}]`` and
@@ -1842,27 +1838,14 @@ async def replace_video_source_file(
         raise HTTPException(404, f"Video '{video_id}' not found")
     row = dict(rows[0])
 
-    if not x_original_filename:
-        raise HTTPException(
-            400,
-            "Missing X-Original-Filename header — the client must send "
-            "the source filename in this header so we can derive a safe "
-            "on-disk name and extension.",
-        )
-    # Header values are 7-bit clean by spec; the UI URL-encodes non-ASCII
-    # filenames before setting the header. Decoding here brings the
-    # original UTF-8 name back.
-    try:
-        filename = urllib.parse.unquote(x_original_filename)
-    except (UnicodeDecodeError, ValueError):
-        raise HTTPException(400, "Could not decode X-Original-Filename header.")
-    if not filename:
-        raise HTTPException(400, "X-Original-Filename header is empty.")
+    if not file.filename:
+        raise HTTPException(400, "No file uploaded")
+    filename = file.filename
 
     # Pre-flight size check from the request header before we copy a
     # 10 GB+ body to disk. A lying client can still slip past with a
-    # missing/wrong header — the streaming write below is the defense
-    # in depth that catches that case at write time.
+    # missing/wrong header — _copy_to_disk_capped is the defense in
+    # depth that catches that case at write time.
     if content_length is not None and content_length > _MAX_SOURCE_FILE_BYTES:
         raise HTTPException(
             413,
@@ -1872,10 +1855,7 @@ async def replace_video_source_file(
 
     # All disk + DB work happens under a per-video lock so two
     # simultaneous replaces for the same video can't see each other's
-    # half-written state and produce orphan files / stale rows. We hold
-    # the lock across the streaming body read, too — concurrent
-    # uploads for the same video serialize at the disk-write step
-    # rather than at DB-update time.
+    # half-written state and produce orphan files / stale rows.
     async with _source_file_lock(video_id):
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         # ``source_pending_*`` while the request is in flight; renamed
@@ -1889,60 +1869,66 @@ async def replace_video_source_file(
         )
         incoming_path = UPLOAD_DIR / incoming_name
 
+        def _copy_to_disk_capped(
+            src, target: Path, cap: int, expected: int | None,
+        ) -> tuple[bool, int]:
+            """Stream ``src`` to ``target`` up to ``cap`` bytes.
+
+            Returns ``(ok, bytes_written)``. ``ok=False`` means the cap
+            was exceeded — the partial file has already been deleted
+            before the return. ``ok=True`` does NOT guarantee the body
+            was complete: ``bytes_written`` is the actual count and the
+            caller compares it to ``expected`` (Content-Length) to
+            detect a client-side abort that produced a short read.
+            """
+            written = 0
+            chunk_size = 1024 * 1024
+            with open(target, "wb") as fh:
+                while True:
+                    chunk = src.read(chunk_size)
+                    if not chunk:
+                        return True, written
+                    written += len(chunk)
+                    if written > cap:
+                        fh.close()
+                        target.unlink(missing_ok=True)
+                        return False, written
+                    fh.write(chunk)
+
         expected_bytes = (
             int(content_length)
             if content_length is not None and content_length > 0
             else None
         )
-        # Stream the raw body straight to the final path in a single
-        # pass. 1MB write buffer keeps syscall count reasonable on
-        # multi-GB uploads; cap check runs per chunk to short-circuit
-        # a lying Content-Length.
-        bytes_written = 0
-        truncated = False
-        oversize = False
-        try:
-            with open(incoming_path, "wb", buffering=1024 * 1024) as fh:
-                async for chunk in request.stream():
-                    if not chunk:
-                        continue
-                    bytes_written += len(chunk)
-                    if bytes_written > _MAX_SOURCE_FILE_BYTES:
-                        oversize = True
-                        break
-                    fh.write(chunk)
-        except ClientDisconnect:
-            truncated = True
-        if oversize:
-            incoming_path.unlink(missing_ok=True)
+        ok, bytes_written = await asyncio.to_thread(
+            _copy_to_disk_capped,
+            file.file, incoming_path, _MAX_SOURCE_FILE_BYTES,
+            expected_bytes,
+        )
+        if not ok:
             raise HTTPException(
                 413,
                 f"File too large: exceeds {_MAX_SOURCE_FILE_BYTES} byte cap.",
             )
-        if truncated or bytes_written == 0:
-            incoming_path.unlink(missing_ok=True)
-            if bytes_written == 0:
-                raise HTTPException(400, "Empty upload (no body bytes).")
-            raise HTTPException(
-                400,
-                "Upload was truncated before the full body arrived "
-                f"(got {bytes_written} bytes). Try again.",
-            )
 
-        # Client-abort detector. Without multipart framing the
-        # Content-Length here equals the raw file bytes, so a short
-        # read is unambiguous truncation.
-        if (
-            expected_bytes is not None
-            and expected_bytes - bytes_written > 0
-        ):
-            incoming_path.unlink(missing_ok=True)
-            raise HTTPException(
-                400,
-                "Upload was truncated before the full body arrived "
-                f"(got {bytes_written} of {expected_bytes} bytes). "
-                "Try again.",
-            )
+        # Client-abort detector. When the browser cancels the XHR mid-
+        # upload, Starlette's UploadFile typically returns short on the
+        # underlying SpooledTemporaryFile (the body terminated early)
+        # but we'd otherwise treat it as a clean close and persist the
+        # truncated file. Comparing against Content-Length catches it.
+        # Allow a small slack for multipart framing overhead.
+        if expected_bytes is not None:
+            # multipart-framed Content-Length is larger than the raw
+            # file bytes (boundaries, headers); a short read by more
+            # than 64KB is unambiguous truncation.
+            if expected_bytes - bytes_written > 64 * 1024:
+                incoming_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    400,
+                    "Upload was truncated before the full body arrived "
+                    f"(got {bytes_written} of {expected_bytes} bytes). "
+                    "Try again.",
+                )
 
         incoming_probe = await asyncio.to_thread(
             media_service.probe_video_file, incoming_path
