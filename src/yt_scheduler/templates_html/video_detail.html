@@ -3233,7 +3233,7 @@ document.getElementById('fi-replace-input').addEventListener('change', async (ev
     const file = input.files && input.files[0];
     input.value = '';
     if (!file) return;
-    await uploadReplacementSource(file, false);
+    await uploadReplacementSource(file);
 });
 
 function formatReplacementIssue(issue) {
@@ -3310,7 +3310,7 @@ function xhrUpload(url, file, onProgress) {
     });
 }
 
-async function uploadReplacementSource(file, force) {
+async function uploadReplacementSource(file) {
     const status = document.getElementById('fi-replace-status');
     const progress = document.getElementById('fi-replace-progress');
     status.style.display = '';
@@ -3322,7 +3322,7 @@ async function uploadReplacementSource(file, force) {
     let result;
     try {
         result = await xhrUpload(
-            `/api/videos/${videoId}/source-file${force ? '?force=1' : ''}`,
+            `/api/videos/${videoId}/source-file`,
             file,
             (loaded, total) => {
                 const pct = Math.floor((loaded / total) * 100);
@@ -3346,10 +3346,20 @@ async function uploadReplacementSource(file, force) {
 
     if (result.status === 422) {
         const issues = (result.body.detail && result.body.detail.issues) || [];
+        const pendingToken = result.body.detail && result.body.detail.pending_token;
         status.style.display = 'none';
         const proceed = await promptForceReplacement(issues);
-        if (proceed) {
-            await uploadReplacementSource(file, true);
+        if (proceed && pendingToken) {
+            await finalizePendingReplacement(pendingToken);
+        } else if (pendingToken) {
+            // User dismissed the confirm — drop the on-disk file
+            // proactively rather than wait for the 30-minute TTL.
+            try {
+                await fetch(
+                    `/api/videos/${videoId}/source-file/pending/${encodeURIComponent(pendingToken)}`,
+                    { method: 'DELETE' },
+                );
+            } catch (e) { /* best effort */ }
         }
         return;
     }
@@ -3361,7 +3371,38 @@ async function uploadReplacementSource(file, force) {
         return;
     }
 
-    status.textContent = result.body.transcript_cleared
+    await onReplacementCommitted(result.body);
+}
+
+async function finalizePendingReplacement(pendingToken) {
+    const status = document.getElementById('fi-replace-status');
+    status.style.display = '';
+    status.style.color = '';
+    status.textContent = 'Finalizing…';
+    let resp, body;
+    try {
+        resp = await fetch(`/api/videos/${videoId}/source-file/finalize`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pending_token: pendingToken }),
+        });
+        body = await resp.json();
+    } catch (e) {
+        status.style.color = 'var(--danger)';
+        status.textContent = 'Finalize failed: network error.';
+        return;
+    }
+    if (!resp.ok) {
+        status.style.color = 'var(--danger)';
+        status.textContent = `Finalize failed: ${(body && body.detail) || ('HTTP ' + resp.status)}`;
+        return;
+    }
+    await onReplacementCommitted(body);
+}
+
+async function onReplacementCommitted(body) {
+    const status = document.getElementById('fi-replace-status');
+    status.textContent = body && body.transcript_cleared
         ? 'Source updated. Saved transcript was cleared because the new file is a different length.'
         : 'Source updated.';
     await refreshFileInfo();

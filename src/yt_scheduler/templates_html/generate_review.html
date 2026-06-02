@@ -191,6 +191,31 @@ window.addEventListener('DOMContentLoaded', async () => {
     }
 });
 
+// When the user comes back to this tab after Replacing Source on the
+// parent's detail page, the server-rendered PARENT_META warnings would
+// otherwise stay frozen at page-load time — i.e. the "low resolution"
+// warning would persist even after a higher-resolution master is
+// attached. Refetch /file-info on visibilitychange so the warning
+// panel reflects the current source.
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+        refreshParentWarnings();
+    }
+});
+
+async function refreshParentWarnings() {
+    try {
+        const resp = await fetch(`/api/videos/${parentId}/file-info`);
+        if (!resp.ok) return;
+        const info = await resp.json();
+        const fresh = info.quality_warnings || [];
+        PARENT_META.parent_warnings = fresh;
+        renderWarnings(fresh);
+    } catch (e) {
+        /* network blip — keep the existing warnings */
+    }
+}
+
 async function loadRejections() {
     let resp, body;
     try {

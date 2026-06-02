@@ -956,13 +956,13 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 
 **Purpose** — Attach or replace the local high-fidelity source file for a video. The YouTube-hosted video is never touched — this only swaps the local file used for clip extraction and other on-device tasks. Used by the "Replace source" / "Attach source" button on the video detail page.
 
-**Query params** — `force` (int, default `0`): set to `1` to override the 422 sanity checks below. Has no effect on the 400 / 413 hard rejects.
+**Query params** — `force` (int, default `0`): set to `1` to bypass the 422 sanity checks below in a single round-trip. The browser UI does **not** use this — it lets the server keep the upload and confirms via `/source-file/finalize` so multi-GB sources don't have to be re-uploaded. `force=1` remains supported for direct API callers and tests.
 
 **Request body** — `multipart/form-data` with a single `file` field (the new source file).
 
 **Response 200** — `{"status": "ok", "original_name": str, "duration_seconds": float|null, "width": int|null, "height": int|null, "bitrate_bps": int|null, "size_bytes": int|null, "source_origin": "user_attached", "transcript_cleared": bool}`. `transcript_cleared` is `true` when the call also blanked the row's transcript columns because the user forced past a `duration_mismatch`.
 
-**Side effects** — The previous local file is *not* renamed or deleted: the row is re-pointed at the new file via a single atomic UPDATE, and the old file stays on disk as an orphan (intentional — trades disk hygiene for crash-safety; no half-written rename + DB state can co-occur). The row's `video_file_path`, `video_file_original_name`, `duration_seconds`, and `source_file_origin` are updated; `video_file_download_state` is cleared. When `force=1` overrides a `duration_mismatch` issue, the row's `transcript`, `transcript_id`, `transcript_source`, `transcript_created_at`, `transcript_updated_at`, and `transcript_is_edited` are also cleared (the saved caption timestamps no longer align with the new file).
+**Side effects** — The previous local file is *not* renamed or deleted: the row is re-pointed at the new file via a single atomic UPDATE, and the old file stays on disk as an orphan (intentional — trades disk hygiene for crash-safety; no half-written rename + DB state can co-occur). The row's `video_file_path`, `video_file_original_name`, `duration_seconds`, and `source_file_origin` are updated; `video_file_download_state` is cleared. When the caller forces past a `duration_mismatch` (either via `?force=1` or via the finalize-pending flow below), the row's `transcript`, `transcript_id`, `transcript_source`, `transcript_created_at`, `transcript_updated_at`, and `transcript_is_edited` are also cleared (the saved caption timestamps no longer align with the new file).
 
 **Concurrency** — Calls for the same `video_id` are serialized via a per-video asyncio lock. Different videos still proceed in parallel.
 
@@ -971,10 +971,29 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 - `400` — no file in the request, or ffprobe ran on the upload and found no video stream (the user picked a non-video file). Not overridable.
 - `404` — video row not found.
 - `413` — file exceeds the 10 GiB cap (checked from `Content-Length` upfront and again as a streaming counter during the copy, so a lying header still gets caught). Not overridable.
-- `422` — sanity check failed. Body is `{"detail": {"issues": [{...}]}}` where each issue is one of:
+- `422` — sanity check failed. Body is `{"detail": {"issues": [{...}], "pending_token": str}}`. The uploaded file is **kept on disk** (not deleted on 422) and `pending_token` references it; the client POSTs the token to `/source-file/finalize` after the user confirms, or DELETEs `/source-file/pending/{token}` if the user cancels. Each issue is one of:
   - `{"code": "duration_mismatch", "expected_seconds": float, "incoming_seconds": float, "tolerance_seconds": float}` — the incoming file's duration differs from the row's `duration_seconds` by more than the tolerance (currently 2.0 s).
   - `{"code": "resolution_downgrade", "current": "WxH", "incoming": "WxH"}` — the incoming file is strictly smaller in both width and height than the current file. Only fires when a current file exists and isn't itself a `youtube_download` (replacing a YouTube re-download is always considered an upgrade).
-  - Resubmit with `?force=1` to bypass.
+
+### `POST /api/videos/{video_id}/source-file/finalize`
+
+**Purpose** — Commit a Replace-Source upload that previously returned 422. Lets the client confirm past the sanity issues without re-uploading the entire body.
+
+**Request body** — `{"pending_token": str}` — the token returned in the 422 `detail` of the original `POST /source-file` call.
+
+**Response 200** — same shape as `POST /source-file` on success.
+
+**Errors**:
+
+- `404` — token unknown, expired (TTL is 30 minutes from upload), already consumed by a previous finalize/cancel, belongs to a different video, or its on-disk file is missing. The client must re-upload.
+
+**Side effects** — Renames the pending file from `source_pending_<hex>.<ext>` to `source_<hex>.<ext>` (atomic, same filesystem) and runs the same DB UPDATE as the `force=1` path on `POST /source-file`. Uses the probe captured at upload time — no re-probe.
+
+### `DELETE /api/videos/{video_id}/source-file/pending/{pending_token}`
+
+**Purpose** — Drop a pending Replace-Source upload without finalizing. Called by the UI when the user dismisses the confirm dialog so the on-disk file is removed immediately instead of waiting for the 30-minute TTL.
+
+**Response 200** — `{"status": "cancelled"}` when the entry existed, `{"status": "gone"}` when it was already finalized / cancelled / expired (idempotent).
 
 ### `POST /api/videos/{video_id}/reveal-file`
 

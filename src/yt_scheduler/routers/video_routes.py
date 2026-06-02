@@ -9,10 +9,11 @@ import secrets
 import shutil
 import subprocess
 import sys
+import time
 import weakref
 from pathlib import Path
 
-from fastapi import APIRouter, Form, Header, UploadFile, File, HTTPException, Query
+from fastapi import APIRouter, Body, Form, Header, UploadFile, File, HTTPException, Query
 
 from yt_scheduler.config import (
     UPLOAD_DIR,
@@ -1554,6 +1555,163 @@ def _source_file_lock(video_id: str) -> asyncio.Lock:
     return lock
 
 
+# When a Replace-Source upload trips a sanity issue (duration mismatch,
+# resolution downgrade) the handler returns 422 with the issue list and
+# the user is prompted to confirm. The old flow then re-uploaded the
+# entire file with force=1 — brutal on multi-GB sources. We now keep
+# the on-disk file and hand the client a one-shot ``pending_token``;
+# the confirm step finalizes the already-uploaded file via
+# :func:`finalize_pending_source_file`.
+#
+# Entries live in process memory only — a server restart drops them
+# and any in-flight pending upload is then resurfaced as an orphan
+# file by ``cleanup_orphan_pending_source_files`` (called from app
+# lifespan).
+_PENDING_FINALIZE_TTL_SECONDS: float = 30 * 60  # 30 min
+_PENDING_FINALIZES: dict[str, dict] = {}
+_PENDING_FINALIZES_LOCK: asyncio.Lock = asyncio.Lock()
+
+
+def _evict_stale_pending_finalizes() -> None:
+    """Drop expired pending entries and unlink their files.
+
+    Called under :data:`_PENDING_FINALIZES_LOCK` from the create / pop
+    sites — keeps the dict from growing unboundedly when users open the
+    confirm prompt and walk away.
+    """
+    now = time.monotonic()
+    for token, entry in list(_PENDING_FINALIZES.items()):
+        if entry["expires_at"] < now:
+            _PENDING_FINALIZES.pop(token, None)
+            Path(entry["path"]).unlink(missing_ok=True)
+
+
+def cleanup_orphan_pending_source_files() -> int:
+    """Delete every ``source_pending_*`` file in UPLOAD_DIR.
+
+    Called on startup so pending-finalize files that survived a previous
+    process being killed (the in-memory map doesn't survive a restart)
+    don't accumulate on disk. The active source files use the
+    ``source_*`` name without the ``pending_`` prefix, so this sweep
+    can't touch a file currently referenced by the videos table.
+
+    Returns the number of files removed (for logging).
+    """
+    removed = 0
+    try:
+        for path in UPLOAD_DIR.glob("source_pending_*"):
+            try:
+                path.unlink()
+                removed += 1
+            except OSError as exc:
+                logger.debug(
+                    "Could not remove orphan pending source %s: %s",
+                    path, exc,
+                )
+    except OSError as exc:
+        logger.debug("Orphan pending-source sweep failed: %s", exc)
+    return removed
+
+
+async def _apply_source_swap(
+    *,
+    video_id: str,
+    row: dict,
+    incoming_path: Path,
+    incoming_probe: "media_service.VideoProbe | None",
+    new_original: str,
+    issues: list[dict],
+) -> dict:
+    """DB-update half of Replace Source.
+
+    Shared by the original POST handler (when the upload passed the
+    sanity checks, or force=1 overrode them) and the new
+    finalize-pending endpoint (which re-uses a file already on disk).
+
+    ``issues`` is the list returned by :func:`_evaluate_replacement`
+    against the incoming file; presence of ``duration_mismatch`` here
+    triggers the transcript wipe.
+    """
+    db = await get_db()
+    force_past_duration = any(i["code"] == "duration_mismatch" for i in issues)
+
+    # probe_is_video(None) → True (when ffprobe isn't installed we
+    # trust the user's upload as best-effort), so incoming_probe can
+    # legitimately be None here. Fall back to existing-row duration
+    # when we can't probe.
+    if incoming_probe is None or incoming_probe.duration_seconds is None:
+        new_duration = row.get("duration_seconds")
+        new_width = incoming_probe.width if incoming_probe else None
+        new_height = incoming_probe.height if incoming_probe else None
+        new_bitrate = incoming_probe.bitrate_bps if incoming_probe else None
+        new_size = incoming_probe.size_bytes if incoming_probe else None
+    else:
+        new_duration = incoming_probe.duration_seconds
+        new_width = incoming_probe.width
+        new_height = incoming_probe.height
+        new_bitrate = incoming_probe.bitrate_bps
+        new_size = incoming_probe.size_bytes
+    if force_past_duration:
+        await db.execute(
+            """UPDATE videos SET
+                video_file_path = ?,
+                video_file_original_name = ?,
+                duration_seconds = ?,
+                source_file_origin = 'user_attached',
+                video_file_download_state = NULL,
+                transcript = NULL,
+                transcript_id = NULL,
+                transcript_source = NULL,
+                transcript_created_at = NULL,
+                transcript_updated_at = NULL,
+                transcript_is_edited = 0,
+                updated_at = datetime('now')
+            WHERE id = ?""",
+            (str(incoming_path), new_original, new_duration, video_id),
+        )
+    else:
+        await db.execute(
+            """UPDATE videos SET
+                video_file_path = ?,
+                video_file_original_name = ?,
+                duration_seconds = ?,
+                source_file_origin = 'user_attached',
+                video_file_download_state = NULL,
+                updated_at = datetime('now')
+            WHERE id = ?""",
+            (str(incoming_path), new_original, new_duration, video_id),
+        )
+    await db.commit()
+
+    await events.record_event(
+        video_id,
+        "metadata_updated",
+        {
+            "source_file_origin": {
+                "old": row.get("source_file_origin"), "new": "user_attached",
+            },
+        },
+    )
+    if force_past_duration:
+        await events.record_event(
+            video_id,
+            "metadata_updated",
+            {"transcript_cleared_reason": "source_file_duration_mismatch_forced"},
+        )
+
+    return {
+        "status": "ok",
+        "original_name": new_original,
+        "duration_seconds": new_duration,
+        "width": new_width,
+        "height": new_height,
+        "bitrate_bps": new_bitrate,
+        "size_bytes": new_size,
+        "source_origin": "user_attached",
+        "transcript_cleared": force_past_duration,
+    }
+
+
 def _format_resolution(width: int | None, height: int | None) -> str | None:
     if width is None or height is None:
         return None
@@ -1690,7 +1848,13 @@ async def replace_video_source_file(
     # half-written state and produce orphan files / stale rows.
     async with _source_file_lock(video_id):
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        incoming_name = f"source_{secrets.token_hex(8)}{safe_upload_ext(file.filename)}"
+        # ``source_pending_*`` while the request is in flight; renamed
+        # in place to ``source_*`` once the swap is committed. The
+        # ``pending`` prefix lets a startup sweep
+        # (cleanup_orphan_pending_source_files) safely delete leftovers
+        # from a crashed / killed previous run without risking an
+        # in-use source file.
+        incoming_name = f"source_pending_{secrets.token_hex(8)}{safe_upload_ext(file.filename)}"
         incoming_path = UPLOAD_DIR / incoming_name
 
         def _copy_to_disk_capped(
@@ -1777,94 +1941,166 @@ async def replace_video_source_file(
         issues = _evaluate_replacement(
             incoming=incoming_probe, row=row, current=current_probe
         )
-        if issues and not force:
-            incoming_path.unlink(missing_ok=True)
-            raise HTTPException(422, detail={"issues": issues})
-
-        # Forcing past a duration mismatch invalidates the timestamped
-        # transcript — the audio in the new file no longer lines up with
-        # the cues we stored. Blank the per-video transcript columns so
-        # downstream features (promo clip generation, caption upload)
-        # don't operate on stale data. The transcripts table row itself
-        # is left alone; the user can re-select it via the chooser if
-        # they replaced with the same content under a different file.
-        force_past_duration = force and any(
-            i["code"] == "duration_mismatch" for i in issues
-        )
-
         new_original = sanitized_original_filename(file.filename)
-        # probe_is_video(None) → True (when ffprobe isn't installed we
-        # trust the user's upload as best-effort), so incoming_probe can
-        # legitimately be None here. The previous `assert ... is not None`
-        # would 500 in that case. Fall back to existing-row duration when
-        # we can't probe.
-        if incoming_probe is None or incoming_probe.duration_seconds is None:
-            new_duration = row.get("duration_seconds")
-            new_width = incoming_probe.width if incoming_probe else None
-            new_height = incoming_probe.height if incoming_probe else None
-            new_bitrate = incoming_probe.bitrate_bps if incoming_probe else None
-            new_size = incoming_probe.size_bytes if incoming_probe else None
-        else:
-            new_duration = incoming_probe.duration_seconds
-            new_width = incoming_probe.width
-            new_height = incoming_probe.height
-            new_bitrate = incoming_probe.bitrate_bps
-            new_size = incoming_probe.size_bytes
-        if force_past_duration:
-            await db.execute(
-                """UPDATE videos SET
-                    video_file_path = ?,
-                    video_file_original_name = ?,
-                    duration_seconds = ?,
-                    source_file_origin = 'user_attached',
-                    video_file_download_state = NULL,
-                    transcript = NULL,
-                    transcript_id = NULL,
-                    transcript_source = NULL,
-                    transcript_created_at = NULL,
-                    transcript_updated_at = NULL,
-                    transcript_is_edited = 0,
-                    updated_at = datetime('now')
-                WHERE id = ?""",
-                (str(incoming_path), new_original, new_duration, video_id),
+        if issues and not force:
+            # Keep the file on disk and hand the client a token. The
+            # confirm path POSTs the token to /source-file/finalize
+            # instead of re-uploading the entire body — a brutal
+            # round-trip on multi-GB sources.
+            token = secrets.token_hex(16)
+            entry = {
+                "video_id": video_id,
+                "path": str(incoming_path),
+                "original_name": new_original,
+                "probe_width": incoming_probe.width if incoming_probe else None,
+                "probe_height": incoming_probe.height if incoming_probe else None,
+                "probe_duration_seconds": (
+                    incoming_probe.duration_seconds if incoming_probe else None
+                ),
+                "probe_bitrate_bps": (
+                    incoming_probe.bitrate_bps if incoming_probe else None
+                ),
+                "probe_size_bytes": (
+                    incoming_probe.size_bytes if incoming_probe else None
+                ),
+                "probe_codec_name": (
+                    incoming_probe.codec_name if incoming_probe else None
+                ),
+                "probe_container": (
+                    incoming_probe.container if incoming_probe else None
+                ),
+                "issues": issues,
+                "expires_at": time.monotonic() + _PENDING_FINALIZE_TTL_SECONDS,
+            }
+            async with _PENDING_FINALIZES_LOCK:
+                _evict_stale_pending_finalizes()
+                _PENDING_FINALIZES[token] = entry
+            raise HTTPException(
+                422, detail={"issues": issues, "pending_token": token},
             )
-        else:
-            await db.execute(
-                """UPDATE videos SET
-                    video_file_path = ?,
-                    video_file_original_name = ?,
-                    duration_seconds = ?,
-                    source_file_origin = 'user_attached',
-                    video_file_download_state = NULL,
-                    updated_at = datetime('now')
-                WHERE id = ?""",
-                (str(incoming_path), new_original, new_duration, video_id),
-            )
-        await db.commit()
 
-    await events.record_event(
-        video_id,
-        "metadata_updated",
-        {"source_file_origin": {"old": row.get("source_file_origin"), "new": "user_attached"}},
-    )
-    if force_past_duration:
-        await events.record_event(
-            video_id,
-            "metadata_updated",
-            {"transcript_cleared_reason": "source_file_duration_mismatch_forced"},
+        # Promote the temp file to its permanent ``source_*`` name so a
+        # startup sweep can't mistake it for an orphan pending upload.
+        final_path = _promote_pending_to_source(incoming_path)
+        result = await _apply_source_swap(
+            video_id=video_id,
+            row=row,
+            incoming_path=final_path,
+            incoming_probe=incoming_probe,
+            new_original=new_original,
+            issues=issues,
+        )
+    return result
+
+
+def _promote_pending_to_source(pending_path: Path) -> Path:
+    """Rename ``source_pending_<hex>.<ext>`` → ``source_<hex>.<ext>``.
+
+    Same-filesystem rename, so it's atomic and free. Done right before
+    the DB UPDATE so the row never references a path with the
+    ``pending_`` prefix; the startup orphan sweep can then safely
+    delete any file matching ``source_pending_*`` without risk of
+    touching an in-use source.
+    """
+    name = pending_path.name
+    if not name.startswith("source_pending_"):
+        # Older code paths that pass an already-promoted path through
+        # — accept it and move on instead of failing loudly.
+        return pending_path
+    new_name = "source_" + name[len("source_pending_"):]
+    final_path = pending_path.with_name(new_name)
+    pending_path.rename(final_path)
+    return final_path
+
+
+@router.post("/{video_id}/source-file/finalize")
+async def finalize_pending_source_file(
+    video_id: str, pending_token: str = Body(..., embed=True),
+) -> dict:
+    """Confirm a pending Replace-Source upload (force=1 on the original).
+
+    The original POST kept the file on disk and returned a token in the
+    422 body. The client calls this endpoint with that token after the
+    user accepts the warning — no body re-upload needed.
+
+    Errors:
+
+    * 404 — token unknown / expired (the user took longer than the TTL,
+      or the server restarted in between). The client should re-upload.
+    * 404 — token belongs to a different video (paranoia check).
+    """
+    async with _PENDING_FINALIZES_LOCK:
+        _evict_stale_pending_finalizes()
+        entry = _PENDING_FINALIZES.pop(pending_token, None)
+    if entry is None or entry["video_id"] != video_id:
+        raise HTTPException(
+            404,
+            "Pending upload not found or expired — please re-upload.",
+        )
+    incoming_path = Path(entry["path"])
+    if not incoming_path.exists():
+        raise HTTPException(
+            404,
+            "Pending upload file missing on disk — please re-upload.",
         )
 
-    return {
-        "status": "ok",
-        "original_name": new_original,
-        "duration_seconds": new_duration,
-        "width": new_width,
-        "height": new_height,
-        "bitrate_bps": new_bitrate,
-        "size_bytes": new_size,
-        "source_origin": "user_attached",
-        "transcript_cleared": force_past_duration,
-    }
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id, video_file_path, video_file_original_name, "
+        "duration_seconds, source_file_origin FROM videos WHERE id = ?",
+        (video_id,),
+    )
+    if not rows:
+        incoming_path.unlink(missing_ok=True)
+        raise HTTPException(404, f"Video '{video_id}' not found")
+    row = dict(rows[0])
+
+    # Reconstruct a probe-shaped object from the snapshot we took at
+    # upload time. We deliberately do NOT re-probe — the file hasn't
+    # been touched and re-probing a multi-GB file just to read the
+    # same numbers is wasteful.
+    incoming_probe = media_service.VideoProbe(
+        width=entry["probe_width"],
+        height=entry["probe_height"],
+        duration_seconds=entry["probe_duration_seconds"],
+        bitrate_bps=entry["probe_bitrate_bps"],
+        size_bytes=entry["probe_size_bytes"],
+        codec_name=entry["probe_codec_name"],
+        container=entry["probe_container"],
+    )
+
+    async with _source_file_lock(video_id):
+        final_path = _promote_pending_to_source(incoming_path)
+        return await _apply_source_swap(
+            video_id=video_id,
+            row=row,
+            incoming_path=final_path,
+            incoming_probe=incoming_probe,
+            new_original=entry["original_name"],
+            issues=entry["issues"],
+        )
+
+
+@router.delete("/{video_id}/source-file/pending/{pending_token}")
+async def cancel_pending_source_file(
+    video_id: str, pending_token: str,
+) -> dict:
+    """Drop a pending Replace-Source upload without finalizing.
+
+    The user dismissed the confirm prompt — pop the entry and delete
+    the on-disk file so we don't carry it until the TTL evicts it.
+
+    Idempotent: a missing or expired token returns ``status=gone``
+    rather than 404, because the user's "cancel" intent is satisfied
+    either way.
+    """
+    async with _PENDING_FINALIZES_LOCK:
+        _evict_stale_pending_finalizes()
+        entry = _PENDING_FINALIZES.pop(pending_token, None)
+    if entry is None or entry["video_id"] != video_id:
+        return {"status": "gone"}
+    Path(entry["path"]).unlink(missing_ok=True)
+    return {"status": "cancelled"}
 
 
 @router.post("/{video_id}/reveal-file")

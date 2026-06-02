@@ -247,6 +247,23 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Orphan-preview sweep failed at startup; continuing")
 
+    # Pending Replace-Source uploads that survived a previous process
+    # being killed. The in-memory _PENDING_FINALIZES dict doesn't
+    # survive a restart, so any source_pending_* file on disk is by
+    # definition unreachable and must be cleaned up.
+    try:
+        from yt_scheduler.routers import video_routes as _video_routes
+        removed = _video_routes.cleanup_orphan_pending_source_files()
+        if removed:
+            logger.info(
+                "Swept %d orphan pending source-file upload(s) on startup",
+                removed,
+            )
+    except Exception:
+        logger.exception(
+            "Orphan pending-source sweep failed at startup; continuing",
+        )
+
     yield
     stop_scheduler()
     await close_db()
