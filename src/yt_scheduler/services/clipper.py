@@ -365,27 +365,19 @@ async def propose_clips_for_kind(
         },
     )
 
-    # Two-block user message: the transcript is the cache-controlled
-    # prefix (shared across the three parallel per-kind calls), the
-    # per-kind rendered body is the differing tail.
-    user_content: list[dict] = [
-        {
-            "type": "text",
-            "text": (
-                "Below is the SRT transcript of the parent video. Use the "
-                "timestamps as anchor points for any ranges you propose.\n\n"
-                + transcript_srt
-            ),
-            "cache_control": {"type": "ephemeral"},
-        },
-        {
-            "type": "text",
-            "text": rendered_body,
-        },
-    ]
+    # The rendered body may embed the transcript inline via a literal
+    # ``{{parent_transcript}}`` placeholder (which the template renderer
+    # leaves untouched because ``parent_transcript`` is intentionally not
+    # in the variables dict — it's a system-managed input, not
+    # user-substituted). Split around the placeholder so we can put the
+    # SRT in its own cache-controlled block. When the placeholder is
+    # missing (custom user-edited prompt that dropped it), fall back to
+    # prepending the transcript as block 0 so the call still works.
+    user_content = _build_proposal_user_content(rendered_body, transcript_srt)
 
+    model = await ai._resolve_model()
     kwargs: dict[str, object] = {
-        "model": await ai._resolve_model(),
+        "model": model,
         "max_tokens": 2048,
         "messages": [{"role": "user", "content": user_content}],
         "tools": [_PROPOSAL_TOOL],
@@ -393,6 +385,8 @@ async def propose_clips_for_kind(
     }
     if prompt["system"]:
         kwargs["system"] = prompt["system"]
+
+    _log_proposal_request(kind, model, kwargs, user_content)
 
     client = ai.get_client()
     try:
@@ -410,12 +404,153 @@ async def propose_clips_for_kind(
                 raw_proposals = [e for e in entries if isinstance(e, dict)]
             break
 
+    _log_proposal_response(kind, message, raw_proposals)
+
     return _validate_proposals(
         raw_proposals,
         kind=kind,
         parent_duration_seconds=parent_duration_seconds,
         existing_ranges=existing_ranges,
     )
+
+
+# Sentinel placeholders authors can put in their prompt body. The
+# renderer is configured to leave unknown placeholders literal
+# (templates.py:350), so the substring survives template rendering
+# and we split on whichever one appears first.
+_TRANSCRIPT_PLACEHOLDERS: tuple[str, ...] = (
+    "{{parent_transcript}}",
+    "{{transcript}}",
+)
+
+
+def _build_proposal_user_content(
+    rendered_body: str, transcript_srt: str,
+) -> list[dict]:
+    """Construct the two-block user content for a clip-proposal call.
+
+    When the rendered body contains ``{{parent_transcript}}`` (or its
+    alias ``{{transcript}}``) we split there so the transcript ends in
+    its own cache-controlled block (shared across the three parallel
+    per-kind calls). When neither appears we prepend the transcript
+    ourselves with a brief header so the model still sees it.
+    """
+    # Pick whichever recognised placeholder appears first in the body.
+    earliest_idx = -1
+    earliest_marker = ""
+    for marker in _TRANSCRIPT_PLACEHOLDERS:
+        idx = rendered_body.find(marker)
+        if idx != -1 and (earliest_idx == -1 or idx < earliest_idx):
+            earliest_idx = idx
+            earliest_marker = marker
+    if earliest_marker:
+        prefix, _, suffix = rendered_body.partition(earliest_marker)
+        blocks: list[dict] = [
+            {
+                "type": "text",
+                "text": prefix + transcript_srt,
+                "cache_control": {"type": "ephemeral"},
+            },
+        ]
+        if suffix:
+            blocks.append({"type": "text", "text": suffix})
+        return blocks
+    # Backwards-compat fallback for custom prompts that omit the
+    # placeholder. Same shape as before this commit.
+    return [
+        {
+            "type": "text",
+            "text": (
+                "Below is the SRT transcript of the parent video. Use the "
+                "timestamps as anchor points for any ranges you propose.\n\n"
+                + transcript_srt
+            ),
+            "cache_control": {"type": "ephemeral"},
+        },
+        {"type": "text", "text": rendered_body},
+    ]
+
+
+def _log_proposal_request(
+    kind: ClipKind, model: str, kwargs: dict, user_content: list[dict],
+) -> None:
+    """Dump the full Anthropic request for a clip-proposal call at INFO.
+
+    Delimited so the block is grep-able. The transcript can be ~10k
+    tokens; we log it in full so a problem with the prompt is visible
+    without guesswork. Operators can rotate / size logs accordingly.
+    """
+    import json as _json
+    try:
+        system_str = kwargs.get("system") or ""
+        # Serialize user_content for the log; cache_control etc. are
+        # included so a reader can confirm the cache marker is on the
+        # right block.
+        uc_str = _json.dumps(user_content, ensure_ascii=False, indent=2)
+        tool_str = _json.dumps(kwargs.get("tools") or [], ensure_ascii=False)
+        logger.info(
+            "===== Claude clip-proposal REQUEST [%s] =====\n"
+            "model=%s tool_choice=%s max_tokens=%s\n"
+            "----- system -----\n%s\n"
+            "----- user content (%d blocks) -----\n%s\n"
+            "----- tools -----\n%s\n"
+            "===== end Claude clip-proposal REQUEST [%s] =====",
+            kind,
+            model,
+            kwargs.get("tool_choice"),
+            kwargs.get("max_tokens"),
+            system_str,
+            len(user_content),
+            uc_str,
+            tool_str,
+            kind,
+        )
+    except Exception:  # noqa: BLE001 — logging must never break the call
+        logger.warning(
+            "Failed to log Claude clip-proposal request for %s", kind,
+            exc_info=True,
+        )
+
+
+def _log_proposal_response(
+    kind: ClipKind, message, raw_proposals: list[dict],
+) -> None:
+    """Dump the full Anthropic response for a clip-proposal call at INFO."""
+    import json as _json
+    try:
+        usage = getattr(message, "usage", None)
+        usage_dict = {
+            "input_tokens": getattr(usage, "input_tokens", None),
+            "output_tokens": getattr(usage, "output_tokens", None),
+            "cache_creation_input_tokens": getattr(
+                usage, "cache_creation_input_tokens", None,
+            ),
+            "cache_read_input_tokens": getattr(
+                usage, "cache_read_input_tokens", None,
+            ),
+        } if usage is not None else {}
+        content_types = [
+            getattr(b, "type", type(b).__name__)
+            for b in (getattr(message, "content", []) or [])
+        ]
+        logger.info(
+            "===== Claude clip-proposal RESPONSE [%s] =====\n"
+            "stop_reason=%s content_blocks=%s usage=%s\n"
+            "----- raw proposals (n=%d) -----\n%s\n"
+            "===== end Claude clip-proposal RESPONSE [%s] =====",
+            kind,
+            getattr(message, "stop_reason", None),
+            content_types,
+            _json.dumps(usage_dict),
+            len(raw_proposals),
+            _json.dumps(raw_proposals, ensure_ascii=False, indent=2),
+            kind,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to log Claude clip-proposal response for %s", kind,
+            exc_info=True,
+        )
 
 
 # Cap on simultaneously-running ffmpeg cut jobs. Precise cuts re-encode
@@ -695,8 +830,9 @@ async def assess_crop_for_proposal(
         })
     content.append({"type": "text", "text": prompt["body"]})
 
+    model = await ai._resolve_model()
     kwargs: dict[str, object] = {
-        "model": await ai._resolve_model(),
+        "model": model,
         "max_tokens": 512,
         "messages": [{"role": "user", "content": content}],
         "tools": [_CROP_ASSESSMENT_TOOL],
@@ -704,6 +840,8 @@ async def assess_crop_for_proposal(
     }
     if prompt["system"]:
         kwargs["system"] = prompt["system"]
+
+    _log_crop_request(proposal, model, kwargs, content)
 
     try:
         async with lane:
@@ -715,6 +853,8 @@ async def assess_crop_for_proposal(
             proposal.start_seconds, proposal.end_seconds, exc,
         )
         return _NEUTRAL_ASSESSMENT
+
+    _log_crop_response(proposal, message)
 
     for block in getattr(message, "content", []) or []:
         if getattr(block, "type", None) == "tool_use" and getattr(block, "name", "") == "assess_crop":
@@ -739,6 +879,97 @@ async def assess_crop_for_proposal(
                 confidence=confidence,
             )
     return _NEUTRAL_ASSESSMENT
+
+
+def _log_crop_request(
+    proposal: ProposedClip, model: str, kwargs: dict, content: list[dict],
+) -> None:
+    """Dump the full Anthropic request for a crop-assessment call at INFO.
+
+    Image blocks log the media type + byte length instead of the
+    base64 payload (each frame is ~50-200 KB; logging the bytes would
+    blow up the file with noise).
+    """
+    import json as _json
+    try:
+        sanitized: list[dict] = []
+        for block in content:
+            btype = block.get("type")
+            if btype == "image":
+                src = block.get("source") or {}
+                data = src.get("data") or ""
+                sanitized.append({
+                    "type": "image",
+                    "source": {
+                        "type": src.get("type"),
+                        "media_type": src.get("media_type"),
+                        "data_length_bytes": len(data),
+                    },
+                })
+            else:
+                sanitized.append(block)
+        system_str = kwargs.get("system") or ""
+        uc_str = _json.dumps(sanitized, ensure_ascii=False, indent=2)
+        tool_str = _json.dumps(kwargs.get("tools") or [], ensure_ascii=False)
+        logger.info(
+            "===== Claude crop-assessment REQUEST [%.1f-%.1f] =====\n"
+            "model=%s tool_choice=%s max_tokens=%s\n"
+            "----- system -----\n%s\n"
+            "----- user content (%d blocks) -----\n%s\n"
+            "----- tools -----\n%s\n"
+            "===== end Claude crop-assessment REQUEST [%.1f-%.1f] =====",
+            proposal.start_seconds, proposal.end_seconds,
+            model,
+            kwargs.get("tool_choice"),
+            kwargs.get("max_tokens"),
+            system_str,
+            len(content),
+            uc_str,
+            tool_str,
+            proposal.start_seconds, proposal.end_seconds,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to log Claude crop-assessment request for %.1f-%.1f",
+            proposal.start_seconds, proposal.end_seconds, exc_info=True,
+        )
+
+
+def _log_crop_response(proposal: ProposedClip, message) -> None:
+    """Dump the full Anthropic response for a crop-assessment call at INFO."""
+    import json as _json
+    try:
+        usage = getattr(message, "usage", None)
+        usage_dict = {
+            "input_tokens": getattr(usage, "input_tokens", None),
+            "output_tokens": getattr(usage, "output_tokens", None),
+        } if usage is not None else {}
+        # Extract every tool_use block's input so the full structured
+        # assessment is visible (not just the one we end up using).
+        tool_uses: list[dict] = []
+        for block in getattr(message, "content", []) or []:
+            if getattr(block, "type", None) == "tool_use":
+                tool_uses.append({
+                    "name": getattr(block, "name", None),
+                    "input": getattr(block, "input", None),
+                })
+        logger.info(
+            "===== Claude crop-assessment RESPONSE [%.1f-%.1f] =====\n"
+            "stop_reason=%s usage=%s\n"
+            "----- tool_use blocks (n=%d) -----\n%s\n"
+            "===== end Claude crop-assessment RESPONSE [%.1f-%.1f] =====",
+            proposal.start_seconds, proposal.end_seconds,
+            getattr(message, "stop_reason", None),
+            _json.dumps(usage_dict),
+            len(tool_uses),
+            _json.dumps(tool_uses, ensure_ascii=False, indent=2),
+            proposal.start_seconds, proposal.end_seconds,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to log Claude crop-assessment response for %.1f-%.1f",
+            proposal.start_seconds, proposal.end_seconds, exc_info=True,
+        )
 
 
 async def cut_clip_from_parent(

@@ -244,6 +244,17 @@ SEED_AI_BLOCK_DEFAULT_SYSTEM_PROMPT = SeedPrompt(
 _CLIP_PROPOSAL_VARIABLES = (
     "parent_title",
     "parent_duration_human",
+    # The full SRT transcript of the parent video. Placed inline in the
+    # rendered body where the author writes ``{{parent_transcript}}``
+    # (or ``{{transcript}}`` — both are recognised aliases). The
+    # renderer leaves the literal placeholder in the output (because
+    # the variable is intentionally not in the substitution dict — it's
+    # a system-managed input), and the caller splits there so the SRT
+    # lands in its own cache-controlled block. Authors who omit the
+    # placeholder still get the transcript prepended as a separate
+    # block (backwards-compat fallback in ``clipper`` itself).
+    "parent_transcript",
+    "transcript",
     "existing_ranges_block",
     "crop_constraints",
     # Per-kind length bounds — sourced from clipper._PER_KIND_BOUNDS so
@@ -262,6 +273,9 @@ SEED_CLIP_PROPOSALS_HOOK_PROMPT = SeedPrompt(
     body=(
         "Parent video: {{parent_title}}\n"
         "Duration: {{parent_duration_human}}\n\n"
+        "SRT transcript of the parent video — use the timestamps as the "
+        "anchor points for every range you propose:\n"
+        "{{parent_transcript}}\n\n"
         "You are looking for HOOKS — standalone clips that grab attention in "
         "under 30 seconds. Each proposal must:\n"
         "- Be between {{min_seconds}} and {{max_seconds}} seconds long.\n"
@@ -297,6 +311,9 @@ SEED_CLIP_PROPOSALS_SHORT_PROMPT = SeedPrompt(
     body=(
         "Parent video: {{parent_title}}\n"
         "Duration: {{parent_duration_human}}\n\n"
+        "SRT transcript of the parent video — use the timestamps as the "
+        "anchor points for every range you propose:\n"
+        "{{parent_transcript}}\n\n"
         "You are looking for SHORTS — complete bits with a setup→payoff arc "
         "that fit between {{min_seconds}} and {{max_seconds}} seconds. "
         "Each proposal must:\n"
@@ -366,6 +383,9 @@ SEED_CLIP_PROPOSALS_SEGMENT_PROMPT = SeedPrompt(
     body=(
         "Parent video: {{parent_title}}\n"
         "Duration: {{parent_duration_human}}\n\n"
+        "SRT transcript of the parent video — use the timestamps as the "
+        "anchor points for every range you propose:\n"
+        "{{parent_transcript}}\n\n"
         "You are looking for SEGMENTS — coherent topic blocks that pull a "
         "whole sub-topic out of the parent. Each proposal must:\n"
         "- Be at least {{min_seconds}} seconds long. No fixed maximum — as "
