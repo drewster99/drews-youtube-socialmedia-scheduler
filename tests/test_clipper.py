@@ -36,6 +36,70 @@ def test_has_timestamps_in_middle_of_text():
     assert has_timestamps(mixed) is True
 
 
+def test_srt_to_llm_timeline_sorts_and_flattens():
+    """Dual-speaker SRT — two channels separately transcribed and
+    interleaved — has overlapping cues whose indices DON'T track time.
+    The flat-timeline form sorts by start, drops cue numbers and end
+    timestamps, and emits one ``[MM:SS] text`` line per cue. Claude
+    can ground proposals against this; against the raw SRT it
+    hallucinates timestamps.
+    """
+    from yt_scheduler.services.transcripts import srt_to_llm_timeline
+
+    # Speaker A first, speaker B second — interleaved cues with
+    # negative deltas between adjacent cue indices.
+    srt = (
+        "1\n"
+        "00:00:00,160 --> 00:00:04,640\n"
+        "Good morning, Drew.\n\n"
+        "2\n"
+        "00:00:02,320 --> 00:00:06,879\n"
+        "Cut that intro.\n\n"
+        "3\n"
+        "00:00:04,640 --> 00:00:08,000\n"
+        "Okay.\n\n"
+        "4\n"
+        "00:00:06,879 --> 00:00:08,320\n"
+        "Good morning.\n"
+    )
+    out = srt_to_llm_timeline(srt)
+    lines = out.splitlines()
+    assert lines == [
+        "[00:00] Good morning, Drew.",
+        "[00:02] Cut that intro.",
+        "[00:04] Okay.",
+        "[00:06] Good morning.",
+    ]
+    assert "-->" not in out  # no cue end times
+    # Cue numbers gone.
+    for ln in lines:
+        head = ln.split("]", 1)[0]
+        assert head.startswith("[")
+
+
+def test_srt_to_llm_timeline_uses_hour_anchor_past_60min():
+    """Sources over an hour need [H:MM:SS], not [MM:SS]."""
+    from yt_scheduler.services.transcripts import srt_to_llm_timeline
+
+    srt = (
+        "1\n"
+        "01:23:45,000 --> 01:23:50,000\n"
+        "Way past an hour.\n"
+    )
+    out = srt_to_llm_timeline(srt)
+    assert out == "[1:23:45] Way past an hour."
+
+
+def test_srt_to_llm_timeline_falls_back_on_unparseable():
+    """A transcript with no parseable cues passes through unchanged so
+    a downstream call still has SOMETHING to send to the model."""
+    from yt_scheduler.services.transcripts import srt_to_llm_timeline
+
+    plain = "Plain prose with no SRT cues at all."
+    assert srt_to_llm_timeline(plain) == plain
+    assert srt_to_llm_timeline("") == ""
+
+
 def test_eligibility_per_kind_bands():
     from yt_scheduler.services.clipper import is_parent_eligible_for_kind
 

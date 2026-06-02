@@ -35,6 +35,80 @@ def has_timestamps(text: str | None) -> bool:
     return bool(_SRT_TIMESTAMP_SEARCH_RE.search(text))
 
 
+_SRT_TIMESTAMP_PARSE_RE = re.compile(
+    r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*"
+    r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})"
+)
+
+
+def _parse_srt_cues(srt: str) -> list[tuple[float, float, str]]:
+    """Parse an SRT into ``[(start_sec, end_sec, text), ...]``.
+
+    Tolerant of WEBVTT headers, cue-number lines, missing cue numbers
+    (some transcribers omit them), and the ``,``/``.`` decimal split.
+    Returns an empty list when nothing parses — caller falls back to
+    the raw SRT in that case.
+    """
+    cues: list[tuple[float, float, str]] = []
+    blocks = re.split(r"\n\s*\n", (srt or "").replace("\r\n", "\n").strip())
+    for blk in blocks:
+        lines = [ln for ln in blk.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        if lines[0].strip().upper() == "WEBVTT":
+            continue
+        # First or second line is the timing; rest is text.
+        ts_idx = 1 if lines[0].strip().isdigit() and len(lines) > 1 else 0
+        if ts_idx >= len(lines):
+            continue
+        m = _SRT_TIMESTAMP_PARSE_RE.search(lines[ts_idx])
+        if m is None:
+            continue
+        sh, sm, ss, sms, eh, em, es, ems = m.groups()
+        start = int(sh) * 3600 + int(sm) * 60 + int(ss) + int(sms) / 1000.0
+        end = int(eh) * 3600 + int(em) * 60 + int(es) + int(ems) / 1000.0
+        text = " ".join(ln.strip() for ln in lines[ts_idx + 1:]).strip()
+        if not text:
+            continue
+        cues.append((start, end, text))
+    return cues
+
+
+def srt_to_llm_timeline(srt: str) -> str:
+    """Reshape a (possibly dual-speaker / overlapping) SRT into a flat,
+    chronological ``[MM:SS] text`` timeline for the LLM.
+
+    The Whisper / mlx-whisper / Apple Speech transcribers on dual-mic
+    podcast audio produce SRTs with overlapping cues — two speaker
+    channels separately transcribed and interleaved. The cue indices
+    don't line up with chronological order, and adjacent cues can
+    differ in start time by negative seconds. Claude has trouble
+    grounding proposals in an SRT that doesn't flow linearly, so we
+    flatten it: sort by start time and present each cue on its own
+    line with a ``[H:MM:SS]`` or ``[MM:SS]`` anchor at the front.
+    The end timestamp is implicit (the next cue's start), and cue
+    numbers are dropped — neither helps the model.
+
+    Falls back to the raw SRT when no cues parse (so a corrupted or
+    plain-text transcript still flows through).
+    """
+    cues = _parse_srt_cues(srt)
+    if not cues:
+        return srt
+    cues.sort(key=lambda c: c[0])
+
+    def stamp(seconds: float) -> str:
+        seconds = max(0.0, float(seconds))
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = int(seconds % 60)
+        if h:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+    return "\n".join(f"[{stamp(start)}] {text}" for start, _end, text in cues)
+
+
 def srt_to_plain_text(srt: str) -> str:
     """Strip SRT/VTT cue numbers and timestamp lines, leaving the spoken text.
 

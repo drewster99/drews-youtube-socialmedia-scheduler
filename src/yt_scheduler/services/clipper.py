@@ -335,9 +335,20 @@ async def propose_clips_for_kind(
     prompt so Claude doesn't re-propose them, then enforced server-side.
     """
     from yt_scheduler.services import prompts as prompt_service
+    from yt_scheduler.services import transcripts as transcript_service
 
     if not is_parent_eligible_for_kind(parent_duration_seconds, kind):
         return []
+
+    # Flatten the SRT into a single chronological [MM:SS] timeline.
+    # Dual-mic podcast SRTs have overlapping cues (each speaker
+    # separately transcribed and interleaved) — cue index doesn't
+    # track time, adjacent cues can have negative start deltas, and
+    # Claude was hallucinating timestamps that didn't match the
+    # transcript content because of it. The normalised form has one
+    # cue per line, sorted by start, with the cue number / end-time
+    # dropped.
+    transcript_for_llm = transcript_service.srt_to_llm_timeline(transcript_srt)
 
     prompt = await prompt_service.get_prompt_with_fallback(
         _PER_KIND_PROMPT_KEY[kind], project_id=project_id,
@@ -373,7 +384,7 @@ async def propose_clips_for_kind(
     # SRT in its own cache-controlled block. When the placeholder is
     # missing (custom user-edited prompt that dropped it), fall back to
     # prepending the transcript as block 0 so the call still works.
-    user_content = _build_proposal_user_content(rendered_body, transcript_srt)
+    user_content = _build_proposal_user_content(rendered_body, transcript_for_llm)
 
     model = await ai._resolve_model()
     kwargs: dict[str, object] = {
