@@ -41,7 +41,7 @@ _SRT_TIMESTAMP_PARSE_RE = re.compile(
 )
 
 
-def _parse_srt_cues(srt: str) -> list[tuple[float, float, str]]:
+def parse_srt_cues(srt: str) -> list[tuple[float, float, str]]:
     """Parse an SRT into ``[(start_sec, end_sec, text), ...]``.
 
     Tolerant of WEBVTT headers, cue-number lines, missing cue numbers
@@ -92,7 +92,7 @@ def srt_to_llm_timeline(srt: str) -> str:
     Falls back to the raw SRT when no cues parse (so a corrupted or
     plain-text transcript still flows through).
     """
-    cues = _parse_srt_cues(srt)
+    cues = parse_srt_cues(srt)
     if not cues:
         return srt
     cues.sort(key=lambda c: c[0])

@@ -165,12 +165,95 @@ def _overlap_seconds(
     return max(0.0, min(a_end, b_end) - max(a_start, b_start))
 
 
+def _normalize_anchor_text(text: str) -> str:
+    """Collapse whitespace and lower-case for fuzzy anchor matching.
+
+    Claude's transcripts have idiosyncratic whitespace (line-wrapped
+    cues, "uh"/"um" fillers); we want the anchor lookup to tolerate
+    minor punctuation/case differences without being permissive
+    enough to match the wrong line.
+    """
+    return " ".join((text or "").lower().split())
+
+
+def _resolve_anchor_to_seconds(
+    anchor_text: str,
+    cues: list[tuple[float, float, str]],
+    *,
+    position: str = "start",
+) -> tuple[int, float] | None:
+    """Find the cue that begins (``position='start'``) or ends
+    (``position='end'``) the quoted ``anchor_text``. Returns
+    ``(cue_index, start_seconds)`` or ``None`` when no cue matches.
+
+    The SRT this is built for has dual-speaker / line-wrapped cues
+    that are typically 3-8 words each, and Claude tends to quote
+    multi-cue spans by concatenating the cue text. So a start anchor
+    is "first cue whose text is a PREFIX of the anchor" and an end
+    anchor is "last cue whose text is a SUFFIX of the anchor", with
+    longest match winning to avoid picking a 1-word cue that happens
+    to overlap.
+
+    Strict equality and a tighter substring fallback come first so
+    a single-cue anchor still works without the multi-cue heuristics
+    kicking in.
+    """
+    if not anchor_text or not cues:
+        return None
+    norm = _normalize_anchor_text(anchor_text)
+    if not norm:
+        return None
+
+    # 1) Exact normalized equality — short anchor that landed on one cue.
+    for i, (start, _end, text) in enumerate(cues):
+        if _normalize_anchor_text(text) == norm:
+            return i, start
+
+    # 2) Prefix / suffix match against the multi-cue concatenation.
+    #    For start anchors: find cues whose text is a prefix of the
+    #    anchor; pick the longest match (keeps "fall off a cliff" from
+    #    matching a 2-word cue that happens to share the start word).
+    #    For end anchors: same idea but suffix.
+    best: tuple[int, float, int] | None = None  # (idx, start, length)
+    for i, (start, _end, text) in enumerate(cues):
+        cue_norm = _normalize_anchor_text(text)
+        if not cue_norm:
+            continue
+        if position == "start" and norm.startswith(cue_norm):
+            if best is None or len(cue_norm) > best[2]:
+                best = (i, start, len(cue_norm))
+        elif position == "end" and norm.endswith(cue_norm):
+            if best is None or len(cue_norm) > best[2]:
+                best = (i, start, len(cue_norm))
+    if best is not None:
+        return best[0], best[1]
+
+    # 3) Last-resort fallback: substring match with a minimum cue
+    #    length so we don't latch onto trivial words like "okay" /
+    #    "yeah" that recur throughout the transcript. Longest match
+    #    wins again.
+    MIN_CUE_LEN = 15
+    best = None
+    for i, (start, _end, text) in enumerate(cues):
+        cue_norm = _normalize_anchor_text(text)
+        if len(cue_norm) < MIN_CUE_LEN:
+            continue
+        if cue_norm in norm:
+            if best is None or len(cue_norm) > best[2]:
+                best = (i, start, len(cue_norm))
+    if best is not None:
+        return best[0], best[1]
+
+    return None
+
+
 def _validate_proposals(
     raw: list[dict],
     *,
     kind: ClipKind,
     parent_duration_seconds: float,
     existing_ranges: list[tuple[float, float]],
+    cues: list[tuple[float, float, str]] | None = None,
 ) -> list[ProposedClip]:
     """Filter Claude's raw tool output against the kind's contract.
 
@@ -179,6 +262,13 @@ def _validate_proposals(
     the band, and dropping is the right user experience (we show the user
     the proposals we accepted, not "the model misbehaved"). Caps at
     :data:`_OUTPUT_CAP_PER_KIND` after filtering.
+
+    When ``cues`` is supplied (parsed transcript cues), the proposal's
+    ``start_text_anchor`` / ``end_text_anchor`` fields are resolved
+    back to real start/end times. Proposals whose anchor text can't
+    be found in the cue list are dropped — that's the only way to
+    keep Claude from hallucinating timestamps that don't match any
+    transcript line.
     """
     min_s, max_s = _PER_KIND_BOUNDS[kind]
     effective_max = max_s if max_s is not None else parent_duration_seconds
@@ -203,6 +293,67 @@ def _validate_proposals(
                 "Dropping clip proposal with non-finite times: %r", entry,
             )
             continue
+
+        # Anchor resolution. When cues are provided, REPLACE start/end
+        # with the resolved cue boundaries. Drop the proposal entirely
+        # if either anchor can't be located — that's a hallucination.
+        if cues is not None:
+            start_anchor = str(entry.get("start_text_anchor") or "").strip()
+            end_anchor = str(entry.get("end_text_anchor") or "").strip()
+            if not start_anchor or not end_anchor:
+                logger.info(
+                    "Dropping clip proposal %r: missing anchor text "
+                    "(start=%r end=%r)", title, start_anchor, end_anchor,
+                )
+                continue
+            start_match = _resolve_anchor_to_seconds(
+                start_anchor, cues, position="start",
+            )
+            end_match = _resolve_anchor_to_seconds(
+                end_anchor, cues, position="end",
+            )
+            if start_match is None:
+                logger.info(
+                    "Dropping clip proposal %r: start anchor not found "
+                    "in transcript — Claude likely hallucinated. "
+                    "anchor=%r", title, start_anchor,
+                )
+                continue
+            if end_match is None:
+                logger.info(
+                    "Dropping clip proposal %r: end anchor not found "
+                    "in transcript — Claude likely hallucinated. "
+                    "anchor=%r", title, end_anchor,
+                )
+                continue
+            start_idx, resolved_start = start_match
+            end_idx, _ = end_match
+            # End time = start of the cue AFTER the end-anchor (so the
+            # anchored line plays in full). When the end anchor is the
+            # last cue, fall back to that cue's own end.
+            if end_idx + 1 < len(cues):
+                resolved_end = cues[end_idx + 1][0]
+            else:
+                resolved_end = cues[end_idx][1]
+            if resolved_end <= resolved_start:
+                logger.info(
+                    "Dropping clip proposal %r: end-anchor cue (%d) "
+                    "precedes or equals start-anchor cue (%d).",
+                    title, end_idx, start_idx,
+                )
+                continue
+            # Log the correction so a reviewer can see Claude's numbers
+            # vs the anchor-resolved truth.
+            if abs(resolved_start - start) > 1.0 or abs(resolved_end - end) > 1.0:
+                logger.info(
+                    "Anchor-resolved %s %r: Claude said %.1f-%.1f, "
+                    "anchors resolved to %.1f-%.1f (delta start=%.1fs "
+                    "end=%.1fs)", kind, title, start, end,
+                    resolved_start, resolved_end,
+                    resolved_start - start, resolved_end - end,
+                )
+            start = resolved_start
+            end = resolved_end
 
         if not title:
             logger.info("Dropping clip proposal with empty title: %r", entry)
@@ -278,20 +429,47 @@ _PROPOSAL_TOOL = {
                 "items": {
                     "type": "object",
                     "properties": {
+                        "start_text_anchor": {
+                            "type": "string",
+                            "description": (
+                                "Copy the EXACT text of the transcript "
+                                "timeline line you want the clip to start "
+                                "at — everything after the [MM:SS] anchor "
+                                "on that line, verbatim. Do not summarise, "
+                                "do not paraphrase, do not combine multiple "
+                                "lines. The server resolves this text back "
+                                "to a real timestamp by finding it in the "
+                                "transcript; proposals whose anchor text "
+                                "can't be located are dropped."
+                            ),
+                        },
+                        "end_text_anchor": {
+                            "type": "string",
+                            "description": (
+                                "Same rules as start_text_anchor, for the "
+                                "LAST transcript line that should be "
+                                "included in the clip. The clip's end "
+                                "time is the start of the line AFTER this "
+                                "anchor (so the anchor line plays in full)."
+                            ),
+                        },
                         "start_seconds": {
                             "type": "number",
                             "description": (
-                                "Sample-accurate start of the clip, in "
-                                "seconds, taken from a transcript "
-                                "timestamp without rounding."
+                                "Numeric start, in seconds, from the "
+                                "[MM:SS] anchor on the start line. "
+                                "Provided as a cross-check — if it "
+                                "disagrees with the resolved anchor by "
+                                "more than a few seconds, the anchor "
+                                "wins. Do not estimate."
                             ),
                         },
                         "end_seconds": {
                             "type": "number",
                             "description": (
-                                "Sample-accurate end of the clip, in "
-                                "seconds, taken from a transcript "
-                                "timestamp without rounding."
+                                "Numeric end, in seconds. Same rules as "
+                                "start_seconds — kept as a cross-check; "
+                                "the anchor is authoritative."
                             ),
                         },
                         "title": {
@@ -308,7 +486,12 @@ _PROPOSAL_TOOL = {
                         },
                     },
                     "required": [
-                        "start_seconds", "end_seconds", "title", "reason",
+                        "start_text_anchor",
+                        "end_text_anchor",
+                        "start_seconds",
+                        "end_seconds",
+                        "title",
+                        "reason",
                     ],
                 },
             },
@@ -349,6 +532,13 @@ async def propose_clips_for_kind(
     # cue per line, sorted by start, with the cue number / end-time
     # dropped.
     transcript_for_llm = transcript_service.srt_to_llm_timeline(transcript_srt)
+    # Parsed cues are passed to _validate_proposals so anchor texts
+    # the model quotes can be resolved back to real cue boundaries.
+    transcript_cues = transcript_service.parse_srt_cues(transcript_srt)
+    # Keep cues sorted by start time — _resolve_anchor_to_seconds walks
+    # them in order and the order-preserving "end = next cue's start"
+    # rule depends on chronological ordering.
+    transcript_cues.sort(key=lambda c: c[0])
 
     prompt = await prompt_service.get_prompt_with_fallback(
         _PER_KIND_PROMPT_KEY[kind], project_id=project_id,
@@ -422,6 +612,7 @@ async def propose_clips_for_kind(
         kind=kind,
         parent_duration_seconds=parent_duration_seconds,
         existing_ranges=existing_ranges,
+        cues=transcript_cues if transcript_cues else None,
     )
 
 
