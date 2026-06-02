@@ -24,6 +24,11 @@
         <label class="generate-kind-row">
             <input type="checkbox" id="gen-kind-hook" checked>
             Hooks (5–30 s)
+            <span class="generate-kind-max">
+                up to
+                <input type="number" id="gen-max-hook" value="8" min="1" max="20" step="1"
+                       style="width:3.5rem; margin: 0 0.2rem;">
+            </span>
             <span class="generate-kind-crop">
                 <input type="checkbox" id="gen-crop-hook" checked>
                 <span>9:16 vertical crop</span>
@@ -32,6 +37,11 @@
         <label class="generate-kind-row">
             <input type="checkbox" id="gen-kind-short" checked>
             Shorts (45–75 s)
+            <span class="generate-kind-max">
+                up to
+                <input type="number" id="gen-max-short" value="8" min="1" max="20" step="1"
+                       style="width:3.5rem; margin: 0 0.2rem;">
+            </span>
             <span class="generate-kind-crop">
                 <input type="checkbox" id="gen-crop-short" checked>
                 <span>9:16 vertical crop</span>
@@ -40,6 +50,11 @@
         <label class="generate-kind-row">
             <input type="checkbox" id="gen-kind-segment" checked>
             Segments (60 s+)
+            <span class="generate-kind-max">
+                up to
+                <input type="number" id="gen-max-segment" value="8" min="1" max="20" step="1"
+                       style="width:3.5rem; margin: 0 0.2rem;">
+            </span>
             <span class="generate-kind-crop">
                 <input type="checkbox" id="gen-crop-segment">
                 <span>9:16 vertical crop</span>
@@ -291,6 +306,20 @@ document.getElementById('gen-go').addEventListener('click', async () => {
         short: document.getElementById('gen-crop-short').checked,
         segment: document.getElementById('gen-crop-segment').checked,
     };
+    // Per-kind max-proposals cap. Clamp to the input element's min/max
+    // so a hand-edited DOM value still lands inside the server's
+    // accepted range.
+    const clampMax = (id) => {
+        const el = document.getElementById(id);
+        const n = parseInt(el.value, 10);
+        if (!Number.isFinite(n)) return 8;
+        return Math.max(1, Math.min(20, n));
+    };
+    const maxPerKind = {
+        hook: clampMax('gen-max-hook'),
+        short: clampMax('gen-max-short'),
+        segment: clampMax('gen-max-segment'),
+    };
     document.getElementById('gen-go').disabled = true;
     showSection('gen-progress');
     document.getElementById('gen-progress-text').textContent = 'Starting…';
@@ -304,7 +333,9 @@ document.getElementById('gen-go').addEventListener('click', async () => {
         resp = await fetch(`/api/projects/${projectSlug}/videos/${parentId}/promos/generate/preview`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ kinds, crop_vertical: cropVertical }),
+            body: JSON.stringify({
+                kinds, crop_vertical: cropVertical, max_per_kind: maxPerKind,
+            }),
             signal: abortController.signal,
         });
         body = await resp.json();

@@ -402,6 +402,25 @@ async def generate_preview(
         k: bool(raw_crop.get(k, k in ("hook", "short")))
         for k in requested_kinds
     }
+    raw_max = payload.get("max_per_kind") or {}
+    max_per_kind: dict[str, int] = {}
+    for k in requested_kinds:
+        raw_val = raw_max.get(k, clipper.DEFAULT_MAX_PROPOSALS_PER_KIND)
+        try:
+            n = int(raw_val)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                400,
+                f"max_per_kind.{k} must be an integer between 1 and "
+                f"{clipper.MAX_PROPOSALS_PER_KIND_CAP}.",
+            )
+        if n < 1 or n > clipper.MAX_PROPOSALS_PER_KIND_CAP:
+            raise HTTPException(
+                400,
+                f"max_per_kind.{k} = {n} out of range "
+                f"[1, {clipper.MAX_PROPOSALS_PER_KIND_CAP}].",
+            )
+        max_per_kind[k] = n
 
     parent_duration = float(parent.get("duration_seconds") or 0.0)
     if parent_duration <= 0:
@@ -455,6 +474,7 @@ async def generate_preview(
 
     existing_ranges = await _existing_cut_ranges(parent_id, int(project["id"]))
 
+    eligible_max_per_kind = {k: max_per_kind[k] for k in eligible_kinds}
     job_id = await clipper.start_generate_job(
         parent_id=parent_id,
         project_id=int(project["id"]),
@@ -464,6 +484,7 @@ async def generate_preview(
         kinds=eligible_kinds,
         crop_vertical_for_kind=crop_vertical,
         existing_ranges_per_kind=existing_ranges,
+        max_per_kind=eligible_max_per_kind,
     )
 
     # Source-quality warnings on the parent are useful to surface here

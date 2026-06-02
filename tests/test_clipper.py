@@ -275,6 +275,69 @@ def test_validate_caps_at_eight():
     assert len(result) == 8
 
 
+def test_validate_honours_user_max_proposals():
+    """When the caller passes a per-kind cap (the value picked in the
+    Generate-from-source UI), the validator stops at that count instead
+    of the default 8, but is still bounded by MAX_PROPOSALS_PER_KIND_CAP
+    so a tampered request body can't ask for thousands."""
+    from yt_scheduler.services.clipper import (
+        MAX_PROPOSALS_PER_KIND_CAP, _validate_proposals,
+    )
+
+    raw = [
+        {"start_seconds": i * 60, "end_seconds": i * 60 + 20, "title": f"t{i}", "reason": "x"}
+        for i in range(50)
+    ]
+    # 3 → exactly 3 accepted (well under cap).
+    assert len(_validate_proposals(
+        raw, kind="hook", parent_duration_seconds=10000.0,
+        existing_ranges=[], max_proposals=3,
+    )) == 3
+    # Way over the ceiling → clamped to MAX_PROPOSALS_PER_KIND_CAP.
+    assert len(_validate_proposals(
+        raw, kind="hook", parent_duration_seconds=10000.0,
+        existing_ranges=[], max_proposals=9999,
+    )) == MAX_PROPOSALS_PER_KIND_CAP
+    # 0 / negative → fall back to default (8), same as None.
+    assert len(_validate_proposals(
+        raw, kind="hook", parent_duration_seconds=10000.0,
+        existing_ranges=[], max_proposals=0,
+    )) == 8
+
+
+async def test_start_generate_job_stores_normalised_max_per_kind(monkeypatch):
+    """start_generate_job must clamp + default the per-kind cap before
+    stashing it on the job dict — the background task reads it back
+    without re-validating."""
+    from yt_scheduler.services import clipper
+
+    async def _noop(_job_id):
+        return None
+
+    monkeypatch.setattr(clipper, "_run_generate_job", _noop)
+    monkeypatch.setattr(clipper, "spawn_background", lambda coro, name=None: None)
+
+    job_id = await clipper.start_generate_job(
+        parent_id="vid_test",
+        project_id=1,
+        parent_video_path="/tmp/x.mp4",
+        parent_title="Parent",
+        parent_duration_seconds=600.0,
+        kinds=["hook", "short", "segment"],
+        crop_vertical_for_kind={"hook": True, "short": True, "segment": False},
+        existing_ranges_per_kind={"hook": [], "short": [], "segment": []},
+        max_per_kind={"hook": 3, "short": 9999, "segment": -5},
+    )
+    job = clipper._GENERATE_JOBS[job_id]
+    try:
+        assert job["max_per_kind"]["hook"] == 3
+        assert job["max_per_kind"]["short"] == clipper.MAX_PROPOSALS_PER_KIND_CAP
+        # Negative → default fallback.
+        assert job["max_per_kind"]["segment"] == clipper.DEFAULT_MAX_PROPOSALS_PER_KIND
+    finally:
+        clipper._GENERATE_JOBS.pop(job_id, None)
+
+
 def test_validate_drops_out_of_parent_bounds():
     from yt_scheduler.services.clipper import _validate_proposals
 

@@ -1481,6 +1481,13 @@ dialog.modal-xwide {
     color: var(--text-muted, #888);
 }
 .generate-kind-crop input { margin: 0; }
+.generate-kind-max {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.2rem;
+    font-size: 0.85em;
+    color: var(--text-muted, #888);
+}
 
 .generate-proposal-grid {
     display: grid;

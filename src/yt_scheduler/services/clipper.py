@@ -72,7 +72,14 @@ _PARENT_HEADROOM_SECONDS: float = 15.0
 
 # Server-side cap. Claude is also told this in the prompt body, but we
 # enforce it regardless so a prompt edit can't silently raise it.
-_OUTPUT_CAP_PER_KIND: int = 8
+# The Generate-from-source UI lets the user pick a per-kind cap; this
+# is the default applied when the caller hasn't specified one, and
+# ``MAX_PROPOSALS_PER_KIND_CAP`` is the absolute ceiling we'll honour
+# (also the upper bound on the UI's number input).
+DEFAULT_MAX_PROPOSALS_PER_KIND: int = 8
+MAX_PROPOSALS_PER_KIND_CAP: int = 20
+# Back-compat alias used by older call sites + tests.
+_OUTPUT_CAP_PER_KIND: int = DEFAULT_MAX_PROPOSALS_PER_KIND
 
 # Overlap with an existing same-kind range that exceeds this fraction of
 # the proposed clip's length → drop the proposal. The threshold is loose
@@ -263,6 +270,7 @@ def _validate_proposals(
     parent_duration_seconds: float,
     existing_ranges: list[tuple[float, float]],
     cues: list[tuple[float, float, str]] | None = None,
+    max_proposals: int | None = None,
 ) -> list[ProposedClip]:
     """Filter Claude's raw tool output against the kind's contract.
 
@@ -270,7 +278,8 @@ def _validate_proposals(
     Claude will sometimes pad slightly past the cap or land just outside
     the band, and dropping is the right user experience (we show the user
     the proposals we accepted, not "the model misbehaved"). Caps at
-    :data:`_OUTPUT_CAP_PER_KIND` after filtering.
+    ``max_proposals`` (defaulting to
+    :data:`DEFAULT_MAX_PROPOSALS_PER_KIND`) after filtering.
 
     When ``cues`` is supplied (parsed transcript cues), the proposal's
     ``start_text_anchor`` / ``end_text_anchor`` fields are resolved
@@ -281,6 +290,10 @@ def _validate_proposals(
     """
     min_s, max_s = _PER_KIND_BOUNDS[kind]
     effective_max = max_s if max_s is not None else parent_duration_seconds
+    if max_proposals is None or max_proposals <= 0:
+        cap = DEFAULT_MAX_PROPOSALS_PER_KIND
+    else:
+        cap = min(max_proposals, MAX_PROPOSALS_PER_KIND_CAP)
 
     accepted: list[ProposedClip] = []
     for entry in raw:
@@ -403,7 +416,7 @@ def _validate_proposals(
             reason=reason,
         ))
 
-        if len(accepted) >= _OUTPUT_CAP_PER_KIND:
+        if len(accepted) >= cap:
             break
 
     return accepted
@@ -519,18 +532,31 @@ async def propose_clips_for_kind(
     existing_ranges: list[tuple[float, float]],
     crop_vertical: bool,
     project_id: int,
+    max_proposals: int | None = None,
 ) -> list[ProposedClip]:
     """Single per-kind Claude call. See module docstring for contract.
 
     ``existing_ranges`` is a list of (start_seconds, end_seconds) tuples for
     clips already cut from this parent under this same kind — fed to the
     prompt so Claude doesn't re-propose them, then enforced server-side.
+
+    ``max_proposals`` is the per-kind cap the user picked in the UI;
+    rendered into the prompt's ``{{max_proposals}}`` variable and also
+    enforced server-side by :func:`_validate_proposals` so a prompt-edit
+    can't raise it past ``MAX_PROPOSALS_PER_KIND_CAP``.
     """
     from yt_scheduler.services import prompts as prompt_service
     from yt_scheduler.services import transcripts as transcript_service
 
     if not is_parent_eligible_for_kind(parent_duration_seconds, kind):
         return []
+
+    if max_proposals is None or max_proposals <= 0:
+        effective_max_proposals = DEFAULT_MAX_PROPOSALS_PER_KIND
+    else:
+        effective_max_proposals = min(
+            max_proposals, MAX_PROPOSALS_PER_KIND_CAP,
+        )
 
     # Flatten the SRT into a single chronological [MM:SS] timeline.
     # Dual-mic podcast SRTs have overlapping cues (each speaker
@@ -571,7 +597,7 @@ async def propose_clips_for_kind(
             ),
             "min_seconds": f"{int(min_s)}",
             "max_seconds": f"{int(max_s)}" if max_s is not None else "",
-            "max_proposals": str(_OUTPUT_CAP_PER_KIND),
+            "max_proposals": str(effective_max_proposals),
         },
     )
 
@@ -622,6 +648,7 @@ async def propose_clips_for_kind(
         parent_duration_seconds=parent_duration_seconds,
         existing_ranges=existing_ranges,
         cues=transcript_cues if transcript_cues else None,
+        max_proposals=effective_max_proposals,
     )
 
 
@@ -1371,6 +1398,7 @@ async def propose_all_clips(
     parent_duration_seconds: float,
     existing_ranges_per_kind: dict[ClipKind, list[tuple[float, float]]],
     project_id: int,
+    max_per_kind: dict[ClipKind, int] | None = None,
 ) -> dict[ClipKind, list[ProposedClip]]:
     """Fan out one Claude call per requested kind, in parallel.
 
@@ -1378,9 +1406,15 @@ async def propose_all_clips(
     Kinds the parent is ineligible for are returned as empty lists so the
     UI can render "0 proposals" rather than the request silently
     disappearing.
+
+    ``max_per_kind`` is the user-selected cap per kind from the
+    Generate-from-source UI. When ``None`` (or a kind missing from it),
+    falls back to :data:`DEFAULT_MAX_PROPOSALS_PER_KIND`.
     """
     if not kinds:
         return {}
+
+    caps = max_per_kind or {}
 
     async def _one(k: ClipKind) -> tuple[ClipKind, list[ProposedClip]]:
         proposals = await propose_clips_for_kind(
@@ -1391,6 +1425,7 @@ async def propose_all_clips(
             existing_ranges=existing_ranges_per_kind.get(k, []),
             crop_vertical=crop_vertical_for_kind.get(k, False),
             project_id=project_id,
+            max_proposals=caps.get(k),
         )
         return k, proposals
 
@@ -1604,6 +1639,7 @@ async def start_generate_job(
     kinds: list[ClipKind],
     crop_vertical_for_kind: dict[ClipKind, bool],
     existing_ranges_per_kind: dict[ClipKind, list[tuple[float, float]]],
+    max_per_kind: dict[ClipKind, int] | None = None,
 ) -> str:
     """Queue a preview job. Returns the job_id the client polls.
 
@@ -1617,6 +1653,17 @@ async def start_generate_job(
     """
     _evict_stale_generate_jobs()
     job_id = "gen_" + secrets.token_hex(8)
+    # Normalise the per-kind cap dict so the job carries one int per
+    # requested kind. Missing entries (e.g. caller didn't pass one) get
+    # the default — keeping later code from having to None-check.
+    normalised_max: dict[ClipKind, int] = {}
+    incoming_max = max_per_kind or {}
+    for k in kinds:
+        raw = incoming_max.get(k)
+        if isinstance(raw, int) and raw > 0:
+            normalised_max[k] = min(raw, MAX_PROPOSALS_PER_KIND_CAP)
+        else:
+            normalised_max[k] = DEFAULT_MAX_PROPOSALS_PER_KIND
     _GENERATE_JOBS[job_id] = {
         "job_id": job_id,
         "parent_id": parent_id,
@@ -1626,6 +1673,7 @@ async def start_generate_job(
         "parent_duration_seconds": parent_duration_seconds,
         "kinds": list(kinds),
         "crop_vertical": dict(crop_vertical_for_kind),
+        "max_per_kind": normalised_max,
         "existing_ranges_per_kind": {
             k: list(v) for k, v in existing_ranges_per_kind.items()
         },
@@ -1758,6 +1806,7 @@ async def _run_generate_job(job_id: str) -> None:
             parent_duration_seconds=job["parent_duration_seconds"],
             existing_ranges_per_kind=job["existing_ranges_per_kind"],
             project_id=int(job["project_id"]),
+            max_per_kind=job.get("max_per_kind"),
         )
 
         # Refinement — for kinds the user toggled for vertical crop,

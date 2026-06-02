@@ -2011,11 +2011,11 @@ Bulk-upload promo children under a primary video. Each upload runs through the m
 
 **Purpose** — Kick off a Generate-from-source preview job. Claude proposes hook / short / segment ranges out of the parent's local MP4 using the parent's SRT transcript. Returns a job_id the client polls; the heavy lifting (transcription if missing + the three parallel Claude calls) runs in the background.
 
-**Request body** — `{"kinds": [...], "crop_vertical": {"hook": bool, "short": bool, "segment": bool}}`. `kinds` is a non-empty subset of `hook | short | segment`. `crop_vertical` defaults to `{hook: true, short: true, segment: false}` for any kind not explicitly set.
+**Request body** — `{"kinds": [...], "crop_vertical": {"hook": bool, "short": bool, "segment": bool}, "max_per_kind": {"hook": int, "short": int, "segment": int}}`. `kinds` is a non-empty subset of `hook | short | segment`. `crop_vertical` defaults to `{hook: true, short: true, segment: false}` for any kind not explicitly set. `max_per_kind` is the per-kind cap on how many proposals Claude is asked for (and how many the server will keep after filtering); each entry must be an integer in `[1, 20]`, default `8`. Both Claude's prompt and the server-side validator honour this value.
 
 **Response 200** — `{"job_id": "gen_...", "eligible_kinds": [...], "ineligible_kinds": [...], "parent_warnings": [...], "parent_video_file_url": str|null, "parent_browser_playable": bool|null, "parent_youtube_id": str}`. `eligible_kinds` is the subset of `kinds` whose minimum required parent length is satisfied (each kind needs `kind_max + 15 s` of parent); `ineligible_kinds` is the rest. `parent_warnings` is the same `quality_warnings` shape from `GET /file-info`. The `parent_*` fields tell the client how to render proposal previews (`<video src="…">` when `parent_browser_playable` is true, YouTube iframe with `?start=&end=` otherwise).
 
-**Errors** — `400` (no kinds requested; parent duration unknown; parent longer than 4 h; no requested kind eligible; parent has no local file; transcript was hand-edited and lacks timestamps), `404` (project or parent missing or parent is itself a child).
+**Errors** — `400` (no kinds requested; `max_per_kind` value out of `[1, 20]` or not an integer; parent duration unknown; parent longer than 4 h; no requested kind eligible; parent has no local file; transcript was hand-edited and lacks timestamps), `404` (project or parent missing or parent is itself a child).
 
 ### `GET /api/projects/{slug}/videos/{parent_id}/promos/generate/jobs/{job_id}`
 
