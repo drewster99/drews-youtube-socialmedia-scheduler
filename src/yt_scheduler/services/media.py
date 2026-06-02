@@ -311,6 +311,31 @@ _VERTICAL_OUTPUT_HEIGHT: int = 1920
 _HARDWARE_BITRATE: str = "6M"
 
 
+def _videotoolbox_bitrate_for_output(width: int | None, height: int | None) -> str:
+    """Pick a sensible videotoolbox bitrate based on output resolution.
+
+    Hand-tuned to match libx264 ``-crf 20`` perceived quality on typical
+    talking-head + camera content at each resolution. The bands are
+    intentionally coarse — videotoolbox quality plateaus past these
+    floors. When the dimensions are unknown we conservatively assume
+    1080p so we don't underbit a 4K output.
+    """
+    if width is None or height is None:
+        return _HARDWARE_BITRATE
+    # Use the larger dimension so 1080x1920 vertical and 1920x1080
+    # landscape pick the same bucket.
+    big = max(int(width), int(height))
+    if big >= 3000:   # 4K-class (3840x2160 or close)
+        return "18M"
+    if big >= 2000:   # 1440p-class
+        return "10M"
+    if big >= 1500:   # 1080p-class (1920x1080, 1080x1920)
+        return "6M"
+    if big >= 1000:   # 720p-class
+        return "4M"
+    return "2M"       # sub-720p (640x360, 640x480, etc.)
+
+
 def _vertical_crop_filter(x_shift_normalized: float) -> str:
     """ffmpeg ``-vf`` filter chain that crops to 9:16 centered + scales.
 
@@ -391,14 +416,15 @@ def extract_clip(
     ``encoder`` selects the H.264 encoder:
 
     * ``"auto"`` — videotoolbox when ffmpeg has it built in,
-      libx264 otherwise.
+      libx264 otherwise. Bitrate is matched to the OUTPUT resolution
+      via :func:`_videotoolbox_bitrate_for_output` so 4K parents
+      aren't crushed at the 1080p target.
     * ``"hardware"`` — force ``h264_videotoolbox``. Raises if the
       detection at module-import said it's not available.
     * ``"software"`` — force ``libx264``.
 
     ``preset`` is libx264-only — pass e.g. ``"ultrafast"`` to trade
-    encode quality for throughput (used by the preview-cut path so
-    16 software cuts don't burn minutes). Ignored when ``encoder``
+    encode quality for throughput. Ignored when ``encoder``
     resolves to videotoolbox (which has its own speed model).
 
     Callers wrap the call in the appropriate semaphore in
@@ -419,15 +445,13 @@ def extract_clip(
             )
         use_hardware = True
     elif encoder == "auto":
-        # ``auto`` is conservative on purpose: videotoolbox needs an
-        # explicit bitrate (``_HARDWARE_BITRATE``) which we've tuned for
-        # the fixed 1080×1920 vertical output. For a non-vertical cut
-        # the output resolution matches the source, so a 4K parent
-        # would be re-encoded at the same 6 Mbps and look terrible —
-        # libx264 with its quality-targeted CRF is the right tool there.
-        # Hardware kicks in only when we know the output is being
-        # scaled down to 1080p.
-        use_hardware = vertical_crop and hardware_encoder_available("h264")
+        # videotoolbox is the right tool when available regardless of
+        # vertical_crop; the previous gate ("only when vertical_crop")
+        # left segments stuck on slow libx264 default-preset. The
+        # output-resolution-aware bitrate picker means a 4K segment no
+        # longer gets crushed at 6 Mbps — it picks 18 Mbps for 4K,
+        # 10 Mbps for 1440p, 6 Mbps for 1080p, etc.
+        use_hardware = hardware_encoder_available("h264")
     # else "software" — leave use_hardware False.
 
     cmd: list[str] = ["ffmpeg", "-y"]
@@ -442,12 +466,21 @@ def extract_clip(
         cmd.extend(["-vf", _vertical_crop_filter(x_shift_normalized)])
 
     if use_hardware:
-        # videotoolbox doesn't accept -crf; needs -b:v. Quality at 6M
-        # for 1080p is comparable to libx264 -crf 20 for typical
-        # content.
+        # Pick the bitrate by what the OUTPUT will actually be: 9:16
+        # crop locks output to 1080×1920 (use 1080 as the larger dim),
+        # otherwise mirror the source's max dim. Probe lazily; on
+        # failure we conservatively assume 1080p.
+        if vertical_crop:
+            bitrate = _videotoolbox_bitrate_for_output(1080, 1920)
+        else:
+            probe = probe_video_file(video_path)
+            bitrate = _videotoolbox_bitrate_for_output(
+                probe.width if probe else None,
+                probe.height if probe else None,
+            )
         cmd.extend([
             "-c:v", "h264_videotoolbox",
-            "-b:v", _HARDWARE_BITRATE,
+            "-b:v", bitrate,
             "-c:a", "aac",
             "-movflags", "+faststart",
             str(output),

@@ -66,6 +66,23 @@ def test_vertical_crop_filter_escapes_min_comma():
     assert ":0,scale=" in out
 
 
+def test_videotoolbox_bitrate_buckets_match_resolution():
+    """4K-class inputs get a higher bitrate so they don't get crushed
+    at the 1080p target. ≤720p sources stay modest so a 640×360 cut
+    doesn't waste bits on noise."""
+    from yt_scheduler.services.media import _videotoolbox_bitrate_for_output
+
+    assert _videotoolbox_bitrate_for_output(3840, 2160) == "18M"   # 4K
+    assert _videotoolbox_bitrate_for_output(2560, 1440) == "10M"   # 1440p
+    assert _videotoolbox_bitrate_for_output(1920, 1080) == "6M"    # 1080p landscape
+    assert _videotoolbox_bitrate_for_output(1080, 1920) == "6M"    # 1080p vertical
+    assert _videotoolbox_bitrate_for_output(1280, 720) == "4M"     # 720p
+    assert _videotoolbox_bitrate_for_output(640, 360) == "2M"      # sub-720p
+    # Unknown dims → conservative 1080p default so we don't underbit.
+    assert _videotoolbox_bitrate_for_output(None, None) == "6M"
+    assert _videotoolbox_bitrate_for_output(None, 1080) == "6M"
+
+
 def test_vertical_crop_filter_handles_fractional_9_16_sources():
     """640x360 source: ih*9/16 = 202.5. Without floor() the crop filter
     expression contains a fractional value and ffmpeg exits 8. With
@@ -204,16 +221,27 @@ def test_extract_clip_hardware_for_vertical_crop_when_auto(
     assert "libx264" not in cmd
 
 
-def test_extract_clip_auto_stays_software_without_vertical_crop(
+def test_extract_clip_auto_uses_hardware_without_vertical_crop(
     monkeypatch: pytest.MonkeyPatch, tmp_path,
 ):
-    """Even with hardware available, ``auto`` defers to libx264 when no
-    crop is requested, because the hardware path's fixed bitrate would
-    butcher a 4K-source horizontal cut."""
+    """``auto`` now picks videotoolbox whenever ffmpeg has it built
+    in, regardless of ``vertical_crop``. The bitrate-by-output-
+    resolution helper avoids the original concern (a 4K source
+    crushed at a 1080p bitrate) by scaling the target up for large
+    inputs. Confirm hardware is selected and that the per-resolution
+    bitrate appears."""
     from yt_scheduler.services import media
 
     monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(media, "_HARDWARE_ENCODERS", frozenset({"h264_videotoolbox"}))
+    # Stub probe so the bitrate picker has dimensions to chew on.
+    monkeypatch.setattr(
+        media, "probe_video_file",
+        lambda _p: media.VideoProbe(
+            duration_seconds=10.0, width=1920, height=1080,
+            bitrate_bps=None, size_bytes=None,
+        ),
+    )
     captured = _capture_cmd(monkeypatch, media)
 
     src = tmp_path / "src.mp4"
@@ -224,8 +252,10 @@ def test_extract_clip_auto_stays_software_without_vertical_crop(
     )
 
     cmd = captured[0]
-    assert "libx264" in cmd
-    assert "h264_videotoolbox" not in cmd
+    assert "h264_videotoolbox" in cmd
+    assert "libx264" not in cmd
+    assert "-b:v" in cmd
+    assert "6M" in cmd  # 1080p band
 
 
 def test_extract_clip_software_when_auto_and_unavailable(
@@ -309,16 +339,17 @@ class _TracingSemaphore:
 
 
 @pytest.mark.asyncio
-async def test_cut_clip_picks_lane_matching_extract_clip_choice(
+async def test_cut_clip_picks_hardware_lane_when_available(
     monkeypatch: pytest.MonkeyPatch, tmp_path,
 ):
     """The semaphore lane held during the cut must match the encoder
     extract_clip will actually use, otherwise hardware sessions and
     software cores skew under load.
 
-    vertical_crop + hardware available → hardware lane.
-    Non-vertical OR no hardware → software lane.
-    """
+    Hardware available → hardware lane for BOTH vertical and non-
+    vertical cuts (the bitrate-by-output-resolution helper now keeps
+    large sources from being undersized). Software lane only when
+    hardware is unavailable (covered by the next test)."""
     from yt_scheduler.services import clipper, media
 
     monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
@@ -342,7 +373,7 @@ async def test_cut_clip_picks_lane_matching_extract_clip_choice(
         parent_video_path=tmp_path / "src.mp4",
         proposal=proposal, vertical_crop=False,
     )
-    assert lanes == ["hw", "sw"]
+    assert lanes == ["hw", "hw"]
 
 
 @pytest.mark.asyncio

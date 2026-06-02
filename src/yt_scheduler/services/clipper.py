@@ -1003,9 +1003,11 @@ async def cut_clip_from_parent(
     # we hold matches the actual encoder lane we're about to use. If we
     # mis-routed (e.g. acquired the hardware lane for a software cut),
     # the system would still be correct but lane utilisation would skew.
-    will_use_hardware = (
-        vertical_crop and media_service.hardware_encoder_available("h264")
-    )
+    # Mirror extract_clip's "auto" choice: hardware whenever ffmpeg
+    # has h264_videotoolbox, regardless of vertical_crop. The output-
+    # resolution-aware bitrate picker inside extract_clip handles the
+    # 4K case so we don't crush large sources at the 1080p bitrate.
+    will_use_hardware = media_service.hardware_encoder_available("h264")
     semaphore = (
         _HARDWARE_CUT_SEMAPHORE if will_use_hardware
         else _SOFTWARE_CUT_SEMAPHORE
@@ -1074,9 +1076,11 @@ async def cut_preview_for_proposal(
     cleanup sweep can glob the unadopted (rejected / failed)
     remainder without bookkeeping per proposal on the job dict.
     """
-    will_use_hardware = (
-        vertical_crop and media_service.hardware_encoder_available("h264")
-    )
+    # Mirror extract_clip's "auto" choice: hardware whenever ffmpeg
+    # has h264_videotoolbox, regardless of vertical_crop. The output-
+    # resolution-aware bitrate picker inside extract_clip handles the
+    # 4K case so we don't crush large sources at the 1080p bitrate.
+    will_use_hardware = media_service.hardware_encoder_available("h264")
     semaphore = (
         _HARDWARE_CUT_SEMAPHORE if will_use_hardware
         else _SOFTWARE_CUT_SEMAPHORE
@@ -1615,21 +1619,43 @@ async def _run_generate_job(job_id: str) -> None:
         # still produce files via asyncio.gather(return_exceptions=True).
         job["state"] = "cutting_previews"
         total = sum(len(v) for v in proposals.values())
-        job["progress_message"] = f"Cutting {total} clip{'s' if total != 1 else ''}…"
+        # cuts_completed is read by the polling endpoint so the UI can
+        # show "M of N" instead of just a single static label. Bumped
+        # by each task's wrapper as soon as ffmpeg returns.
+        job["cuts_total"] = total
+        job["cuts_completed"] = 0
+        job["progress_message"] = f"Cutting clips… 0 of {total}"
         parent_path = Path(job["parent_video_path"])
+
+        async def _cut_and_count(
+            k: str, p_idx: int, p: ProposedClip, kind_crop: bool, x_shift: float,
+        ) -> Path:
+            try:
+                return await cut_preview_for_proposal(
+                    job_id=job_id,
+                    parent_video_path=parent_path,
+                    proposal=p,
+                    idx=p_idx,
+                    vertical_crop=kind_crop,
+                    x_shift_normalized=x_shift,
+                )
+            finally:
+                # Count failures too — completed means "we're done
+                # waiting on this slot", not "succeeded". The error
+                # path stashes preview_error separately.
+                job["cuts_completed"] = job.get("cuts_completed", 0) + 1
+                done = job["cuts_completed"]
+                job["progress_message"] = f"Cutting clips… {done} of {total}"
+
         preview_tasks: list[tuple[str, int, asyncio.Task]] = []
         for k, v in proposals.items():
             kind_crop = crop_for_kind.get(k, False)
             for idx, p in enumerate(v):
                 pub = public_per_kind[k][idx]
                 preview_tasks.append((k, idx, asyncio.create_task(
-                    cut_preview_for_proposal(
-                        job_id=job_id,
-                        parent_video_path=parent_path,
-                        proposal=p,
-                        idx=idx,
-                        vertical_crop=kind_crop,
-                        x_shift_normalized=float(pub.get("x_shift_normalized") or 0.0),
+                    _cut_and_count(
+                        k, idx, p, kind_crop,
+                        float(pub.get("x_shift_normalized") or 0.0),
                     ),
                 )))
         if preview_tasks:
