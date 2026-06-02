@@ -109,41 +109,28 @@
         for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
             if (signal && signal.aborted) throw new ChunkedUploadError('cancelled', 0, true);
             try {
-                const resp = await fetch(
+                const result = await postBlobXhr(
                     `/api/uploads/${encodeURIComponent(uploadId)}/chunk/${offset}`,
-                    {
-                        method: 'POST',
-                        // Raw octet-stream body — no multipart. Small
-                        // (8 MB) Blob slice doesn't hit Safari's
-                        // stream-exhaustion bug.
-                        body: blob,
-                        signal,
-                    },
+                    blob,
+                    signal,
                 );
-                if (resp.ok) {
-                    const body = await resp.json();
+                if (result.status >= 200 && result.status < 300) {
+                    const body = result.body || {};
                     return body.received_bytes;
                 }
                 // 4xx are not retriable (offset mismatch, oversize,
                 // unknown upload) — surface immediately so the caller
                 // can decide what to do.
-                if (resp.status >= 400 && resp.status < 500) {
-                    const body = await safeJson(resp);
+                if (result.status >= 400 && result.status < 500) {
                     throw new ChunkedUploadError(
-                        `chunk failed: ${(body && body.detail) || resp.status}`,
-                        resp.status,
+                        `chunk failed: ${(result.body && result.body.detail) || result.status}`,
+                        result.status,
                     );
                 }
                 // 5xx — retry with backoff.
-                lastError = new ChunkedUploadError(`HTTP ${resp.status}`, resp.status);
+                lastError = new ChunkedUploadError(`HTTP ${result.status}`, result.status);
             } catch (e) {
                 if (e instanceof ChunkedUploadError) throw e;
-                // AbortError from fetch when the AbortController fires —
-                // propagate as cancellation, don't retry.
-                if (e && (e.name === 'AbortError' || (signal && signal.aborted))) {
-                    throw new ChunkedUploadError('cancelled', 0, true);
-                }
-                // Network error: retriable.
                 lastError = new ChunkedUploadError(e.message || 'network', 0);
             }
             if (attempt < RETRY_DELAYS_MS.length) {
@@ -156,6 +143,51 @@
             }
         }
         throw lastError;
+    }
+
+    // Use XHR (not fetch) for the chunk body. Safari/WebKit has had
+    // recurring bugs with fetch + Blob body, surfaced as "Load failed"
+    // before the request even leaves the browser. XHR with a small
+    // sliced Blob is the path Safari handles cleanly. The previous
+    // ``xhr.send(file)`` bug is specific to sending the whole multi-GB
+    // File — small slices don't trip it.
+    function postBlobXhr(url, blob, signal) {
+        return new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', url);
+            xhr.responseType = 'text';
+            // Don't set Content-Type explicitly — the browser will
+            // derive one from the Blob's own type, and explicit
+            // headers around Blob bodies have historically been one
+            // of the trigger conditions for Safari's stream-
+            // exhaustion bug. Server doesn't check Content-Type on
+            // chunk POSTs.
+            function onAbort() {
+                try { xhr.abort(); } catch (e) {}
+            }
+            if (signal) {
+                if (signal.aborted) {
+                    reject(new ChunkedUploadError('cancelled', 0, true));
+                    return;
+                }
+                signal.addEventListener('abort', onAbort, { once: true });
+            }
+            xhr.onload = () => {
+                if (signal) signal.removeEventListener('abort', onAbort);
+                let body = null;
+                try { body = JSON.parse(xhr.responseText || '{}'); } catch (e) { /* leave null */ }
+                resolve({ status: xhr.status, body });
+            };
+            xhr.onerror = () => {
+                if (signal) signal.removeEventListener('abort', onAbort);
+                reject(new Error('network'));
+            };
+            xhr.onabort = () => {
+                if (signal) signal.removeEventListener('abort', onAbort);
+                reject(new ChunkedUploadError('cancelled', 0, true));
+            };
+            xhr.send(blob);
+        });
     }
 
     async function cancel(uploadId) {
