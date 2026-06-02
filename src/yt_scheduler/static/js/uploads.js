@@ -145,23 +145,32 @@
         throw lastError;
     }
 
-    // Use XHR (not fetch) for the chunk body. Safari/WebKit has had
-    // recurring bugs with fetch + Blob body, surfaced as "Load failed"
-    // before the request even leaves the browser. XHR with a small
-    // sliced Blob is the path Safari handles cleanly. The previous
-    // ``xhr.send(file)`` bug is specific to sending the whole multi-GB
-    // File — small slices don't trip it.
-    function postBlobXhr(url, blob, signal) {
+    // Send the chunk body as an ArrayBuffer, NOT a Blob.
+    //
+    // Safari/WebKit raises "request body stream exhausted" whenever
+    // an XHR / fetch body is a Blob — the engine internally reads
+    // the Blob's one-shot stream once during a pre-send pass and the
+    // actual send sees an empty stream. The bug fires on small
+    // sliced Blobs and on whole Files alike; "small slices avoid it"
+    // (my last guess) was wrong. ArrayBuffer is plain bytes with no
+    // stream semantics, so Safari has nothing to exhaust.
+    //
+    // Memory: we hold one chunk's worth of bytes (~8 MB) in RAM while
+    // the request is in flight, then release it. Bounded.
+    async function postBlobXhr(url, blob, signal) {
+        if (signal && signal.aborted) {
+            throw new ChunkedUploadError('cancelled', 0, true);
+        }
+        // Materialise the Blob into a single ArrayBuffer once, BEFORE
+        // calling xhr.send. arrayBuffer() returns a Promise.
+        const buffer = await blob.arrayBuffer();
         return new Promise((resolve, reject) => {
             const xhr = new XMLHttpRequest();
             xhr.open('POST', url);
             xhr.responseType = 'text';
-            // Don't set Content-Type explicitly — the browser will
-            // derive one from the Blob's own type, and explicit
-            // headers around Blob bodies have historically been one
-            // of the trigger conditions for Safari's stream-
-            // exhaustion bug. Server doesn't check Content-Type on
-            // chunk POSTs.
+            // No explicit Content-Type — the server doesn't check it
+            // for chunk POSTs and an explicit header was historically
+            // another trigger condition for the WebKit body bug.
             function onAbort() {
                 try { xhr.abort(); } catch (e) {}
             }
@@ -186,7 +195,7 @@
                 if (signal) signal.removeEventListener('abort', onAbort);
                 reject(new ChunkedUploadError('cancelled', 0, true));
             };
-            xhr.send(blob);
+            xhr.send(buffer);
         });
     }
 
