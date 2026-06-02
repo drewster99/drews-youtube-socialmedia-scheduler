@@ -20,6 +20,7 @@ Generated from the router source. When endpoints change, update this file. (CLAU
 - [Built-in social OAuth flows (`/api/oauth`)](#built-in-social-oauth-flows-apioauth) — `oauth_routes.py`
 - [Social credentials (`/api/social-credentials`)](#social-credentials-apisocial-credentials) — `social_credentials_routes.py`
 - [YouTube imports (`/api/projects/{slug}/imports`)](#youtube-imports-apiprojectsslugimports) — `import_routes.py`
+- [Chunked uploads (`/api/uploads`)](#chunked-uploads-apiuploads) — `uploads_routes.py`
 
 ## Conventions
 
@@ -630,14 +631,14 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 
 ### `POST /api/videos/upload`
 
-**Purpose** — Upload a video to YouTube and track it inside a project.
+**Purpose** — Upload a video to YouTube and track it inside a project. The bytes have already been streamed to disk via the chunked-upload protocol (`POST /api/uploads/init` → `/chunk/{offset}` → `/finalize`) — this endpoint takes the resulting `upload_id` instead of a multipart body.
 
-**Request body** — multipart/form-data:
+**Request body** — `application/json`:
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `video_file` | file | yes | Video binary. |
-| `thumbnail_file` | file | no | Optional thumbnail image. |
+| `upload_id` | string | yes | Finalized chunked-upload id for the video file. |
+| `thumbnail_upload_id` | string | no | Finalized chunked-upload id for an optional thumbnail. |
 | `title` | string | yes | Video title. |
 | `description` | string | no | Default `""`. |
 | `tags` | string | no | Comma-separated tag list. |
@@ -645,7 +646,7 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 | `privacy_status` | string | no | `unlisted` (default), `private`, `public`. |
 | `publish_at` | string | no | ISO 8601 future timestamp; tells YouTube to scheduled-publish at that time. |
 | `project_slug` | string | no | Target project. Default `default`. |
-| `item_type` | string | no | One of `episode | short | segment | hook`. Default `episode`. `standalone` is rejected here — standalone items don't go through YouTube; use a separate creation path (forthcoming). |
+| `item_type` | string | no | One of `episode | short | segment | hook`. Default `episode`. `standalone` is rejected here — standalone items don't go through YouTube; use `POST /api/videos/items` instead. |
 | `parent_item_id` | string | no | Optional parent item id. Required-shape only for `short`, `segment`, `hook`; rejected for `episode`. The FK is enforced by `videos.parent_item_id REFERENCES videos(id) ON DELETE SET NULL`. |
 
 The endpoint refuses with `400` when the target project has no YouTube channel bound (`youtube_channel_id IS NULL`) — uploads to YouTube need a bound channel.
@@ -671,7 +672,7 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 
 **Purpose** — Create an item that does **not** go through YouTube. Used for `standalone` items (a GitHub-repo post with screenshots, an "AI Chess" project announcement, an image-only Bluesky post) and for `hook` items where the user wants to post the clip directly to social without also uploading to YouTube.
 
-**Request body** — `multipart/form-data`:
+**Request body** — `application/json`. When a video / thumbnail is attached, its bytes go through the chunked-upload protocol first.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -682,8 +683,8 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 | `item_type` | string | no | One of `standalone | hook`. Default `standalone`. `episode/short/segment` are rejected here — they need YouTube and go through `/api/videos/upload`. |
 | `parent_item_id` | string | no | Optional parent item id (e.g. a hook attaching to its episode). Rejected for `standalone`. |
 | `url` | string | no | The value behind `{{url}}` for this item. For a hook attached to a parent, omit this and `{{url}}` will resolve to the hook's own URL (NULL → empty); use `{{episode_url}}` to link to the parent. |
-| `video_file` | file | no | Optional video file. When present, this is the file `{{video}}` attaches in templates and what the platform-specific Posters upload as a media asset. |
-| `thumbnail_file` | file | no | Optional thumbnail image. |
+| `upload_id` | string | no | Finalized chunked-upload id for the item's video file. When present, this is the file `{{video}}` attaches in templates and what the platform-specific Posters upload as a media asset. |
+| `thumbnail_upload_id` | string | no | Finalized chunked-upload id for an optional thumbnail. |
 
 **Response 200**:
 
@@ -958,7 +959,7 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 
 **Query params** — `force` (int, default `0`): set to `1` to bypass the 422 sanity checks below in a single round-trip. The browser UI does **not** use this — it lets the server keep the upload and confirms via `/source-file/finalize` so multi-GB sources don't have to be re-uploaded. `force=1` remains supported for direct API callers and tests.
 
-**Request body** — `multipart/form-data` with a single `file` field. (A raw octet-stream body would let the server stream straight to `UPLOAD_DIR` in one pass, but Safari/WebKit has a body-stream-exhaustion bug when `xhr.send(file)` is combined with custom headers — multipart side-steps that. The trade-off is a double-disk-write on the server: Starlette buffers the body into a `SpooledTemporaryFile` in `$TMPDIR` first, then the handler re-reads and writes to `UPLOAD_DIR`. Tracking this for a future chunked-upload protocol.)
+**Request body** — `application/json` with `{"upload_id": str}`. The bytes have already been streamed to disk via the chunked-upload protocol (`POST /api/uploads/init` → `/chunk/{offset}` → `/finalize`); this endpoint just consumes the finalized file.
 
 **Response 200** — `{"status": "ok", "original_name": str, "duration_seconds": float|null, "width": int|null, "height": int|null, "bitrate_bps": int|null, "size_bytes": int|null, "source_origin": "user_attached", "transcript_cleared": bool}`. `transcript_cleared` is `true` when the call also blanked the row's transcript columns because the user forced past a `duration_mismatch`.
 
@@ -2100,3 +2101,50 @@ Terminal jobs (`done` / `failed`) are evicted from the in-memory job dict 30 min
 **Errors** — `404` (project / parent missing), `400` (parent is itself a child / parent has no publish time / readiness gates fail / no eligible children / malformed `delays`).
 
 **Side effects** — For each scheduled video: writes `videos.publish_at`, sets `videos.status='scheduled'`, registers the APScheduler `publish_video_job` (which also re-stages per-post social jobs), and stamps `publish_at_manual = 0` so future cascade routines may sweep these rows.
+
+
+## Chunked uploads (`/api/uploads`)
+
+All large-file domain endpoints (`POST /api/videos/upload`, `POST /api/videos/items`, `POST /api/videos/{id}/source-file`) consume an `upload_id` produced by this chunked-upload protocol rather than accepting a multipart body. The protocol exists because:
+
+* FastAPI / Starlette's `UploadFile` buffers the body into a `SpooledTemporaryFile` in `$TMPDIR` before invoking the handler, doubling disk I/O on multi-GB sources (8 GB body → ~24 GB of total disk traffic).
+* Safari/WebKit raises "request body stream exhausted" when `xhr.send(file)` is combined with custom request headers — the entire body stream is consumed once for an engine pre-flight and then can't be re-read for the actual send.
+
+Slicing the file into ~8 MB chunks side-steps both: each chunk is small enough not to spill to a temp file on the server, and small `Blob.slice(...)` bodies don't trip Safari's stream-exhaustion bug.
+
+### `POST /api/uploads/init`
+
+**Purpose** — Reserve an upload slot.
+
+**Request body** — `{"filename": str, "size": int}`. `size` is the byte count of the source.
+
+**Response 200** — `{"upload_id": str, "chunk_size": int}`. The client slices into chunks no larger than `chunk_size` (currently 8 MB).
+
+**Errors** — `400` (missing fields, non-positive size), `413` (size exceeds the 10 GiB global cap).
+
+### `POST /api/uploads/{upload_id}/chunk/{offset}`
+
+**Purpose** — Append the raw request body at `offset` (which must equal the upload's current `received_bytes` — out-of-order or overlapping chunks are rejected to avoid silent corruption).
+
+**Request body** — Raw octet-stream bytes (no multipart, no custom headers — small chunks slide under Safari's stream-exhaustion bug).
+
+**Response 200** — `{"received_bytes": int}` (the new running total).
+
+**Errors** — `404` unknown / expired upload, `409` offset mismatch or upload finalized, `413` chunk would exceed declared size, `400` empty body / chunk over the per-chunk cap.
+
+### `POST /api/uploads/{upload_id}/finalize`
+
+**Purpose** — Declare the upload complete. Verifies received_bytes equals the declared size and renames `upload_<id>.partial` to `upload_<id>.<ext>`.
+
+**Response 200** — `{"upload_id", "size", "filename"}`. The server-internal `path` isn't surfaced.
+
+**Errors** — `404` unknown / expired, `409` incomplete (received_bytes ≠ declared size).
+
+### `DELETE /api/uploads/{upload_id}`
+
+**Purpose** — Drop an in-flight or finalized upload and unlink its on-disk file. Idempotent.
+
+**Response 200** — `{"status": "cancelled"}` when the entry existed, `{"status": "gone"}` when it was already removed (TTL'd / consumed / cancelled).
+
+**Lifetime** — Uploads expire 30 minutes after the last successful append. A startup sweep removes any `upload_*.partial` files from a previous process.
+

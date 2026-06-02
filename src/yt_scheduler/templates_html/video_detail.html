@@ -3192,14 +3192,13 @@ async function refreshFileInfo() {
 // In-flight upload XHR — kept on this scope so the Close button can
 // abort it. Replacing a multi-GB master can take minutes; the user
 // expects "Close" to mean "I changed my mind", not "let it finish in
-// the background". xhr.abort() also tells the server to clean up the
-// partial file via the streaming cap.
-let fiReplaceXhr = null;
-
+// the background". The AbortController also signals the chunked-upload
+// helper to fire DELETE /api/uploads/{id} so the server-side partial
+// is cleaned up immediately rather than waiting for the TTL sweep.
 function closeFileInfoModal() {
-    if (fiReplaceXhr) {
-        try { fiReplaceXhr.abort(); } catch (e) { /* already done */ }
-        fiReplaceXhr = null;
+    if (typeof fiReplaceAbort !== 'undefined' && fiReplaceAbort) {
+        try { fiReplaceAbort.abort(); } catch (e) { /* already done */ }
+        fiReplaceAbort = null;
     }
     document.getElementById('file-info-modal').close();
 }
@@ -3279,98 +3278,70 @@ function promptForceReplacement(issues) {
     });
 }
 
-// Upload via XHR (fetch can't report upload progress). Uses multipart
-// FormData rather than a raw octet-stream body even though raw-stream
-// would let the server skip its temp-file buffering pass: Safari's
-// WebKit has a bug where ``xhr.send(file)`` combined with custom
-// request headers consumes the file's body stream twice, raising
-// "request body stream exhausted" before any bytes hit the wire. The
-// FormData path doesn't trigger that bug, so we eat the server-side
-// double-disk-write cost until we have a chunked-upload protocol.
-//
-// Callbacks (all optional):
-//   onPreparing(): browser is preparing the request.
-//   onProgress(loaded, total): bytes pushed so far / Content-Length.
-// xhrPromise resolves to {status, body} or rejects on network error / abort.
-function xhrUpload(url, file, onProgress, onPreparing) {
-    return new Promise((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        fiReplaceXhr = xhr;
-        xhr.open('POST', url);
-        xhr.responseType = 'text';
-        xhr.upload.addEventListener('loadstart', () => {
-            if (onPreparing) onPreparing();
-        });
-        xhr.upload.addEventListener('progress', (ev) => {
-            if (ev.lengthComputable) onProgress(ev.loaded, ev.total);
-        });
-        xhr.onload = () => {
-            if (fiReplaceXhr === xhr) fiReplaceXhr = null;
-            let body = {};
-            try { body = JSON.parse(xhr.responseText || '{}'); } catch (e) { /* ignore */ }
-            resolve({ status: xhr.status, body });
-        };
-        xhr.onerror = () => {
-            if (fiReplaceXhr === xhr) fiReplaceXhr = null;
-            reject(new Error('network'));
-        };
-        xhr.onabort = () => {
-            if (fiReplaceXhr === xhr) fiReplaceXhr = null;
-            reject(new Error('aborted'));
-        };
-        const form = new FormData();
-        form.append('file', file);
-        xhr.send(form);
-    });
-}
+// Replace Source goes through the chunked-upload protocol
+// (POST /api/uploads/init → /chunk/{offset} → /finalize). The server's
+// /source-file endpoint then takes a JSON {upload_id} rather than a
+// file body — see static/js/uploads.js for the slicing helper.
+// fiReplaceAbort is an AbortController we can fire from Close to
+// cancel an in-flight upload and tell the server to drop the partial.
+let fiReplaceAbort = null;
 
 async function uploadReplacementSource(file) {
     const status = document.getElementById('fi-replace-status');
     const progress = document.getElementById('fi-replace-progress');
     status.style.display = '';
     status.style.color = '';
-    // Initial status — replaced once the browser starts pushing bytes.
-    // Safari buffers multi-GB Blob bodies before opening the TCP
-    // connection so the very first second of an 8 GB upload can sit
-    // here for a long time; we tell the user that's expected rather
-    // than letting it look like the upload is hung at 0%.
-    const sizeMb = (file.size / (1024 * 1024)).toFixed(0);
-    status.textContent = `Preparing ${file.name} (${sizeMb} MB)… large files may sit here for a minute before bytes start flowing.`;
     progress.style.display = '';
     progress.value = 0;
 
-    let firstProgressSeen = false;
-    let result;
+    const sizeMb = (file.size / (1024 * 1024)).toFixed(0);
+    status.textContent = `Uploading ${file.name} (${sizeMb} MB)…`;
+
+    if (fiReplaceAbort) { try { fiReplaceAbort.abort(); } catch (e) {} }
+    fiReplaceAbort = new AbortController();
+    const signal = fiReplaceAbort.signal;
+
+    let uploadId;
     try {
-        result = await xhrUpload(
-            `/api/videos/${videoId}/source-file`,
-            file,
-            (loaded, total) => {
-                firstProgressSeen = true;
+        const result = await window.chunkedUpload(file, {
+            signal,
+            onProgress: (loaded, total) => {
                 const pct = Math.floor((loaded / total) * 100);
                 progress.value = pct;
                 const mb = (n) => (n / (1024 * 1024)).toFixed(1);
                 status.textContent = `Uploading ${file.name}… ${pct}% (${mb(loaded)} / ${mb(total)} MB)`;
             },
-            () => {
-                // loadstart — XHR queued, browser is preparing the body.
-                if (!firstProgressSeen) {
-                    status.textContent = `Preparing ${file.name} (${sizeMb} MB)…`;
-                }
-            },
-        );
+        });
+        uploadId = result.upload_id;
     } catch (e) {
         progress.style.display = 'none';
-        if (e.message === 'aborted') {
+        if (e && e.cancelled) {
             status.style.display = 'none';
         } else {
             status.style.color = 'var(--danger)';
-            status.textContent = 'Upload failed: network error.';
+            status.textContent = `Upload failed: ${(e && e.message) || 'network error'}`;
         }
         return;
     }
 
+    // Bytes are on disk; now ask the domain endpoint to do the swap.
+    status.textContent = 'Verifying source file…';
     progress.style.display = 'none';
+
+    let resp, body;
+    try {
+        resp = await fetch(`/api/videos/${videoId}/source-file`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ upload_id: uploadId }),
+        });
+        body = await resp.json();
+    } catch (e) {
+        status.style.color = 'var(--danger)';
+        status.textContent = 'Could not reach the server.';
+        return;
+    }
+    const result = { status: resp.status, body };
 
     if (result.status === 422) {
         const issues = (result.body.detail && result.body.detail.issues) || [];

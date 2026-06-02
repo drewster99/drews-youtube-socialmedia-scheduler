@@ -88,16 +88,33 @@ def _post_source_file(
     client: TestClient, url: str, filename: str, body: bytes,
     *, extra_headers: dict[str, str] | None = None,
 ):
-    """Replace-source uploads use ``multipart/form-data`` with a single
-    ``file`` field — same wire format the browser UI sends. Safari's
-    raw-body XHR bug makes a single-pass octet-stream path unworkable
-    in the browser, so the server speaks multipart and the tests
-    mirror that.
+    """Drive Replace Source end-to-end: chunked upload then POST the
+    domain endpoint with the resulting ``upload_id``. Mirrors what the
+    browser does — there's no longer a multipart wire shape for
+    Replace Source, so the tests have to go through the same gate.
     """
+    init = client.post(
+        "/api/uploads/init",
+        json={"filename": filename, "size": len(body)},
+    )
+    assert init.status_code == 200, init.text
+    upload_id = init.json()["upload_id"]
+    if body:
+        chunk = client.post(
+            f"/api/uploads/{upload_id}/chunk/0",
+            content=body,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert chunk.status_code == 200, chunk.text
+    fin = client.post(f"/api/uploads/{upload_id}/finalize")
+    assert fin.status_code == 200, fin.text
+    headers = {"Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
     return client.post(
         url,
-        files={"file": (filename, body, "application/octet-stream")},
-        headers=(extra_headers or None),
+        json={"upload_id": upload_id},
+        headers=headers,
     )
 
 

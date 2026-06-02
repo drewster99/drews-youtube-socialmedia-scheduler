@@ -71,10 +71,28 @@ def test_items_upload_uses_canonical_name_and_records_original(
     from yt_scheduler.config import DB_PATH, UPLOAD_DIR
 
     evil = "../../../../tmp/pwned_by_test.mp4"
+    # Upload bytes via the chunked-upload protocol. The evil filename
+    # is the one the chunked-upload service records as the "original
+    # name" — the on-disk name is server-chosen.
+    init = client.post(
+        "/api/uploads/init", json={"filename": evil, "size": 64},
+    )
+    assert init.status_code == 200, init.text
+    uid = init.json()["upload_id"]
+    chunk = client.post(
+        f"/api/uploads/{uid}/chunk/0", content=b"\x00" * 64,
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert chunk.status_code == 200, chunk.text
+    fin = client.post(f"/api/uploads/{uid}/finalize")
+    assert fin.status_code == 200, fin.text
+
     resp = client.post(
         "/api/videos/items",
-        data={"title": "safe-name test", "item_type": "standalone"},
-        files={"video_file": (evil, b"\x00" * 64, "video/mp4")},
+        json={
+            "title": "safe-name test", "item_type": "standalone",
+            "upload_id": uid,
+        },
     )
     assert resp.status_code == 200, resp.text
     video_id = resp.json()["video_id"]

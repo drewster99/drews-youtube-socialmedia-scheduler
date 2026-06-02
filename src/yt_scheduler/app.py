@@ -36,6 +36,7 @@ from yt_scheduler.routers import (
     social_routes,
     template_routes,
     transcript_routes,
+    uploads_routes,
     video_routes,
 )
 from yt_scheduler.services.auth import backfill_channel_assets, backfill_channel_ids
@@ -264,6 +265,21 @@ async def lifespan(app: FastAPI):
             "Orphan pending-source sweep failed at startup; continuing",
         )
 
+    # Chunked-upload partials (upload_*.partial) from a previous run.
+    # The chunked-upload service's in-memory table doesn't survive a
+    # restart, so any .partial file is unreachable and must go.
+    try:
+        from yt_scheduler.services import chunked_uploads as _chunked
+        removed = _chunked.cleanup_orphan_partial_uploads()
+        if removed:
+            logger.info(
+                "Swept %d orphan chunked-upload partial(s) on startup", removed,
+            )
+    except Exception:
+        logger.exception(
+            "Orphan chunked-upload sweep failed at startup; continuing",
+        )
+
     yield
     stop_scheduler()
     await close_db()
@@ -345,6 +361,7 @@ app.include_router(project_variable_routes.router)
 app.include_router(item_variable_routes.router)
 app.include_router(item_image_routes.router)
 app.include_router(media_routes.router)
+app.include_router(uploads_routes.router)
 
 
 # --- HTML pages -------------------------------------------------------------

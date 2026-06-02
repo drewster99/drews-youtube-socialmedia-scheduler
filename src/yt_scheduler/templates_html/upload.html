@@ -172,28 +172,76 @@ document.getElementById('upload-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const btn = document.getElementById('upload-btn');
     const progress = document.getElementById('upload-progress');
+    const progressText = progress.querySelector('.progress-text');
+    const progressFill = progress.querySelector('.progress-fill');
+
+    const videoFile = document.getElementById('video_file').files[0];
+    if (!videoFile) {
+        showToast('Pick a video file first.', 'error');
+        return;
+    }
+    const thumbnailFile = document.getElementById('thumbnail_file').files[0] || null;
 
     btn.disabled = true;
     btn.textContent = 'Uploading...';
     progress.style.display = 'block';
+    if (progressFill) progressFill.style.width = '0%';
 
-    const formData = new FormData(e.target);
-    formData.set('project_slug', uploadProjectSlug);
-
-    // datetime-local inputs are TZ-naive; replace with ISO+offset so the
-    // server doesn't treat local wall-time as UTC.
-    const rawPublishAt = formData.get('publish_at');
-    if (rawPublishAt) {
-        formData.set('publish_at', new Date(rawPublishAt).toISOString());
-    }
+    const setProgressText = (txt) => {
+        if (progressText) progressText.textContent = txt;
+    };
+    const setProgressPct = (pct) => {
+        if (progressFill) progressFill.style.width = `${pct}%`;
+    };
 
     try {
+        // 1) Chunk the video into UPLOAD_DIR.
+        setProgressText(`Uploading ${videoFile.name}…`);
+        const videoResult = await window.chunkedUpload(videoFile, {
+            onProgress: (loaded, total) => {
+                const pct = Math.floor((loaded / total) * 100);
+                setProgressPct(pct);
+                const mb = (n) => (n / (1024 * 1024)).toFixed(1);
+                setProgressText(
+                    `Uploading ${videoFile.name}… ${pct}% `
+                    + `(${mb(loaded)} / ${mb(total)} MB)`,
+                );
+            },
+        });
+
+        // 2) Optional thumbnail.
+        let thumbnailUploadId = null;
+        if (thumbnailFile) {
+            setProgressText('Uploading thumbnail…');
+            const thumbResult = await window.chunkedUpload(thumbnailFile, {});
+            thumbnailUploadId = thumbResult.upload_id;
+        }
+
+        // 3) Build the JSON payload and call the domain endpoint.
+        setProgressText('Sending to YouTube…');
+        setProgressPct(100);
+        const formData = new FormData(e.target);
+        formData.set('project_slug', uploadProjectSlug);
+        const rawPublishAt = formData.get('publish_at');
+        const payload = {
+            upload_id: videoResult.upload_id,
+            thumbnail_upload_id: thumbnailUploadId,
+            title: formData.get('title') || '',
+            description: formData.get('description') || '',
+            tags: formData.get('tags') || '',
+            pinned_links: formData.get('pinned_links') || '',
+            privacy_status: formData.get('privacy_status') || 'unlisted',
+            publish_at: rawPublishAt ? new Date(rawPublishAt).toISOString() : '',
+            project_slug: uploadProjectSlug,
+            item_type: formData.get('item_type') || 'episode',
+            parent_item_id: formData.get('parent_item_id') || '',
+        };
         const resp = await fetch('/api/videos/upload', {
             method: 'POST',
-            body: formData,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
         });
         const result = await resp.json();
-
         if (resp.ok) {
             showToast('Video uploaded successfully!', 'success');
             if (result.thumbnail_error) {
@@ -204,7 +252,8 @@ document.getElementById('upload-form').addEventListener('submit', async (e) => {
             showToast(result.detail || 'Upload failed', 'error');
         }
     } catch (err) {
-        showToast('Upload failed: ' + err.message, 'error');
+        const msg = (err && err.message) ? err.message : String(err);
+        showToast('Upload failed: ' + msg, 'error');
     } finally {
         btn.disabled = false;
         btn.textContent = 'Upload to YouTube';

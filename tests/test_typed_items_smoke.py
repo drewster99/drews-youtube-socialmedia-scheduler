@@ -120,7 +120,7 @@ def test_create_project_with_kind_and_project_url(client: TestClient) -> None:
 def test_items_endpoint_creates_standalone(client: TestClient) -> None:
     resp = client.post(
         "/api/videos/items",
-        data={
+        json={
             "title": "Chess preview",
             "description": "Working on chess",
             "item_type": "standalone",
@@ -144,7 +144,7 @@ def test_items_endpoint_creates_standalone(client: TestClient) -> None:
 def test_items_rejects_episode_type(client: TestClient) -> None:
     resp = client.post(
         "/api/videos/items",
-        data={"title": "x", "item_type": "episode"},
+        json={"title": "x", "item_type": "episode"},
     )
     assert resp.status_code == 400
     assert "hook" in resp.json()["detail"].lower()
@@ -154,7 +154,7 @@ def test_items_rejects_episode_type(client: TestClient) -> None:
 def test_items_rejects_standalone_with_parent(client: TestClient) -> None:
     resp = client.post(
         "/api/videos/items",
-        data={"title": "x", "item_type": "standalone", "parent_item_id": "fake"},
+        json={"title": "x", "item_type": "standalone", "parent_item_id": "fake"},
     )
     assert resp.status_code == 400
 
@@ -177,14 +177,28 @@ def test_upload_rejects_when_project_has_no_channel(client: TestClient) -> None:
     ).json()
     assert proj["youtube_channel_id"] is None
 
+    # Bytes are uploaded via the chunked-upload protocol first.
+    init = client.post(
+        "/api/uploads/init", json={"filename": "clip.mp4", "size": 16},
+    )
+    assert init.status_code == 200, init.text
+    uid = init.json()["upload_id"]
+    chunk = client.post(
+        f"/api/uploads/{uid}/chunk/0", content=b"\x00" * 16,
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert chunk.status_code == 200, chunk.text
+    fin = client.post(f"/api/uploads/{uid}/finalize")
+    assert fin.status_code == 200, fin.text
+
     resp = client.post(
         "/api/videos/upload",
-        data={
+        json={
             "title": "x",
             "item_type": "episode",
             "project_slug": "gh-test",
+            "upload_id": uid,
         },
-        files={"video_file": ("clip.mp4", b"\x00" * 16, "video/mp4")},
     )
     assert resp.status_code == 400, resp.text
     assert "youtube channel" in resp.json()["detail"].lower()
@@ -194,7 +208,7 @@ def test_item_variable_crud_round_trip(client: TestClient) -> None:
     # Need a real item to attach variables to.
     item = client.post(
         "/api/videos/items",
-        data={"title": "test", "item_type": "standalone"},
+        json={"title": "test", "item_type": "standalone"},
     ).json()
     video_id = item["video_id"]
 

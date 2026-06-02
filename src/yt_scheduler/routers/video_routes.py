@@ -13,7 +13,7 @@ import time
 import weakref
 from pathlib import Path
 
-from fastapi import APIRouter, Body, Form, Header, UploadFile, File, HTTPException, Query
+from fastapi import APIRouter, Body, UploadFile, File, HTTPException, Query
 
 from yt_scheduler.config import (
     UPLOAD_DIR,
@@ -24,7 +24,7 @@ from yt_scheduler.config import (
 )
 from yt_scheduler.database import get_db
 from yt_scheduler.services import (
-    ai, auto_actions, events, media as media_service, tiers,
+    ai, auto_actions, chunked_uploads, events, media as media_service, tiers,
     transcripts as transcript_service, youtube,
 )
 from yt_scheduler.services.auth import set_active_project
@@ -343,29 +343,44 @@ _YT_BACKED_ITEM_TYPES = {"episode", "short", "segment", "hook"}
 
 
 @router.post("/upload")
-async def upload_video(
-    video_file: UploadFile = File(...),
-    thumbnail_file: UploadFile | None = File(None),
-    title: str = Form(...),
-    description: str = Form(""),
-    tags: str = Form(""),  # comma-separated
-    pinned_links: str = Form(""),
-    privacy_status: str = Form("unlisted"),
-    publish_at: str = Form(""),
-    project_slug: str = Form("default"),
-    item_type: str = Form("episode"),
-    parent_item_id: str = Form(""),
-):
+async def upload_video(payload: dict = Body(...)):
     """Upload a video to YouTube and track it inside a project as a typed item.
 
-    Form fields:
-        item_type: one of ``episode | short | segment | hook``. ``standalone``
-            isn't valid here — standalone items don't go through YouTube; use
-            the ``POST /api/videos/items`` endpoint instead (Phase D).
-        parent_item_id: optional. Required-shape only for ``short``, ``segment``,
-            ``hook``; for ``episode`` it must be empty.
+    Wire format: JSON. The video bytes have already been streamed to
+    disk via the chunked-upload protocol (``POST /api/uploads/init`` →
+    ``/chunk/{offset}`` → ``/finalize``); this endpoint consumes the
+    resulting ``upload_id`` rather than accepting a multipart body.
+
+    Body (JSON):
+        upload_id (str, required): finalized chunked-upload id for the
+            video file.
+        thumbnail_upload_id (str, optional): finalized chunked-upload id
+            for the thumbnail.
+        title (str, required), description, tags (comma-separated),
+        pinned_links, privacy_status (default ``unlisted``),
+        publish_at, project_slug (default ``default``),
+        item_type (default ``episode``; must be in
+        ``_YT_BACKED_ITEM_TYPES``),
+        parent_item_id (required-shape only for ``short`` / ``segment``
+        / ``hook``).
     """
     from yt_scheduler.services import projects as project_service
+
+    title = payload.get("title")
+    if not isinstance(title, str) or not title:
+        raise HTTPException(400, "title (str) is required")
+    description = str(payload.get("description") or "")
+    tags = str(payload.get("tags") or "")
+    pinned_links = str(payload.get("pinned_links") or "")
+    privacy_status = str(payload.get("privacy_status") or "unlisted")
+    publish_at = str(payload.get("publish_at") or "")
+    project_slug = str(payload.get("project_slug") or "default")
+    item_type = str(payload.get("item_type") or "episode")
+    parent_item_id = str(payload.get("parent_item_id") or "")
+    upload_id = payload.get("upload_id")
+    thumbnail_upload_id = payload.get("thumbnail_upload_id")
+    if not isinstance(upload_id, str) or not upload_id:
+        raise HTTPException(400, "upload_id (str) is required")
 
     if item_type not in _YT_BACKED_ITEM_TYPES:
         raise HTTPException(
@@ -399,24 +414,33 @@ async def upload_video(
 
     db = await get_db()
 
-    # Save the upload under names we control — never the raw client
-    # filename, which can carry path separators (traversal) or collide
-    # with an unrelated upload. The video id isn't known until the
-    # YouTube upload returns, so write to a temp name and rename after.
+    # Pull the bytes off the chunked-upload table. They're already on
+    # disk at upload_<id>.<ext> — we just rename to a name we control
+    # (collision-resistant random hex) before handing to YouTube.
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    video_ext = safe_upload_ext(video_file.filename)
+    try:
+        upload_entry = await chunked_uploads.consume_upload(upload_id)
+    except chunked_uploads.UploadNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except chunked_uploads.UploadConflict as exc:
+        raise HTTPException(400, str(exc)) from exc
+    video_ext = upload_entry["ext"]
     video_path = UPLOAD_DIR / f"upload_{secrets.token_hex(8)}{video_ext}"
-    with open(video_path, "wb") as f:
-        shutil.copyfileobj(video_file.file, f)
-    video_original_name = sanitized_original_filename(video_file.filename)
+    Path(upload_entry["path"]).rename(video_path)
+    video_original_name = sanitized_original_filename(upload_entry["filename"])
 
-    # Save thumbnail if provided
+    # Optional thumbnail (also via the chunked-upload protocol).
     thumbnail_path = None
-    if thumbnail_file and thumbnail_file.filename:
-        thumb_ext = safe_upload_ext(thumbnail_file.filename, default=".jpg")
+    if isinstance(thumbnail_upload_id, str) and thumbnail_upload_id:
+        try:
+            thumb_entry = await chunked_uploads.consume_upload(thumbnail_upload_id)
+        except chunked_uploads.UploadNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except chunked_uploads.UploadConflict as exc:
+            raise HTTPException(400, str(exc)) from exc
+        thumb_ext = thumb_entry["ext"] or ".jpg"
         thumbnail_path = UPLOAD_DIR / f"upload_{secrets.token_hex(8)}{thumb_ext}"
-        with open(thumbnail_path, "wb") as f:
-            shutil.copyfileobj(thumbnail_file.file, f)
+        Path(thumb_entry["path"]).rename(thumbnail_path)
 
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
 
@@ -521,17 +545,7 @@ _NON_YT_ITEM_TYPES = {"hook", "standalone"}
 
 
 @router.post("/items")
-async def create_non_youtube_item(
-    title: str = Form(...),
-    description: str = Form(""),
-    tags: str = Form(""),
-    project_slug: str = Form("default"),
-    item_type: str = Form("standalone"),
-    parent_item_id: str = Form(""),
-    url: str = Form(""),
-    video_file: UploadFile | None = File(None),
-    thumbnail_file: UploadFile | None = File(None),
-):
+async def create_non_youtube_item(payload: dict = Body(...)):
     """Create an item that does NOT go through YouTube.
 
     Used for ``standalone`` items (text / image / video posts that don't get
@@ -543,8 +557,23 @@ async def create_non_youtube_item(
 
     For YouTube-backed items (``episode | short | segment``, plus hooks that
     you do want on YouTube), use ``POST /api/videos/upload`` instead.
+
+    Wire format: JSON. ``upload_id`` / ``thumbnail_upload_id`` reference
+    finalized chunked uploads — see ``POST /api/uploads/init``.
     """
     from yt_scheduler.services import projects as project_service
+
+    title = payload.get("title")
+    if not isinstance(title, str) or not title:
+        raise HTTPException(400, "title (str) is required")
+    description = str(payload.get("description") or "")
+    tags = str(payload.get("tags") or "")
+    project_slug = str(payload.get("project_slug") or "default")
+    item_type = str(payload.get("item_type") or "standalone")
+    parent_item_id = (str(payload.get("parent_item_id") or "")).strip() or None
+    url = str(payload.get("url") or "")
+    upload_id = payload.get("upload_id")
+    thumbnail_upload_id = payload.get("thumbnail_upload_id")
 
     if item_type not in _NON_YT_ITEM_TYPES:
         raise HTTPException(
@@ -557,7 +586,6 @@ async def create_non_youtube_item(
     if project is None:
         raise HTTPException(404, f"Project '{project_slug}' not found")
 
-    parent_item_id = (parent_item_id or "").strip() or None
     if parent_item_id:
         if item_type == "standalone":
             raise HTTPException(
@@ -582,18 +610,28 @@ async def create_non_youtube_item(
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     video_path: Path | None = None
     video_original_name: str | None = None
-    if video_file is not None and video_file.filename:
-        video_path = UPLOAD_DIR / f"{video_id}{safe_upload_ext(video_file.filename)}"
-        with open(video_path, "wb") as f:
-            shutil.copyfileobj(video_file.file, f)
-        video_original_name = sanitized_original_filename(video_file.filename)
+    if isinstance(upload_id, str) and upload_id:
+        try:
+            entry = await chunked_uploads.consume_upload(upload_id)
+        except chunked_uploads.UploadNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except chunked_uploads.UploadConflict as exc:
+            raise HTTPException(400, str(exc)) from exc
+        video_path = UPLOAD_DIR / f"{video_id}{entry['ext']}"
+        Path(entry["path"]).rename(video_path)
+        video_original_name = sanitized_original_filename(entry["filename"])
 
     thumbnail_path: Path | None = None
-    if thumbnail_file is not None and thumbnail_file.filename:
-        thumb_ext = safe_upload_ext(thumbnail_file.filename, default=".jpg")
+    if isinstance(thumbnail_upload_id, str) and thumbnail_upload_id:
+        try:
+            entry = await chunked_uploads.consume_upload(thumbnail_upload_id)
+        except chunked_uploads.UploadNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except chunked_uploads.UploadConflict as exc:
+            raise HTTPException(400, str(exc)) from exc
+        thumb_ext = entry["ext"] or ".jpg"
         thumbnail_path = UPLOAD_DIR / f"{video_id}_thumb{thumb_ext}"
-        with open(thumbnail_path, "wb") as f:
-            shutil.copyfileobj(thumbnail_file.file, f)
+        Path(entry["path"]).rename(thumbnail_path)
 
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
     duration = tiers.probe_local_duration(video_path) if video_path else 0.0
@@ -1781,9 +1819,8 @@ def _evaluate_replacement(
 @router.post("/{video_id}/source-file")
 async def replace_video_source_file(
     video_id: str,
-    file: UploadFile = File(...),
+    payload: dict = Body(...),
     force: int = Query(0),
-    content_length: int | None = Header(default=None),
 ) -> dict:
     """Attach or replace the local high-fidelity source file for a video.
 
@@ -1792,13 +1829,13 @@ async def replace_video_source_file(
     swaps the local file the app uses for clip extraction and other
     on-device tasks.
 
-    Wire format: ``multipart/form-data`` with a single ``file`` field.
-    A raw octet-stream body would let us stream directly to disk in
-    one pass (skipping FastAPI's ``SpooledTemporaryFile``), but
-    Safari/WebKit has a bug where ``xhr.send(file)`` with custom
-    request headers exhausts the file body stream before the bytes
-    hit the wire ("request body stream exhausted"). Until we have a
-    chunked-upload protocol, multipart is the compatibility floor.
+    Wire format: JSON ``{"upload_id": str}``. The bytes themselves have
+    already been streamed to disk via the chunked-upload protocol
+    (``POST /api/uploads/init`` → ``/chunk/{offset}`` → ``/finalize``);
+    this endpoint just consumes the finished file. Going through the
+    chunked protocol avoids two problems at once: FastAPI/Starlette's
+    ``UploadFile`` double-disk-write for multi-GB sources, and
+    Safari/WebKit's ``xhr.send(file)`` body-stream-exhaustion bug.
 
     Sanity checks (override with ``?force=1``, or with the pending-token
     finalize flow):
@@ -1814,8 +1851,10 @@ async def replace_video_source_file(
 
     Hard rejects (no force override):
 
-    * 400 — no file in the request, or ffprobe ran on the upload and
-      found no video stream (the user picked a non-video file).
+    * 400 — missing ``upload_id``, upload not finalized, or ffprobe ran
+      on the file and produced no recognisable video stream (the user
+      picked, say, a text file).
+    * 404 — ``upload_id`` not found / expired.
     * 413 — file larger than ``_MAX_SOURCE_FILE_BYTES``.
 
     On 422 the body contains ``issues: [{code, ...details}]`` and
@@ -1838,18 +1877,26 @@ async def replace_video_source_file(
         raise HTTPException(404, f"Video '{video_id}' not found")
     row = dict(rows[0])
 
-    if not file.filename:
-        raise HTTPException(400, "No file uploaded")
-    filename = file.filename
+    upload_id = payload.get("upload_id") if isinstance(payload, dict) else None
+    if not isinstance(upload_id, str) or not upload_id:
+        raise HTTPException(400, "upload_id (str) is required")
 
-    # Pre-flight size check from the request header before we copy a
-    # 10 GB+ body to disk. A lying client can still slip past with a
-    # missing/wrong header — _copy_to_disk_capped is the defense in
-    # depth that catches that case at write time.
-    if content_length is not None and content_length > _MAX_SOURCE_FILE_BYTES:
+    # Consume the upload — this validates the upload is finalized and
+    # pops it from the chunked-upload table so the same id can't be
+    # used twice. UploadNotFound → 404, UploadConflict (not finalized,
+    # already consumed) → 400.
+    try:
+        upload_entry = await chunked_uploads.consume_upload(upload_id)
+    except chunked_uploads.UploadNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except chunked_uploads.UploadConflict as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    if upload_entry["size"] > _MAX_SOURCE_FILE_BYTES:
+        Path(upload_entry["path"]).unlink(missing_ok=True)
         raise HTTPException(
             413,
-            f"File too large: {content_length} bytes exceeds "
+            f"File too large: {upload_entry['size']} bytes exceeds "
             f"{_MAX_SOURCE_FILE_BYTES} byte cap.",
         )
 
@@ -1858,77 +1905,20 @@ async def replace_video_source_file(
     # half-written state and produce orphan files / stale rows.
     async with _source_file_lock(video_id):
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        # ``source_pending_*`` while the request is in flight; renamed
+        # ``source_pending_*`` while sanity checks are pending; renamed
         # in place to ``source_*`` once the swap is committed. The
-        # ``pending`` prefix lets a startup sweep
+        # ``pending`` prefix lets the startup sweep
         # (cleanup_orphan_pending_source_files) safely delete leftovers
         # from a crashed / killed previous run without risking an
         # in-use source file.
+        filename = upload_entry["filename"]
         incoming_name = (
             f"source_pending_{secrets.token_hex(8)}{safe_upload_ext(filename)}"
         )
         incoming_path = UPLOAD_DIR / incoming_name
-
-        def _copy_to_disk_capped(
-            src, target: Path, cap: int, expected: int | None,
-        ) -> tuple[bool, int]:
-            """Stream ``src`` to ``target`` up to ``cap`` bytes.
-
-            Returns ``(ok, bytes_written)``. ``ok=False`` means the cap
-            was exceeded — the partial file has already been deleted
-            before the return. ``ok=True`` does NOT guarantee the body
-            was complete: ``bytes_written`` is the actual count and the
-            caller compares it to ``expected`` (Content-Length) to
-            detect a client-side abort that produced a short read.
-            """
-            written = 0
-            chunk_size = 1024 * 1024
-            with open(target, "wb") as fh:
-                while True:
-                    chunk = src.read(chunk_size)
-                    if not chunk:
-                        return True, written
-                    written += len(chunk)
-                    if written > cap:
-                        fh.close()
-                        target.unlink(missing_ok=True)
-                        return False, written
-                    fh.write(chunk)
-
-        expected_bytes = (
-            int(content_length)
-            if content_length is not None and content_length > 0
-            else None
-        )
-        ok, bytes_written = await asyncio.to_thread(
-            _copy_to_disk_capped,
-            file.file, incoming_path, _MAX_SOURCE_FILE_BYTES,
-            expected_bytes,
-        )
-        if not ok:
-            raise HTTPException(
-                413,
-                f"File too large: exceeds {_MAX_SOURCE_FILE_BYTES} byte cap.",
-            )
-
-        # Client-abort detector. When the browser cancels the XHR mid-
-        # upload, Starlette's UploadFile typically returns short on the
-        # underlying SpooledTemporaryFile (the body terminated early)
-        # but we'd otherwise treat it as a clean close and persist the
-        # truncated file. Comparing against Content-Length catches it.
-        # Allow a small slack for multipart framing overhead.
-        if expected_bytes is not None:
-            # multipart-framed Content-Length is larger than the raw
-            # file bytes (boundaries, headers); a short read by more
-            # than 64KB is unambiguous truncation.
-            if expected_bytes - bytes_written > 64 * 1024:
-                incoming_path.unlink(missing_ok=True)
-                raise HTTPException(
-                    400,
-                    "Upload was truncated before the full body arrived "
-                    f"(got {bytes_written} of {expected_bytes} bytes). "
-                    "Try again.",
-                )
+        # Rename from upload_<id>.<ext> → source_pending_<hex>.<ext>.
+        # Same filesystem, free.
+        Path(upload_entry["path"]).rename(incoming_path)
 
         incoming_probe = await asyncio.to_thread(
             media_service.probe_video_file, incoming_path

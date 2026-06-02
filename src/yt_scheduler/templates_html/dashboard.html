@@ -332,9 +332,50 @@ csForm.addEventListener('submit', async (e) => {
     btn.disabled = true;
     btn.textContent = 'Creating…';
     const fd = new FormData(csForm);
-    fd.set('project_slug', projectSlug);
+
+    const videoInput = document.getElementById('cs-video');
+    const thumbInput = document.getElementById('cs-thumb');
+    const videoFile = videoInput && videoInput.files[0];
+    const thumbFile = thumbInput && thumbInput.files[0];
+
     try {
-        const resp = await fetch('/api/videos/items', { method: 'POST', body: fd });
+        // 1) Upload optional video bytes via chunked protocol.
+        let uploadId = null;
+        if (videoFile) {
+            btn.textContent = `Uploading ${videoFile.name}…`;
+            const res = await window.chunkedUpload(videoFile, {
+                onProgress: (loaded, total) => {
+                    const pct = Math.floor((loaded / total) * 100);
+                    btn.textContent = `Uploading… ${pct}%`;
+                },
+            });
+            uploadId = res.upload_id;
+        }
+        // 2) Optional thumbnail.
+        let thumbnailUploadId = null;
+        if (thumbFile) {
+            btn.textContent = 'Uploading thumbnail…';
+            const res = await window.chunkedUpload(thumbFile, {});
+            thumbnailUploadId = res.upload_id;
+        }
+        // 3) Domain endpoint.
+        btn.textContent = 'Creating…';
+        const payload = {
+            title: fd.get('title') || '',
+            description: fd.get('description') || '',
+            tags: fd.get('tags') || '',
+            project_slug: projectSlug,
+            item_type: fd.get('item_type') || 'standalone',
+            parent_item_id: fd.get('parent_item_id') || '',
+            url: fd.get('url') || '',
+            upload_id: uploadId,
+            thumbnail_upload_id: thumbnailUploadId,
+        };
+        const resp = await fetch('/api/videos/items', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
         const data = await resp.json();
         if (!resp.ok) {
             showToast(data.detail || 'Could not create item', 'error');
@@ -346,7 +387,8 @@ csForm.addEventListener('submit', async (e) => {
         // images, set custom variables, generate posts, etc.
         window.location.href = `/projects/${projectSlug}/videos/${data.video_id}`;
     } catch (err) {
-        showToast('Create failed: ' + err.message, 'error');
+        const msg = (err && err.message) ? err.message : String(err);
+        showToast('Create failed: ' + msg, 'error');
     } finally {
         btn.disabled = false;
         btn.textContent = 'Create item';
