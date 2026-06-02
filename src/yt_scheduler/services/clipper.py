@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
@@ -165,15 +166,23 @@ def _overlap_seconds(
     return max(0.0, min(a_end, b_end) - max(a_start, b_start))
 
 
-def _normalize_anchor_text(text: str) -> str:
-    """Collapse whitespace and lower-case for fuzzy anchor matching.
+_PUNCT_STRIP_RE = re.compile(r"[^\w\s]")
 
-    Claude's transcripts have idiosyncratic whitespace (line-wrapped
-    cues, "uh"/"um" fillers); we want the anchor lookup to tolerate
-    minor punctuation/case differences without being permissive
-    enough to match the wrong line.
+
+def _normalize_anchor_text(text: str) -> str:
+    """Collapse whitespace, lower-case, and strip non-word punctuation
+    for fuzzy anchor matching.
+
+    Claude can drop a trailing comma or period when quoting, change
+    smart-quote variants, or write "doesn't" vs the cue's "doesn 't"
+    artifact. Word characters + whitespace is the right granularity:
+    permissive enough to ignore those nuisance variants but strict
+    enough to keep distinct sentences distinct.
     """
-    return " ".join((text or "").lower().split())
+    if not text:
+        return ""
+    stripped = _PUNCT_STRIP_RE.sub(" ", text.lower())
+    return " ".join(stripped.split())
 
 
 def _resolve_anchor_to_seconds(

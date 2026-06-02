@@ -100,6 +100,119 @@ def test_srt_to_llm_timeline_falls_back_on_unparseable():
     assert srt_to_llm_timeline("") == ""
 
 
+# --- Anchor resolution ----------------------------------------------------
+
+
+def _make_cues(*rows: tuple[float, float, str]) -> list[tuple[float, float, str]]:
+    return list(rows)
+
+
+def test_anchor_resolver_exact_match():
+    """Single-cue anchor: exact text equality, normalized."""
+    from yt_scheduler.services.clipper import _resolve_anchor_to_seconds
+
+    cues = _make_cues(
+        (0.0, 3.0, "Good morning, Drew."),
+        (3.0, 6.0, "Cut that intro."),
+        (6.0, 9.0, "Welcome back to the show."),
+    )
+    res = _resolve_anchor_to_seconds("Cut that intro.", cues, position="start")
+    assert res == (1, 3.0)
+
+
+def test_anchor_resolver_prefix_match_for_start():
+    """Multi-cue anchor: start cue is a PREFIX of the quoted anchor.
+    Longest-prefix wins so a trivial 1-word cue doesn't latch on."""
+    from yt_scheduler.services.clipper import _resolve_anchor_to_seconds
+
+    cues = _make_cues(
+        (0.0, 3.0, "Welcome"),                 # could match by trivial prefix
+        (3.0, 6.0, "back to the show today."),
+        (10.0, 13.0, "A lot of blog posts"),   # the real prefix
+        (13.0, 16.0, "talk about the front end"),
+        (16.0, 19.0, "and you fall off a cliff."),
+    )
+    anchor = "A lot of blog posts talk about the front end and you fall off a cliff."
+    res = _resolve_anchor_to_seconds(anchor, cues, position="start")
+    assert res is not None
+    idx, start = res
+    assert idx == 2  # the "A lot of blog posts" cue, not "Welcome"
+    assert start == 10.0
+
+
+def test_anchor_resolver_suffix_match_for_end():
+    """End anchor: last cue whose text is a SUFFIX of the quoted text."""
+    from yt_scheduler.services.clipper import _resolve_anchor_to_seconds
+
+    cues = _make_cues(
+        (10.0, 13.0, "A lot of blog posts"),
+        (13.0, 16.0, "talk about the front end"),
+        (16.0, 19.0, "and you fall off a cliff."),
+        (19.0, 22.0, "And then nothing on the back end."),
+    )
+    anchor = (
+        "A lot of blog posts talk about the front end and you "
+        "fall off a cliff."
+    )
+    res = _resolve_anchor_to_seconds(anchor, cues, position="end")
+    assert res is not None
+    idx, _start = res
+    assert idx == 2  # the "fall off a cliff" cue
+
+
+def test_anchor_resolver_rejects_hallucinated_text():
+    """Text that doesn't appear in any cue can't be resolved."""
+    from yt_scheduler.services.clipper import _resolve_anchor_to_seconds
+
+    cues = _make_cues(
+        (0.0, 3.0, "Good morning, Drew."),
+        (3.0, 6.0, "Welcome back."),
+    )
+    assert _resolve_anchor_to_seconds(
+        "This text was hallucinated.", cues, position="start",
+    ) is None
+
+
+def test_anchor_resolver_ignores_trivial_substring_matches():
+    """The prefix/suffix passes pick the LONGEST matching cue, and
+    the substring fallback has a min cue-length floor so trivial
+    recurring words like 'okay' / 'yeah' can't steal the match."""
+    from yt_scheduler.services.clipper import _resolve_anchor_to_seconds
+
+    cues = _make_cues(
+        (0.0, 1.0, "Okay."),         # appears as substring in many anchors
+        (1.0, 4.0, "Yeah."),
+        (200.0, 204.0, "We talked about app store ratings"),
+        (204.0, 208.0, "and the thing is that the floor is 4.5"),
+    )
+    # Anchor starts with cue at 200s. "Okay" and "Yeah" appear later
+    # in the anchor as recurring filler.
+    anchor = (
+        "We talked about app store ratings okay yeah and the "
+        "floor is 4.5 yeah."
+    )
+    res = _resolve_anchor_to_seconds(anchor, cues, position="start")
+    # Prefix pass should pick cue 2 (longest cue that's a prefix of
+    # the anchor), NOT the 1-char-after-normalization Okay/Yeah cues.
+    assert res is not None
+    _, start = res
+    assert start == 200.0
+
+
+def test_anchor_resolver_handles_punctuation_and_case_drift():
+    """Claude sometimes drops trailing punctuation or changes case;
+    normalization handles both."""
+    from yt_scheduler.services.clipper import _resolve_anchor_to_seconds
+
+    cues = _make_cues(
+        (5.0, 8.0, "Good morning, Drew."),
+    )
+    res = _resolve_anchor_to_seconds(
+        "good morning drew", cues, position="start",
+    )
+    assert res == (0, 5.0)
+
+
 def test_eligibility_per_kind_bands():
     from yt_scheduler.services.clipper import is_parent_eligible_for_kind
 
