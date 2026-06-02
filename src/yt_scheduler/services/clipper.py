@@ -1424,12 +1424,17 @@ async def _run_generate_job(job_id: str) -> None:
                     # misleading parent-with-#t= preview (which for a
                     # vertical-crop kind would render the landscape
                     # source and look "fine" while hiding the failure).
-                    msg = f"{type(res).__name__}: {res}"[:400]
+                    # Log untruncated server-side; bound the UI string
+                    # at a generous length so the actual ffmpeg
+                    # diagnostic survives (media.extract_clip now
+                    # re-raises CalledProcessError as RuntimeError
+                    # with the stderr tail attached).
+                    full_msg = f"{type(res).__name__}: {res}"
                     logger.warning(
                         "Preview cut failed for %s[%d] in job %s: %s",
-                        k, idx, job_id, msg,
+                        k, idx, job_id, full_msg,
                     )
-                    public_per_kind[k][idx]["preview_error"] = msg
+                    public_per_kind[k][idx]["preview_error"] = full_msg[:2000]
                     continue
                 from yt_scheduler.config import media_url
                 public_per_kind[k][idx]["preview_url"] = media_url(str(res))

@@ -334,10 +334,16 @@ def _vertical_crop_filter(x_shift_normalized: float) -> str:
     shift = max(-1.0, min(1.0, float(x_shift_normalized)))
     # Force the crop width to an even integer ≤ the ideal 9:16 width.
     # ffmpeg's crop filter rejects non-integer dims, and libx264 (the
-    # YUV 4:2:0 default) needs both width and height even. A 640×360
-    # source would otherwise compute ih*9/16 = 202.5 → ffmpeg exits 8.
+    # YUV 4:2:0 default) needs both width and height even.
     # floor(.../2)*2 rounds down to the nearest even integer.
-    cw = "floor(min(iw,ih*9/16)/2)*2"
+    #
+    # The literal comma inside ``min(iw,ih*9/16)`` MUST be escaped as
+    # ``\,`` — ffmpeg's ``-vf`` parser treats unescaped commas as
+    # filter-chain separators, so the unescaped form makes ffmpeg
+    # parse the expression as four bogus filters and exit with
+    # "No such filter: 'ih*9/16)/2)*2:...'". Comma between
+    # ``crop=...:0`` and ``scale=...`` is intentional (chains them).
+    cw = "floor(min(iw\\,ih*9/16)/2)*2"
     if shift == 0.0:
         x_expr = f"floor((iw-{cw})/2)"
     else:
@@ -467,6 +473,25 @@ def extract_clip(
         # and treat the cut as failed.
         Path(output).unlink(missing_ok=True)
         raise
+    except subprocess.CalledProcessError as exc:
+        # Default str(CalledProcessError) just shows the argv and exit
+        # code — ffmpeg's real error (filter parse error, missing
+        # codec, etc.) lives in stderr. Re-raise as RuntimeError with
+        # the last few lines of stderr appended so callers (and the
+        # UI's preview_error display) see the actual reason instead
+        # of "non-zero exit status N".
+        Path(output).unlink(missing_ok=True)
+        stderr_text = (exc.stderr or b"").decode("utf-8", errors="replace")
+        # The bottom of ffmpeg's stderr is almost always the error
+        # message (preceded by status spam). Last ~6 non-empty lines
+        # is a reliable signal.
+        tail = "\n".join(
+            line for line in stderr_text.strip().splitlines()[-6:]
+            if line.strip()
+        )
+        raise RuntimeError(
+            f"ffmpeg exit {exc.returncode}: {tail or 'no stderr captured'}"
+        ) from exc
 
     return output
 

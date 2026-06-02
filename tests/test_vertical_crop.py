@@ -20,8 +20,14 @@ def test_vertical_crop_filter_center():
     # source whose ih*9/16 is fractional (e.g. 360 -> 202.5) still
     # produces a valid ffmpeg crop expression rather than ffmpeg
     # exit 8. x offset wrapped in floor() for the same reason.
+    #
+    # The comma inside min(iw,ih*9/16) MUST be backslash-escaped
+    # because ffmpeg's -vf parser treats unescaped commas as filter
+    # chain separators — without the escape ffmpeg parses the whole
+    # crop expression as four bogus filters and dies with "No such
+    # filter: 'ih*9/16)/2)*2...'".
     assert out.startswith(
-        "crop=floor(min(iw,ih*9/16)/2)*2:ih:floor((iw-floor(min(iw,ih*9/16)/2)*2)/2):0"
+        r"crop=floor(min(iw\,ih*9/16)/2)*2:ih:floor((iw-floor(min(iw\,ih*9/16)/2)*2)/2):0"
     )
     assert out.endswith("scale=1080:1920")
 
@@ -31,7 +37,7 @@ def test_vertical_crop_filter_shift_right():
 
     out = _vertical_crop_filter(0.5)
     # Same floor() wrapping; the +0.5*(iw-cw)/2 shift sits inside floor().
-    assert "+(0.5000)*(iw-floor(min(iw,ih*9/16)/2)*2)/2)" in out
+    assert r"+(0.5000)*(iw-floor(min(iw\,ih*9/16)/2)*2)/2)" in out
 
 
 def test_vertical_crop_filter_shift_left():
@@ -39,6 +45,25 @@ def test_vertical_crop_filter_shift_left():
 
     out = _vertical_crop_filter(-0.4)
     assert "(-0.4000)" in out
+
+
+def test_vertical_crop_filter_escapes_min_comma():
+    """The comma inside ``min(iw,ih*9/16)`` MUST be escaped as ``\\,``;
+    unescaped commas inside an expression are interpreted by
+    ffmpeg's ``-vf`` parser as filter-chain separators and the cut
+    fails with "No such filter: ..." (real-world reproduction:
+    640×360 source preview cuts).
+
+    The chain comma between ``crop=...`` and ``scale=...`` is a real
+    chain separator and stays unescaped."""
+    from yt_scheduler.services.media import _vertical_crop_filter
+
+    out = _vertical_crop_filter(0.0)
+    # Inside-expression commas escaped.
+    assert r"min(iw\,ih*9/16)" in out
+    assert "min(iw,ih*9/16)" not in out  # no UNescaped form anywhere
+    # The chain separator before scale is unescaped (just one).
+    assert ":0,scale=" in out
 
 
 def test_vertical_crop_filter_handles_fractional_9_16_sources():
@@ -245,7 +270,7 @@ def test_extract_clip_vertical_crop_filter_included(
     assert "-vf" in cmd
     vf_idx = cmd.index("-vf")
     vf_value = cmd[vf_idx + 1]
-    assert vf_value.startswith("crop=floor(min(iw,ih*9/16)/2)*2:ih:")
+    assert vf_value.startswith(r"crop=floor(min(iw\,ih*9/16)/2)*2:ih:")
     assert vf_value.endswith("scale=1080:1920")
 
 
