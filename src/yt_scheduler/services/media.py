@@ -396,17 +396,28 @@ def extract_clip(
     ``start`` / ``end`` are ffmpeg-style timestamps — ``"0:30"`` or
     ``"1:30:00"``.
 
-    ``precise=True`` (default) puts ``-ss`` *after* ``-i`` so ffmpeg
-    decodes from the nearest preceding keyframe forward and the cut
-    lands sample-accurate. The cost is re-encoding the leading GOP
-    (the frames between the keyframe and the requested start). This is
-    the right setting for the Generate-from-source flow where Claude's
-    proposed timestamps should be respected exactly.
+    Both seek modes put ``-ss`` *before* ``-i`` so ffmpeg can fast-seek
+    the demuxer to a nearby keyframe instead of decoding the whole
+    prefix from the start of the file. For a multi-GB 4K source with
+    cuts late in the timeline this is the difference between minutes
+    and seconds of wall clock per cut.
 
-    ``precise=False`` puts ``-ss`` *before* ``-i`` for a fast seek that
-    snaps to the nearest preceding keyframe — the cut may start up to
-    one GOP early. Useful when accuracy doesn't matter and throughput
-    does (e.g. preview thumbnails). The output is still re-encoded.
+    ``precise=True`` (default) leaves ``-accurate_seek`` enabled (the
+    ffmpeg default for transcoding): the demuxer jumps to the nearest
+    preceding keyframe and then decodes-and-discards frames until the
+    requested ``start`` so the output lands sample-accurately. The
+    cost is decoding the keyframe-to-start prefix (usually <2 s).
+
+    ``precise=False`` disables ``-accurate_seek`` so the cut snaps to
+    the nearest preceding keyframe — may start up to one GOP early
+    but skips the prefix decode entirely. Useful for preview
+    thumbnails where exact start doesn't matter.
+
+    Hardware-accelerated decode (``-hwaccel auto``) is always
+    requested. On Apple Silicon that means videotoolbox, which is
+    5–10× faster than software H.264/HEVC decode for 4K sources.
+    ffmpeg falls back to software decode for codecs the hardware
+    doesn't support.
 
     ``vertical_crop=True`` crops the output to 9:16 (1080×1920) using
     :func:`_vertical_crop_filter`. ``x_shift_normalized`` shifts the
@@ -455,12 +466,21 @@ def extract_clip(
     # else "software" — leave use_hardware False.
 
     cmd: list[str] = ["ffmpeg", "-y"]
-    if precise:
-        # Slow seek inside the decoder — sample-accurate.
-        cmd.extend(["-i", str(video_path), "-ss", start, "-to", end])
-    else:
-        # Fast seek at the container level — keyframe-snap.
-        cmd.extend(["-ss", start, "-to", end, "-i", str(video_path)])
+
+    # Hardware-accelerated decode. On Apple Silicon ``-hwaccel auto``
+    # resolves to videotoolbox, which decodes 4K H.264/HEVC many times
+    # faster than the CPU. ffmpeg falls back to software decode for
+    # codecs the hardware doesn't recognise, so this is safe to apply
+    # to every cut regardless of source.
+    cmd.extend(["-hwaccel", "auto"])
+    # Fast container-level seek — demuxer jumps to the nearest
+    # preceding keyframe instead of decoding the whole prefix.
+    # ``-accurate_seek`` (the default for transcoding) keeps the cut
+    # sample-accurate when ``precise=True``; we disable it for the
+    # fast preview path where exact start doesn't matter.
+    if not precise:
+        cmd.extend(["-noaccurate_seek"])
+    cmd.extend(["-ss", start, "-to", end, "-i", str(video_path)])
 
     if vertical_crop:
         cmd.extend(["-vf", _vertical_crop_filter(x_shift_normalized)])

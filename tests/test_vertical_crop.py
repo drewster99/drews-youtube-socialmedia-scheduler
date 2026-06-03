@@ -258,6 +258,59 @@ def test_extract_clip_auto_uses_hardware_without_vertical_crop(
     assert "6M" in cmd  # 1080p band
 
 
+def test_extract_clip_uses_hardware_decode_and_fast_seek(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+):
+    """Two changes that turn minute-long 4K cuts into second-long ones:
+
+    1. ``-hwaccel auto`` before ``-i`` — on Apple Silicon this resolves
+       to videotoolbox and decodes 4K H.264/HEVC ~10× faster than CPU.
+    2. ``-ss`` BEFORE ``-i`` (input-side seek) instead of after — the
+       demuxer fast-seeks to the nearest preceding keyframe rather
+       than software-decoding the whole prefix from frame 0.
+
+    With ``precise=True`` (the default), ``-accurate_seek`` stays
+    enabled (ffmpeg's default for transcoding), so the cut still
+    lands sample-accurate — the demuxer hops to the keyframe, then
+    decode-and-discards the last few seconds until the requested
+    start. With ``precise=False`` we add ``-noaccurate_seek`` so the
+    cut snaps to the keyframe with zero prefix decode.
+    """
+    from yt_scheduler.services import media
+
+    monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
+    captured = _capture_cmd(monkeypatch, media)
+
+    src = tmp_path / "src.mp4"
+    src.write_bytes(b"\x00")
+
+    media.extract_clip(
+        src, "00:10:00", "00:10:30", output_name="precise.mp4",
+        encoder="software", precise=True,
+    )
+    cmd = captured[-1]
+    # Hardware decode requested for every cut.
+    hwaccel_idx = cmd.index("-hwaccel")
+    assert cmd[hwaccel_idx + 1] == "auto"
+    # -ss is before -i (fast input-side seek).
+    ss_idx = cmd.index("-ss")
+    i_idx = cmd.index("-i")
+    assert ss_idx < i_idx, f"-ss must precede -i for fast seek; got {cmd!r}"
+    # precise=True keeps the accurate_seek default — do NOT pass -noaccurate_seek.
+    assert "-noaccurate_seek" not in cmd
+
+    media.extract_clip(
+        src, "00:10:00", "00:10:30", output_name="fast.mp4",
+        encoder="software", precise=False,
+    )
+    cmd = captured[-1]
+    # precise=False explicitly disables accurate_seek for max speed.
+    assert "-noaccurate_seek" in cmd
+    ss_idx = cmd.index("-ss")
+    i_idx = cmd.index("-i")
+    assert ss_idx < i_idx
+
+
 def test_extract_clip_software_when_auto_and_unavailable(
     monkeypatch: pytest.MonkeyPatch, tmp_path,
 ):
