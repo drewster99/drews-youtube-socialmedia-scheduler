@@ -3399,6 +3399,18 @@ async function _uploadReplacementSafariMultipart(file) {
             const mb = (n) => (n / (1024 * 1024)).toFixed(1);
             status.textContent = `Uploading ${file.name}… ${pct}% (${mb(ev.loaded)} / ${mb(ev.total)} MB)`;
         });
+        // upload.load fires when the last byte is on the wire. The
+        // server is still ahead of us — for a multi-GB body Starlette
+        // has to read the temp spool back, our handler runs ffprobe
+        // twice (incoming + current), and only then sends the
+        // response. Tell the user that's happening rather than
+        // leaving the bar stuck at 100% Uploading.
+        xhr.upload.addEventListener('load', () => {
+            progress.removeAttribute('value');  // back to indeterminate
+            status.textContent =
+                `Verifying source file on the server… `
+                + `this can take a couple of minutes for multi-GB files.`;
+        });
         xhr.onload = () => {
             if (fiReplaceXhr === xhr) fiReplaceXhr = null;
             let body = {};
