@@ -3195,7 +3195,45 @@ async function refreshFileInfo() {
 // the background". The AbortController also signals the chunked-upload
 // helper to fire DELETE /api/uploads/{id} so the server-side partial
 // is cleaned up immediately rather than waiting for the TTL sweep.
+// Once the upload bytes are fully on the server we can't safely
+// cancel — the server is mid-rename / ffprobe / DB UPDATE and an
+// aborted XHR would leave the row inconsistent. While
+// fiReplaceVerifying is true the Close button + ESC are no-ops; both
+// the chunked and Safari-multipart paths flip this at the right
+// moments via setReplaceVerifying().
+let fiReplaceVerifying = false;
+
+function setReplaceVerifying(verifying) {
+    fiReplaceVerifying = !!verifying;
+    const closeBtn = document.getElementById('fi-close');
+    const replaceBtn = document.getElementById('fi-replace');
+    if (closeBtn) {
+        closeBtn.disabled = fiReplaceVerifying;
+        closeBtn.title = fiReplaceVerifying
+            ? 'Cannot close while the server is finalizing the upload'
+            : '';
+    }
+    if (replaceBtn) {
+        // Stop a second upload from racing with the in-flight finalize.
+        replaceBtn.disabled = fiReplaceVerifying;
+    }
+}
+
 function closeFileInfoModal() {
+    if (fiReplaceVerifying) {
+        // The server is finalizing the upload — bailing now would
+        // leave the row in a half-written state. Tell the user why
+        // the click is being ignored and stay open.
+        const status = document.getElementById('fi-replace-status');
+        if (status) {
+            status.style.display = '';
+            status.style.color = 'var(--warning, #b76e00)';
+            status.textContent =
+                "Please don't close — the server is still finalizing "
+                + "the upload. The dialog will free up when it's done.";
+        }
+        return;
+    }
     if (typeof fiReplaceAbort !== 'undefined' && fiReplaceAbort) {
         try { fiReplaceAbort.abort(); } catch (e) { /* already done */ }
         fiReplaceAbort = null;
@@ -3352,8 +3390,11 @@ async function _uploadReplacementChunked(file) {
     }
 
     // Bytes are on disk; now ask the domain endpoint to do the swap.
-    status.textContent = 'Verifying source file…';
+    // Lock the Close button — the server is renaming + probing + DB-
+    // updating and an abort mid-stream leaves things half-written.
+    status.textContent = 'Verifying source file… please wait, do not close.';
     progress.style.display = 'none';
+    setReplaceVerifying(true);
 
     let resp, body;
     try {
@@ -3364,10 +3405,12 @@ async function _uploadReplacementChunked(file) {
         });
         body = await resp.json();
     } catch (e) {
+        setReplaceVerifying(false);
         status.style.color = 'var(--danger)';
         status.textContent = 'Could not reach the server.';
         return;
     }
+    setReplaceVerifying(false);
     const result = { status: resp.status, body };
     await _handleReplaceSourceResponse(result);
 }
@@ -3404,25 +3447,31 @@ async function _uploadReplacementSafariMultipart(file) {
         // has to read the temp spool back, our handler runs ffprobe
         // twice (incoming + current), and only then sends the
         // response. Tell the user that's happening rather than
-        // leaving the bar stuck at 100% Uploading.
+        // leaving the bar stuck at 100% Uploading, AND lock the
+        // Close button so they can't cancel mid-DB-write.
         xhr.upload.addEventListener('load', () => {
             progress.removeAttribute('value');  // back to indeterminate
             status.textContent =
                 `Verifying source file on the server… `
-                + `this can take a couple of minutes for multi-GB files.`;
+                + `please wait, do not close — this can take a couple `
+                + `of minutes for multi-GB files.`;
+            setReplaceVerifying(true);
         });
         xhr.onload = () => {
             if (fiReplaceXhr === xhr) fiReplaceXhr = null;
+            setReplaceVerifying(false);
             let body = {};
             try { body = JSON.parse(xhr.responseText || '{}'); } catch (e) {}
             resolve({ status: xhr.status, body, kind: 'load' });
         };
         xhr.onerror = () => {
             if (fiReplaceXhr === xhr) fiReplaceXhr = null;
+            setReplaceVerifying(false);
             resolve({ kind: 'error' });
         };
         xhr.onabort = () => {
             if (fiReplaceXhr === xhr) fiReplaceXhr = null;
+            setReplaceVerifying(false);
             resolve({ kind: 'aborted' });
         };
         const form = new FormData();
@@ -3489,7 +3538,10 @@ async function finalizePendingReplacement(pendingToken) {
     const status = document.getElementById('fi-replace-status');
     status.style.display = '';
     status.style.color = '';
-    status.textContent = 'Finalizing…';
+    status.textContent = 'Finalizing… please wait, do not close.';
+    // Server is doing the DB UPDATE — same closing-is-unsafe window as
+    // a fresh upload's verify phase.
+    setReplaceVerifying(true);
     let resp, body;
     try {
         resp = await fetch(`/api/videos/${videoId}/source-file/finalize`, {
@@ -3499,15 +3551,18 @@ async function finalizePendingReplacement(pendingToken) {
         });
         body = await resp.json();
     } catch (e) {
+        setReplaceVerifying(false);
         status.style.color = 'var(--danger)';
         status.textContent = 'Finalize failed: network error.';
         return;
     }
     if (!resp.ok) {
+        setReplaceVerifying(false);
         status.style.color = 'var(--danger)';
         status.textContent = `Finalize failed: ${(body && body.detail) || ('HTTP ' + resp.status)}`;
         return;
     }
+    setReplaceVerifying(false);
     await onReplacementCommitted(body);
 }
 
