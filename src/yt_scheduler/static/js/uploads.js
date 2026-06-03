@@ -21,6 +21,18 @@
 (function () {
     'use strict';
 
+    // Version marker — bump on every meaningful edit so we can tell
+    // from the browser console whether the loaded uploads.js matches
+    // the latest server build. Surfaced via:
+    //   - console.log on load (visible in Web Inspector → Console)
+    //   - window.UPLOADS_JS_VERSION (queryable from the console)
+    //   - the value is also returned by chunkedUpload._version()
+    // When bundling into the macOS app via build.sh, the build must
+    // include any uploads.js edits since the previous build for this
+    // to match.
+    const UPLOADS_JS_VERSION = '2026-06-02-filereader-arraybuffer';
+    try { console.log('[uploads.js] version:', UPLOADS_JS_VERSION); } catch (e) {}
+
     const RETRY_DELAYS_MS = [500, 1500, 3000];  // per-chunk retry backoff
 
     async function chunkedUpload(file, opts) {
@@ -162,6 +174,10 @@
     // been around since the original File API draft and has its own
     // code path in WebKit that doesn't go through the resource loader.
     //
+    // TODO: once Safari fixes the blob.arrayBuffer() bug on File slices
+    // (filed at Apple as of 2024, not yet resolved), drop the
+    // FileReader wrapper and use the modern API directly.
+    //
     // Memory: one chunk (~8 MB) in RAM during flight, then GC'd.
     async function postBlobXhr(url, blob, signal) {
         if (signal && signal.aborted) {
@@ -282,4 +298,5 @@
 
     window.chunkedUpload = chunkedUpload;
     window.ChunkedUploadError = ChunkedUploadError;
+    window.UPLOADS_JS_VERSION = UPLOADS_JS_VERSION;
 })();
