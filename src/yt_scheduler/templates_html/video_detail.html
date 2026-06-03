@@ -3426,9 +3426,11 @@ async function _uploadReplacementSafariMultipart(file) {
     progress.value = 0;
 
     const sizeMb = (file.size / (1024 * 1024)).toFixed(0);
-    status.textContent =
-        `Preparing ${file.name} (${sizeMb} MB)… Safari can sit here `
-        + `for a minute on a multi-GB file before bytes start flowing.`;
+    // Multi-GB uploads can sit on this status for a minute or two
+    // before the browser starts streaming bytes — the helpful info
+    // is the size, not the wait. Plain copy avoids reading
+    // "unprofessional" and avoids implying the wait is a bug.
+    status.textContent = `Preparing upload: ${file.name} (${sizeMb} MB)…`;
 
     const xhrResult = await new Promise((resolve) => {
         const xhr = new XMLHttpRequest();
