@@ -479,6 +479,72 @@ def test_replace_works_when_ffprobe_unavailable(
     assert data["width"] is None
 
 
+def test_replace_via_multipart_safari_fallback(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """The /source-file endpoint accepts multipart/form-data as the
+    Safari fallback (chunked-upload fails on WebKit's FileReaderLoader
+    for files ≥4 GB). Exercise the multipart path directly without
+    going through the chunked init/finalize flow.
+    """
+    _insert("MPMULTI0001", imported_from_youtube=1, duration_seconds=60.0)
+    _stub_probe(monkeypatch, {
+        "__default__": _make_probe(
+            duration_seconds=60.5, width=3840, height=2160,
+            bitrate_bps=80_000_000, size_bytes=1_000_000,
+        ),
+    })
+    # Direct multipart POST — bytes go in the request body, no chunked
+    # init/chunk/finalize round-trip.
+    resp = client.post(
+        "/api/videos/MPMULTI0001/source-file",
+        files={"file": ("master.mov", b"\x00" * 64, "video/quicktime")},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["source_origin"] == "user_attached"
+    assert data["width"] == 3840
+    row = _row("MPMULTI0001")
+    assert row["source_file_origin"] == "user_attached"
+    assert row["video_file_path"]
+
+
+def test_replace_via_multipart_returns_pending_token_on_issues(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """The multipart fallback path produces the same 422 + pending_token
+    shape as the chunked path so the confirm-without-reupload flow
+    works regardless of which transport the client used."""
+    _insert(
+        "MPMULTI0002", imported_from_youtube=1, duration_seconds=60.0,
+        transcript="00:00:00,000 --> 00:00:05,000\nhello\n",
+        transcript_source="youtube",
+    )
+    _stub_probe(monkeypatch, {
+        "__default__": _make_probe(
+            duration_seconds=90.0, width=1920, height=1080,
+        ),
+    })
+    resp = client.post(
+        "/api/videos/MPMULTI0002/source-file",
+        files={"file": ("longer.mp4", b"\x00" * 64, "video/mp4")},
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["pending_token"]
+    assert any(i["code"] == "duration_mismatch" for i in detail["issues"])
+
+
+def test_replace_via_multipart_400_when_file_part_missing(client: TestClient):
+    """A multipart body without a 'file' part should 400, not 500."""
+    _insert("MPMULTI0003", duration_seconds=60.0)
+    resp = client.post(
+        "/api/videos/MPMULTI0003/source-file",
+        files={"not_file": ("x.mp4", b"\x00", "video/mp4")},
+    )
+    assert resp.status_code == 400
+
+
 def test_unknown_video_404(client: TestClient):
     resp = _post_source_file(
         client, "/api/videos/NOPE0000001/source-file", "x.mp4", b"\x00",

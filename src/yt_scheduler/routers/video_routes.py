@@ -13,7 +13,7 @@ import time
 import weakref
 from pathlib import Path
 
-from fastapi import APIRouter, Body, UploadFile, File, HTTPException, Query
+from fastapi import APIRouter, Body, Request, UploadFile, File, HTTPException, Query
 
 from yt_scheduler.config import (
     UPLOAD_DIR,
@@ -1816,10 +1816,102 @@ def _evaluate_replacement(
     return issues
 
 
+async def _save_multipart_to_pending(request: Request) -> tuple[Path, str]:
+    """Read the request's multipart form, copy the ``file`` part to
+    ``source_pending_<hex>.<ext>``, and return ``(path, filename)``.
+
+    Used as the Safari fallback path for Replace Source. Safari's
+    WebKit has a 32-bit overflow bug in ``FileReaderLoader`` (WebKit
+    Bug 272600) that breaks reading File slices ≥4 GB, which kills
+    the chunked-upload flow for multi-GB sources. The native multipart
+    submission path goes through Safari's C++ network engine instead
+    of ``FileReaderLoader`` and works for arbitrarily large files.
+
+    The trade-off vs the chunked path: FastAPI / Starlette buffers
+    the body into a ``SpooledTemporaryFile`` first, so each byte
+    lands on disk twice. Worth it for the user-facing reliability.
+    """
+    try:
+        form = await request.form()
+    except Exception as exc:
+        raise HTTPException(400, f"Could not parse multipart body: {exc}") from exc
+    file = form.get("file")
+    if file is None or not hasattr(file, "file"):
+        raise HTTPException(400, "Missing 'file' part in multipart body")
+    filename = getattr(file, "filename", None) or ""
+    if not filename:
+        raise HTTPException(400, "No file uploaded")
+
+    incoming_name = (
+        f"source_pending_{secrets.token_hex(8)}{safe_upload_ext(filename)}"
+    )
+    incoming_path = UPLOAD_DIR / incoming_name
+
+    def _copy_capped(src, target: Path, cap: int) -> tuple[bool, int]:
+        written = 0
+        with open(target, "wb") as fh:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    return True, written
+                written += len(chunk)
+                if written > cap:
+                    target.unlink(missing_ok=True)
+                    return False, written
+                fh.write(chunk)
+
+    ok, bytes_written = await asyncio.to_thread(
+        _copy_capped, file.file, incoming_path, _MAX_SOURCE_FILE_BYTES,
+    )
+    if not ok:
+        raise HTTPException(
+            413,
+            f"File too large: exceeds {_MAX_SOURCE_FILE_BYTES} byte cap.",
+        )
+    if bytes_written == 0:
+        incoming_path.unlink(missing_ok=True)
+        raise HTTPException(400, "Empty upload (no body bytes).")
+
+    return incoming_path, filename
+
+
+async def _save_chunked_upload_to_pending(payload: dict) -> tuple[Path, str]:
+    """Consume an ``upload_id`` from the chunked-upload service and
+    rename its on-disk file to ``source_pending_<hex>.<ext>``. Returns
+    ``(path, filename)``.
+
+    Single-pass disk write (the chunked-upload bytes are already on
+    disk; we only rename). Used as the primary Replace Source path
+    for browsers without Safari's FileReaderLoader bug.
+    """
+    upload_id = payload.get("upload_id") if isinstance(payload, dict) else None
+    if not isinstance(upload_id, str) or not upload_id:
+        raise HTTPException(400, "upload_id (str) is required")
+    try:
+        entry = await chunked_uploads.consume_upload(upload_id)
+    except chunked_uploads.UploadNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except chunked_uploads.UploadConflict as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if entry["size"] > _MAX_SOURCE_FILE_BYTES:
+        Path(entry["path"]).unlink(missing_ok=True)
+        raise HTTPException(
+            413,
+            f"File too large: {entry['size']} bytes exceeds "
+            f"{_MAX_SOURCE_FILE_BYTES} byte cap.",
+        )
+    incoming_name = (
+        f"source_pending_{secrets.token_hex(8)}{safe_upload_ext(entry['filename'])}"
+    )
+    incoming_path = UPLOAD_DIR / incoming_name
+    Path(entry["path"]).rename(incoming_path)
+    return incoming_path, entry["filename"]
+
+
 @router.post("/{video_id}/source-file")
 async def replace_video_source_file(
+    request: Request,
     video_id: str,
-    payload: dict = Body(...),
     force: int = Query(0),
 ) -> dict:
     """Attach or replace the local high-fidelity source file for a video.
@@ -1829,43 +1921,24 @@ async def replace_video_source_file(
     swaps the local file the app uses for clip extraction and other
     on-device tasks.
 
-    Wire format: JSON ``{"upload_id": str}``. The bytes themselves have
-    already been streamed to disk via the chunked-upload protocol
-    (``POST /api/uploads/init`` → ``/chunk/{offset}`` → ``/finalize``);
-    this endpoint just consumes the finished file. Going through the
-    chunked protocol avoids two problems at once: FastAPI/Starlette's
-    ``UploadFile`` double-disk-write for multi-GB sources, and
-    Safari/WebKit's ``xhr.send(file)`` body-stream-exhaustion bug.
+    Wire format: dispatched on ``Content-Type``:
+
+    * ``multipart/form-data`` with a ``file`` part — the Safari path
+      (also accepted by direct API callers). Safari/WebKit's
+      ``FileReaderLoader`` has a 32-bit overflow bug (WebKit Bug
+      272600) that breaks JS-side reading of File slices ≥4 GB, so the
+      chunked path fails for multi-GB sources. Multipart form-data
+      uses Safari's native network engine and bypasses the bug.
+    * Any other Content-Type → JSON ``{"upload_id": str}``. Consumes a
+      file already on disk via the chunked-upload protocol
+      (``POST /api/uploads/init`` → ``/chunk/{offset}`` → ``/finalize``).
+      Single-pass disk write — preferred when the browser allows it.
 
     Sanity checks (override with ``?force=1``, or with the pending-token
-    finalize flow):
-
-    * Duration must be within ``_DURATION_TOLERANCE_SECONDS`` of the row's
-      recorded duration. A larger drift almost always means the wrong
-      cut was selected. Forcing past this also blanks the stored
-      transcript columns, since timestamped captions are no longer
-      aligned with the new file's audio.
-    * If a current local file exists and isn't itself a youtube_download,
-      the incoming file's resolution must not be strictly smaller in both
-      width and height.
-
-    Hard rejects (no force override):
-
-    * 400 — missing ``upload_id``, upload not finalized, or ffprobe ran
-      on the file and produced no recognisable video stream (the user
-      picked, say, a text file).
-    * 404 — ``upload_id`` not found / expired.
-    * 413 — file larger than ``_MAX_SOURCE_FILE_BYTES``.
-
-    On 422 the body contains ``issues: [{code, ...details}]`` and
+    finalize flow): duration tolerance, resolution downgrade. On 422
+    the body contains ``issues: [{code, ...details}]`` and
     ``pending_token`` so the UI can render a precise confirm prompt
     and call ``/source-file/finalize`` instead of re-uploading.
-
-    The previous file is *not* renamed or deleted — the row is just
-    re-pointed to the new file (atomic single UPDATE). The old file
-    stays on disk as an orphan; this trades a little disk hygiene for
-    crash-safety and avoids needing to coordinate filesystem renames
-    with the DB write.
     """
     db = await get_db()
     rows = await db.execute_fetchall(
@@ -1877,48 +1950,29 @@ async def replace_video_source_file(
         raise HTTPException(404, f"Video '{video_id}' not found")
     row = dict(rows[0])
 
-    upload_id = payload.get("upload_id") if isinstance(payload, dict) else None
-    if not isinstance(upload_id, str) or not upload_id:
-        raise HTTPException(400, "upload_id (str) is required")
-
-    # Consume the upload — this validates the upload is finalized and
-    # pops it from the chunked-upload table so the same id can't be
-    # used twice. UploadNotFound → 404, UploadConflict (not finalized,
-    # already consumed) → 400.
-    try:
-        upload_entry = await chunked_uploads.consume_upload(upload_id)
-    except chunked_uploads.UploadNotFound as exc:
-        raise HTTPException(404, str(exc)) from exc
-    except chunked_uploads.UploadConflict as exc:
-        raise HTTPException(400, str(exc)) from exc
-
-    if upload_entry["size"] > _MAX_SOURCE_FILE_BYTES:
-        Path(upload_entry["path"]).unlink(missing_ok=True)
-        raise HTTPException(
-            413,
-            f"File too large: {upload_entry['size']} bytes exceeds "
-            f"{_MAX_SOURCE_FILE_BYTES} byte cap.",
-        )
+    content_type = (request.headers.get("content-type") or "").lower()
+    use_multipart = content_type.startswith("multipart/")
+    if not use_multipart:
+        # JSON body is fully read before we enter the per-video lock,
+        # consistent with the previous chunked-only behaviour.
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(
+                400, f"Body must be JSON or multipart/form-data: {exc}",
+            ) from exc
+    else:
+        payload = None  # Not used in the multipart path.
 
     # All disk + DB work happens under a per-video lock so two
     # simultaneous replaces for the same video can't see each other's
     # half-written state and produce orphan files / stale rows.
     async with _source_file_lock(video_id):
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        # ``source_pending_*`` while sanity checks are pending; renamed
-        # in place to ``source_*`` once the swap is committed. The
-        # ``pending`` prefix lets the startup sweep
-        # (cleanup_orphan_pending_source_files) safely delete leftovers
-        # from a crashed / killed previous run without risking an
-        # in-use source file.
-        filename = upload_entry["filename"]
-        incoming_name = (
-            f"source_pending_{secrets.token_hex(8)}{safe_upload_ext(filename)}"
-        )
-        incoming_path = UPLOAD_DIR / incoming_name
-        # Rename from upload_<id>.<ext> → source_pending_<hex>.<ext>.
-        # Same filesystem, free.
-        Path(upload_entry["path"]).rename(incoming_path)
+        if use_multipart:
+            incoming_path, filename = await _save_multipart_to_pending(request)
+        else:
+            incoming_path, filename = await _save_chunked_upload_to_pending(payload)
 
         incoming_probe = await asyncio.to_thread(
             media_service.probe_video_file, incoming_path

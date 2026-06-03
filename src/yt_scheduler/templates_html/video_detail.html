@@ -3200,6 +3200,10 @@ function closeFileInfoModal() {
         try { fiReplaceAbort.abort(); } catch (e) { /* already done */ }
         fiReplaceAbort = null;
     }
+    if (typeof fiReplaceXhr !== 'undefined' && fiReplaceXhr) {
+        try { fiReplaceXhr.abort(); } catch (e) { /* already done */ }
+        fiReplaceXhr = null;
+    }
     document.getElementById('file-info-modal').close();
 }
 
@@ -3278,15 +3282,38 @@ function promptForceReplacement(issues) {
     });
 }
 
-// Replace Source goes through the chunked-upload protocol
-// (POST /api/uploads/init → /chunk/{offset} → /finalize). The server's
-// /source-file endpoint then takes a JSON {upload_id} rather than a
-// file body — see static/js/uploads.js for the slicing helper.
-// fiReplaceAbort is an AbortController we can fire from Close to
-// cancel an in-flight upload and tell the server to drop the partial.
+// Replace Source uses two different transports depending on the
+// browser:
+//
+//   * Safari → multipart FormData via XHR. Safari/WebKit's
+//     FileReaderLoader has a 32-bit overflow bug (WebKit Bug 272600)
+//     that breaks JS-side reading of File slices ≥4 GB, which kills
+//     the chunked-upload protocol for multi-GB sources. The native
+//     FormData submission path uses Safari's C++ network engine and
+//     bypasses FileReaderLoader entirely. Slower on the server
+//     (Starlette's UploadFile double-buffers to a temp file) but
+//     reliable.
+//   * Other browsers → chunked upload via window.chunkedUpload.
+//     Single-pass server-side disk write.
+//
+// fiReplaceAbort is an AbortController we fire from Close to cancel
+// in-flight chunked uploads.
 let fiReplaceAbort = null;
+let fiReplaceXhr = null;
+
+function _isSafari() {
+    const ua = navigator.userAgent || '';
+    return /^((?!chrome|chromium|crios|fxios|android).)*safari/i.test(ua);
+}
 
 async function uploadReplacementSource(file) {
+    if (_isSafari()) {
+        return await _uploadReplacementSafariMultipart(file);
+    }
+    return await _uploadReplacementChunked(file);
+}
+
+async function _uploadReplacementChunked(file) {
     const status = document.getElementById('fi-replace-status');
     const progress = document.getElementById('fi-replace-progress');
     status.style.display = '';
@@ -3342,6 +3369,72 @@ async function uploadReplacementSource(file) {
         return;
     }
     const result = { status: resp.status, body };
+    await _handleReplaceSourceResponse(result);
+}
+
+// Safari multipart fallback. Uses XHR with FormData(file) — Safari's
+// native body-streaming path that doesn't go through FileReaderLoader.
+async function _uploadReplacementSafariMultipart(file) {
+    const status = document.getElementById('fi-replace-status');
+    const progress = document.getElementById('fi-replace-progress');
+    status.style.display = '';
+    status.style.color = '';
+    progress.style.display = '';
+    progress.value = 0;
+
+    const sizeMb = (file.size / (1024 * 1024)).toFixed(0);
+    status.textContent =
+        `Preparing ${file.name} (${sizeMb} MB)… Safari can sit here `
+        + `for a minute on a multi-GB file before bytes start flowing.`;
+
+    const xhrResult = await new Promise((resolve) => {
+        const xhr = new XMLHttpRequest();
+        fiReplaceXhr = xhr;
+        xhr.open('POST', `/api/videos/${videoId}/source-file`);
+        xhr.responseType = 'text';
+        xhr.upload.addEventListener('progress', (ev) => {
+            if (!ev.lengthComputable) return;
+            const pct = Math.floor((ev.loaded / ev.total) * 100);
+            progress.value = pct;
+            const mb = (n) => (n / (1024 * 1024)).toFixed(1);
+            status.textContent = `Uploading ${file.name}… ${pct}% (${mb(ev.loaded)} / ${mb(ev.total)} MB)`;
+        });
+        xhr.onload = () => {
+            if (fiReplaceXhr === xhr) fiReplaceXhr = null;
+            let body = {};
+            try { body = JSON.parse(xhr.responseText || '{}'); } catch (e) {}
+            resolve({ status: xhr.status, body, kind: 'load' });
+        };
+        xhr.onerror = () => {
+            if (fiReplaceXhr === xhr) fiReplaceXhr = null;
+            resolve({ kind: 'error' });
+        };
+        xhr.onabort = () => {
+            if (fiReplaceXhr === xhr) fiReplaceXhr = null;
+            resolve({ kind: 'aborted' });
+        };
+        const form = new FormData();
+        form.append('file', file);
+        xhr.send(form);
+    });
+
+    progress.style.display = 'none';
+    if (xhrResult.kind === 'aborted') {
+        status.style.display = 'none';
+        return;
+    }
+    if (xhrResult.kind === 'error') {
+        status.style.color = 'var(--danger)';
+        status.textContent = 'Upload failed: network error.';
+        return;
+    }
+    await _handleReplaceSourceResponse({
+        status: xhrResult.status, body: xhrResult.body,
+    });
+}
+
+async function _handleReplaceSourceResponse(result) {
+    const status = document.getElementById('fi-replace-status');
 
     if (result.status === 422) {
         const issues = (result.body.detail && result.body.detail.issues) || [];

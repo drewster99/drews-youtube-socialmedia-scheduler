@@ -30,7 +30,7 @@
     // When bundling into the macOS app via build.sh, the build must
     // include any uploads.js edits since the previous build for this
     // to match.
-    const UPLOADS_JS_VERSION = '2026-06-02-filereader-arraybuffer';
+    const UPLOADS_JS_VERSION = '2026-06-03-safari-multipart-fallback';
     try { console.log('[uploads.js] version:', UPLOADS_JS_VERSION); } catch (e) {}
 
     const RETRY_DELAYS_MS = [500, 1500, 3000];  // per-chunk retry backoff
