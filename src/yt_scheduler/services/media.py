@@ -593,6 +593,7 @@ def extract_gif(
     subprocess.run(
         [
             "ffmpeg", "-y",
+            "-hwaccel", "auto",
             "-ss", start, "-to", end,
             "-i", str(video_path),
             "-vf", f"fps={fps},scale={width}:-1:flags=lanczos,palettegen",
@@ -603,10 +604,13 @@ def extract_gif(
         timeout=_FFMPEG_TIMEOUT_SECONDS,
     )
 
-    # Pass 2: create GIF with palette
+    # Pass 2: create GIF with palette. ``-hwaccel auto`` precedes only the
+    # video ``-i`` so it accelerates that decode; the palette PNG input is
+    # untouched by it.
     subprocess.run(
         [
             "ffmpeg", "-y",
+            "-hwaccel", "auto",
             "-ss", start, "-to", end,
             "-i", str(video_path),
             "-i", str(palette),
@@ -683,6 +687,7 @@ def extract_keyframes_in_range(
             result = subprocess.run(
                 [
                     "ffmpeg",
+                    "-hwaccel", "auto",
                     "-ss", f"{ts:.3f}",
                     "-i", str(video_path),
                     "-frames:v", "1",
@@ -746,6 +751,7 @@ def extract_keyframes(
             result = subprocess.run(
                 [
                     "ffmpeg",
+                    "-hwaccel", "auto",
                     "-ss", f"{ts:.3f}",
                     "-i", str(video_path),
                     "-frames:v", "1",
@@ -781,6 +787,7 @@ def generate_thumbnail(
     subprocess.run(
         [
             "ffmpeg", "-y",
+            "-hwaccel", "auto",
             "-ss", timestamp,
             "-i", str(video_path),
             "-vframes", "1",
