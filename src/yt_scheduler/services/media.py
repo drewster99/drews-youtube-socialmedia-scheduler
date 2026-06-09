@@ -379,6 +379,13 @@ def _vertical_crop_filter(x_shift_normalized: float) -> str:
     )
 
 
+def _ffmpeg_timestamp_to_seconds(ts: str) -> float:
+    """Parse an ffmpeg timestamp (``"SS.mmm"``, ``"MM:SS"``, ``"HH:MM:SS.mmm"``)
+    into seconds. Used to position the audio fade-out from the clip duration."""
+    parts = ts.split(":")
+    return sum(float(p) * (60 ** i) for i, p in enumerate(reversed(parts)))
+
+
 def extract_clip(
     video_path: str | Path,
     start: str,
@@ -390,6 +397,8 @@ def extract_clip(
     x_shift_normalized: float = 0.0,
     encoder: Literal["auto", "hardware", "software"] = "auto",
     preset: str | None = None,
+    audio_fade_in: float = 0.0,
+    audio_fade_out: float = 0.0,
 ) -> Path:
     """Extract a video clip from ``start`` to ``end``.
 
@@ -484,6 +493,19 @@ def extract_clip(
 
     if vertical_crop:
         cmd.extend(["-vf", _vertical_crop_filter(x_shift_normalized)])
+
+    # Audio edge ramps. Cubic IN (sharp attack pops up at the first word) and a
+    # gentler linear OUT (the word's natural decay / room-tone tail rings out
+    # rather than being slammed). Positions are relative to the OUTPUT (``-ss``
+    # before ``-i`` resets timestamps to 0). No video fade by design.
+    fades: list[str] = []
+    if audio_fade_in > 0:
+        fades.append(f"afade=t=in:curve=cub:st=0:d={audio_fade_in:.4f}")
+    if audio_fade_out > 0:
+        out_st = max(0.0, _ffmpeg_timestamp_to_seconds(end) - _ffmpeg_timestamp_to_seconds(start) - audio_fade_out)
+        fades.append(f"afade=t=out:curve=tri:st={out_st:.4f}:d={audio_fade_out:.4f}")
+    if fades:
+        cmd.extend(["-af", ",".join(fades)])
 
     if use_hardware:
         # Pick the bitrate by what the OUTPUT will actually be: 9:16
