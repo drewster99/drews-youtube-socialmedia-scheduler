@@ -416,9 +416,38 @@ try await run()
 '''
 
 
+# Subtitle-cue segmentation tuning for the Apple word stream. A cue breaks at
+# the FIRST of: sentence punctuation, a clear pause, the hard word cap, or the
+# duration cap — and prefers a minor pause once past the soft word cap. The word
+# and duration caps are the safety net: SpeechTranscriber usually emits sentence
+# punctuation, but if a run comes back with none, these alone still produce
+# bounded, readable cues instead of one cue spanning the whole video.
+_SRT_PAUSE_GAP_SECONDS = 0.6   # a clear pause — break here regardless of length
+_SRT_SOFT_PAUSE_SECONDS = 0.2  # a minor pause that's worth breaking on once long
+_SRT_SOFT_WORD_CAP = 8         # past this, break at the next minor pause
+_SRT_HARD_WORD_CAP = 14        # never put more than this many words in one cue
+_SRT_MAX_CUE_SECONDS = 6.0     # never let a cue run longer than this on screen
+_SENTENCE_END_PUNCT = ('.', '!', '?')
+
+
 def _macos_words_to_segments(raw_words: list[dict]) -> list[TranscriptSegment]:
-    """Group Apple's word stream into sentence-ish segments, each carrying its
-    ``TranscriptWord`` list, so the result has full word-level timing."""
+    """Group Apple's word stream into subtitle-sized segments, each carrying its
+    ``TranscriptWord`` list, so the result has full word-level timing.
+
+    Breaks are driven by both punctuation AND timing/length so the segmentation
+    degrades gracefully: even a run with no sentence punctuation still yields
+    cues bounded by ``_SRT_HARD_WORD_CAP`` / ``_SRT_MAX_CUE_SECONDS`` rather than
+    collapsing into a single video-length cue. Word-level timing is preserved
+    regardless, so the index clip path (which re-segments from the flat word
+    stream) is unaffected by how cues are grouped here.
+    """
+    words: list[TranscriptWord] = [
+        TranscriptWord(
+            start=float(w["start"]), end=float(w["end"]),
+            word=str(w.get("word", "")), probability=1.0)
+        for w in raw_words
+    ]
+
     segments: list[TranscriptSegment] = []
     cur: list[TranscriptWord] = []
 
@@ -430,12 +459,20 @@ def _macos_words_to_segments(raw_words: list[dict]) -> list[TranscriptSegment]:
             start=cur[0].start, end=cur[-1].end, text=text, words=list(cur)))
         cur.clear()
 
-    for w in raw_words:
-        word = str(w.get("word", ""))
-        cur.append(TranscriptWord(
-            start=float(w["start"]), end=float(w["end"]),
-            word=word, probability=1.0))
-        if word.strip().endswith((".", "!", "?")):
+    for i, w in enumerate(words):
+        cur.append(w)
+        gap_after = (words[i + 1].start - w.end) if i + 1 < len(words) else 1e9
+        cue_seconds = cur[-1].end - cur[0].start
+        stripped = w.word.strip().rstrip('"”\'’')
+        if stripped.endswith(_SENTENCE_END_PUNCT):
+            flush()
+        elif gap_after >= _SRT_PAUSE_GAP_SECONDS:
+            flush()
+        elif cue_seconds >= _SRT_MAX_CUE_SECONDS:
+            flush()
+        elif len(cur) >= _SRT_HARD_WORD_CAP:
+            flush()
+        elif len(cur) >= _SRT_SOFT_WORD_CAP and gap_after >= _SRT_SOFT_PAUSE_SECONDS:
             flush()
     flush()
     return segments
