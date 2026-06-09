@@ -2,6 +2,39 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Plan
+
+- Always plan your work. Don't just start coding.
+- Always validate your assumptions. If you only THINK a thing to be true, figure out how to verify it
+- Always challenge your assumptions. You might have a good idea, but there could be a better one -- or you could be wrong.
+- Think about the user's intent. Sometimes user's don't say exactly what they want. Make sure you're getting it right.
+- Clarify. Ask clarifying questions as needed. Make sure you're not assuming your way through building.
+- Always surface errors.
+- No hidden defaults.
+- Always follow best practices for each domain you are working within.
+- Excellence and precision -- all the way.
+- Logging, error reporting, performance timing, testability, unit tests, regression tests.
+- If you fix a bug, fix it so that it can't happen again, for example by adding regression tests.
+- The user wants to be abble to verify and validate everything. Make sure you have full and complete logs.
+- Think of the simplest thing that might work and start there.
+- Pay attention to the CURRENT architecture of the project when designing and architecting
+- Single source of truth.
+- Make good use of the javascript console
+- When composing AI prompts, generally:
+  - Short and clear
+  - Step by step instructions
+  - Main instruction is system prompt. User data in user prompt.
+  - Prefer JSON input
+  - Prefer JSON response
+  - When possible, use a JSON schema for both input and output, where the LLM knows and will validate against the schema before our app ever sees it.
+  - Minimize token use when possible
+- Brevity is a non-goal. Clarity is the only thing that matters.
+- Naming things: Again, brevity is not a goal. The name should be clear as to what it is and how it is used. When used at the call sight, it should be obvious what is happening without adding any comments
+- Comments that explain WHY you are doing a thing are a good idea.
+- Comments that explain WHAT you are doing usually means that you didn't properly name things or otherwise havfe disorganized code. In some cases where the work done is particularly complex, a comment may be added explaining WHAT you are doing. In 90%+ of cases, this should be unnecessary.
+- Doc comments are helpful but keep them short
+- Avoid putting values into comments, since they go stale quickly
+
 ## Project Overview
 
 Drew's Video + Socials Scheduler is a local web application for managing the YouTube video publishing workflow. It uploads videos as unlisted drafts, generates SEO descriptions via Claude AI from auto-captions, creates platform-specific social media posts, supports scheduled publishing, and performs background comment moderation. Written in Python 3.11+ with FastAPI, SQLite (async via aiosqlite), and Jinja2 templates.
