@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import logging
+import socket
+import time
 from pathlib import Path
 
+import httplib2
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 
 from yt_scheduler.services.auth import get_youtube_service
@@ -74,9 +78,65 @@ def upload_video(
         media_body=media,
     )
 
+    # next_chunk() handles HTTP 5xx/429 retries internally via num_retries, but
+    # transport-level exceptions (socket resets, SSL errors, connection errors)
+    # are re-raised immediately regardless of num_retries — the library sets
+    # _in_error_state and raises. On the next call, _in_error_state causes the
+    # library to re-query the server for the upload progress byte range before
+    # resuming, so the resumable position is never lost across retries here.
+    _RETRIABLE_TRANSPORT_EXC = (
+        ConnectionError,
+        OSError,
+        socket.timeout,
+        httplib2.HttpLib2Error,
+    )
+    _RETRIABLE_HTTP_STATUSES = {500, 502, 503, 504}
+    _MAX_OUTER_RETRIES = 10
+    _INITIAL_BACKOFF_SECS = 1.0
+
     response = None
+    outer_attempt = 0
     while response is None:
-        status, response = request.next_chunk()
+        try:
+            # num_retries covers HTTP 5xx/429 within the library's own loop.
+            status, response = request.next_chunk(num_retries=3)
+            outer_attempt = 0  # reset backoff counter on each successful chunk
+        except HttpError as exc:
+            if exc.status_code not in _RETRIABLE_HTTP_STATUSES:
+                raise
+            outer_attempt += 1
+            if outer_attempt > _MAX_OUTER_RETRIES:
+                raise RuntimeError(
+                    f"Upload failed after {_MAX_OUTER_RETRIES} retries "
+                    f"(last HTTP status {exc.status_code})"
+                ) from exc
+            backoff = _INITIAL_BACKOFF_SECS * (2 ** (outer_attempt - 1))
+            logger.warning(
+                "Transient HTTP %s during upload chunk (attempt %d/%d); "
+                "retrying in %.1fs",
+                exc.status_code,
+                outer_attempt,
+                _MAX_OUTER_RETRIES,
+                backoff,
+            )
+            time.sleep(backoff)
+        except _RETRIABLE_TRANSPORT_EXC as exc:
+            outer_attempt += 1
+            if outer_attempt > _MAX_OUTER_RETRIES:
+                raise RuntimeError(
+                    f"Upload failed after {_MAX_OUTER_RETRIES} retries "
+                    f"(last error: {exc!r})"
+                ) from exc
+            backoff = _INITIAL_BACKOFF_SECS * (2 ** (outer_attempt - 1))
+            logger.warning(
+                "Transient transport error during upload chunk (attempt %d/%d); "
+                "retrying in %.1fs: %r",
+                outer_attempt,
+                _MAX_OUTER_RETRIES,
+                backoff,
+                exc,
+            )
+            time.sleep(backoff)
 
     return response
 

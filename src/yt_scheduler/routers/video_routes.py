@@ -1412,8 +1412,13 @@ async def set_thumbnail(video_id: str, file: UploadFile = File(...)):
     resolved = path.resolve()
     if UPLOAD_DIR.resolve() not in resolved.parents:
         raise HTTPException(400, "Invalid thumbnail path")
-    with open(path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    # Offload the blocking file copy to a worker thread so the event loop
+    # is not stalled during the I/O transfer.
+    def _copy_thumbnail(src, dest: Path) -> None:
+        with open(dest, "wb") as fh:
+            shutil.copyfileobj(src, fh)
+
+    await asyncio.to_thread(_copy_thumbnail, file.file, path)
 
     await _bind_project_for_video(video_id)
     try:

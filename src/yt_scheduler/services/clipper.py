@@ -1066,8 +1066,27 @@ def _log_proposal_response(
 # generate confirm with vertical crops gets up to 4 hardware encodes in
 # flight while non-crop cuts keep filling the 8 software slots
 # independently.
-_SOFTWARE_CUT_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(8)
-_HARDWARE_CUT_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(4)
+#
+# Lazily initialised on first use so that the semaphores are always
+# created on the running event loop — avoids "bound to a different loop"
+# errors when tests spin up a fresh loop per test or a server restart
+# creates a new loop in-process.
+_SOFTWARE_CUT_SEMAPHORE: asyncio.Semaphore | None = None
+_HARDWARE_CUT_SEMAPHORE: asyncio.Semaphore | None = None
+
+
+def _get_software_cut_semaphore() -> asyncio.Semaphore:
+    global _SOFTWARE_CUT_SEMAPHORE
+    if _SOFTWARE_CUT_SEMAPHORE is None:
+        _SOFTWARE_CUT_SEMAPHORE = asyncio.Semaphore(8)
+    return _SOFTWARE_CUT_SEMAPHORE
+
+
+def _get_hardware_cut_semaphore() -> asyncio.Semaphore:
+    global _HARDWARE_CUT_SEMAPHORE
+    if _HARDWARE_CUT_SEMAPHORE is None:
+        _HARDWARE_CUT_SEMAPHORE = asyncio.Semaphore(4)
+    return _HARDWARE_CUT_SEMAPHORE
 
 
 # In-flight Generate-from-source preview jobs. Same pattern as
@@ -1182,7 +1201,14 @@ _MIN_SHIFT_TO_APPLY: float = 0.15
 # implicitly (one call per kind, 3 kinds max) and keeps the dominant
 # input prompt cached across consecutive calls.
 _VISION_CONCURRENCY: int = 4
-_VISION_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(_VISION_CONCURRENCY)
+_VISION_SEMAPHORE: asyncio.Semaphore | None = None
+
+
+def _get_vision_semaphore() -> asyncio.Semaphore:
+    global _VISION_SEMAPHORE
+    if _VISION_SEMAPHORE is None:
+        _VISION_SEMAPHORE = asyncio.Semaphore(_VISION_CONCURRENCY)
+    return _VISION_SEMAPHORE
 
 
 class _NullAsyncContext:
@@ -1509,8 +1535,8 @@ async def cut_clip_from_parent(
     # 4K case so we don't crush large sources at the 1080p bitrate.
     will_use_hardware = media_service.hardware_encoder_available("h264")
     semaphore = (
-        _HARDWARE_CUT_SEMAPHORE if will_use_hardware
-        else _SOFTWARE_CUT_SEMAPHORE
+        _get_hardware_cut_semaphore() if will_use_hardware
+        else _get_software_cut_semaphore()
     )
     async with semaphore:
         out_name = f"clip_{proposal.kind}_{secrets.token_hex(6)}.mp4"
@@ -1584,8 +1610,8 @@ async def cut_preview_for_proposal(
     # 4K case so we don't crush large sources at the 1080p bitrate.
     will_use_hardware = media_service.hardware_encoder_available("h264")
     semaphore = (
-        _HARDWARE_CUT_SEMAPHORE if will_use_hardware
-        else _SOFTWARE_CUT_SEMAPHORE
+        _get_hardware_cut_semaphore() if will_use_hardware
+        else _get_software_cut_semaphore()
     )
     out_name = _preview_filename(job_id, proposal.kind, idx)
     out_path = UPLOAD_DIR / out_name
@@ -2148,7 +2174,7 @@ async def _run_generate_job(job_id: str) -> None:
                         proposal=prop,
                         parent_video_path=Path(job["parent_video_path"]),
                         project_id=int(job["project_id"]),
-                        semaphore=_VISION_SEMAPHORE,
+                        semaphore=_get_vision_semaphore(),
                     )
                 )
                 refinement_tasks.append((k, idx, task))

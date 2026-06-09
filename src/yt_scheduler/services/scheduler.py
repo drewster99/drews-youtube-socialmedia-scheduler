@@ -457,6 +457,32 @@ async def _send_scheduled_post(post_id: int) -> None:
                 "previous_post_url": dup.get("post_url"),
             },
         )
+        # The DateTrigger that fired is now gone. Re-register a fresh job
+        # one hour from now so the duplicate window can expire and the post
+        # can self-heal without requiring a server restart. Without this the
+        # post would sit 'approved' with a stale scheduler_job_id and no
+        # live trigger until the next restart (or the user manually retimes it).
+        retry_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        try:
+            await schedule_social_post(post_id, retry_at)
+            logger.info(
+                "_send_scheduled_post: re-scheduled duplicate post %s for %s",
+                post_id, retry_at.isoformat(),
+            )
+        except Exception as reschedule_exc:
+            # Non-fatal: restore_scheduled_posts will re-create the job on
+            # the next restart. Null the stale id so the state is at least
+            # self-consistent for restore to pick up.
+            logger.error(
+                "_send_scheduled_post: could not re-schedule post %s after "
+                "duplicate guard — clearing stale job id: %s",
+                post_id, reschedule_exc,
+            )
+            await db.execute(
+                "UPDATE social_posts SET scheduler_job_id = NULL WHERE id = ?",
+                (post_id,),
+            )
+            await db.commit()
         return
 
     try:
@@ -483,7 +509,8 @@ async def _send_scheduled_post(post_id: int) -> None:
                 poster = get_poster(post["platform"])
     except ValueError as exc:
         await db.execute(
-            "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
+            "UPDATE social_posts SET status = 'failed', error = ?, "
+            "scheduler_job_id = NULL WHERE id = ?",
             (f"credential resolution failed: {exc}", post_id),
         )
         await db.commit()
@@ -491,7 +518,8 @@ async def _send_scheduled_post(post_id: int) -> None:
 
     if not await poster.is_configured():
         await db.execute(
-            "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
+            "UPDATE social_posts SET status = 'failed', error = ?, "
+            "scheduler_job_id = NULL WHERE id = ?",
             (f"{post['platform']} not configured", post_id),
         )
         await db.commit()
@@ -549,7 +577,8 @@ async def _send_scheduled_post(post_id: int) -> None:
             )
         logger.error("Failed to send scheduled post %s: %s", post_id, exc)
         await db.execute(
-            "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
+            "UPDATE social_posts SET status = 'failed', error = ?, "
+            "scheduler_job_id = NULL WHERE id = ?",
             (str(exc), post_id),
         )
         await db.commit()
@@ -969,6 +998,10 @@ async def restore_scheduled_jobs() -> None:
     )
 
     now = datetime.now(timezone.utc)
+    # Missed-publish jobs are staggered so many concurrent publishes don't
+    # thundering-herd the YouTube quota and social platform rate limits.
+    _MISSED_PUBLISH_STAGGER_SECONDS = 5
+    missed_index = 0
     for row in rows:
         publish_at = _parse_iso_datetime(row["publish_at"])
         if publish_at is None:
@@ -982,9 +1015,28 @@ async def restore_scheduled_jobs() -> None:
                 await schedule_publish(row["id"], publish_at)
                 logger.info(f"Restored scheduled publish for {row['id']} at {publish_at}")
             else:
-                # Missed the window — publish immediately
-                logger.warning(f"Missed publish window for {row['id']}, publishing now")
-                await publish_video_job(row["id"])
+                # Missed the window — schedule as an immediate APScheduler job
+                # rather than awaiting inline, so: (a) startup completes without
+                # waiting for YouTube/social-platform I/O; (b) one hanging publish
+                # can't block the others or restore_scheduled_posts; (c) each job
+                # runs inside the scheduler with its own error isolation.
+                run_at = now + timedelta(seconds=missed_index * _MISSED_PUBLISH_STAGGER_SECONDS)
+                missed_index += 1
+                missed_job_id = f"missed_publish_{row['id']}"
+                scheduler.add_job(
+                    publish_video_job,
+                    "date",
+                    run_date=run_at,
+                    args=[row["id"]],
+                    id=missed_job_id,
+                    replace_existing=True,
+                    misfire_grace_time=300,
+                    coalesce=True,
+                )
+                logger.warning(
+                    "Missed publish window for %s, scheduled recovery job at %s",
+                    row["id"], run_at.isoformat(),
+                )
         except Exception as e:
             logger.error(f"Failed to restore schedule for {row['id']}: {e}")
 
@@ -1022,9 +1074,6 @@ async def restore_pending_auto_actions() -> None:
             datetime('now', '-{_AUTO_ACTION_RESUME_WINDOW_HOURS} hours')
         """
     )
-    if not rows:
-        return
-
     from yt_scheduler.services.auto_actions import run_post_create_actions
     restored = 0
     for row in rows:

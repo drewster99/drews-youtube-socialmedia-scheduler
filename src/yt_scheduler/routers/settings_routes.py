@@ -37,6 +37,17 @@ from yt_scheduler.services.social_credentials import (
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
+# Keys the generic PUT /api/settings endpoint is allowed to write.
+# anthropic_model is intentionally excluded — it has its own PUT /api/settings/anthropic
+# route that also busts the in-process model cache. Writing it here would leave the
+# cache stale and cause silent use of the old model until restart.
+_SETTINGS_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "comment_check_interval",
+        "caption_check_interval",
+    }
+)
+
 
 # --- General Settings ---
 
@@ -51,7 +62,20 @@ async def get_settings():
 
 @router.put("")
 async def update_settings(data: dict):
-    """Update settings (key-value pairs)."""
+    """Update settings (key-value pairs).
+
+    Only keys in ``_SETTINGS_ALLOWLIST`` are accepted. Unknown keys are
+    rejected with a 400 so callers know their data was not saved rather
+    than silently discarded or, worse, silently accepted with broken
+    side-effects (e.g. stale model cache if anthropic_model were written here).
+    """
+    unknown = sorted(set(data) - _SETTINGS_ALLOWLIST)
+    if unknown:
+        raise HTTPException(
+            400,
+            f"Unknown or disallowed settings key(s): {unknown}. "
+            f"Allowed: {sorted(_SETTINGS_ALLOWLIST)}",
+        )
     db = await get_db()
     for key, value in data.items():
         await db.execute(
@@ -455,9 +479,12 @@ async def add_keyword(data: dict, project_slug: str | None = None):
     keyword = data.get("keyword", "").strip()
     if not keyword:
         raise HTTPException(400, "Keyword is required")
-    await moderation.add_keyword(
-        keyword, is_regex=data.get("is_regex", False), project_id=project_id
-    )
+    try:
+        await moderation.add_keyword(
+            keyword, is_regex=data.get("is_regex", False), project_id=project_id
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     return {"status": "ok"}
 
 

@@ -154,3 +154,60 @@ async def test_seeded_ai_block_default_system_present(prompts_env) -> None:
     assert record["body"] == ""
     assert record["system"] is not None
     assert "social media copywriter" in record["system"]
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: a saved-but-empty/whitespace body must FAIL LOUDLY rather
+# than silently fall back to the seed. A blank saved body means the user cleared
+# the editor; surfacing the error stops a blank prompt from quietly driving
+# generation. (A *missing* row still uses the seed — that's the intended default,
+# covered by test_fallback_when_row_missing.)
+# ---------------------------------------------------------------------------
+
+async def test_empty_body_raises(prompts_env) -> None:
+    """Upserting body='' for a seeded key must raise, not return the seed."""
+    import pytest
+
+    prompts, _db = prompts_env
+    await prompts.upsert_prompt_template(
+        key="tags_from_metadata_prompt",
+        name="Tags from metadata",
+        body="",
+        project_id=1,
+    )
+    with pytest.raises(prompts.EmptyPromptBodyError):
+        await prompts.get_prompt_with_fallback(
+            "tags_from_metadata_prompt", project_id=1
+        )
+
+
+async def test_whitespace_only_body_raises(prompts_env) -> None:
+    """Upserting body='   ' (whitespace only) must also raise."""
+    import pytest
+
+    prompts, _db = prompts_env
+    await prompts.upsert_prompt_template(
+        key="tags_from_metadata_prompt",
+        name="Tags from metadata",
+        body="   ",
+        project_id=1,
+    )
+    with pytest.raises(prompts.EmptyPromptBodyError):
+        await prompts.get_prompt_with_fallback(
+            "tags_from_metadata_prompt", project_id=1
+        )
+
+
+async def test_non_empty_custom_body_is_preserved(prompts_env) -> None:
+    """A genuinely non-empty saved body must win over the seed — not replaced."""
+    prompts, _db = prompts_env
+    await prompts.upsert_prompt_template(
+        key="tags_from_metadata_prompt",
+        name="Tags from metadata",
+        body="My custom tags prompt",
+        project_id=1,
+    )
+    record = await prompts.get_prompt_with_fallback(
+        "tags_from_metadata_prompt", project_id=1
+    )
+    assert record["body"] == "My custom tags prompt"

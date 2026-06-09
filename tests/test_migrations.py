@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import aiosqlite
@@ -9,6 +10,7 @@ import pytest
 
 from yt_scheduler.migrations import (
     MIGRATIONS_DIR,
+    _split_statements,
     apply_migrations,
     discover_migrations,
 )
@@ -114,3 +116,79 @@ def test_discover_returns_sorted(tmp_path: Path) -> None:
     migrations = discover_migrations(tmp_path)
     assert [m.version for m in migrations] == [1, 2, 3]
     assert [m.name for m in migrations] == ["a", "b", "c"]
+
+
+@pytest.mark.asyncio
+async def test_failed_migration_is_fully_rolled_back(tmp_path: Path) -> None:
+    """A migration that fails mid-way must leave no schema changes and no stamp.
+
+    This is the core atomicity guarantee: the DB is identical before and after
+    a failed migration run, so the next startup can safely retry.
+    """
+    db_path = tmp_path / "publisher.db"
+    async with aiosqlite.connect(str(db_path)) as conn:
+        # Apply the baseline so schema_migrations exists (version 1 stamped).
+        await apply_migrations(conn, target_version=1)
+
+        # Build an isolated migrations dir holding the REAL baseline (so the
+        # runner discovers a contiguous [1, 2] set — otherwise discover_migrations
+        # rejects a lone version 2 and we'd never reach the migration at all) plus
+        # a 002 that adds a column then re-adds it (duplicate → fails mid-script).
+        mig_dir = tmp_path / "migrations"
+        mig_dir.mkdir()
+        shutil.copy(MIGRATIONS_DIR / "001_baseline.sql", mig_dir / "001_baseline.sql")
+        (mig_dir / "002_partial_fail.sql").write_text(
+            "ALTER TABLE videos ADD COLUMN canary_col TEXT;\n"
+            "ALTER TABLE videos ADD COLUMN canary_col TEXT;\n"  # duplicate → fail
+        )
+
+        # Version 1 is already applied, so only 002 runs — and must raise for the
+        # migration's own reason, NOT a discovery/contiguity error.
+        with pytest.raises(Exception) as exc_info:
+            await apply_migrations(conn, directory=mig_dir, target_version=2)
+        assert "canary_col" in str(exc_info.value).lower() or (
+            "duplicate column" in str(exc_info.value).lower()
+        ), f"failed for the wrong reason: {exc_info.value!r}"
+
+        # The partial column must NOT have been committed.
+        cursor = await conn.execute("PRAGMA table_info(videos)")
+        col_names = {row[1] for row in await cursor.fetchall()}
+        assert "canary_col" not in col_names, (
+            "Failed migration left a partial schema change — rollback did not work"
+        )
+
+        # Version 2 must NOT be stamped — next startup can retry.
+        cursor = await conn.execute("SELECT version FROM schema_migrations")
+        versions = {row[0] for row in await cursor.fetchall()}
+        assert 2 not in versions, (
+            "Failed migration was stamped as applied — would be skipped on retry"
+        )
+
+
+def test_split_statements_strips_semicolons_in_comments(tmp_path: Path) -> None:
+    """Semicolons inside -- comment text must not produce spurious statement fragments."""
+    sql = (
+        "-- duration < 50s; the UI shows a picker.\n"
+        "ALTER TABLE t ADD COLUMN x INTEGER;\n"
+        "ALTER TABLE t ADD COLUMN y INTEGER;\n"
+    )
+    leading_pragmas, txn_stmts = _split_statements(sql)
+    assert leading_pragmas == []
+    assert len(txn_stmts) == 2
+    assert all(s.upper().startswith("ALTER") for s in txn_stmts)
+
+
+def test_split_statements_leading_pragma_excluded_from_txn(tmp_path: Path) -> None:
+    """Leading PRAGMA lines are separated from transactional statements."""
+    sql = (
+        "PRAGMA foreign_keys = OFF;\n"
+        "CREATE TABLE t (x INTEGER);\n"
+        "INSERT INTO t VALUES (1);\n"
+        "PRAGMA foreign_keys = ON;\n"
+    )
+    leading_pragmas, txn_stmts = _split_statements(sql)
+    assert len(leading_pragmas) == 1
+    assert "OFF" in leading_pragmas[0]
+    # Trailing PRAGMA must be excluded from txn_stmts.
+    assert all("PRAGMA" not in s.upper() for s in txn_stmts)
+    assert len(txn_stmts) == 2

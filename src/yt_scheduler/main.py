@@ -55,15 +55,55 @@ def _bundle_passphrase(*, confirm: bool) -> str:
 
 
 def _server_is_running() -> bool:
-    """True if something is already bound to the scheduler's host:port."""
+    """True if the scheduler server appears to be running.
+
+    Primary check: the PID file written by the server at startup. If it
+    contains a PID for a live process, the server is running. A stale file
+    (left behind by a crash) is detected via os.kill(pid, 0) — if the
+    process doesn't exist the file is stale and we remove it.
+
+    Fallback: if no PID file exists (e.g. an older server build that
+    predates this file), we probe the port on both IPv4 and IPv6 without
+    SO_REUSEADDR so a live bind reliably causes EADDRINUSE.
+    """
+    import os
     import socket
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    from yt_scheduler.config import PID_FILE
+
+    if PID_FILE.exists():
         try:
-            sock.bind((HOST, PORT))
+            pid = int(PID_FILE.read_text().strip())
+        except (ValueError, OSError):
+            # Unreadable or malformed — treat as stale.
+            PID_FILE.unlink(missing_ok=True)
+        else:
+            try:
+                os.kill(pid, 0)
+                # Signal delivered: process is alive.
+                return True
+            except ProcessLookupError:
+                # Process is gone — stale lock file.
+                PID_FILE.unlink(missing_ok=True)
+            except PermissionError:
+                # Process exists but we don't own it — very unlikely for a
+                # single-user app, but treat it as live to be safe.
+                return True
+
+    # Fallback port probe: try both IPv4 and IPv6, no SO_REUSEADDR so that a
+    # genuinely bound port surfaces as EADDRINUSE.
+    for family, addr in (
+        (socket.AF_INET, "127.0.0.1"),
+        (socket.AF_INET6, "::1"),
+    ):
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
+                sock.bind((addr, PORT))
         except OSError:
             return True
+        except Exception:
+            pass
+
     return False
 
 
@@ -179,9 +219,17 @@ def main():
             print("Usage: yt-scheduler import-all <input-file.dysbak>", file=sys.stderr)
             sys.exit(2)
         if _server_is_running():
+            from yt_scheduler.config import PID_FILE
+
             print(
-                "The scheduler server appears to be running. Quit the app (or stop the "
-                f"launch agent) so nothing is using port {PORT}, then run this again.",
+                "The scheduler server appears to be running. Restoring now would "
+                "overwrite the live database underneath it and corrupt your data.\n"
+                "Stop the server first — quitting the macOS app fully stops it. "
+                "Note: simply killing the process is NOT enough when it's installed "
+                "as a launch agent/service, because launchd will relaunch it; use "
+                "the app to stop it (or `launchctl bootout` the service).\n"
+                f"If you're certain it is not running, delete the stale PID file "
+                f"({PID_FILE}) and try again.",
                 file=sys.stderr,
             )
             sys.exit(1)

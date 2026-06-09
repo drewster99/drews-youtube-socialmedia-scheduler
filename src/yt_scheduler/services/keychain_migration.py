@@ -29,10 +29,10 @@ import httpx
 
 from yt_scheduler.database import get_db
 from yt_scheduler.services.keychain import (
-    delete_secret,
-    load_all_secrets,
-    load_secret,
-    store_secret,
+    delete_secret_async,
+    load_all_secrets_async,
+    load_secret_async,
+    store_secret_async,
 )
 
 logger = logging.getLogger(__name__)
@@ -131,10 +131,10 @@ def _is_legacy_key(key: str) -> bool:
 
 async def _migrate_platform(platform: str) -> None:
     """Migrate one platform. Idempotent — re-runs are no-ops."""
-    if load_secret(platform, MIGRATION_MARKER_KEY):
+    if await load_secret_async(platform, MIGRATION_MARKER_KEY):
         return
 
-    secrets_map = load_all_secrets(platform)
+    secrets_map = await load_all_secrets_async(platform)
     legacy = {k: v for k, v in secrets_map.items() if _is_legacy_key(k)}
 
     db = await get_db()
@@ -149,7 +149,7 @@ async def _migrate_platform(platform: str) -> None:
             (platform,),
         )
         await db.commit()
-        store_secret(platform, MIGRATION_MARKER_KEY, "1")
+        await store_secret_async(platform, MIGRATION_MARKER_KEY, "1")
         return
 
     resolver = _RESOLVERS.get(platform)
@@ -161,6 +161,48 @@ async def _migrate_platform(platform: str) -> None:
     if not username:
         username = legacy.get("username") or legacy.get("handle") or platform
         is_nickname = 1
+
+    # Detect a partial run: a crash after db.commit() but before the bundle
+    # write or marker write would leave a real (non-pending) row with no bundle.
+    # Reuse the existing uuid so credentials_ref stays valid and we don't
+    # accumulate duplicate rows on re-runs.
+    cursor = await db.execute(
+        "SELECT id, uuid, provider_account_id FROM social_accounts "
+        "WHERE platform = ? AND uuid NOT LIKE '__pending__:%' ORDER BY id LIMIT 1",
+        (platform,),
+    )
+    committed_row = await cursor.fetchone()
+    if committed_row is not None:
+        existing_uuid = committed_row["uuid"]
+        existing_bundle_raw = await load_secret_async(
+            platform, f"{CREDENTIAL_KEY_PREFIX}{existing_uuid}"
+        )
+        if existing_bundle_raw:
+            # Row and bundle both exist — only the marker was missing.
+            await store_secret_async(platform, MIGRATION_MARKER_KEY, "1")
+            logger.info(
+                "Keychain v8: %s already migrated to cred.%s (marker recovered after partial run)",
+                platform, existing_uuid[:8],
+            )
+            return
+        # Row committed but bundle missing — reuse uuid, write bundle, clean up legacy.
+        row_id = int(committed_row["id"])
+        final_provider_id = committed_row["provider_account_id"]
+        bundle = dict(legacy)
+        bundle["uuid"] = existing_uuid
+        bundle["provider_account_id"] = final_provider_id
+        bundle["username"] = username
+        await store_secret_async(
+            platform, f"{CREDENTIAL_KEY_PREFIX}{existing_uuid}", json.dumps(bundle)
+        )
+        for key in legacy:
+            await delete_secret_async(platform, key)
+        await store_secret_async(platform, MIGRATION_MARKER_KEY, "1")
+        logger.info(
+            "Keychain v8: %s → cred.%s (id=%s, bundle recovered after partial run)",
+            platform, existing_uuid[:8], row_id,
+        )
+        return
 
     new_uuid = uuidlib.uuid4().hex
     final_provider_id = provider_account_id or f"legacy:{new_uuid}"
@@ -179,6 +221,18 @@ async def _migrate_platform(platform: str) -> None:
         (platform,),
     )
     placeholder = await cursor.fetchone()
+
+    bundle = dict(legacy)
+    bundle["uuid"] = new_uuid
+    bundle["provider_account_id"] = final_provider_id
+    bundle["username"] = username
+
+    # Write Keychain bundle BEFORE committing the DB row so a crash between
+    # the two leaves an orphaned-but-harmless secret rather than a committed
+    # row with credentials_ref pointing at a missing bundle.
+    await store_secret_async(
+        platform, f"{CREDENTIAL_KEY_PREFIX}{new_uuid}", json.dumps(bundle)
+    )
 
     if placeholder is not None:
         row_id = int(placeholder[0])
@@ -201,16 +255,10 @@ async def _migrate_platform(platform: str) -> None:
         row_id = int(cursor.lastrowid)
     await db.commit()
 
-    bundle = dict(legacy)
-    bundle["uuid"] = new_uuid
-    bundle["provider_account_id"] = final_provider_id
-    bundle["username"] = username
-    store_secret(platform, f"{CREDENTIAL_KEY_PREFIX}{new_uuid}", json.dumps(bundle))
-
     for key in legacy:
-        delete_secret(platform, key)
+        await delete_secret_async(platform, key)
 
-    store_secret(platform, MIGRATION_MARKER_KEY, "1")
+    await store_secret_async(platform, MIGRATION_MARKER_KEY, "1")
     logger.info(
         "Keychain v8: %s → cred.%s (id=%s, %s)",
         platform, new_uuid[:8], row_id,
@@ -227,7 +275,7 @@ async def _wipe_bluesky_app_password_bundles() -> None:
     bundle and soft-delete the row so the UI prompts the user to
     re-connect via the new Connect with Bluesky flow.
     """
-    if load_secret("bluesky", BLUESKY_OAUTH_MARKER_KEY):
+    if await load_secret_async("bluesky", BLUESKY_OAUTH_MARKER_KEY):
         return
 
     db = await get_db()
@@ -241,7 +289,7 @@ async def _wipe_bluesky_app_password_bundles() -> None:
         uuid = row["uuid"]
         if uuid.startswith("__pending__:"):
             continue
-        bundle_raw = load_secret("bluesky", f"{CREDENTIAL_KEY_PREFIX}{uuid}")
+        bundle_raw = await load_secret_async("bluesky", f"{CREDENTIAL_KEY_PREFIX}{uuid}")
         keep = False
         if bundle_raw:
             try:
@@ -252,7 +300,7 @@ async def _wipe_bluesky_app_password_bundles() -> None:
                 pass
         if keep:
             continue
-        delete_secret("bluesky", f"{CREDENTIAL_KEY_PREFIX}{uuid}")
+        await delete_secret_async("bluesky", f"{CREDENTIAL_KEY_PREFIX}{uuid}")
         await db.execute(
             "UPDATE social_accounts SET deleted_at = datetime('now') WHERE id = ?",
             (int(row["id"]),),
@@ -269,7 +317,7 @@ async def _wipe_bluesky_app_password_bundles() -> None:
             wiped,
         )
 
-    store_secret("bluesky", BLUESKY_OAUTH_MARKER_KEY, "1")
+    await store_secret_async("bluesky", BLUESKY_OAUTH_MARKER_KEY, "1")
 
 
 async def migrate_to_per_credential_bundles() -> None:

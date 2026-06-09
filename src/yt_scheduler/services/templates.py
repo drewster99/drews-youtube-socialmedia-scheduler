@@ -334,6 +334,22 @@ def render_template(template_text: str, variables: dict[str, object]) -> str:
 # bare-suffix. Default text is non-greedy so it stops at the next '}}'.
 _VAR_PATTERN = re.compile(r"\{\{(\w+)(?:(!)|\?\?(.*?))?\}\}")
 
+# Matches the exact two-char opener that _resolve_ai_blocks looks for.
+# Replacing it with a non-matching form in user-supplied values prevents
+# variable content from being executed as template directives.
+_AI_OPENER = re.compile(r"\{\{(?=ai[\[:])")
+
+
+def _sanitize_value(value: str) -> str:
+    """Neutralize any ``{{ai`` openers inside a substituted variable value.
+
+    Variable values come from user-supplied data (video titles, descriptions,
+    transcripts) and must never be executed as template directives. A space
+    is inserted between the braces so the opener no longer matches the
+    literal two-char sequence the AI-block walker requires.
+    """
+    return _AI_OPENER.sub("{ {", value)
+
 
 def _substitute_variables(text: str, variables: dict[str, object]) -> str:
     def replace(match: re.Match) -> str:
@@ -342,7 +358,9 @@ def _substitute_variables(text: str, variables: dict[str, object]) -> str:
         default_text = match.group(3)  # None when no `??...` was present
         if name in variables:
             value = variables[name]
-            return "" if value is None else str(value)
+            if value is None:
+                return ""
+            return _sanitize_value(str(value))
         if required:
             raise MissingRequiredVariable(name)
         if default_text is not None:
@@ -352,6 +370,40 @@ def _substitute_variables(text: str, variables: dict[str, object]) -> str:
     return _VAR_PATTERN.sub(replace, text)
 
 
+# Hard limits applied per render() call to prevent runaway cost and recursion.
+_MAX_AI_BLOCK_DEPTH = 5   # nesting levels of {{ai:}} inside {{ai:}}
+_MAX_AI_BLOCKS_PER_RENDER = 20  # total Claude calls across the whole template
+
+
+class _RenderLimits:
+    """Mutable call-count bucket shared across a single render() invocation."""
+
+    __slots__ = ("blocks_fired",)
+
+    def __init__(self) -> None:
+        self.blocks_fired = 0
+
+
+class TooManyAIBlocksError(RuntimeError):
+    """Raised when a template exceeds the per-render AI-block budget."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(
+            f"Template exceeded the {limit}-block AI call limit per render. "
+            "Reduce the number of {{ai:}} blocks in the template."
+        )
+
+
+class AIBlockDepthError(RuntimeError):
+    """Raised when {{ai:}} nesting exceeds the recursion depth cap."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(
+            f"{{{{ai:}}}} blocks nested more than {limit} levels deep. "
+            "Flatten the template."
+        )
+
+
 def _resolve_ai_blocks(
     text: str,
     *,
@@ -359,7 +411,14 @@ def _resolve_ai_blocks(
     model: str | None,
     max_tokens: int,
     trace: list[dict] | None = None,
+    _depth: int = 0,
+    _limits: _RenderLimits | None = None,
 ) -> str:
+    if _limits is None:
+        _limits = _RenderLimits()
+    if _depth > _MAX_AI_BLOCK_DEPTH:
+        raise AIBlockDepthError(_MAX_AI_BLOCK_DEPTH)
+
     out: list[str] = []
     i = 0
     n = len(text)
@@ -407,6 +466,10 @@ def _resolve_ai_blocks(
             out.append(text[idx:])
             break
 
+        _limits.blocks_fired += 1
+        if _limits.blocks_fired > _MAX_AI_BLOCKS_PER_RENDER:
+            raise TooManyAIBlocksError(_MAX_AI_BLOCKS_PER_RENDER)
+
         inner_text = text[body_start : j - 2].strip()
         prompt = _resolve_ai_blocks(
             inner_text,
@@ -414,6 +477,8 @@ def _resolve_ai_blocks(
             model=model,
             max_tokens=max_tokens,
             trace=trace,
+            _depth=_depth + 1,
+            _limits=_limits,
         )
         effective_system = (
             system_override if system_override is not None else default_system_prompt

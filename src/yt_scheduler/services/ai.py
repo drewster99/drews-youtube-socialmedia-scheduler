@@ -63,16 +63,24 @@ def _extract_text(message) -> str:
     use plain mock objects (no ``type`` discriminator) keep working.
     """
     blocks = list(message.content or ())
-    # Modern SDK: TextBlock has a discriminator.
-    for block in blocks:
-        if getattr(block, "type", None) == "text":
-            return getattr(block, "text", "") or ""
-    # Fallback: any block whose .text is a string (skips ToolUseBlock
-    # and ThinkingBlock — neither carries a text str — but matches the
-    # plain MagicMock / type(...) shapes used in tests).
+    # Modern SDK: collect text from ALL type=="text" blocks — a response can
+    # legitimately interleave thinking/tool_use blocks with multiple text
+    # blocks, and we want the full combined output, not just the first shard.
+    texts = [
+        getattr(block, "text", "") or ""
+        for block in blocks
+        if getattr(block, "type", None) == "text"
+    ]
+    combined = "".join(texts)
+    if combined.strip():
+        # Return the unstripped value so callers control their own whitespace
+        # handling (most callers already do .strip()).
+        return combined
+    # Fallback: plain mock objects (no type discriminator) used in tests.
+    # Skips empty-string .text so mocks that return "" trigger the same error.
     for block in blocks:
         text = getattr(block, "text", None)
-        if isinstance(text, str):
+        if isinstance(text, str) and text.strip():
             return text
     raise ClaudeEmptyResponseError(message)
 

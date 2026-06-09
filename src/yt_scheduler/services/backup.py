@@ -172,7 +172,7 @@ def _build_inner_archive(tar_path: Path) -> dict:
                         rel = full.relative_to(data_dir)
                         if rel.parts and rel.parts[0] in _SKIP_TOP_LEVEL:
                             continue
-                        if rel.name == "publisher.db" or rel.name in _DB_SIDE_FILES:
+                        if rel.name in {"publisher.db", "server.pid"} or rel.name in _DB_SIDE_FILES:
                             continue
                         tar.add(full, arcname=str(Path("data") / rel))
                         summary["data_files"] += 1
@@ -307,8 +307,8 @@ def import_bundle(in_path: Path, passphrase: str) -> dict:
         data_dir.mkdir(parents=True, exist_ok=True)
         for entry in new_data.iterdir():
             shutil.move(str(entry), str(data_dir / entry.name))
-        for side in _DB_SIDE_FILES:
-            stale = data_dir / side
+        for stale_name in (*_DB_SIDE_FILES, "server.pid"):
+            stale = data_dir / stale_name
             if stale.exists():
                 stale.unlink()
 

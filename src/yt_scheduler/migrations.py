@@ -2,9 +2,17 @@
 
 Migrations are plain `.sql` files in the repo's top-level `migrations/` directory,
 named `NNN_<slug>.sql` where NNN is a zero-padded integer version number starting
-at 001. The runner applies each pending file in numeric order inside a single
-transaction per file and records the version (with checksum and timestamp) in
-`schema_migrations`.
+at 001. The runner applies each pending file in a single atomic transaction per
+file: all DDL/DML statements plus the `schema_migrations` stamp are committed
+together, so a mid-migration failure leaves the schema unchanged and the version
+unstamped, letting the next startup safely retry.
+
+``PRAGMA`` statements (e.g. ``foreign_keys = OFF/ON`` used by table-rebuild
+migrations) are non-transactional in SQLite — they are silently ignored when
+issued inside an active transaction. The runner therefore executes any
+``PRAGMA`` lines outside the ``BEGIN``/``COMMIT`` envelope. ``PRAGMA
+foreign_keys`` is restored to ON unconditionally in the ``finally`` block
+regardless of success or failure.
 
 A pre-existing database whose tables already match `001_baseline.sql` is stamped
 at version 1 without re-running the statements (so we don't trip over the
@@ -68,6 +76,68 @@ class Migration:
     @property
     def checksum(self) -> str:
         return hashlib.sha256(self.sql.encode("utf-8")).hexdigest()
+
+
+def _split_statements(sql: str) -> tuple[list[str], list[str]]:
+    """Split a migration SQL file into leading PRAGMA statements and transactional statements.
+
+    Returns ``(leading_pragmas, txn_stmts)``.
+
+    ``leading_pragmas`` are PRAGMA statements that appear before the first
+    non-PRAGMA statement in the file.  They must run outside the transaction
+    because SQLite silently ignores ``PRAGMA foreign_keys`` (and a few others)
+    when issued inside an active transaction.  ``002_projects.sql`` and
+    ``008_per_project_credentials.sql`` use ``PRAGMA foreign_keys = OFF`` here
+    to allow their DROP/RENAME table-rebuild dance.
+
+    Trailing PRAGMA lines (after the last DDL/DML statement) are intentionally
+    excluded: the ``apply_migrations`` finally-block restores FK enforcement
+    unconditionally, so including the trailing ``PRAGMA foreign_keys = ON``
+    would prematurely turn FKs back ON before the transaction commits and
+    re-enable the very CASCADE deletions that ``PRAGMA foreign_keys = OFF``
+    was meant to suppress.
+
+    Strips ``--`` comments (both full-line and inline) before splitting on
+    semicolons, so semicolons that appear inside comment text don't produce
+    spurious fragments.  This is correct for this codebase because no migration
+    uses string literals that contain semicolons or ``--`` sequences.
+    """
+    # Strip inline and full-line -- comments from each line before splitting.
+    # This prevents semicolons inside comment text from creating bogus fragments.
+    stripped_lines = []
+    for line in sql.splitlines():
+        comment_pos = line.find("--")
+        if comment_pos != -1:
+            line = line[:comment_pos]
+        stripped_lines.append(line)
+    stripped_sql = "\n".join(stripped_lines)
+
+    all_stmts: list[str] = []
+    for raw in stripped_sql.split(";"):
+        stmt = raw.strip()
+        if stmt:
+            all_stmts.append(stmt)
+
+    # Collect leading PRAGMAs (before the first non-PRAGMA statement).
+    leading_pragmas: list[str] = []
+    first_non_pragma = 0
+    for i, stmt in enumerate(all_stmts):
+        if stmt.upper().startswith("PRAGMA"):
+            leading_pragmas.append(stmt)
+        else:
+            first_non_pragma = i
+            break
+
+    # All statements from the first non-PRAGMA onward go into the transaction,
+    # except trailing PRAGMAs after the last DDL/DML statement. Those are the
+    # closing "PRAGMA foreign_keys = ON" fence lines covered by the finally-block.
+    remaining = all_stmts[first_non_pragma:]
+    last_non_pragma = len(remaining) - 1
+    while last_non_pragma >= 0 and remaining[last_non_pragma].upper().startswith("PRAGMA"):
+        last_non_pragma -= 1
+    txn_stmts = remaining[: last_non_pragma + 1]
+
+    return leading_pragmas, txn_stmts
 
 
 def discover_migrations(directory: Path = MIGRATIONS_DIR) -> list[Migration]:
@@ -200,24 +270,36 @@ async def apply_migrations(
             continue
 
         logger.info("Applying migration %03d_%s", migration.version, migration.name)
+        leading_pragmas, txn_stmts = _split_statements(migration.sql)
         try:
+            # Leading PRAGMAs (e.g. PRAGMA foreign_keys = OFF) must run outside
+            # the transaction — SQLite silently ignores foreign_keys changes
+            # issued inside an active transaction.
+            for pragma in leading_pragmas:
+                await conn.execute(pragma)
+
+            # All DDL/DML plus the version stamp go in one atomic transaction.
+            # Using explicit BEGIN + per-statement execute() (not executescript)
+            # keeps us in control: executescript issues an implicit COMMIT before
+            # running, making rollback a no-op on failure.
+            await conn.execute("BEGIN")
             try:
-                await conn.executescript(migration.sql)
+                for stmt in txn_stmts:
+                    await conn.execute(stmt)
                 await conn.execute(
                     "INSERT INTO schema_migrations (version, name, checksum) "
                     "VALUES (?, ?, ?)",
                     (migration.version, migration.name, migration.checksum),
                 )
-                await conn.commit()
+                await conn.execute("COMMIT")
             except Exception:
-                await conn.rollback()
+                await conn.execute("ROLLBACK")
                 raise
         finally:
-            # `PRAGMA foreign_keys` is per-connection and NOT transactional,
-            # so rollback() doesn't restore it. Any migration that toggles
-            # FKs off mid-script (002_projects.sql does, around the table
-            # rebuilds) would otherwise leave them off for the process
-            # lifetime if its tail failed — silently disabling cascades.
+            # PRAGMA foreign_keys is per-connection and non-transactional, so
+            # neither COMMIT nor ROLLBACK restores it. Ensure it stays ON
+            # regardless of outcome so later migrations and the app aren't
+            # silently running with FK enforcement disabled.
             await conn.execute("PRAGMA foreign_keys = ON")
         newly_applied.append(migration.version)
 

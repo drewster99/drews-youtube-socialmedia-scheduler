@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from yt_scheduler.config import UPLOAD_DIR
+
+logger = logging.getLogger(__name__)
 
 
 # Generous cap on a single ffmpeg invocation. Precise (sample-accurate)
@@ -48,6 +51,7 @@ class VideoProbe:
     size_bytes: int | None
     codec_name: str | None = None
     container: str | None = None
+    has_audio: bool | None = None
 
 
 def probe_video_file(video_path: str | Path) -> VideoProbe | None:
@@ -72,7 +76,6 @@ def probe_video_file(video_path: str | Path) -> VideoProbe | None:
                 "-print_format", "json",
                 "-show_format",
                 "-show_streams",
-                "-select_streams", "v:0",
                 str(path),
             ],
             capture_output=True,
@@ -94,16 +97,29 @@ def probe_video_file(video_path: str | Path) -> VideoProbe | None:
     fmt = data.get("format") or {}
     width = height = None
     codec_name: str | None = None
-    if streams:
-        stream = streams[0]
-        try:
-            width = int(stream["width"]) if "width" in stream else None
-            height = int(stream["height"]) if "height" in stream else None
-        except (TypeError, ValueError):
-            pass
-        raw_codec = stream.get("codec_name")
-        if isinstance(raw_codec, str) and raw_codec:
-            codec_name = raw_codec.lower()
+    has_audio: bool = False
+    for stream in streams:
+        codec_type = stream.get("codec_type")
+        # Identify the video stream by codec_type, but also accept a stream that
+        # carries width/height when codec_type is absent — a video stream always
+        # has dimensions, an audio stream never does. This keeps us robust to
+        # ffprobe output that omits codec_type (matching the pre-`-show_streams`
+        # behavior that keyed off width presence).
+        is_video = codec_type == "video" or (
+            codec_type is None and ("width" in stream or "height" in stream)
+        )
+        if is_video and width is None:
+            # Use the first video stream for dimensions/codec.
+            try:
+                width = int(stream["width"]) if "width" in stream else None
+                height = int(stream["height"]) if "height" in stream else None
+            except (TypeError, ValueError):
+                pass
+            raw_codec = stream.get("codec_name")
+            if isinstance(raw_codec, str) and raw_codec:
+                codec_name = raw_codec.lower()
+        elif codec_type == "audio":
+            has_audio = True
 
     # ffprobe's format_name is a comma-separated list of compatible
     # container labels. We pick the first non-generic token. This is a
@@ -136,6 +152,7 @@ def probe_video_file(video_path: str | Path) -> VideoProbe | None:
         size_bytes=_maybe_int(fmt.get("size")),
         codec_name=codec_name,
         container=container,
+        has_audio=has_audio,
     )
 
 
@@ -494,18 +511,47 @@ def extract_clip(
     if vertical_crop:
         cmd.extend(["-vf", _vertical_crop_filter(x_shift_normalized)])
 
+    # Probe the source once when we need it for either bitrate selection
+    # (hardware encoder, non-cropped) or audio-stream detection (fades).
+    # Doing this before the fade block lets both uses share the same probe.
+    needs_probe = (use_hardware and not vertical_crop) or (audio_fade_in > 0 or audio_fade_out > 0)
+    probe: VideoProbe | None = probe_video_file(video_path) if needs_probe else None
+
     # Audio edge ramps. Cubic IN (sharp attack pops up at the first word) and a
     # gentler linear OUT (the word's natural decay / room-tone tail rings out
     # rather than being slammed). Positions are relative to the OUTPUT (``-ss``
     # before ``-i`` resets timestamps to 0). No video fade by design.
-    fades: list[str] = []
-    if audio_fade_in > 0:
-        fades.append(f"afade=t=in:curve=cub:st=0:d={audio_fade_in:.4f}")
-    if audio_fade_out > 0:
-        out_st = max(0.0, _ffmpeg_timestamp_to_seconds(end) - _ffmpeg_timestamp_to_seconds(start) - audio_fade_out)
-        fades.append(f"afade=t=out:curve=tri:st={out_st:.4f}:d={audio_fade_out:.4f}")
-    if fades:
-        cmd.extend(["-af", ",".join(fades)])
+    #
+    # Guard: only emit -af when the source has an audio stream. Applying
+    # afade to a video-only input makes ffmpeg fail the filter graph
+    # ("Stream specifier ':a' matches no streams"). When the probe
+    # explicitly reports no audio (has_audio is False) we skip the filter
+    # and log so callers can diagnose silent parents. When the probe is
+    # unavailable (has_audio is None) we still emit the filter — unknown
+    # audio presence is not the same as confirmed absence.
+    source_has_audio = probe.has_audio if probe is not None else None
+    if source_has_audio is False and (audio_fade_in > 0 or audio_fade_out > 0):
+        logger.info(
+            "Skipping audio fades for %s — source has no audio stream.",
+            video_path,
+        )
+    else:
+        clip_duration = _ffmpeg_timestamp_to_seconds(end) - _ffmpeg_timestamp_to_seconds(start)
+        # When the probe gives us the real file duration we can derive an
+        # upper bound on the actual output duration and clamp the fade-out
+        # start time so it never lands past EOF.
+        if probe is not None and probe.duration_seconds is not None:
+            max_out_duration = min(clip_duration, probe.duration_seconds)
+        else:
+            max_out_duration = clip_duration
+        fades: list[str] = []
+        if audio_fade_in > 0:
+            fades.append(f"afade=t=in:curve=cub:st=0:d={audio_fade_in:.4f}")
+        if audio_fade_out > 0:
+            out_st = max(0.0, max_out_duration - audio_fade_out)
+            fades.append(f"afade=t=out:curve=tri:st={out_st:.4f}:d={audio_fade_out:.4f}")
+        if fades:
+            cmd.extend(["-af", ",".join(fades)])
 
     if use_hardware:
         # Pick the bitrate by what the OUTPUT will actually be: 9:16
@@ -515,7 +561,8 @@ def extract_clip(
         if vertical_crop:
             bitrate = _videotoolbox_bitrate_for_output(1080, 1920)
         else:
-            probe = probe_video_file(video_path)
+            # probe was already obtained above when needs_probe is True
+            # (hardware + not vertical_crop satisfies that condition).
             bitrate = _videotoolbox_bitrate_for_output(
                 probe.width if probe else None,
                 probe.height if probe else None,
@@ -629,20 +676,44 @@ def extract_gif(
 
 
 def get_video_duration(video_path: str | Path) -> float:
-    """Get video duration in seconds."""
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v", "quiet",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(video_path),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return float(result.stdout.strip())
+    """Get video duration in seconds. Returns 0.0 if duration cannot be read.
+
+    Every failure mode resolves to 0.0 (the documented contract) rather than
+    raising: a non-zero ffprobe exit (corrupt/unreadable file), a timeout, the
+    binary being missing, an empty/"N/A" duration tag, or unparseable output.
+    Callers treat ``<= 0`` as "no usable duration".
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "quiet",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_FFMPEG_FRAME_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("ffprobe duration probe failed for %s: %s", video_path, exc)
+        return 0.0
+    if result.returncode != 0:
+        logger.warning(
+            "ffprobe duration probe exited %d for %s", result.returncode, video_path
+        )
+        return 0.0
+    raw = result.stdout.strip()
+    # ffprobe outputs "N/A" when the container has no duration tag.
+    if not raw or raw == "N/A":
+        return 0.0
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("ffprobe returned unparseable duration %r for %s", raw, video_path)
+        return 0.0
 
 
 def extract_keyframes_in_range(

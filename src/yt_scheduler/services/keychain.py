@@ -1,6 +1,7 @@
 """Secure credential storage — macOS Keychain with file fallback.
 
-On macOS: stores secrets in the system Keychain via the `security` CLI.
+On macOS: writes secrets directly via the Security framework (ctypes) to avoid
+exposing secret values on the process argv; reads them back via the `security` CLI.
 On other platforms: stores secrets in a JSON file at ~/.drews-yt-scheduler/secrets.json
 with restrictive file permissions (600).
 
@@ -13,6 +14,8 @@ forward transparently.
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import json
 import logging
 import os
@@ -43,21 +46,170 @@ def _is_macos() -> bool:
     return platform.system() == "Darwin"
 
 
-def _keychain_set(service: str, account: str, value: str) -> bool:
-    """Store a value in macOS Keychain.
+# Lazy-loaded handle for the macOS Security framework. Initialised once on
+# first use and reused across calls so we don't pay dlopen overhead per write.
+_sec_lib: ctypes.CDLL | None = None
+_SEC_LIB_UNAVAILABLE = False  # set True on first failed load so we stop retrying
 
-    We delete + re-add (rather than using -U alone) so that stale ACL entries
-    from prior runs don't accumulate. The new item is created with
-    `-T /usr/bin/security` trusted, which means later reads via
-    `security find-generic-password` (the same Apple-signed binary, run as a
-    subprocess from Python) don't trigger "app wants to use your confidential
-    information" prompts.
+_ERR_SEC_DUPLICATE_ITEM = -25299
 
-    `-T ""` — the previous value — sounds like "allow all apps" but actually
-    produces an empty trusted-app ACL, forcing macOS to prompt every read.
-    """
+
+def _get_sec_lib() -> ctypes.CDLL | None:
+    global _sec_lib, _SEC_LIB_UNAVAILABLE
+    if _SEC_LIB_UNAVAILABLE:
+        return None
+    if _sec_lib is not None:
+        return _sec_lib
+    path = ctypes.util.find_library("Security")
+    if not path:
+        _SEC_LIB_UNAVAILABLE = True
+        return None
     try:
-        # Delete existing (ignore errors) so the new ACL replaces any stale one.
+        lib = ctypes.CDLL(path)
+        lib.SecKeychainAddGenericPassword.restype = ctypes.c_int32
+        lib.SecKeychainAddGenericPassword.argtypes = [
+            ctypes.c_void_p,   # keychain (NULL = default)
+            ctypes.c_uint32,   # serviceNameLength
+            ctypes.c_char_p,   # serviceName
+            ctypes.c_uint32,   # accountNameLength
+            ctypes.c_char_p,   # accountName
+            ctypes.c_uint32,   # passwordLength
+            ctypes.c_void_p,   # passwordData
+            ctypes.c_void_p,   # itemRef (NULL = not needed)
+        ]
+        lib.SecKeychainFindGenericPassword.restype = ctypes.c_int32
+        lib.SecKeychainFindGenericPassword.argtypes = [
+            ctypes.c_void_p,                    # keychain
+            ctypes.c_uint32,                    # serviceNameLength
+            ctypes.c_char_p,                    # serviceName
+            ctypes.c_uint32,                    # accountNameLength
+            ctypes.c_char_p,                    # accountName
+            ctypes.POINTER(ctypes.c_uint32),    # passwordLength (out)
+            ctypes.POINTER(ctypes.c_void_p),    # passwordData (out)
+            ctypes.c_void_p,                    # itemRef (out)
+        ]
+        lib.SecKeychainItemModifyAttributesAndData.restype = ctypes.c_int32
+        lib.SecKeychainItemModifyAttributesAndData.argtypes = [
+            ctypes.c_void_p,   # item
+            ctypes.c_void_p,   # attrList (NULL = no attribute changes)
+            ctypes.c_uint32,   # length
+            ctypes.c_void_p,   # data
+        ]
+        lib.SecKeychainItemFreeContent.restype = ctypes.c_int32
+        lib.SecKeychainItemFreeContent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        _sec_lib = lib
+        return lib
+    except OSError:
+        _SEC_LIB_UNAVAILABLE = True
+        return None
+
+
+_cf_lib: ctypes.CDLL | None = None
+_CF_LIB_UNAVAILABLE = False
+
+
+def _get_cf_lib() -> ctypes.CDLL | None:
+    """Lazily load CoreFoundation for CFRelease (memory management of CF refs)."""
+    global _cf_lib, _CF_LIB_UNAVAILABLE
+    if _CF_LIB_UNAVAILABLE:
+        return None
+    if _cf_lib is not None:
+        return _cf_lib
+    path = ctypes.util.find_library("CoreFoundation")
+    if not path:
+        _CF_LIB_UNAVAILABLE = True
+        return None
+    try:
+        lib = ctypes.CDLL(path)
+        lib.CFRelease.restype = None
+        lib.CFRelease.argtypes = [ctypes.c_void_p]
+        _cf_lib = lib
+        return lib
+    except OSError:
+        _CF_LIB_UNAVAILABLE = True
+        return None
+
+
+def _cf_release(ref: ctypes.c_void_p) -> None:
+    """Release a CF ref returned with the Create/Copy/RETAINED ownership rule.
+
+    SecKeychainFindGenericPassword's itemRef out-param is CF_RETURNS_RETAINED,
+    so the caller owns it and must CFRelease it to avoid leaking the item ref
+    on every credential overwrite (re-OAuth / token refresh).
+    """
+    if not ref or not ref.value:
+        return
+    cf = _get_cf_lib()
+    if cf is not None:
+        cf.CFRelease(ref)
+
+
+def _keychain_set(service: str, account: str, value: str) -> bool:
+    """Store a value in macOS Keychain without exposing the secret on argv.
+
+    Calls SecKeychainAddGenericPassword directly via ctypes rather than
+    passing the secret as a `-w <value>` command-line argument to
+    `security add-generic-password`, which would expose it to all local users
+    via the process table (ps/libproc).
+
+    Falls back to the `security` CLI subprocess if the Security framework
+    cannot be loaded (should never happen on macOS, but guards against the
+    unexpected).
+    """
+    svc_b = service.encode()
+    acct_b = account.encode()
+    val_b = value.encode("utf-8")
+
+    lib = _get_sec_lib()
+    if lib is not None:
+        try:
+            status = lib.SecKeychainAddGenericPassword(
+                None,
+                len(svc_b), svc_b,
+                len(acct_b), acct_b,
+                len(val_b), val_b,
+                None,
+            )
+            if status == _ERR_SEC_DUPLICATE_ITEM:
+                # Item already exists; find it and overwrite the password data.
+                pw_len = ctypes.c_uint32(0)
+                pw_data = ctypes.c_void_p(None)
+                item_ref = ctypes.c_void_p(None)
+                find_status = lib.SecKeychainFindGenericPassword(
+                    None,
+                    len(svc_b), svc_b,
+                    len(acct_b), acct_b,
+                    ctypes.byref(pw_len),
+                    ctypes.byref(pw_data),
+                    ctypes.byref(item_ref),
+                )
+                if find_status != 0:
+                    logger.warning("SecKeychainFindGenericPassword returned %d for %s/%s", find_status, service, account)
+                    return False
+                try:
+                    lib.SecKeychainItemFreeContent(None, pw_data)
+                    mod_status = lib.SecKeychainItemModifyAttributesAndData(
+                        item_ref, None, len(val_b), val_b,
+                    )
+                    if mod_status != 0:
+                        logger.warning("SecKeychainItemModifyAttributesAndData returned %d for %s/%s", mod_status, service, account)
+                        return False
+                finally:
+                    # itemRef is CF_RETURNS_RETAINED — release it so the update
+                    # path doesn't leak a keychain item ref on every refresh.
+                    _cf_release(item_ref)
+            elif status != 0:
+                logger.warning("SecKeychainAddGenericPassword returned %d for %s/%s", status, service, account)
+                return False
+            return True
+        except Exception:
+            logger.exception("Security framework call failed for %s/%s", service, account)
+            return False
+
+    # Fallback path: Security framework unavailable.
+    # The secret is still on argv here — this path should never be reached on macOS.
+    logger.warning("Security framework unavailable; falling back to security CLI for %s/%s", service, account)
+    try:
         subprocess.run(
             ["security", "delete-generic-password", "-s", service, "-a", account],
             capture_output=True,
@@ -66,8 +218,8 @@ def _keychain_set(service: str, account: str, value: str) -> bool:
             [
                 "security", "add-generic-password",
                 "-s", service, "-a", account, "-w", value,
-                "-U",                        # update if exists (belt-and-suspenders after delete)
-                "-T", "/usr/bin/security",   # trust the CLI we use to read it back
+                "-U",
+                "-T", "/usr/bin/security",
             ],
             capture_output=True,
             text=True,
@@ -78,7 +230,44 @@ def _keychain_set(service: str, account: str, value: str) -> bool:
 
 
 def _keychain_get(service: str, account: str) -> str | None:
-    """Load a value from macOS Keychain."""
+    """Load a value from macOS Keychain.
+
+    Reads via the Security framework (ctypes) so the EXACT stored bytes come
+    back. The `security` CLI's ``-w`` output hex-encodes any password that
+    contains a newline or non-ASCII byte (and there's no marker to tell hex
+    output apart from a genuinely hex-looking secret), which silently corrupts
+    such values. The framework read returns the raw bytes with no such
+    ambiguity, and also preserves leading/trailing whitespace. Falls back to
+    the CLI only if the framework can't be loaded (never on macOS).
+    """
+    svc_b = service.encode()
+    acct_b = account.encode()
+
+    lib = _get_sec_lib()
+    if lib is not None:
+        try:
+            pw_len = ctypes.c_uint32(0)
+            pw_data = ctypes.c_void_p(None)
+            status = lib.SecKeychainFindGenericPassword(
+                None,
+                len(svc_b), svc_b,
+                len(acct_b), acct_b,
+                ctypes.byref(pw_len),
+                ctypes.byref(pw_data),
+                None,  # itemRef not requested → nothing retained, nothing to release
+            )
+            if status != 0:
+                # errSecItemNotFound (-25300) or any other lookup failure → absent.
+                return None
+            try:
+                raw = ctypes.string_at(pw_data, pw_len.value) if pw_data.value else b""
+            finally:
+                lib.SecKeychainItemFreeContent(None, pw_data)
+            return raw.decode("utf-8")
+        except Exception:
+            logger.exception("Security framework read failed for %s/%s; trying CLI", service, account)
+            # fall through to the CLI fallback
+
     try:
         result = subprocess.run(
             ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
@@ -86,7 +275,11 @@ def _keychain_get(service: str, account: str) -> str | None:
             text=True,
         )
         if result.returncode == 0:
-            return result.stdout.strip()
+            # `security` appends exactly one trailing newline; remove only that.
+            # Using .strip() would corrupt secrets that legitimately begin or end
+            # with whitespace.
+            raw = result.stdout
+            return raw[:-1] if raw.endswith("\n") else raw
         return None
     except FileNotFoundError:
         return None
@@ -215,16 +408,20 @@ def store_secret(namespace: str, key: str, value: str) -> None:
     service = _service_name(namespace)
 
     if _is_macos():
+        # Write the index sentinel BEFORE calling Keychain so that a crash
+        # between the two leaves a stale-but-harmless index entry rather than
+        # an orphaned Keychain item that is invisible to load_all/export/delete.
+        # If _save_secrets_file raises here we never reach _keychain_set, so
+        # nothing is orphaned; the exception propagates and the caller retries.
+        # If _keychain_set then fails we fall through to _file_set, which
+        # overwrites the "__keychain__" sentinel with the real value — correct.
+        with _secrets_file_lock:
+            data = _load_secrets_file()
+            data.setdefault(service, {})[key] = "__keychain__"
+            _save_secrets_file(data)
         if _keychain_set(service, key, value):
-            # Also store key name in file index (not the value) for listing
-            with _secrets_file_lock:
-                data = _load_secrets_file()
-                if service not in data:
-                    data[service] = {}
-                data[service][key] = "__keychain__"
-                _save_secrets_file(data)
             return
-        logger.warning(f"Keychain store failed for {namespace}/{key}, using file fallback")
+        logger.warning("Keychain store failed for %s/%s, using file fallback", namespace, key)
 
     _file_set(service, key, value)
 

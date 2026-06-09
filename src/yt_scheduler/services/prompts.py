@@ -21,6 +21,24 @@ from typing import Iterable
 from yt_scheduler.database import get_db
 
 
+class EmptyPromptBodyError(ValueError):
+    """Raised when a saved prompt row has an empty/whitespace-only body.
+
+    A blank saved body means the user cleared the editor. We refuse to fall
+    back to the seed silently — that would let a blank prompt quietly drive
+    generation. Surfacing the error lets the user fix their prompt instead of
+    getting weird/empty output.
+    """
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+        super().__init__(
+            f"Prompt '{key}' has an empty body. Restore the default or enter "
+            "prompt text in Project Settings — generation won't run on a blank "
+            "prompt."
+        )
+
+
 @dataclass(frozen=True)
 class SeedPrompt:
     key: str
@@ -525,9 +543,21 @@ async def get_prompt_with_fallback(key: str, *, project_id: int) -> dict:
     if record is None and seed is None:
         raise KeyError(f"No prompt template for key '{key}'")
 
-    body = (record or {}).get("body") if record is not None else None
-    if body is None:
-        body = seed.body if seed is not None else ""
+    seed_body = seed.body if seed is not None else ""
+    if record is not None:
+        body = record.get("body")
+        # A saved row with a blank body means the user cleared the editor.
+        # Do NOT silently fall back to the seed — fail loudly so a blank prompt
+        # can't quietly drive generation. The exception is the system-only seeds
+        # whose seed body is itself intentionally empty (e.g. the default
+        # {{ai:}} system prompt): a blank body there matches the seed and is
+        # fine. (A *missing* row, below, legitimately uses the shipped seed.)
+        if body is None or not body.strip():
+            if seed_body.strip():
+                raise EmptyPromptBodyError(key)
+            body = seed_body
+    else:
+        body = seed_body
 
     if record is not None and record.get("system_body") is not None:
         system: str | None = record["system_body"]

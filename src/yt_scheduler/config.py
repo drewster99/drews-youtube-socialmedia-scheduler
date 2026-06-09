@@ -84,6 +84,9 @@ LOG_DIR = _resolve_log_dir()
 DB_PATH = DATA_DIR / "publisher.db"
 TEMPLATES_DIR = DATA_DIR / "templates"
 UPLOAD_DIR = DATA_DIR / "uploads"
+# Written by the server at startup and removed on clean shutdown. Checked by
+# import-all so it can refuse to overwrite a live data dir.
+PID_FILE = DATA_DIR / "server.pid"
 
 # Public URL prefix under which files in ``UPLOAD_DIR`` are served (see
 # ``routers/media_routes.py``). The browser only ever sees these URLs, never
@@ -176,7 +179,30 @@ def get_anthropic_api_key() -> str:
 
 # Server
 HOST = os.getenv("DYS_HOST") or os.getenv("YTP_HOST", "127.0.0.1")
-PORT = int(os.getenv("DYS_PORT") or os.getenv("YTP_PORT", "8008"))
+
+
+def _parse_int_env(primary: str, legacy: str, default: int) -> int:
+    """Parse an integer environment variable, raising a clear error on bad input.
+
+    Using a bare ``int(os.getenv(...))`` at module level produces an opaque
+    ``ValueError`` traceback that doesn't identify which variable is broken.
+    This wrapper names the variable in the error so the user knows exactly what
+    to fix without having to read a traceback.
+    """
+    raw = os.getenv(primary) or os.getenv(legacy)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(
+            f"Environment variable {primary} (or legacy {legacy}) must be an integer, "
+            f"got {raw!r}"
+        ) from None
+
+
+PORT = _parse_int_env("DYS_PORT", "YTP_PORT", 8008)
 
 
 def allowed_oauth_origins() -> list[str]:
@@ -245,11 +271,11 @@ THREADS_REDIRECT_URL = (
 ).strip().rstrip("/")
 
 # Scheduler
-COMMENT_CHECK_INTERVAL_MINUTES = int(
-    os.getenv("DYS_COMMENT_CHECK_MINUTES") or os.getenv("YTP_COMMENT_CHECK_MINUTES", "30")
+COMMENT_CHECK_INTERVAL_MINUTES = _parse_int_env(
+    "DYS_COMMENT_CHECK_MINUTES", "YTP_COMMENT_CHECK_MINUTES", 30
 )
-CAPTION_CHECK_INTERVAL_MINUTES = int(
-    os.getenv("DYS_CAPTION_CHECK_MINUTES") or os.getenv("YTP_CAPTION_CHECK_MINUTES", "15")
+CAPTION_CHECK_INTERVAL_MINUTES = _parse_int_env(
+    "DYS_CAPTION_CHECK_MINUTES", "YTP_CAPTION_CHECK_MINUTES", 15
 )
 
 

@@ -17,6 +17,11 @@ from yt_scheduler.services.transcripts import srt_to_plain_text
 
 from yt_scheduler.services import tiers
 
+# Statuses a client is permitted to set via PUT /api/social/posts/{id}.
+# Statuses set exclusively by server-side operations (sending, posted, failed)
+# are intentionally excluded — only draft↔approved transitions are client-driven.
+_CLIENT_WRITABLE_POST_STATUSES: frozenset[str] = frozenset({"draft", "approved"})
+
 
 def _tier_from_iso_duration(iso: str | None) -> str:
     """Map an ISO-8601 duration (e.g. PT3M31S) to our tier naming."""
@@ -722,8 +727,15 @@ async def update_post(post_id: int, data: dict):
         updates.append("content = ?")
         params.append((data["content"] or "").strip())
     if "status" in data:
+        status = data["status"]
+        if status not in _CLIENT_WRITABLE_POST_STATUSES:
+            raise HTTPException(
+                400,
+                f"Invalid status {status!r}. "
+                f"Allowed values: {sorted(_CLIENT_WRITABLE_POST_STATUSES)}",
+            )
         updates.append("status = ?")
-        params.append(data["status"])
+        params.append(status)
     if "media_path" in data:
         updates.append("media_path = ?")
         params.append(data["media_path"])

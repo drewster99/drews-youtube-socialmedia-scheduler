@@ -11,6 +11,10 @@ from yt_scheduler.services import youtube
 
 logger = logging.getLogger(__name__)
 
+# Comments are short by nature; capping the input before regex matching bounds
+# the backtracking surface for catastrophic patterns without losing real data.
+_MATCH_INPUT_MAX_CHARS = 10_000
+
 
 async def get_blocklist(project_id: int) -> list[dict]:
     """Get all blocked keywords for a project."""
@@ -23,7 +27,17 @@ async def get_blocklist(project_id: int) -> list[dict]:
 
 
 async def add_keyword(keyword: str, *, is_regex: bool = False, project_id: int) -> None:
-    """Add a keyword to a project's blocklist."""
+    """Add a keyword to a project's blocklist.
+
+    Raises ValueError for an invalid regex pattern so the caller can surface
+    the error to the user rather than storing an unrunnable entry.
+    """
+    if is_regex:
+        try:
+            re.compile(keyword, re.IGNORECASE)
+        except re.error as exc:
+            raise ValueError(f"Invalid regex pattern: {exc}") from exc
+
     db = await get_db()
     await db.execute(
         "INSERT OR IGNORE INTO blocklist (project_id, keyword, is_regex) "
@@ -43,21 +57,42 @@ async def remove_keyword(keyword_id: int, project_id: int) -> None:
     await db.commit()
 
 
-def matches_blocklist(text: str, blocklist: list[dict]) -> str | None:
-    """Check if text matches any keyword in the blocklist.
+def _matches_blocklist_sync(text: str, blocklist: list[dict]) -> str | None:
+    """Synchronous core of blocklist matching — runs in a worker thread.
 
-    Returns the matched keyword or None.
+    Pure-Python ``re`` has no timeout, so this is intentionally isolated from
+    the event loop via ``asyncio.to_thread``.  Input is pre-truncated by the
+    caller to bound backtracking exposure on catastrophic patterns.
+
+    Per-entry try/except means a single bad stored pattern (e.g. leftover from
+    before validation was added) skips and logs rather than aborting the sweep.
     """
     text_lower = text.lower()
     for entry in blocklist:
         keyword = entry["keyword"]
         if entry["is_regex"]:
-            if re.search(keyword, text, re.IGNORECASE):
-                return keyword
+            try:
+                if re.search(keyword, text, re.IGNORECASE):
+                    return keyword
+            except re.error:
+                logger.warning(
+                    "Skipping invalid stored regex pattern %r — remove and re-add it",
+                    keyword,
+                )
         else:
             if keyword.lower() in text_lower:
                 return keyword
     return None
+
+
+async def matches_blocklist(text: str, blocklist: list[dict]) -> str | None:
+    """Check if text matches any keyword in the blocklist.
+
+    Runs in a worker thread so regex CPU spin cannot block the event loop.
+    Returns the matched keyword or None.
+    """
+    truncated = text[:_MATCH_INPUT_MAX_CHARS]
+    return await asyncio.to_thread(_matches_blocklist_sync, truncated, blocklist)
 
 
 async def _list_comment_threads_async(video_id: str, max_results: int = 200) -> list[dict]:
@@ -115,7 +150,7 @@ async def _process_one(
     comment_id = comment["id"]
     text = comment["snippet"].get("textDisplay", "")
     author = comment["snippet"].get("authorDisplayName", "")
-    matched = matches_blocklist(text, blocklist)
+    matched = await matches_blocklist(text, blocklist)
     if not matched:
         return []
     # Skip if we've already logged anything for this comment in this project.

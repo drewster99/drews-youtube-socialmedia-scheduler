@@ -8,6 +8,7 @@ caller.
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from yt_scheduler.database import get_db
@@ -170,6 +171,13 @@ def validate_promo_delays(payload: dict) -> dict:
                 raise ValueError(
                     f"{tier}.{key}.value must be a number"
                 ) from exc
+            # NaN passes every comparison silently (NaN < 0 is False, NaN > cap
+            # is False) and would flow into timedelta() producing nonsensical or
+            # crashing schedules. Inf likewise defeats the >366-day overflow guard.
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"{tier}.{key}.value must be a finite number, got {value!r}"
+                )
             if value < 0:
                 raise ValueError(f"{tier}.{key}.value must be >= 0")
             # Upper bound: keeps a bogus value from overflowing the

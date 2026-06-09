@@ -196,7 +196,6 @@ async def delete_project(project_id: int) -> None:
     if project["slug"] == DEFAULT_PROJECT_SLUG:
         raise ValueError("The Default project cannot be deleted")
     db = await get_db()
-    await db.execute("PRAGMA foreign_keys = ON")
     await db.execute("DELETE FROM projects WHERE id = ?", (project_id,))
     await db.commit()
 

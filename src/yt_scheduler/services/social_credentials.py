@@ -198,6 +198,13 @@ async def upsert_credential(
     if row is not None:
         existing_id = int(row["id"])
         existing_uuid = row["uuid"]
+        # Write the Keychain bundle BEFORE committing the DB row so that a
+        # crash between the two leaves an orphaned-but-harmless secret rather
+        # than a committed row pointing at a missing bundle.
+        await save_bundle(
+            platform, existing_uuid,
+            dict(bundle, provider_account_id=provider_account_id, username=username),
+        )
         # Clear needs_reauth: the user just successfully re-OAuthed.
         await db.execute(
             "UPDATE social_accounts "
@@ -208,13 +215,15 @@ async def upsert_credential(
             (username, display_name, 1 if is_nickname else 0, verified_type, existing_id),
         )
         await db.commit()
-        await save_bundle(
-            platform, existing_uuid,
-            dict(bundle, provider_account_id=provider_account_id, username=username),
-        )
         return await get_credential_by_id(existing_id)  # type: ignore[return-value]
 
     new_uuid = uuidlib.uuid4().hex
+    # Write the Keychain bundle BEFORE inserting the DB row for the same
+    # reason: a failed bundle write leaves nothing in the DB to dangle.
+    await save_bundle(
+        platform, new_uuid,
+        dict(bundle, provider_account_id=provider_account_id, username=username),
+    )
     cursor = await db.execute(
         "INSERT INTO social_accounts "
         "(uuid, platform, provider_account_id, username, display_name, "
@@ -227,10 +236,6 @@ async def upsert_credential(
     )
     await db.commit()
     new_id = int(cursor.lastrowid)
-    await save_bundle(
-        platform, new_uuid,
-        dict(bundle, provider_account_id=provider_account_id, username=username),
-    )
     return await get_credential_by_id(new_id)  # type: ignore[return-value]
 
 
@@ -275,6 +280,21 @@ async def soft_delete_credential(uuid: str) -> dict | None:
         return cred
 
     db = await get_db()
+    # Attempt the Keychain delete BEFORE committing the DB soft-delete so that
+    # a crash between the two leaves a harmless orphaned secret rather than a
+    # committed "deleted" row whose secret can never be cleaned up. A failed
+    # delete is logged but does not block the DB update — the secret can't be
+    # loaded via load_bundle once deleted_at is set (the row is excluded from
+    # list_credentials and the bundle ref is gone from the UI), so it only
+    # wastes Keychain space, not a security concern.
+    try:
+        await delete_secret_async(cred["platform"], f"{CREDENTIAL_KEY_PREFIX}{uuid}")
+    except Exception:
+        logger.warning(
+            "Keychain delete failed for %s cred.%s — proceeding with DB soft-delete; "
+            "orphaned secret may remain in Keychain",
+            cred["platform"], uuid[:8],
+        )
     await db.execute(
         "UPDATE social_accounts SET deleted_at = datetime('now') WHERE uuid = ?",
         (uuid,),
@@ -284,7 +304,6 @@ async def soft_delete_credential(uuid: str) -> dict | None:
         (cred["id"],),
     )
     await db.commit()
-    await delete_secret_async(cred["platform"], f"{CREDENTIAL_KEY_PREFIX}{uuid}")
     return await get_credential_by_uuid(uuid)
 
 

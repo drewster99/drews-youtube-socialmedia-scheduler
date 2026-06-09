@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import json
 import logging
 import secrets
@@ -1184,6 +1185,21 @@ async def youtube_callback(
     )
 
 
+def _safe_script_json(value: object) -> str:
+    """Serialize *value* to JSON that is safe to embed verbatim inside a
+    ``<script>`` element without risking HTML-injection breakout.
+
+    Escapes ``<`` and ``>`` as their ``\\u003c`` / ``\\u003e`` JSON unicode
+    escapes. This neutralizes ``</script>``, ``<!--`` and any other tag
+    breakout while keeping the output strictly valid JSON (so ``JSON.parse``
+    in the page still succeeds — unlike a literal ``<\\!--`` which is NOT a
+    valid JSON escape and would throw). This mirrors Django's ``json_script``.
+    U+2028/U+2029 are already emitted as ``\\u2028`` / ``\\u2029`` by
+    ``json.dumps`` (ensure_ascii defaults to True).
+    """
+    return json.dumps(value).replace("<", "\\u003c").replace(">", "\\u003e")
+
+
 def _result_page(
     ok: bool,
     message: str,
@@ -1213,7 +1229,11 @@ def _result_page(
         message_payload.update(payload)
     if nonce:
         message_payload["nonce"] = nonce
-    payload_json = json.dumps(message_payload)
+    payload_json = _safe_script_json(message_payload)
+    # quote=False: message is rendered as element text content (<p>...</p>),
+    # where only &, <, > can break out — escaping ' / " too would mangle
+    # apostrophes in human-readable messages for no security benefit here.
+    safe_message = html.escape(message, quote=False)
     body = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>{title}</title>
 <style>
@@ -1228,7 +1248,7 @@ def _result_page(
 <body><div class="card">
   <div class="icon">{icon}</div>
   <h1>{"Success" if ok else "Failed"}</h1>
-  <p>{message}</p>
+  <p>{safe_message}</p>
   <button onclick="window.close()">Close</button>
 </div>
 <script>

@@ -165,18 +165,23 @@ def _extract_audio(video_path: Path) -> Path:
     fd, tmp_path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
     audio_path = Path(tmp_path)
-    subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-i", str(video_path),
-            "-ar", "16000",
-            "-ac", "1",
-            "-c:a", "pcm_s16le",
-            str(audio_path),
-        ],
-        check=True,
-        capture_output=True,
-    )
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", str(video_path),
+                "-ar", "16000",
+                "-ac", "1",
+                "-c:a", "pcm_s16le",
+                str(audio_path),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=30 * 60,  # 30 min — demuxing long videos takes real time
+        )
+    except Exception:
+        audio_path.unlink(missing_ok=True)
+        raise
     return audio_path
 
 
@@ -268,27 +273,33 @@ def _try_whisper_cpp(audio_path: Path, model: str, language: str | None) -> Tran
     fd, tmp_path = tempfile.mkstemp()
     os.close(fd)
     output_base = Path(tmp_path)
-
-    cmd = [
-        binary,
-        "-m", str(model_path),
-        "-f", str(audio_path),
-        "--output-json",
-        "-of", str(output_base),
-    ]
-    if language:
-        cmd.extend(["-l", language])
-
-    subprocess.run(cmd, check=True, capture_output=True)
-
-    # Clean up the base temp file (whisper.cpp writes to output_base.json instead)
-    output_base.unlink(missing_ok=True)
-
     json_path = Path(f"{output_base}.json")
-    if not json_path.exists():
-        return None
 
-    data = json.loads(json_path.read_text())
+    try:
+        cmd = [
+            binary,
+            "-m", str(model_path),
+            "-f", str(audio_path),
+            "--output-json",
+            "-of", str(output_base),
+        ]
+        if language:
+            cmd.extend(["-l", language])
+
+        subprocess.run(cmd, check=True, capture_output=True, timeout=30 * 60)
+
+        # Clean up the base temp file (whisper.cpp writes to output_base.json instead)
+        output_base.unlink(missing_ok=True)
+
+        if not json_path.exists():
+            return None
+
+        data = json.loads(json_path.read_text())
+    except Exception:
+        output_base.unlink(missing_ok=True)
+        json_path.unlink(missing_ok=True)
+        raise
+
     json_path.unlink(missing_ok=True)
 
     segments = []
@@ -333,46 +344,55 @@ def _macos_speech_timeout_seconds(audio_path: Path) -> int:
     return max(120, min(1800, timeout))
 
 
-def _macos_speech_analyzer_swift(audio_path: Path, locale: str) -> str:
+def _macos_speech_analyzer_swift() -> str:
     """Swift source for the macOS 26 SpeechAnalyzer/SpeechTranscriber helper.
+
+    Reads ``SPEECH_AUDIO_PATH`` and ``SPEECH_LOCALE_ID`` from the process
+    environment rather than embedding them in source, so no caller-supplied
+    value can break out of a Swift string literal.
 
     Emits a JSON array of ``{start, end, word}`` (word-level timing from the
     ``.audioTimeRange`` attribute) on stdout; diagnostics on stderr.
     """
-    return f'''
+    return '''
 import Foundation
 import Speech
 import AVFoundation
 import CoreMedia
 
-func log(_ s: String) {{ FileHandle.standardError.write(Data("[apple-speech] \\(s)\\n".utf8)) }}
+func log(_ s: String) { FileHandle.standardError.write(Data("[apple-speech] \\(s)\\n".utf8)) }
 
-let audioPath = "{audio_path}"
-let localeID = "{locale}"
+let env = ProcessInfo.processInfo.environment
+guard let audioPath = env["SPEECH_AUDIO_PATH"], !audioPath.isEmpty else {
+    log("ERROR: SPEECH_AUDIO_PATH not set"); exit(1)
+}
+guard let localeID = env["SPEECH_LOCALE_ID"], !localeID.isEmpty else {
+    log("ERROR: SPEECH_LOCALE_ID not set"); exit(1)
+}
 
-func ensureModel(_ transcriber: SpeechTranscriber, _ locale: Locale) async throws {{
+func ensureModel(_ transcriber: SpeechTranscriber, _ locale: Locale) async throws {
     let installed = await SpeechTranscriber.installedLocales
-    if installed.contains(where: {{ $0.identifier(.bcp47) == locale.identifier(.bcp47) }}) {{ return }}
+    if installed.contains(where: { $0.identifier(.bcp47) == locale.identifier(.bcp47) }) { return }
     let reserved = await AssetInventory.reservedLocales
-    if !reserved.contains(where: {{ $0.identifier == locale.identifier }}) {{
+    if !reserved.contains(where: { $0.identifier == locale.identifier }) {
         try await AssetInventory.reserve(locale: locale)
-    }}
-    if let req = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {{
+    }
+    if let req = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
         log("downloading speech assets…")
         try await req.downloadAndInstall()
         log("assets installed")
-    }}
-}}
+    }
+}
 
-func run() async throws {{
-    let status = await withCheckedContinuation {{ (c: CheckedContinuation<SFSpeechRecognizerAuthorizationStatus, Never>) in
-        SFSpeechRecognizer.requestAuthorization {{ c.resume(returning: $0) }}
-    }}
-    guard status == .authorized else {{ log("ERROR: not authorized (\\(status.rawValue))"); exit(2) }}
-    guard SpeechTranscriber.isAvailable else {{ log("ERROR: SpeechTranscriber unavailable"); exit(3) }}
-    guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: localeID)) else {{
+func run() async throws {
+    let status = await withCheckedContinuation { (c: CheckedContinuation<SFSpeechRecognizerAuthorizationStatus, Never>) in
+        SFSpeechRecognizer.requestAuthorization { c.resume(returning: $0) }
+    }
+    guard status == .authorized else { log("ERROR: not authorized (\\(status.rawValue))"); exit(2) }
+    guard SpeechTranscriber.isAvailable else { log("ERROR: SpeechTranscriber unavailable"); exit(3) }
+    guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: localeID)) else {
         log("ERROR: locale \\(localeID) unsupported"); exit(3)
-    }}
+    }
     log("using locale \\(locale.identifier)")
 
     let transcriber = SpeechTranscriber(
@@ -386,31 +406,31 @@ func run() async throws {{
     let analyzer = SpeechAnalyzer(modules: [transcriber])
     let audioFile = try AVAudioFile(forReading: URL(fileURLWithPath: audioPath))
 
-    let collector = Task {{ () -> [[String: Any]] in
+    let collector = Task { () -> [[String: Any]] in
         var words: [[String: Any]] = []
-        for try await result in transcriber.results {{
+        for try await result in transcriber.results {
             let attr = result.text
-            for run in attr.runs {{
-                guard let range = run.audioTimeRange else {{ continue }}
+            for run in attr.runs {
+                guard let range = run.audioTimeRange else { continue }
                 let word = String(attr[run.range].characters)
-                if word.trimmingCharacters(in: .whitespaces).isEmpty {{ continue }}
+                if word.trimmingCharacters(in: .whitespaces).isEmpty { continue }
                 words.append(["start": range.start.seconds, "end": range.end.seconds, "word": word])
-            }}
-        }}
+            }
+        }
         return words
-    }}
+    }
 
-    if let last = try await analyzer.analyzeSequence(from: audioFile) {{
+    if let last = try await analyzer.analyzeSequence(from: audioFile) {
         try await analyzer.finalizeAndFinish(through: last)
-    }} else {{
+    } else {
         await analyzer.cancelAndFinishNow()
-    }}
+    }
 
     let words = try await collector.value
     let out = try JSONSerialization.data(withJSONObject: words)
     FileHandle.standardOutput.write(out)
     log("emitted \\(words.count) words")
-}}
+}
 
 try await run()
 '''
@@ -490,8 +510,21 @@ def _try_macos_speech(audio_path: Path, language: str | None) -> TranscriptionRe
         return None
 
     locale = language or "en-US"
+
+    # Validate locale against BCP-47 format (e.g. "en", "en-US", "zh-Hans-CN")
+    # before it touches any subprocess call. Language tags outside this pattern
+    # are not legitimate and could indicate injection via the API param.
+    if not re.fullmatch(r"[a-zA-Z]{2,8}(-[a-zA-Z0-9]{1,8})*", locale):
+        logger.warning("SpeechAnalyzer: rejecting invalid locale %r", locale)
+        return None
+
     logger.info("Transcribing with Apple SpeechAnalyzer (locale=%s)", locale)
-    swift_code = _macos_speech_analyzer_swift(audio_path, locale)
+    swift_code = _macos_speech_analyzer_swift()
+
+    # Pass audio path and locale via environment variables rather than
+    # interpolating them into Swift source, so no filesystem path character
+    # or locale string can break out of a string literal in the generated code.
+    child_env = {**os.environ, "SPEECH_AUDIO_PATH": str(audio_path), "SPEECH_LOCALE_ID": locale}
 
     try:
         result = subprocess.run(
@@ -500,6 +533,7 @@ def _try_macos_speech(audio_path: Path, language: str | None) -> TranscriptionRe
             capture_output=True,
             text=True,
             timeout=_macos_speech_timeout_seconds(audio_path),
+            env=child_env,
         )
 
         if result.stderr:

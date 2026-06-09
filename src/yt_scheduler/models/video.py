@@ -35,6 +35,7 @@ class Video(BaseModel):
     transcript_created_at: datetime | None = None
     transcript_updated_at: datetime | None = None
     description_generated_at: datetime | None = None
+    tags_generated_at: datetime | None = None
     imported_from_youtube: bool = False
     # Provenance of the on-disk file referenced by ``video_file_path``
     # (migration 026 + the generated_clip extension). One of:

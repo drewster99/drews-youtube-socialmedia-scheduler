@@ -13,7 +13,7 @@ import shutil
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from yt_scheduler.config import UPLOAD_DIR, media_filename, media_url
+from yt_scheduler.config import UPLOAD_DIR, media_filename, media_url, safe_upload_ext
 from yt_scheduler.database import get_db
 
 router = APIRouter(prefix="/api/videos/{video_id}/images", tags=["item-images"])
@@ -75,10 +75,16 @@ async def upload_item_image(
     _validate_shortname(shortname)
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    # Filename collision protection: prefix with the video id and
-    # shortname so two uploads with identical filenames don't clobber.
-    safe_name = f"{video_id}__{shortname}__{file.filename or 'image'}"
+    # Build a fully app-controlled filename — never embed the raw client-supplied
+    # file.filename, which may contain path separators that escape UPLOAD_DIR.
+    # safe_upload_ext strips all path components and falls back to ".jpg".
+    ext = safe_upload_ext(file.filename, default=".jpg")
+    safe_name = f"{video_id}__{shortname}{ext}"
     dest = UPLOAD_DIR / safe_name
+    # Containment assert: resolve() follows symlinks on both sides so a crafted
+    # ext or symlink inside UPLOAD_DIR cannot escape the directory.
+    if not dest.resolve().is_relative_to(UPLOAD_DIR.resolve()):
+        raise HTTPException(400, "Invalid upload path.")
     with open(dest, "wb") as out:
         shutil.copyfileobj(file.file, out)
 

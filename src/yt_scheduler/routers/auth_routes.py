@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, HTTPException, UploadFile
 
 from yt_scheduler.services.auth import (
@@ -25,9 +27,13 @@ async def auth_status(project_slug: str = DEFAULT_PROJECT_SLUG):
 
 @router.post("/login")
 async def login(project_slug: str = DEFAULT_PROJECT_SLUG):
-    """Run the OAuth installed-app flow against ``project_slug``."""
+    """Run the OAuth installed-app flow against ``project_slug``.
+
+    run_local_server blocks for however long the browser dance takes, so we
+    offload it to a worker thread so the event loop stays responsive.
+    """
     try:
-        run_oauth_flow(project_slug)
+        await asyncio.to_thread(run_oauth_flow, project_slug)
         return {"status": "ok", "message": "Authentication successful"}
     except RuntimeError as e:
         return {"status": "error", "message": str(e)}
@@ -45,10 +51,17 @@ async def logout(project_slug: str = DEFAULT_PROJECT_SLUG):
         return {"status": "error", "message": f"Failed to clear credentials: {e}"}
 
 
+_MAX_CLIENT_SECRET_BYTES = 64 * 1024  # 64 KiB; client_secret JSON is never larger
+
 @router.post("/upload-client-secret")
 async def upload_client_secret(file: UploadFile):
     """Persist the Google Cloud OAuth client JSON to Keychain (no on-disk copy)."""
-    content = await file.read()
+    content = await file.read(_MAX_CLIENT_SECRET_BYTES + 1)
+    if len(content) > _MAX_CLIENT_SECRET_BYTES:
+        raise HTTPException(
+            413,
+            f"File too large: client_secret JSON must be under {_MAX_CLIENT_SECRET_BYTES} bytes",
+        )
     try:
         store_client_secret_from_text(content.decode("utf-8"))
     except Exception as exc:

@@ -17,7 +17,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from yt_scheduler import build_info
-from yt_scheduler.config import HOST, PORT, ensure_dirs
+from yt_scheduler.config import HOST, PID_FILE, PORT, ensure_dirs
 from yt_scheduler.database import close_db, get_db
 from yt_scheduler.routers import (
     auth_routes,
@@ -182,9 +182,16 @@ async def lifespan(app: FastAPI):
     seeding, and restore_scheduled_jobs are best-effort — a bad row in
     one shouldn't keep the app from coming up.
     """
+    import os as _os
+
     db = await get_db()
     await migrate_to_per_credential_bundles()
     await ensure_default_project()
+
+    # Write the PID file only after the critical startup path succeeds. If boot
+    # crashes before this point the shutdown cleanup below never runs, so writing
+    # earlier would leave a stale PID that blocks import-all on the next attempt.
+    PID_FILE.write_text(str(_os.getpid()))
 
     try:
         await backfill_channel_ids()
@@ -283,6 +290,7 @@ async def lifespan(app: FastAPI):
     yield
     stop_scheduler()
     await close_db()
+    PID_FILE.unlink(missing_ok=True)
 
 
 app = FastAPI(

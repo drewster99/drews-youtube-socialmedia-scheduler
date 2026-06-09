@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import secrets
 import shutil
@@ -106,9 +107,10 @@ async def _run_chain(video_id: str, project_id: int, source: Source) -> None:
     if column.get("auto_transcribe") and not (video.get("transcript") or "").strip():
         backend = column.get("auto_transcribe_backend")
         model = column.get("auto_transcribe_model")
-        await _maybe_transcribe(
-            video_id, video.get("video_file_path"), backend=backend, model=model
-        )
+        async with _get_whisper_semaphore():
+            await _maybe_transcribe(
+                video_id, video.get("video_file_path"), backend=backend, model=model
+            )
         # Refresh the row so downstream gates see the new transcript.
         rows = await db.execute_fetchall("SELECT * FROM videos WHERE id = ?", (video_id,))
         video = dict(rows[0]) if rows else video
@@ -318,6 +320,13 @@ async def _maybe_transcribe(
 
 
 async def _maybe_generate_tags(video: dict, project_id: int, column: dict) -> None:
+    # Skip if tags were already auto-generated (or user-edited). This mirrors
+    # the description gate's "skip if description exists" check and prevents
+    # a restart from clobbering hand-edited tags: once tags_generated_at is
+    # stamped the chain will never re-run this step for the same video.
+    if video.get("tags_generated_at"):
+        return
+
     title = video.get("title", "") if column.get("auto_tags_include_title", True) else ""
     description = video.get("description", "") if column.get(
         "auto_tags_include_description", True
@@ -361,7 +370,8 @@ async def _maybe_generate_tags(video: dict, project_id: int, column: dict) -> No
 
     db = await get_db()
     await db.execute(
-        "UPDATE videos SET tags = ?, updated_at = datetime('now') WHERE id = ?",
+        "UPDATE videos SET tags = ?, tags_generated_at = datetime('now'), "
+        "updated_at = datetime('now') WHERE id = ?",
         (json.dumps(merged), video["id"]),
     )
     await db.commit()
@@ -559,10 +569,20 @@ PROMO_STEP_ORDER: tuple[str, ...] = (
     PROMO_STATE_PUSHING_METADATA,
 )
 
-# Whisper transcription is CPU-bound (and a model load is ~RAM-bound); a
-# serial lock keeps concurrent promo uploads from thrashing the box. YT
-# upload and Claude calls don't need the lock — they're I/O bound.
-_PROMO_WHISPER_LOCK: asyncio.Lock = asyncio.Lock()
+# Whisper transcription is CPU-bound and model load is RAM-bound. A process-wide
+# semaphore bounds all on-device transcription — both the standard upload/import
+# chain and the promo chain — to the CPU count, so boot-time restores and promo
+# chains can't fan out unboundedly and OOM the machine. YT upload and Claude
+# calls don't take it — they're I/O-bound. Created lazily so it binds to the
+# running event loop rather than import time.
+_WHISPER_SEMAPHORE: asyncio.Semaphore | None = None
+
+
+def _get_whisper_semaphore() -> asyncio.Semaphore:
+    global _WHISPER_SEMAPHORE
+    if _WHISPER_SEMAPHORE is None:
+        _WHISPER_SEMAPHORE = asyncio.Semaphore(os.cpu_count() or 1)
+    return _WHISPER_SEMAPHORE
 
 # In-flight upload jobs that don't yet have a videos row. The Promo screen
 # polls upload-jobs/<id> until ``video_id`` flips to a real id, then
@@ -582,7 +602,19 @@ _UPLOAD_JOB_FAILED_TTL_SECONDS: float = 10 * 60  # 10 minutes
 # in parallel would saturate a Mac (whisper alone is CPU-bound and
 # YouTube's upload SDK isn't reentrant per-token). 4 is comfortable on
 # wide hardware and keeps individual jobs from starving each other.
-_PROMO_CHAIN_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(4)
+#
+# Lazily initialised on first use so that the semaphore is always
+# created on the running event loop — avoids "bound to a different loop"
+# errors when tests spin up a fresh loop per test or a server restart
+# creates a new loop in-process.
+_PROMO_CHAIN_SEMAPHORE: asyncio.Semaphore | None = None
+
+
+def _get_promo_chain_semaphore() -> asyncio.Semaphore:
+    global _PROMO_CHAIN_SEMAPHORE
+    if _PROMO_CHAIN_SEMAPHORE is None:
+        _PROMO_CHAIN_SEMAPHORE = asyncio.Semaphore(4)
+    return _PROMO_CHAIN_SEMAPHORE
 
 
 def _evict_stale_upload_jobs() -> None:
@@ -748,7 +780,7 @@ async def retry_promo_step(video_id: str, step: str) -> None:
         # Without this gate a user who mass-retries 12 failed cards
         # fan-outs 12 simultaneous chains and we lose the cap the new-
         # upload entrypoint installed.
-        async with _PROMO_CHAIN_SEMAPHORE:
+        async with _get_promo_chain_semaphore():
             await _resume_promo_chain(video_id, project_id, start_step=step)
 
     spawn_background(_gated_resume(), name=f"promo-retry:{video_id}:{step}")
@@ -804,7 +836,7 @@ async def _run_promo_chain(job_id: str) -> None:
     the user accepting 12 generated clips) queues rather than thrashes
     the machine.
     """
-    async with _PROMO_CHAIN_SEMAPHORE:
+    async with _get_promo_chain_semaphore():
         await _run_promo_chain_inner(job_id)
 
 
@@ -1057,8 +1089,9 @@ async def _resume_promo_chain(
 
 
 async def _promo_step_transcribe(video_id: str) -> None:
-    """Run Whisper if we don't already have a transcript. Sequential
-    via :data:`_PROMO_WHISPER_LOCK`."""
+    """Run Whisper if we don't already have a transcript. Concurrency is bounded
+    to the CPU count via :data:`_WHISPER_SEMAPHORE` (shared with the standard
+    auto-action path)."""
     db = await get_db()
     rows = await db.execute_fetchall(
         "SELECT transcript, video_file_path FROM videos WHERE id = ?",
@@ -1069,7 +1102,7 @@ async def _promo_step_transcribe(video_id: str) -> None:
     row = dict(rows[0])
     if (row.get("transcript") or "").strip():
         return  # already done; the chain will move on
-    async with _PROMO_WHISPER_LOCK:
+    async with _get_whisper_semaphore():
         await _maybe_transcribe(
             video_id, row.get("video_file_path"), backend=None, model=None
         )
@@ -1130,21 +1163,24 @@ async def _promo_step_description(video_id: str, project_id: int) -> None:
 async def _promo_step_tags(video_id: str, project_id: int) -> None:
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT id, title, description, transcript, tags, video_file_path "
+        "SELECT id, title, description, transcript, tags, tags_generated_at, video_file_path "
         "FROM videos WHERE id = ?",
         (video_id,),
     )
     if not rows:
         raise RuntimeError(f"videos row {video_id} missing")
     row = dict(rows[0])
+    # Skip if auto-generation already ran for this video. Using tags_generated_at
+    # rather than a tag-count gate prevents re-generation on retry/restart even
+    # when the previous run produced an empty or small list.
+    if row.get("tags_generated_at"):
+        return
     try:
         existing = json.loads(row.get("tags") or "[]")
         if not isinstance(existing, list):
             existing = []
     except json.JSONDecodeError:
         existing = []
-    if len(existing) >= 3:
-        return  # readiness gate is "≥3 tags"; treat as already done
 
     title = row.get("title") or ""
     description = row.get("description") or ""
@@ -1175,7 +1211,8 @@ async def _promo_step_tags(video_id: str, project_id: int) -> None:
         )
 
     await db.execute(
-        "UPDATE videos SET tags = ?, updated_at = datetime('now') WHERE id = ?",
+        "UPDATE videos SET tags = ?, tags_generated_at = datetime('now'), "
+        "updated_at = datetime('now') WHERE id = ?",
         (json.dumps(new_tags), video_id),
     )
     await db.commit()

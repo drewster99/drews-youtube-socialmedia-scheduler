@@ -30,6 +30,11 @@ async def _twitter_refresh_bearer(creds: dict[str, str]) -> str | None:
     """Mint a fresh access_token using the stored refresh_token, persist it
     back into Keychain, and return the new bearer.
 
+    Operates on a *local copy* of ``creds`` so it never mutates the caller's
+    dict across await points. Callers must re-read the persisted bundle after
+    this returns if they need the updated token — never rely on ``creds``
+    being updated in place.
+
     Returns ``None`` only when there's no refresh path (no refresh_token /
     no client_id). Raises :class:`RuntimeError` when the API *rejects* the
     refresh (terminal — re-auth needed). Network/transport errors propagate
@@ -38,6 +43,16 @@ async def _twitter_refresh_bearer(creds: dict[str, str]) -> str | None:
     client_id = creds.get("client_id")
     if not refresh or not client_id:
         return None
+
+    cred_uuid = creds.get("uuid")
+    if not cred_uuid:
+        # Every credential created by upsert_credential has a uuid. A missing
+        # uuid means a legacy bare-key bundle that the system can no longer
+        # route, so we cannot safely persist — fail loudly instead of silently
+        # writing to flat keys that nothing reads back.
+        raise RuntimeError(
+            "X credential bundle is missing 'uuid' — re-OAuth to generate a fresh bundle."
+        )
 
     body = {
         "grant_type": "refresh_token",
@@ -59,21 +74,17 @@ async def _twitter_refresh_bearer(creds: dict[str, str]) -> str | None:
         raise RuntimeError(f"X token refresh response missing access_token: {payload}")
     new_refresh = payload.get("refresh_token")
 
-    creds["bearer_token"] = new_bearer
+    # Work on a local copy — never mutate the caller's dict across awaits.
+    updated = dict(creds)
+    updated["bearer_token"] = new_bearer
     if new_refresh:
-        creds["refresh_token"] = new_refresh
+        updated["refresh_token"] = new_refresh
     # X access tokens live ~2h; persist the expiry so the background refresh
     # job can pre-emptively renew before it lapses.
     if payload.get("expires_in"):
-        creds["expires_at"] = int(time.time()) + int(payload["expires_in"])
+        updated["expires_at"] = int(time.time()) + int(payload["expires_in"])
 
-    cred_uuid = creds.get("uuid")
-    if cred_uuid:
-        await store_secret_async("twitter", f"cred.{cred_uuid}", json.dumps(creds))
-    else:
-        await store_secret_async("twitter", "bearer_token", new_bearer)
-        if new_refresh:
-            await store_secret_async("twitter", "refresh_token", new_refresh)
+    await store_secret_async("twitter", f"cred.{cred_uuid}", json.dumps(updated))
     return new_bearer
 
 
@@ -400,13 +411,15 @@ class TwitterPoster(SocialPoster):
         )
         async with get_credential_lock(uuid):
             fresh = await load_bundle("twitter", uuid)
-            if fresh:
-                creds.update(fresh)
-            expires_at = int(creds.get("expires_at") or 0)
+            # Use the re-read bundle as the source of truth; fall back to the
+            # original creds only when Keychain returns nothing. Never mutate
+            # `creds` (which may be self._bundle) across await points.
+            current = fresh or creds
+            expires_at = int(current.get("expires_at") or 0)
             if expires_at and expires_at - window_secs > int(time.time()):
                 return False
             try:
-                new_bearer = await _twitter_refresh_bearer(creds)
+                new_bearer = await _twitter_refresh_bearer(current)
             except RuntimeError as exc:
                 raise CredentialAuthError(uuid, str(exc)) from exc
             if not new_bearer:
@@ -483,26 +496,73 @@ class TwitterPoster(SocialPoster):
                 text=text, media_ids=media_ids, user_auth=False,
             )
 
+        from yt_scheduler.services.social_credentials import (
+            clear_needs_reauth,
+            get_credential_lock,
+            load_bundle,
+        )
+
+        uuid = creds.get("uuid")
+
+        async def _refresh_under_lock() -> str:
+            """Refresh the bearer inside the per-credential lock.
+
+            Uses double-checked locking: another waiter (e.g. the background
+            refresh job) may have already refreshed while we were queued on the
+            lock, in which case the re-read bundle already has a valid bearer
+            and we skip the network call entirely — and more importantly we
+            never present a consumed single-use refresh token to the API.
+
+            Returns the fresh bearer string, or raises CredentialAuthError for
+            terminal failures."""
+            if not uuid:
+                raise CredentialAuthError(
+                    None,
+                    "X bearer expired and there's no refresh token — re-OAuth.",
+                )
+            async with get_credential_lock(uuid):
+                # Re-read from Keychain: another coroutine may have refreshed
+                # while we were waiting on the lock, giving us a valid bearer
+                # without a network round-trip and without burning the token.
+                fresh = await load_bundle("twitter", uuid)
+                if fresh and fresh.get("bearer_token") and fresh.get("bearer_token") != bearer:
+                    logger.info("Twitter bearer already refreshed by another waiter; reusing.")
+                    return fresh["bearer_token"]
+
+                current = fresh or creds
+                if not (current.get("refresh_token") and current.get("client_id")):
+                    raise CredentialAuthError(
+                        uuid,
+                        "X bearer expired and there's no refresh token — re-OAuth.",
+                    )
+                try:
+                    new_b = await _twitter_refresh_bearer(current)
+                except RuntimeError as rexc:
+                    raise CredentialAuthError(
+                        uuid,
+                        "X bearer expired and the refresh was rejected — re-OAuth.",
+                    ) from rexc
+                if not new_b:
+                    raise CredentialAuthError(
+                        uuid,
+                        "X bearer expired and there's no refresh token — re-OAuth.",
+                    )
+                return new_b
+
         try:
             try:
                 media_ids = await _upload_all(bearer)
                 response = _tweet(bearer, media_ids)
-            except (tweepy.errors.Unauthorized, _TwitterBearerExpired) as exc:
-                # Bearer expired (~2h lifetime). One refresh attempt; a
-                # *rejected* refresh is terminal (re-OAuth), a network blip
-                # propagates as a generic post failure.
-                try:
-                    new_bearer = await _twitter_refresh_bearer(creds)
-                except RuntimeError as rexc:
-                    raise CredentialAuthError(
-                        creds.get("uuid"),
-                        "X bearer expired and the refresh was rejected — re-OAuth.",
-                    ) from rexc
-                if not new_bearer:
-                    raise CredentialAuthError(
-                        creds.get("uuid"),
-                        "X bearer expired and there's no refresh token — re-OAuth.",
-                    ) from exc
+            except (tweepy.errors.Unauthorized, _TwitterBearerExpired):
+                # Bearer expired (~2h lifetime). Refresh under the per-credential
+                # lock so a concurrent background refresh can't race us to the
+                # single-use refresh token.
+                new_bearer = await _refresh_under_lock()
+                if uuid:
+                    # The bearer just refreshed and we're about to retry the
+                    # tweet — clear any stale needs_reauth flag a prior flap set,
+                    # matching the background refresh_if_stale path.
+                    await clear_needs_reauth(uuid)
                 logger.info("Twitter bearer refreshed; retrying tweet.")
                 # Re-upload against the fresh token — media ids from the prior
                 # auth session may not be valid.
@@ -511,7 +571,7 @@ class TwitterPoster(SocialPoster):
                     response = _tweet(new_bearer, media_ids)
                 except (tweepy.errors.Unauthorized, _TwitterBearerExpired) as exc2:
                     raise CredentialAuthError(
-                        creds.get("uuid"),
+                        uuid,
                         "X rejected the refreshed bearer — re-OAuth.",
                     ) from exc2
 
@@ -938,7 +998,9 @@ class BlueskyPoster(SocialPoster):
         url = f"{creds['pds'].rstrip('/')}/xrpc/com.atproto.repo.uploadBlob"
         mime, _ = mimetypes.guess_type(path.name)
         mime = mime or "application/octet-stream"
-        data = path.read_bytes()
+        # File can be large (~512 MB); read on a worker thread to avoid
+        # blocking the event loop.
+        data = await asyncio.to_thread(path.read_bytes)
 
         async def _do() -> bluesky_http.Response:
             proof = bluesky_oauth.sign_dpop_proof(
@@ -1263,10 +1325,12 @@ class LinkedInPoster(SocialPoster):
             "Authorization": f"Bearer {token}",
             "Content-Type": mime or ("video/mp4" if is_video else "image/jpeg"),
         }
-        with path.open("rb") as f:
-            put_resp = await client.put(
-                upload_url, headers=put_headers, content=f.read()
-            )
+        # File can be large (~512 MB); read on a worker thread to avoid
+        # blocking the event loop.
+        asset_bytes = await asyncio.to_thread(path.read_bytes)
+        put_resp = await client.put(
+            upload_url, headers=put_headers, content=asset_bytes
+        )
         if put_resp.status_code not in (200, 201):
             raise RuntimeError(
                 f"LinkedIn asset PUT failed: HTTP {put_resp.status_code} {put_resp.text}"

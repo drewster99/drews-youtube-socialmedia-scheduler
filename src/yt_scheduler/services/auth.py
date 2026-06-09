@@ -17,6 +17,7 @@ cloud sync becomes real, swap to a project_uuid column and migrate.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import json
 import logging
@@ -221,16 +222,42 @@ _active_project_slug: contextvars.ContextVar[str | None] = contextvars.ContextVa
 )
 
 
-def set_active_project(slug: str | None) -> None:
+def set_active_project(slug: str | None) -> contextvars.Token:
     """Bind an active project for callers (background jobs) that don't thread
     a ``project_slug`` argument through every ``youtube.*`` wrapper. Callers
     that pass an explicit ``project_slug`` always win over this binding.
+
+    Returns the ``Token`` produced by ``ContextVar.set`` so callers can restore
+    the previous value via ``_active_project_slug.reset(token)`` in a
+    ``finally`` block. Prefer :func:`scoped_active_project` when the scope is
+    a single ``with`` block.
     """
-    _active_project_slug.set(slug)
+    return _active_project_slug.set(slug)
 
 
 def get_active_project() -> str | None:
     return _active_project_slug.get()
+
+
+@contextlib.contextmanager
+def scoped_active_project(slug: str | None):
+    """Context manager that sets the active project and resets it on exit.
+
+    Using this instead of a bare ``set_active_project`` call ensures the
+    ContextVar is restored even if an exception is raised, and prevents the
+    root asyncio context (used as the copy-on-create template for new Tasks)
+    from being left with a stale project slug after startup backfills.
+
+    Usage::
+
+        with scoped_active_project(project["slug"]):
+            youtube.do_something()
+    """
+    token = _active_project_slug.set(slug)
+    try:
+        yield
+    finally:
+        _active_project_slug.reset(token)
 
 
 def get_youtube_service(project_slug: str | None = None):
@@ -426,22 +453,27 @@ async def backfill_channel_assets() -> None:
         slug = project["slug"]
         if project["channel_thumbnail_url"] and project["channel_banner_url"]:
             continue
-        if not get_credentials(slug):
+        if not await asyncio.to_thread(get_credentials, slug):
             continue
-        set_active_project(slug)
-        try:
-            assets = await asyncio.to_thread(_youtube.get_channel_assets)
-        except Exception as exc:
-            logger.info("Channel asset backfill failed for %s: %s", slug, exc)
-            continue
-        thumb = assets.get("thumbnail_url") or project["channel_thumbnail_url"]
-        banner = assets.get("banner_url") or project["channel_banner_url"]
-        if not thumb and not banner:
-            continue
-        await db.execute(
-            "UPDATE projects SET channel_thumbnail_url = ?, "
-            "channel_banner_url = ?, updated_at = datetime('now') WHERE id = ?",
-            (thumb, banner, project["id"]),
-        )
-        await db.commit()
-        logger.info("Cached channel assets for project %s", slug)
+        # scoped_active_project resets the ContextVar on exit (including
+        # continue/exception), preventing the root asyncio context from being
+        # left with a stale project slug after startup completes. New Tasks
+        # inherit from the root context, so a leaked slug would silently poison
+        # every subsequently-created request and job.
+        with scoped_active_project(slug):
+            try:
+                assets = await asyncio.to_thread(_youtube.get_channel_assets)
+            except Exception as exc:
+                logger.info("Channel asset backfill failed for %s: %s", slug, exc)
+                continue
+            thumb = assets.get("thumbnail_url") or project["channel_thumbnail_url"]
+            banner = assets.get("banner_url") or project["channel_banner_url"]
+            if not thumb and not banner:
+                continue
+            await db.execute(
+                "UPDATE projects SET channel_thumbnail_url = ?, "
+                "channel_banner_url = ?, updated_at = datetime('now') WHERE id = ?",
+                (thumb, banner, project["id"]),
+            )
+            await db.commit()
+            logger.info("Cached channel assets for project %s", slug)
