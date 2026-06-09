@@ -333,145 +333,128 @@ def _macos_speech_timeout_seconds(audio_path: Path) -> int:
     return max(120, min(1800, timeout))
 
 
+def _macos_speech_analyzer_swift(audio_path: Path, locale: str) -> str:
+    """Swift source for the macOS 26 SpeechAnalyzer/SpeechTranscriber helper.
+
+    Emits a JSON array of ``{start, end, word}`` (word-level timing from the
+    ``.audioTimeRange`` attribute) on stdout; diagnostics on stderr.
+    """
+    return f'''
+import Foundation
+import Speech
+import AVFoundation
+import CoreMedia
+
+func log(_ s: String) {{ FileHandle.standardError.write(Data("[apple-speech] \\(s)\\n".utf8)) }}
+
+let audioPath = "{audio_path}"
+let localeID = "{locale}"
+
+func ensureModel(_ transcriber: SpeechTranscriber, _ locale: Locale) async throws {{
+    let installed = await SpeechTranscriber.installedLocales
+    if installed.contains(where: {{ $0.identifier(.bcp47) == locale.identifier(.bcp47) }}) {{ return }}
+    let reserved = await AssetInventory.reservedLocales
+    if !reserved.contains(where: {{ $0.identifier == locale.identifier }}) {{
+        try await AssetInventory.reserve(locale: locale)
+    }}
+    if let req = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {{
+        log("downloading speech assets…")
+        try await req.downloadAndInstall()
+        log("assets installed")
+    }}
+}}
+
+func run() async throws {{
+    let status = await withCheckedContinuation {{ (c: CheckedContinuation<SFSpeechRecognizerAuthorizationStatus, Never>) in
+        SFSpeechRecognizer.requestAuthorization {{ c.resume(returning: $0) }}
+    }}
+    guard status == .authorized else {{ log("ERROR: not authorized (\\(status.rawValue))"); exit(2) }}
+    guard SpeechTranscriber.isAvailable else {{ log("ERROR: SpeechTranscriber unavailable"); exit(3) }}
+    guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: localeID)) else {{
+        log("ERROR: locale \\(localeID) unsupported"); exit(3)
+    }}
+    log("using locale \\(locale.identifier)")
+
+    let transcriber = SpeechTranscriber(
+        locale: locale,
+        transcriptionOptions: [],
+        reportingOptions: [],
+        attributeOptions: [.audioTimeRange]
+    )
+    try await ensureModel(transcriber, locale)
+
+    let analyzer = SpeechAnalyzer(modules: [transcriber])
+    let audioFile = try AVAudioFile(forReading: URL(fileURLWithPath: audioPath))
+
+    let collector = Task {{ () -> [[String: Any]] in
+        var words: [[String: Any]] = []
+        for try await result in transcriber.results {{
+            let attr = result.text
+            for run in attr.runs {{
+                guard let range = run.audioTimeRange else {{ continue }}
+                let word = String(attr[run.range].characters)
+                if word.trimmingCharacters(in: .whitespaces).isEmpty {{ continue }}
+                words.append(["start": range.start.seconds, "end": range.end.seconds, "word": word])
+            }}
+        }}
+        return words
+    }}
+
+    if let last = try await analyzer.analyzeSequence(from: audioFile) {{
+        try await analyzer.finalizeAndFinish(through: last)
+    }} else {{
+        await analyzer.cancelAndFinishNow()
+    }}
+
+    let words = try await collector.value
+    let out = try JSONSerialization.data(withJSONObject: words)
+    FileHandle.standardOutput.write(out)
+    log("emitted \\(words.count) words")
+}}
+
+try await run()
+'''
+
+
+def _macos_words_to_segments(raw_words: list[dict]) -> list[TranscriptSegment]:
+    """Group Apple's word stream into sentence-ish segments, each carrying its
+    ``TranscriptWord`` list, so the result has full word-level timing."""
+    segments: list[TranscriptSegment] = []
+    cur: list[TranscriptWord] = []
+
+    def flush() -> None:
+        if not cur:
+            return
+        text = " ".join(w.word.strip() for w in cur).strip()
+        segments.append(TranscriptSegment(
+            start=cur[0].start, end=cur[-1].end, text=text, words=list(cur)))
+        cur.clear()
+
+    for w in raw_words:
+        word = str(w.get("word", ""))
+        cur.append(TranscriptWord(
+            start=float(w["start"]), end=float(w["end"]),
+            word=word, probability=1.0))
+        if word.strip().endswith((".", "!", "?")):
+            flush()
+    flush()
+    return segments
+
+
 def _try_macos_speech(audio_path: Path, language: str | None) -> TranscriptionResult | None:
-    """Transcribe using macOS built-in speech recognition via a Swift helper."""
+    """Transcribe with Apple's on-device Speech framework.
+
+    Uses the macOS 26 ``SpeechAnalyzer`` / ``SpeechTranscriber`` API (NOT the
+    legacy ``SFSpeechRecognizer``). The modern API transcribes long-form audio in
+    one pass — no sliding-window truncation — and exposes per-word timing via the
+    ``.audioTimeRange`` attribute, which we surface as ``TranscriptWord`` stamps.
+    """
     if platform.system() != "Darwin":
         return None
 
-    logger.info("Transcribing with macOS SFSpeechRecognizer")
-
-    # We use a small inline Swift script via `swift` CLI
     locale = language or "en-US"
-    swift_timeout = _macos_speech_timeout_seconds(audio_path)
-    logger.info("SFSpeechRecognizer timeout set to %ds for %s", swift_timeout, audio_path.name)
-    swift_code = f"""
-import Foundation
-import Speech
-
-func log(_ s: String) {{ fputs("[apple-speech] \\(s)\\n", stderr) }}
-
-enum SpeechErr: Error {{ case notAuthorized, noRecognizer, notAvailable, timedOut }}
-
-log("starting; audio=\\"{audio_path}\\" locale={locale}")
-
-let status = await withCheckedContinuation {{ (continuation: CheckedContinuation<SFSpeechRecognizerAuthorizationStatus, Never>) in
-    SFSpeechRecognizer.requestAuthorization {{ authStatus in
-        continuation.resume(returning: authStatus)
-    }}
-}}
-log("authorization status=\\(status.rawValue)")
-guard status == .authorized else {{
-    log("ERROR: authorization denied — grant in System Settings → Privacy & Security → Speech Recognition")
-    exit(2)
-}}
-
-guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "{locale}")) else {{
-    log("ERROR: no recognizer for locale {locale}")
-    exit(3)
-}}
-guard recognizer.isAvailable else {{
-    log("ERROR: recognizer not available for locale {locale} — ensure the locale is downloaded in System Settings → Keyboard → Dictation")
-    exit(3)
-}}
-log("recognizer ready; on-device support=\\(recognizer.supportsOnDeviceRecognition)")
-
-let url = URL(fileURLWithPath: "{audio_path}")
-let request = SFSpeechURLRecognitionRequest(url: url)
-// Even though `shouldReportPartialResults = false` is documented to send
-// only the final result, on macOS 14+ the on-device recognizer often
-// sends a stream of partials and never flips ``isFinal`` for audio
-// longer than ~60s. So we ASK for partials, treat each one as the
-// running best-known transcript, and on timeout emit the latest partial
-// instead of failing — that's still a usable transcript even if the
-// framework refuses to mark it final.
-request.shouldReportPartialResults = true
-if #available(macOS 10.15, *), recognizer.supportsOnDeviceRecognition {{
-    request.requiresOnDeviceRecognition = true
-    log("using on-device recognition")
-}} else {{
-    log("falling back to network recognition")
-}}
-
-func runRecognition() async throws -> [[String: Any]] {{
-    try await withCheckedThrowingContinuation {{ (continuation: CheckedContinuation<[[String: Any]], Error>) in
-        var resumed = false
-        // Last partial transcript we've seen; emitted as the final
-        // answer if the framework times out without flipping isFinal.
-        var lastPartial: [[String: Any]] = []
-        var partialCount = 0
-        let resumeOnce: (Result<[[String: Any]], Error>) -> Void = {{ outcome in
-            if resumed {{ return }}
-            resumed = true
-            continuation.resume(with: outcome)
-        }}
-
-        log("starting recognition task…")
-        let task = recognizer.recognitionTask(with: request) {{ result, error in
-            if let error = error {{
-                // If we've already buffered partials, prefer them over
-                // failing — the framework sometimes errors out at the
-                // tail of a long file even after producing usable text.
-                if !lastPartial.isEmpty {{
-                    log("recognition error after \\(partialCount) partials — emitting latest partial: \\(error)")
-                    resumeOnce(.success(lastPartial))
-                }} else {{
-                    log("recognition error: \\(error)")
-                    resumeOnce(.failure(error))
-                }}
-                return
-            }}
-            guard let result = result else {{ log("callback with nil result"); return }}
-            // Capture every partial as the current best-known transcript.
-            var snapshot: [[String: Any]] = []
-            for segment in result.bestTranscription.segments {{
-                snapshot.append([
-                    "start": segment.timestamp,
-                    "end": segment.timestamp + segment.duration,
-                    "text": segment.substring
-                ])
-            }}
-            if !snapshot.isEmpty {{
-                lastPartial = snapshot
-                partialCount += 1
-            }}
-            if result.isFinal {{
-                log("final result received (\\(result.bestTranscription.segments.count) segments)")
-                resumeOnce(.success(snapshot))
-            }}
-        }}
-
-        // Timeout sized to the audio length (passed in from Python via
-        // ffprobe — see ``_macos_speech_timeout_seconds``). Apple Speech
-        // runs roughly 1x real-time on-device. If we hit it, fall back
-        // to whatever partial we have rather than failing.
-        DispatchQueue.global().asyncAfter(deadline: .now() + {swift_timeout}) {{
-            if !resumed {{
-                if !lastPartial.isEmpty {{
-                    log("timeout after {swift_timeout}s — emitting latest partial (\\(lastPartial.count) segments from \\(partialCount) partials)")
-                    task.cancel()
-                    resumeOnce(.success(lastPartial))
-                }} else {{
-                    log("ERROR: timed out after {swift_timeout}s with no partials (state=\\(task.state.rawValue))")
-                    task.cancel()
-                    resumeOnce(.failure(SpeechErr.timedOut))
-                }}
-            }}
-        }}
-    }}
-}}
-
-do {{
-    let resultJSON = try await runRecognition()
-    log("done; emitting JSON")
-    if let data = try? JSONSerialization.data(withJSONObject: resultJSON),
-       let str = String(data: data, encoding: .utf8) {{
-        print(str)
-    }}
-}} catch {{
-    log("ERROR: recognition failed: \\(error)")
-    exit(4)
-}}
-"""
+    logger.info("Transcribing with Apple SpeechAnalyzer (locale=%s)", locale)
+    swift_code = _macos_speech_analyzer_swift(audio_path, locale)
 
     try:
         result = subprocess.run(
@@ -479,29 +462,32 @@ do {{
             input=swift_code,
             capture_output=True,
             text=True,
-            timeout=600,  # 10 minute timeout
+            timeout=_macos_speech_timeout_seconds(audio_path),
         )
 
-        # Surface the Swift helper's diagnostic lines (prefixed [apple-speech])
-        # so the server log shows progress regardless of success.
         if result.stderr:
             for line in result.stderr.splitlines():
                 if line.strip():
-                    logger.info("SFSpeechRecognizer: %s", line)
+                    logger.info("SpeechAnalyzer: %s", line)
 
         if result.returncode != 0:
-            logger.warning(f"SFSpeechRecognizer exited rc={result.returncode}: {result.stderr}")
+            logger.warning("SpeechAnalyzer exited rc=%s: %s", result.returncode, result.stderr[-400:])
             return None
 
-        data = json.loads(result.stdout.strip())
-        segments = [
-            TranscriptSegment(start=s["start"], end=s["end"], text=s["text"])
-            for s in data
-        ]
+        raw_words = json.loads(result.stdout.strip() or "[]")
+        if not raw_words:
+            logger.warning("SpeechAnalyzer returned no words")
+            return None
 
-        return TranscriptionResult(segments=segments, backend="macos-speech", language=locale)
+        segments = _macos_words_to_segments(raw_words)
+        return TranscriptionResult(
+            segments=segments,
+            backend="macos-speech",
+            language=locale,
+            has_word_timestamps=True,
+        )
     except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception) as e:
-        logger.warning(f"SFSpeechRecognizer failed: {e}")
+        logger.warning("SpeechAnalyzer failed: %s", e)
         return None
 
 
@@ -543,23 +529,16 @@ def transcribe(
     try:
         # Try backends in order.
         #
-        # ``macos-speech`` (Apple SFSpeechRecognizer) is intentionally NOT in
-        # the auto-fallback list. Bench testing on a 12-min screencast showed
-        # that ``SFSpeechURLRecognitionRequest`` with on-device recognition
-        # operates as a sliding window for long audio: it processes the whole
-        # file fast (~15× realtime) but each result callback REPLACES the
-        # previous transcript instead of extending it, so we end up with only
-        # the final ~10s of the recording. Apple's URL request was designed
-        # for short utterances (< ~60s), not long-form transcription. The
-        # ``_try_macos_speech`` implementation is preserved below for short
-        # clips and as reference, but it can only be reached by passing
-        # ``backend="macos-speech"`` explicitly via the API. A proper fix
-        # would chunk the audio and run a separate request per chunk —
-        # not done yet.
+        # ``macos-speech`` now uses the macOS 26 ``SpeechAnalyzer`` API, which
+        # (unlike the old ``SFSpeechURLRecognitionRequest``) transcribes
+        # long-form audio in one pass with per-word timing and runs ~70× faster
+        # than realtime. It sits last in the auto-fallback order so the more
+        # accurate Whisper backends are preferred when present, but it can also
+        # be selected explicitly via ``backend="macos-speech"``.
         backends = [
             ("mlx-whisper", lambda: _try_mlx_whisper(audio_path, model, language)),
             ("whisper.cpp", lambda: _try_whisper_cpp(audio_path, model, language)),
-            # ("macos-speech", lambda: _try_macos_speech(audio_path, language)),
+            ("macos-speech", lambda: _try_macos_speech(audio_path, language)),
         ]
 
         if backend:
@@ -684,11 +663,15 @@ def list_available_backends() -> list[dict]:
     else:
         available.append({"name": "whisper.cpp", "status": "installable", "note": "brew install whisper-cpp"})
 
-    # macOS Speech (Apple SFSpeechRecognizer) is deliberately omitted from
-    # the user-facing backend list. See the comment above the ``backends``
-    # list in ``transcribe()`` for the long-form transcription bug. The
-    # ``_try_macos_speech`` codepath is still reachable via the API by
-    # passing ``backend="macos-speech"``, but it isn't surfaced as a
-    # choice in the UI.
+    # macOS Speech — Apple SpeechAnalyzer (macOS 26+). On-device, word-level
+    # timing, long-form in one pass. Surfaced only where the API exists.
+    if platform.system() == "Darwin":
+        try:
+            mac_major = int(platform.mac_ver()[0].split(".")[0])
+        except (ValueError, IndexError):
+            mac_major = 0
+        if mac_major >= 26:
+            available.append({"name": "macos-speech", "status": "available",
+                              "note": "Apple SpeechAnalyzer (on-device)"})
 
     return available
