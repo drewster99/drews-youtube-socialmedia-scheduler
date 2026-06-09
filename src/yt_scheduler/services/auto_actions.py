@@ -665,6 +665,8 @@ async def start_promo_from_cut(
     cut_end_seconds: float,
     vertical_crop: bool = False,
     x_shift_normalized: float = 0.0,
+    audio_fade_in: float = 0.0,
+    audio_fade_out: float = 0.0,
     existing_cut_path: Path | None = None,
 ) -> str:
     """Queue a Promo chain for a clip cut from a parent video.
@@ -716,6 +718,8 @@ async def start_promo_from_cut(
         "parent_video_path": str(parent_video_path),
         "vertical_crop": bool(vertical_crop),
         "x_shift_normalized": float(x_shift_normalized),
+        "audio_fade_in": float(audio_fade_in),
+        "audio_fade_out": float(audio_fade_out),
     }
     spawn_background(_run_promo_chain(job_id), name=f"promo-from-cut:{job_id}")
     return job_id
@@ -824,6 +828,8 @@ async def _run_promo_chain_inner(job_id: str) -> None:
                 end_seconds=float(job["cut_end_seconds"]),
                 title=job.get("pre_supplied_title") or "",
                 reason="",
+                audio_fade_in=float(job.get("audio_fade_in", 0.0)),
+                audio_fade_out=float(job.get("audio_fade_out", 0.0)),
             )
             cut_path = await clipper.cut_clip_from_parent(
                 parent_video_path=Path(job["parent_video_path"]),

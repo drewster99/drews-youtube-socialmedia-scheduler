@@ -43,8 +43,9 @@ from pathlib import Path
 from typing import Literal
 
 from yt_scheduler.config import UPLOAD_DIR
-from yt_scheduler.services import ai, media as media_service
+from yt_scheduler.services import ai, clip_edges, media as media_service
 from yt_scheduler.services.background import spawn_background
+from yt_scheduler.services.clip_edges import ClipUnit
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,12 @@ class ProposedClip:
     end_seconds: float
     title: str
     reason: str
+    # Populated by the word-stream (index) proposal path; ignored by the
+    # legacy anchor path. ``rating`` is the model's 1-4 self-score; the fade
+    # lengths drive the audio ramps at cut time (see media.extract_clip).
+    rating: int | None = None
+    audio_fade_in: float = 0.0
+    audio_fade_out: float = 0.0
 
     @property
     def duration_seconds(self) -> float:
@@ -521,6 +528,261 @@ _PROPOSAL_TOOL = {
         "required": ["proposals"],
     },
 }
+
+
+# --- Word-stream (index) proposal path -------------------------------------
+#
+# When word-level transcription is available we show Claude a NUMBERED list of
+# complete-thought units and have it return integer index ranges, rather than
+# anchor text + timestamps. Indexing is robust where anchor-matching was not
+# (LLMs copy long text imperfectly and can't do timestamp math); all precision
+# is recovered here from the word timing via ``clip_edges``.
+
+_INDEX_PROPOSAL_TOOL = {
+    "name": "propose_clips",
+    "description": (
+        "Submit proposed clip ranges by transcript UNIT INDEX. Returns no "
+        "value; the caller reads the tool input."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "proposals": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "first_index": {
+                            "type": "integer",
+                            "description": "1-based index of the unit where the clip STARTS.",
+                        },
+                        "last_index": {
+                            "type": "integer",
+                            "description": "1-based index of the unit where the clip ENDS (inclusive).",
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "A punchy working title for the clip (see length/tone guidance).",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "One sentence on why this range stands alone.",
+                        },
+                        "rating": {
+                            "type": "integer",
+                            "description": "1-4 self-score (4 = best), judging content and title together.",
+                        },
+                    },
+                    "required": ["first_index", "last_index", "title", "reason", "rating"],
+                },
+            },
+        },
+        "required": ["proposals"],
+    },
+}
+
+# Per-kind length window, content focus, and title tone for the index prompt.
+_KIND_INDEX_GUIDANCE: dict[ClipKind, dict[str, str]] = {
+    "hook": {
+        "window": "5 to 30 seconds",
+        "content": (
+            "A hook is a single surprising, opinionated, useful, or candid "
+            "moment with an immediate payoff — one clear point, no setup."
+        ),
+        "title": (
+            "The title IS the hook: 4-8 words, punchy and a little "
+            "opinionated/divisive (never clickbait like 'You won't believe'); "
+            "state the actual point."
+        ),
+    },
+    "short": {
+        "window": "45 to 75 seconds",
+        "content": (
+            "A short is ONE complete mini-story or explanation: a brief setup "
+            "and a satisfying payoff, understandable on its own — one coherent "
+            "idea, not a grab-bag."
+        ),
+        "title": "4-9 words, punchy and clear, mildly opinionated; never clickbait.",
+    },
+    "segment": {
+        "window": "at least 90 seconds (up to several minutes)",
+        "content": (
+            "A segment is a full, self-contained discussion of ONE topic from "
+            "where it is introduced to where it wraps up, before the next topic."
+        ),
+        "title": (
+            "5-10 words, clear, descriptive and informative — NOT divisive and "
+            "NOT clickbait; name the topic."
+        ),
+    },
+}
+
+
+def _build_index_user_text(
+    kind: ClipKind, units: list[ClipUnit], *, parent_title: str,
+    existing_ranges: list[tuple[float, float]], crop_vertical: bool,
+    max_proposals: int,
+) -> str:
+    """Assemble the instruction block + numbered units the model selects from."""
+    spec = _KIND_INDEX_GUIDANCE[kind]
+    min_s, max_s = _PER_KIND_BOUNDS[kind]
+    durs = sorted(u.duration for u in units) or [1.0]
+    median = durs[len(durs) // 2] or 1.0
+    lo_units = max(1, round(min_s / median))
+    hi_units = round((max_s if max_s is not None else min_s * 3) / median)
+    visual = (
+        "AUDIO ONLY: never pick a clip that depends on something visual (a "
+        "chart, code on screen, a demo, 'look at this', 'right here'). If the "
+        "words only make sense with a picture, skip it.\n"
+    )
+    crop = (VERTICAL_CROP_PROMPT_BLOCK if crop_vertical else "")
+    avoid = _build_existing_ranges_block(existing_ranges, kind)
+    return (
+        f"You select {kind} clips from a podcast transcript of "
+        f"\"{parent_title}\" for posting as standalone vertical videos.\n\n"
+        "The transcript is a NUMBERED list of complete-thought units, one per "
+        "line as `<index>\\t(<duration>s)\\t<text>`. Choose clips by referencing "
+        "unit INDEX NUMBERS only — never write timestamps and never retype the "
+        "text. A clip is a contiguous run of units from first_index through "
+        "last_index inclusive.\n\n"
+        f"## What makes a good {kind}\n"
+        f"- Length: {spec['window']}.\n"
+        f"- {spec['content']}\n"
+        "- Self-contained: it makes sense with no other context. Starts and "
+        "ends on a complete thought.\n"
+        f"- {visual}\n"
+        "## Title\n"
+        f"- {spec['title']}\n\n"
+        "## Length is a hard constraint — verify it\n"
+        "You are not good at summing many numbers, so do it explicitly: add up "
+        "the (Ns) values from first_index to last_index. If the total is above "
+        "the maximum, drop units from the end; if below the minimum, extend. As "
+        f"a rough guide that window is about {lo_units}-{hi_units} units here. A "
+        "clip outside the length window is REJECTED, not trimmed for you.\n\n"
+        f"## Rating\nRate each clip 1-4 (4 = best), content and title together.\n\n"
+        f"{crop}{avoid}"
+        f"Propose UP TO {max_proposals} clips. Return FEWER (even zero) if there "
+        "aren't that many strong ones — do not pad, do not overlap.\n\n"
+        "## Transcript\n"
+        f"{clip_edges.numbered_units_block(units)}"
+    )
+
+
+def _validate_indexed_proposals(
+    raw_proposals: list[dict], *, kind: ClipKind, units: list[ClipUnit],
+    existing_ranges: list[tuple[float, float]], max_proposals: int,
+) -> list[ProposedClip]:
+    """Resolve index ranges to clips: drop bad/duplicate indices and any clip
+    outside the kind's duration window; compute the gap-ramp edges."""
+    min_s, max_s = _PER_KIND_BOUNDS[kind]
+    out: list[ProposedClip] = []
+    accepted: list[tuple[float, float]] = []
+    for entry in raw_proposals:
+        if len(out) >= max_proposals:
+            break
+        try:
+            first_index = int(entry["first_index"])
+            last_index = int(entry["last_index"])
+        except (KeyError, TypeError, ValueError):
+            logger.info("Dropping clip proposal: missing/invalid indices %r", entry)
+            continue
+        title = str(entry.get("title") or "").strip() or f"Untitled {kind}"
+        resolved = clip_edges.resolve_unit_range(units, first_index, last_index)
+        if resolved is None:
+            logger.info(
+                "Dropping clip proposal %r: index range %s-%s out of bounds "
+                "(have %d units).", title, first_index, last_index, len(units),
+            )
+            continue
+        if resolved.duration < min_s or (max_s is not None and resolved.duration > max_s):
+            logger.info(
+                "Dropping clip proposal %r: duration %.1fs out of [%s, %s].",
+                title, resolved.duration, min_s, max_s,
+            )
+            continue
+        edges = clip_edges.compute_edges(units, first_index, last_index)
+        # Overlap guard — against already-cut clips and earlier proposals in
+        # this same batch (the model is told not to overlap; enforce it).
+        prior = existing_ranges + accepted
+        if any(
+            _overlap_seconds(edges.final_start, edges.final_end, s, e)
+            > _MAX_OVERLAP_FRACTION * (edges.final_end - edges.final_start)
+            for s, e in prior
+        ):
+            logger.info("Dropping clip proposal %r: overlaps an existing range.", title)
+            continue
+        rating = entry.get("rating")
+        out.append(ProposedClip(
+            kind=kind,
+            start_seconds=edges.final_start,
+            end_seconds=edges.final_end,
+            title=title,
+            reason=str(entry.get("reason") or "").strip(),
+            rating=int(rating) if isinstance(rating, (int, float)) else None,
+            audio_fade_in=edges.fade_in,
+            audio_fade_out=edges.fade_out,
+        ))
+        accepted.append((edges.final_start, edges.final_end))
+    return out
+
+
+async def propose_clips_for_kind_indexed(
+    *,
+    kind: ClipKind,
+    units: list[ClipUnit],
+    parent_title: str,
+    parent_duration_seconds: float,
+    existing_ranges: list[tuple[float, float]],
+    crop_vertical: bool,
+    max_proposals: int | None = None,
+) -> list[ProposedClip]:
+    """Word-stream proposal: one per-kind Claude call over the numbered units."""
+    if not is_parent_eligible_for_kind(parent_duration_seconds, kind) or not units:
+        return []
+
+    if max_proposals is None or max_proposals <= 0:
+        effective_max = DEFAULT_MAX_PROPOSALS_PER_KIND
+    else:
+        effective_max = min(max_proposals, MAX_PROPOSALS_PER_KIND_CAP)
+
+    user_text = _build_index_user_text(
+        kind, units, parent_title=parent_title, existing_ranges=existing_ranges,
+        crop_vertical=crop_vertical, max_proposals=effective_max,
+    )
+
+    model = await ai._resolve_model()
+    kwargs: dict[str, object] = {
+        "model": model,
+        "max_tokens": 2048,
+        "messages": [{"role": "user", "content": user_text}],
+        "tools": [_INDEX_PROPOSAL_TOOL],
+        "tool_choice": {"type": "tool", "name": "propose_clips"},
+    }
+    logger.info("Clip-proposal (index) request: kind=%s units=%d model=%s",
+                kind, len(units), model)
+
+    client = ai.get_client()
+    try:
+        message = await asyncio.to_thread(client.messages.create, **kwargs)
+    except Exception as exc:
+        logger.warning("Claude clip-proposal (index) call failed for %s: %s", kind, exc)
+        return []
+
+    raw_proposals: list[dict] = []
+    for block in getattr(message, "content", []) or []:
+        if getattr(block, "type", None) == "tool_use" and getattr(block, "name", "") == "propose_clips":
+            entries = (getattr(block, "input", None) or {}).get("proposals")
+            if isinstance(entries, list):
+                raw_proposals = [e for e in entries if isinstance(e, dict)]
+            break
+
+    proposals = _validate_indexed_proposals(
+        raw_proposals, kind=kind, units=units,
+        existing_ranges=existing_ranges, max_proposals=effective_max,
+    )
+    logger.info("Clip-proposal (index) for %s: %d raw -> %d accepted",
+                kind, len(raw_proposals), len(proposals))
+    return proposals
 
 
 async def propose_clips_for_kind(
@@ -1264,6 +1526,8 @@ async def cut_clip_from_parent(
                 vertical_crop=vertical_crop,
                 x_shift_normalized=x_shift_normalized,
                 encoder="auto",
+                audio_fade_in=proposal.audio_fade_in,
+                audio_fade_out=proposal.audio_fade_out,
             )
         except Exception:
             # ffmpeg can leave a partial mp4 behind on non-zero exit /
@@ -1343,6 +1607,8 @@ async def cut_preview_for_proposal(
                 vertical_crop=vertical_crop,
                 x_shift_normalized=x_shift_normalized,
                 encoder="auto",
+                audio_fade_in=proposal.audio_fade_in,
+                audio_fade_out=proposal.audio_fade_out,
             )
             ok = True
         finally:
@@ -1399,6 +1665,7 @@ async def propose_all_clips(
     existing_ranges_per_kind: dict[ClipKind, list[tuple[float, float]]],
     project_id: int,
     max_per_kind: dict[ClipKind, int] | None = None,
+    units: list[ClipUnit] | None = None,
 ) -> dict[ClipKind, list[ProposedClip]]:
     """Fan out one Claude call per requested kind, in parallel.
 
@@ -1410,6 +1677,10 @@ async def propose_all_clips(
     ``max_per_kind`` is the user-selected cap per kind from the
     Generate-from-source UI. When ``None`` (or a kind missing from it),
     falls back to :data:`DEFAULT_MAX_PROPOSALS_PER_KIND`.
+
+    ``units`` is the word-stream segmentation. When supplied (word-level
+    transcription was available) the index-based proposal path is used; when
+    ``None`` we fall back to the legacy anchor-text path over the SRT.
     """
     if not kinds:
         return {}
@@ -1417,16 +1688,27 @@ async def propose_all_clips(
     caps = max_per_kind or {}
 
     async def _one(k: ClipKind) -> tuple[ClipKind, list[ProposedClip]]:
-        proposals = await propose_clips_for_kind(
-            kind=k,
-            transcript_srt=transcript_srt,
-            parent_title=parent_title,
-            parent_duration_seconds=parent_duration_seconds,
-            existing_ranges=existing_ranges_per_kind.get(k, []),
-            crop_vertical=crop_vertical_for_kind.get(k, False),
-            project_id=project_id,
-            max_proposals=caps.get(k),
-        )
+        if units is not None:
+            proposals = await propose_clips_for_kind_indexed(
+                kind=k,
+                units=units,
+                parent_title=parent_title,
+                parent_duration_seconds=parent_duration_seconds,
+                existing_ranges=existing_ranges_per_kind.get(k, []),
+                crop_vertical=crop_vertical_for_kind.get(k, False),
+                max_proposals=caps.get(k),
+            )
+        else:
+            proposals = await propose_clips_for_kind(
+                kind=k,
+                transcript_srt=transcript_srt,
+                parent_title=parent_title,
+                parent_duration_seconds=parent_duration_seconds,
+                existing_ranges=existing_ranges_per_kind.get(k, []),
+                crop_vertical=crop_vertical_for_kind.get(k, False),
+                project_id=project_id,
+                max_proposals=caps.get(k),
+            )
         return k, proposals
 
     results = await asyncio.gather(*(_one(k) for k in kinds))
@@ -1612,6 +1894,11 @@ def proposal_to_public_dict(
         "duration_seconds": p.duration_seconds,
         "title": p.title,
         "reason": p.reason,
+        "rating": p.rating,
+        # Audio edge ramps from the word-stream path; carried through so the
+        # final cut applies the same fades as the preview (0 on the anchor path).
+        "audio_fade_in": p.audio_fade_in,
+        "audio_fade_out": p.audio_fade_out,
         "vertical_crop": crop_vertical,
     }
     if vision_crashed:
@@ -1710,6 +1997,11 @@ async def _run_generate_job(job_id: str) -> None:
         if rows:
             transcript = rows[0]["transcript"] or ""
 
+        # Captures the fresh TranscriptionResult when we transcribe below, so we
+        # can reuse its word-level timing for the index proposal path without a
+        # second transcription pass.
+        fresh_result = None
+
         if not transcript_service.has_timestamps(transcript):
             # Inline auto-transcribe. Single path — we don't try to detect
             # an in-progress transcription started by another flow. Worst
@@ -1736,6 +2028,7 @@ async def _run_generate_job(job_id: str) -> None:
                 )
                 return
 
+            fresh_result = result
             srt = result.to_srt()
             # Persist so the next Generate run on this parent doesn't
             # have to re-transcribe — same upsert path the manual
@@ -1795,6 +2088,34 @@ async def _run_generate_job(job_id: str) -> None:
                 await db.commit()
             transcript = srt
 
+        # Word-stream units for the index proposal path. Prefer the fresh
+        # transcription's word timing; if a stored (timestamped) transcript was
+        # used instead, transcribe now purely to obtain word timing — the
+        # transcribers are fast enough (Apple SpeechAnalyzer ~70x realtime) to
+        # do this at the point we need it rather than persisting word data.
+        # When no word timing is available the proposer falls back to the
+        # legacy anchor path over the SRT.
+        units = None
+        word_result = fresh_result
+        if word_result is None:
+            from yt_scheduler.services import transcription
+            try:
+                word_result = await asyncio.to_thread(
+                    transcription.transcribe,
+                    video_path=job["parent_video_path"],
+                    model="large-v3",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Generate-from-source: word-timing transcription failed "
+                    "(%s); using the anchor path.", exc,
+                )
+                word_result = None
+        if word_result is not None and word_result.has_word_timestamps:
+            units = clip_edges.build_units(word_result.all_words) or None
+            logger.info("Generate-from-source: %d word-stream units (%s).",
+                        len(units) if units else 0, word_result.backend)
+
         # Proposing — fan out the per-kind calls.
         job["state"] = "proposing"
         job["progress_message"] = "Asking Claude to propose clips…"
@@ -1807,6 +2128,7 @@ async def _run_generate_job(job_id: str) -> None:
             existing_ranges_per_kind=job["existing_ranges_per_kind"],
             project_id=int(job["project_id"]),
             max_per_kind=job.get("max_per_kind"),
+            units=units,
         )
 
         # Refinement — for kinds the user toggled for vertical crop,

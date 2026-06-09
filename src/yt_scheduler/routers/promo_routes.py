@@ -642,6 +642,14 @@ async def generate_confirm(
         # Clamp to the same range extract_clip clamps to so logs and
         # event records match what actually runs.
         x_shift = max(-1.0, min(1.0, x_shift))
+        # Audio edge ramps from the word-stream proposal path (0 on the legacy
+        # anchor path). Echoed back by the client; used only by the fallback
+        # re-cut — when a preview cut is adopted it already carries the fades.
+        try:
+            audio_fade_in = max(0.0, float(entry.get("audio_fade_in") or 0.0))
+            audio_fade_out = max(0.0, float(entry.get("audio_fade_out") or 0.0))
+        except (TypeError, ValueError):
+            audio_fade_in = audio_fade_out = 0.0
 
         # Cross-check against the preview snapshot when we have one. A
         # client-supplied vertical_crop=true on a kind whose preview
@@ -699,6 +707,8 @@ async def generate_confirm(
             cut_end_seconds=end,
             vertical_crop=vertical_crop,
             x_shift_normalized=x_shift,
+            audio_fade_in=audio_fade_in,
+            audio_fade_out=audio_fade_out,
             existing_cut_path=existing_cut,
         )
         jobs_out.append({"job_id": job_id, "kind": kind, "title": title})

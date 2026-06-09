@@ -603,6 +603,8 @@ document.getElementById('gen-confirm').addEventListener('click', async () => {
                 x_shift_normalized: Number(p.x_shift_normalized || 0),
                 crop_classification: p.crop_classification || null,
                 crop_confidence: Number(p.crop_confidence || 0),
+                audio_fade_in: Number(p.audio_fade_in || 0),
+                audio_fade_out: Number(p.audio_fade_out || 0),
             });
         });
     }
