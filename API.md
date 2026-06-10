@@ -2003,7 +2003,7 @@ Bulk-upload promo children under a primary video. Each upload runs through the m
 
 **Purpose** — List the parent's children, bucketed by `item_type`.
 
-**Response 200** — `{"summary": {"segment": N, "short": N, "hook": N}, "children": {"segment": [...], "short": [...], "hook": [...]}, "readiness": {"segment": {"count": N, "line": "...", "state": "..."}, "short": {...}, "hook": {...}}}`. Each child entry is the `_video_public` projection. `readiness` is a per-tier one-line summary for the parent's Promo videos card: `line` is human-readable (e.g. `"4 need thumbnail · 1 ready"`, `"all ready"`); `state` is one of `empty | ready | working | attention` (drives the card's status dot).
+**Response 200** — `{"summary": {"segment": N, "short": N, "hook": N}, "children": {"segment": [...], "short": [...], "hook": [...]}, "readiness": {"segment": {"count": N, "line": "...", "state": "..."}, "short": {...}, "hook": {...}}, "pending_jobs": [{"job_id": str, "video_id": str|null, "item_type": "segment"|"short"|"hook"|null, "state": str, "title": str|null, "last_error": str|null}, ...]}`. Each child entry is the `_video_public` projection. `readiness` is a per-tier one-line summary for the parent's Promo videos card: `line` is human-readable (e.g. `"4 need thumbnail · 1 ready"`, `"all ready"`); `state` is one of `empty | ready | working | attention` (drives the card's status dot). `pending_jobs` lists in-flight promo-chain jobs for this parent that haven't reached `ready` (e.g. just-inserted Generate clips still cutting/uploading/transcribing) — surfaced from the in-memory job table so the page renders live placeholder cards before a DB row exists, on any load. `state` is one of the promo-chain states (`pending`, `cutting`, `uploading`, `transcribing`, `generating_desc`, …) or `failed:<step>`.
 
 **Errors** — `404` (project or parent video not found in project), `400` (parent is itself a child — only one level of parenting is supported).
 
@@ -2069,6 +2069,16 @@ Terminal jobs (`done` / `failed`) are evicted from the in-memory job dict 30 min
 **Response 200** — `{"rejections": [{"id": int, "kind": str, "start_seconds": float, "end_seconds": float, "duration_seconds": float, "title": str|null, "reason": str|null, "x_shift_normalized": float|null, "crop_classification": str|null, "crop_confidence": float|null, "rejected_at": str}, ...]}`. Sorted newest first. Survives process restart (unlike the in-memory generate-job dict).
 
 **Errors** — `404` (project / parent missing or parent is itself a child).
+
+### `POST /api/projects/{slug}/videos/{parent_id}/promos/generate/rejections`
+
+**Purpose** — Persist one or more dismissed proposals immediately, the moment the user dismisses them on the review page — independent of `/generate/confirm` (which only records rejections as a side-effect of accepting at least one clip). Keeps the "Previously dismissed" memory in sync even when the user accepts nothing.
+
+**Request body** — `{"rejected": [{"kind": "hook" | "short" | "segment", "start_seconds": float, "end_seconds": float, "title"?: str, "reason"?: str, "x_shift_normalized"?: float, "crop_classification"?: str, "crop_confidence"?: float}, ...]}`. Each entry is upserted into `generate_rejections` keyed on `(parent_id, project_id, kind, start_seconds, end_seconds)`; malformed entries are skipped.
+
+**Response 200** — `{"stored": int}` — the number of entries actually written.
+
+**Errors** — `400` (missing / empty `rejected` list); `404` (project / parent missing or parent is itself a child).
 
 ### `DELETE /api/projects/{slug}/videos/{parent_id}/promos/generate/rejections/{rejection_id}`
 

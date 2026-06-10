@@ -40,6 +40,7 @@ from yt_scheduler.routers import (
     video_routes,
 )
 from yt_scheduler.services.auth import backfill_channel_assets, backfill_channel_ids
+from yt_scheduler.services.keychain_acl_repair import repair_keychain_acls
 from yt_scheduler.services.keychain_migration import (
     migrate_to_per_credential_bundles,
 )
@@ -185,6 +186,11 @@ async def lifespan(app: FastAPI):
     import os as _os
 
     db = await get_db()
+    # Repair stale Keychain ACLs BEFORE any in-process secret read. The
+    # per-credential migration below reads via the Security framework, which
+    # would otherwise trigger one "python3.12 wants to use…" prompt per item
+    # for secrets written under the old `/usr/bin/security` scheme.
+    await repair_keychain_acls()
     await migrate_to_per_credential_bundles()
     await ensure_default_project()
 

@@ -229,6 +229,63 @@ def _keychain_set(service: str, account: str, value: str) -> bool:
         return False
 
 
+def _keychain_get_cli(service: str, account: str) -> str | None:
+    """Read a secret via the ``security`` CLI subprocess.
+
+    The process that actually touches the item is ``/usr/bin/security``
+    (Apple-signed), so items written under the pre-2026-06 scheme — whose ACL
+    trusts ``/usr/bin/security`` via ``-T`` and NOT the embedded ``python3.12``
+    — are read WITHOUT the "python3.12 wants to use your confidential
+    information" prompt that an in-process Security-framework read triggers.
+
+    The ACL-repair migration relies on this to read legacy items prompt-free
+    before rewriting them with a self-trusting ACL.
+    """
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            # `security` appends exactly one trailing newline; remove only that.
+            raw = result.stdout
+            return raw[:-1] if raw.endswith("\n") else raw
+        return None
+    except FileNotFoundError:
+        return None
+
+
+def _keychain_set_cli_trusted(service: str, account: str, value: str) -> bool:
+    """Re-create an item via the CLI, trusting ``/usr/bin/security`` (restore path).
+
+    Used only to undo a half-finished ACL repair: if the in-process framework
+    re-add fails *after* the original item was deleted, we put the secret back
+    in its old-scheme form (``-T /usr/bin/security``) so nothing is lost and the
+    next boot can retry. The secret is on argv here, exactly like the
+    pre-2026-06 write path — acceptable because this runs only on the rare
+    repair-failure branch, not on the normal write path.
+    """
+    try:
+        subprocess.run(
+            ["security", "delete-generic-password", "-s", service, "-a", account],
+            capture_output=True,
+        )
+        result = subprocess.run(
+            [
+                "security", "add-generic-password",
+                "-s", service, "-a", account, "-w", value,
+                "-U",
+                "-T", "/usr/bin/security",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
 def _keychain_get(service: str, account: str) -> str | None:
     """Load a value from macOS Keychain.
 
@@ -268,21 +325,7 @@ def _keychain_get(service: str, account: str) -> str | None:
             logger.exception("Security framework read failed for %s/%s; trying CLI", service, account)
             # fall through to the CLI fallback
 
-    try:
-        result = subprocess.run(
-            ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            # `security` appends exactly one trailing newline; remove only that.
-            # Using .strip() would corrupt secrets that legitimately begin or end
-            # with whitespace.
-            raw = result.stdout
-            return raw[:-1] if raw.endswith("\n") else raw
-        return None
-    except FileNotFoundError:
-        return None
+    return _keychain_get_cli(service, account)
 
 
 def _keychain_delete(service: str, account: str) -> bool:

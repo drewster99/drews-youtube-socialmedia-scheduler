@@ -191,7 +191,10 @@ def test_extract_clip_software_no_crop(
     cmd = captured[0]
     assert "libx264" in cmd
     assert "h264_videotoolbox" not in cmd
-    assert "-vf" not in cmd
+    # -vf is always present now: setpts rebases the first frame to t=0 (fixes
+    # the black-first-frame edit-list offset). No crop filter when not cropping.
+    assert "-vf" in cmd
+    assert cmd[cmd.index("-vf") + 1] == "setpts=PTS-STARTPTS"
 
 
 def test_extract_clip_hardware_for_vertical_crop_when_auto(
@@ -353,7 +356,9 @@ def test_extract_clip_vertical_crop_filter_included(
     assert "-vf" in cmd
     vf_idx = cmd.index("-vf")
     vf_value = cmd[vf_idx + 1]
-    assert vf_value.startswith(r"crop=floor(min(iw\,ih*9/16)/2)*2:ih:")
+    # The setpts PTS-rebase is prepended; the crop filter follows it.
+    assert vf_value.startswith("setpts=PTS-STARTPTS,")
+    assert r"crop=floor(min(iw\,ih*9/16)/2)*2:ih:" in vf_value
     assert vf_value.endswith("scale=1080:1920")
 
 

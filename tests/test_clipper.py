@@ -12,11 +12,7 @@ import pytest
 def test_has_timestamps_positive():
     from yt_scheduler.services.transcripts import has_timestamps
 
-    srt = (
-        "1\n"
-        "00:00:00,000 --> 00:00:05,123\n"
-        "Hello world\n\n"
-    )
+    srt = "1\n00:00:00,000 --> 00:00:05,123\nHello world\n\n"
     assert has_timestamps(srt) is True
 
 
@@ -81,11 +77,7 @@ def test_srt_to_llm_timeline_uses_hour_anchor_past_60min():
     """Sources over an hour need [H:MM:SS], not [MM:SS]."""
     from yt_scheduler.services.transcripts import srt_to_llm_timeline
 
-    srt = (
-        "1\n"
-        "01:23:45,000 --> 01:23:50,000\n"
-        "Way past an hour.\n"
-    )
+    srt = "1\n01:23:45,000 --> 01:23:50,000\nWay past an hour.\n"
     out = srt_to_llm_timeline(srt)
     assert out == "[1:23:45] Way past an hour."
 
@@ -98,119 +90,6 @@ def test_srt_to_llm_timeline_falls_back_on_unparseable():
     plain = "Plain prose with no SRT cues at all."
     assert srt_to_llm_timeline(plain) == plain
     assert srt_to_llm_timeline("") == ""
-
-
-# --- Anchor resolution ----------------------------------------------------
-
-
-def _make_cues(*rows: tuple[float, float, str]) -> list[tuple[float, float, str]]:
-    return list(rows)
-
-
-def test_anchor_resolver_exact_match():
-    """Single-cue anchor: exact text equality, normalized."""
-    from yt_scheduler.services.clipper import _resolve_anchor_to_seconds
-
-    cues = _make_cues(
-        (0.0, 3.0, "Good morning, Drew."),
-        (3.0, 6.0, "Cut that intro."),
-        (6.0, 9.0, "Welcome back to the show."),
-    )
-    res = _resolve_anchor_to_seconds("Cut that intro.", cues, position="start")
-    assert res == (1, 3.0)
-
-
-def test_anchor_resolver_prefix_match_for_start():
-    """Multi-cue anchor: start cue is a PREFIX of the quoted anchor.
-    Longest-prefix wins so a trivial 1-word cue doesn't latch on."""
-    from yt_scheduler.services.clipper import _resolve_anchor_to_seconds
-
-    cues = _make_cues(
-        (0.0, 3.0, "Welcome"),                 # could match by trivial prefix
-        (3.0, 6.0, "back to the show today."),
-        (10.0, 13.0, "A lot of blog posts"),   # the real prefix
-        (13.0, 16.0, "talk about the front end"),
-        (16.0, 19.0, "and you fall off a cliff."),
-    )
-    anchor = "A lot of blog posts talk about the front end and you fall off a cliff."
-    res = _resolve_anchor_to_seconds(anchor, cues, position="start")
-    assert res is not None
-    idx, start = res
-    assert idx == 2  # the "A lot of blog posts" cue, not "Welcome"
-    assert start == 10.0
-
-
-def test_anchor_resolver_suffix_match_for_end():
-    """End anchor: last cue whose text is a SUFFIX of the quoted text."""
-    from yt_scheduler.services.clipper import _resolve_anchor_to_seconds
-
-    cues = _make_cues(
-        (10.0, 13.0, "A lot of blog posts"),
-        (13.0, 16.0, "talk about the front end"),
-        (16.0, 19.0, "and you fall off a cliff."),
-        (19.0, 22.0, "And then nothing on the back end."),
-    )
-    anchor = (
-        "A lot of blog posts talk about the front end and you "
-        "fall off a cliff."
-    )
-    res = _resolve_anchor_to_seconds(anchor, cues, position="end")
-    assert res is not None
-    idx, _start = res
-    assert idx == 2  # the "fall off a cliff" cue
-
-
-def test_anchor_resolver_rejects_hallucinated_text():
-    """Text that doesn't appear in any cue can't be resolved."""
-    from yt_scheduler.services.clipper import _resolve_anchor_to_seconds
-
-    cues = _make_cues(
-        (0.0, 3.0, "Good morning, Drew."),
-        (3.0, 6.0, "Welcome back."),
-    )
-    assert _resolve_anchor_to_seconds(
-        "This text was hallucinated.", cues, position="start",
-    ) is None
-
-
-def test_anchor_resolver_ignores_trivial_substring_matches():
-    """The prefix/suffix passes pick the LONGEST matching cue, and
-    the substring fallback has a min cue-length floor so trivial
-    recurring words like 'okay' / 'yeah' can't steal the match."""
-    from yt_scheduler.services.clipper import _resolve_anchor_to_seconds
-
-    cues = _make_cues(
-        (0.0, 1.0, "Okay."),         # appears as substring in many anchors
-        (1.0, 4.0, "Yeah."),
-        (200.0, 204.0, "We talked about app store ratings"),
-        (204.0, 208.0, "and the thing is that the floor is 4.5"),
-    )
-    # Anchor starts with cue at 200s. "Okay" and "Yeah" appear later
-    # in the anchor as recurring filler.
-    anchor = (
-        "We talked about app store ratings okay yeah and the "
-        "floor is 4.5 yeah."
-    )
-    res = _resolve_anchor_to_seconds(anchor, cues, position="start")
-    # Prefix pass should pick cue 2 (longest cue that's a prefix of
-    # the anchor), NOT the 1-char-after-normalization Okay/Yeah cues.
-    assert res is not None
-    _, start = res
-    assert start == 200.0
-
-
-def test_anchor_resolver_handles_punctuation_and_case_drift():
-    """Claude sometimes drops trailing punctuation or changes case;
-    normalization handles both."""
-    from yt_scheduler.services.clipper import _resolve_anchor_to_seconds
-
-    cues = _make_cues(
-        (5.0, 8.0, "Good morning, Drew."),
-    )
-    res = _resolve_anchor_to_seconds(
-        "good morning drew", cues, position="start",
-    )
-    assert res == (0, 5.0)
 
 
 def test_eligibility_per_kind_bands():
@@ -227,82 +106,6 @@ def test_eligibility_per_kind_bands():
     # Segment has no hard max — needs min (60) + 15 = 75 s.
     assert is_parent_eligible_for_kind(75.0, "segment") is True
     assert is_parent_eligible_for_kind(74.0, "segment") is False
-
-
-def test_validate_drops_out_of_band():
-    from yt_scheduler.services.clipper import _validate_proposals
-
-    raw = [
-        {"start_seconds": 0, "end_seconds": 4, "title": "too short", "reason": "x"},   # 4s, under hook min 5
-        {"start_seconds": 0, "end_seconds": 31, "title": "too long", "reason": "x"},   # 31s, over hook max 30
-        {"start_seconds": 10, "end_seconds": 25, "title": "ok", "reason": "x"},        # 15s, in band
-    ]
-    result = _validate_proposals(
-        raw, kind="hook", parent_duration_seconds=120.0, existing_ranges=[],
-    )
-    assert len(result) == 1
-    assert result[0].title == "ok"
-
-
-def test_validate_drops_overlap_above_threshold():
-    from yt_scheduler.services.clipper import _validate_proposals
-
-    raw = [
-        {"start_seconds": 10, "end_seconds": 20, "title": "overlaps", "reason": "x"},
-        {"start_seconds": 80, "end_seconds": 95, "title": "clean", "reason": "x"},
-    ]
-    # Existing 12-18 covers 6s of the proposed 10-20 (a 10s clip) = 60%, > 50%.
-    result = _validate_proposals(
-        raw, kind="hook",
-        parent_duration_seconds=200.0,
-        existing_ranges=[(12.0, 18.0)],
-    )
-    titles = [p.title for p in result]
-    assert "overlaps" not in titles
-    assert "clean" in titles
-
-
-def test_validate_caps_at_eight():
-    from yt_scheduler.services.clipper import _validate_proposals
-
-    raw = [
-        {"start_seconds": i * 60, "end_seconds": i * 60 + 20, "title": f"t{i}", "reason": "x"}
-        for i in range(12)
-    ]
-    result = _validate_proposals(
-        raw, kind="hook", parent_duration_seconds=10000.0, existing_ranges=[],
-    )
-    assert len(result) == 8
-
-
-def test_validate_honours_user_max_proposals():
-    """When the caller passes a per-kind cap (the value picked in the
-    Generate-from-source UI), the validator stops at that count instead
-    of the default 8, but is still bounded by MAX_PROPOSALS_PER_KIND_CAP
-    so a tampered request body can't ask for thousands."""
-    from yt_scheduler.services.clipper import (
-        MAX_PROPOSALS_PER_KIND_CAP, _validate_proposals,
-    )
-
-    raw = [
-        {"start_seconds": i * 60, "end_seconds": i * 60 + 20, "title": f"t{i}", "reason": "x"}
-        for i in range(50)
-    ]
-    # 3 → exactly 3 accepted (well under cap).
-    assert len(_validate_proposals(
-        raw, kind="hook", parent_duration_seconds=10000.0,
-        existing_ranges=[], max_proposals=3,
-    )) == 3
-    # Way over the ceiling → clamped to MAX_PROPOSALS_PER_KIND_CAP.
-    assert len(_validate_proposals(
-        raw, kind="hook", parent_duration_seconds=10000.0,
-        existing_ranges=[], max_proposals=9999,
-    )) == MAX_PROPOSALS_PER_KIND_CAP
-    # 0 / negative → fall back to default (8), same as None.
-    assert len(_validate_proposals(
-        raw, kind="hook", parent_duration_seconds=10000.0,
-        existing_ranges=[], max_proposals=0,
-    )) == 8
 
 
 async def test_start_generate_job_stores_normalised_max_per_kind(monkeypatch):
@@ -332,25 +135,10 @@ async def test_start_generate_job_stores_normalised_max_per_kind(monkeypatch):
     try:
         assert job["max_per_kind"]["hook"] == 3
         assert job["max_per_kind"]["short"] == clipper.MAX_PROPOSALS_PER_KIND_CAP
-        # Negative → default fallback.
-        assert job["max_per_kind"]["segment"] == clipper.DEFAULT_MAX_PROPOSALS_PER_KIND
+        # Negative → per-kind default fallback (segment = 6).
+        assert job["max_per_kind"]["segment"] == clipper._DEFAULT_MAX_PER_KIND["segment"]
     finally:
         clipper._GENERATE_JOBS.pop(job_id, None)
-
-
-def test_validate_drops_out_of_parent_bounds():
-    from yt_scheduler.services.clipper import _validate_proposals
-
-    raw = [
-        {"start_seconds": -1, "end_seconds": 20, "title": "neg", "reason": "x"},
-        {"start_seconds": 150, "end_seconds": 170, "title": "past", "reason": "x"},  # parent only 120s
-        {"start_seconds": 10, "end_seconds": 25, "title": "ok", "reason": "x"},
-    ]
-    result = _validate_proposals(
-        raw, kind="hook", parent_duration_seconds=120.0, existing_ranges=[],
-    )
-    titles = [p.title for p in result]
-    assert titles == ["ok"]
 
 
 def test_seed_prompts_render_cap_from_output_cap():
@@ -361,7 +149,8 @@ def test_seed_prompts_render_cap_from_output_cap():
     from yt_scheduler.services import templates
     from yt_scheduler.services.prompts import _SEEDS_BY_KEY
     from yt_scheduler.services.clipper import (
-        _OUTPUT_CAP_PER_KIND, _PER_KIND_BOUNDS,
+        _OUTPUT_CAP_PER_KIND,
+        _PER_KIND_BOUNDS,
     )
 
     expected = f"up to {_OUTPUT_CAP_PER_KIND}"
@@ -374,16 +163,16 @@ def test_seed_prompts_render_cap_from_output_cap():
         rendered = templates.render(
             _SEEDS_BY_KEY[key].body,
             {
-                "parent_title": "X", "parent_duration_human": "1h",
-                "existing_ranges_block": "", "crop_constraints": "",
+                "parent_title": "X",
+                "parent_duration_human": "1h",
+                "existing_ranges_block": "",
+                "crop_constraints": "",
                 "min_seconds": str(int(mn)),
                 "max_seconds": str(int(mx)) if mx is not None else "",
                 "max_proposals": str(_OUTPUT_CAP_PER_KIND),
             },
         )
-        assert expected in rendered, (
-            f"Rendered {kind} prompt does not contain {expected!r}"
-        )
+        assert expected in rendered, f"Rendered {kind} prompt does not contain {expected!r}"
 
 
 def test_seed_prompts_render_bounds_from_per_kind_bounds():
@@ -416,8 +205,7 @@ def test_seed_prompts_render_bounds_from_per_kind_bounds():
             },
         )
         assert expected_phrase in rendered, (
-            f"Rendered {kind} prompt does not contain {expected_phrase!r}: "
-            f"{rendered}"
+            f"Rendered {kind} prompt does not contain {expected_phrase!r}: {rendered}"
         )
 
 
@@ -435,9 +223,7 @@ def test_evict_stale_upload_jobs_drops_old_failures():
     }
     auto_actions._UPLOAD_JOBS["stale"] = {
         "state": "failed:cutting",
-        "_failed_at": (
-            time.monotonic() - auto_actions._UPLOAD_JOB_FAILED_TTL_SECONDS - 1
-        ),
+        "_failed_at": (time.monotonic() - auto_actions._UPLOAD_JOB_FAILED_TTL_SECONDS - 1),
     }
     auto_actions._UPLOAD_JOBS["alive"] = {
         "state": "transcribing",
@@ -473,9 +259,7 @@ def test_evict_stale_generate_jobs_drops_old_terminals():
     }
     clipper._GENERATE_JOBS["gen_stale"] = {
         "state": "done",
-        "_terminal_at": (
-            time.monotonic() - clipper._GENERATE_JOB_TTL_SECONDS - 1
-        ),
+        "_terminal_at": (time.monotonic() - clipper._GENERATE_JOB_TTL_SECONDS - 1),
     }
     clipper._GENERATE_JOBS["gen_active"] = {
         "state": "proposing",
@@ -486,50 +270,6 @@ def test_evict_stale_generate_jobs_drops_old_terminals():
     assert "gen_stale" not in clipper._GENERATE_JOBS
     assert "gen_active" in clipper._GENERATE_JOBS
     clipper._GENERATE_JOBS.clear()
-
-
-def test_validate_drops_nan_and_inf():
-    """NaN compares False to every numeric bound, would slip past the
-    range guards and crash _format_ffmpeg_timestamp downstream."""
-    from yt_scheduler.services.clipper import _validate_proposals
-
-    nan = float("nan")
-    inf = float("inf")
-    raw = [
-        {"start_seconds": nan, "end_seconds": 20.0, "title": "nan", "reason": ""},
-        {"start_seconds": 10.0, "end_seconds": inf, "title": "inf", "reason": ""},
-        {"start_seconds": 10.0, "end_seconds": 25.0, "title": "ok", "reason": ""},
-    ]
-    result = _validate_proposals(
-        raw, kind="hook", parent_duration_seconds=600.0, existing_ranges=[],
-    )
-    assert [p.title for p in result] == ["ok"]
-
-
-def test_validate_drops_empty_title():
-    from yt_scheduler.services.clipper import _validate_proposals
-
-    raw = [
-        {"start_seconds": 10, "end_seconds": 25, "title": "  ", "reason": "x"},
-        {"start_seconds": 30, "end_seconds": 45, "title": "ok", "reason": "x"},
-    ]
-    result = _validate_proposals(
-        raw, kind="hook", parent_duration_seconds=200.0, existing_ranges=[],
-    )
-    assert [p.title for p in result] == ["ok"]
-
-
-def test_segment_has_no_hard_max_but_caps_at_parent():
-    """Segment proposals can be as long as the parent — no fixed max."""
-    from yt_scheduler.services.clipper import _validate_proposals
-
-    raw = [
-        {"start_seconds": 5, "end_seconds": 250, "title": "long segment", "reason": "x"},
-    ]
-    result = _validate_proposals(
-        raw, kind="segment", parent_duration_seconds=300.0, existing_ranges=[],
-    )
-    assert len(result) == 1
 
 
 def test_format_duration_human():
@@ -555,8 +295,7 @@ async def test_propose_all_clips_empty_kinds_short_circuits():
 
     out = await propose_all_clips(
         kinds=[],
-        crop_vertical_for_kind={},
-        transcript_srt="x",
+        units=[],
         parent_title="t",
         parent_duration_seconds=120.0,
         existing_ranges_per_kind={},
@@ -566,10 +305,9 @@ async def test_propose_all_clips_empty_kinds_short_circuits():
 
 
 @pytest.mark.asyncio
-async def test_propose_all_clips_skips_ineligible_kinds(monkeypatch: pytest.MonkeyPatch):
-    """A 50-second parent is eligible for hook (45s floor) but not short
-    or segment. We should call Claude once (for hook only) and return
-    empty lists for the others without hitting the API."""
+async def test_propose_all_clips_dispatches_each_kind(monkeypatch: pytest.MonkeyPatch):
+    """propose_all_clips fans out one index call per requested kind via the
+    gather wiring — there is no anchor-text path."""
     from yt_scheduler.services import clipper
 
     calls: list[str] = []
@@ -578,21 +316,104 @@ async def test_propose_all_clips_skips_ineligible_kinds(monkeypatch: pytest.Monk
         calls.append(kind)
         return []
 
-    monkeypatch.setattr(clipper, "propose_clips_for_kind", fake_propose)
+    monkeypatch.setattr(clipper, "propose_clips_for_kind_indexed", fake_propose)
     await clipper.propose_all_clips(
         kinds=["hook", "short", "segment"],
-        crop_vertical_for_kind={"hook": True, "short": True, "segment": False},
-        transcript_srt="x",
+        units=[],
         parent_title="t",
-        parent_duration_seconds=50.0,
+        parent_duration_seconds=600.0,
         existing_ranges_per_kind={},
         project_id=1,
     )
-    # propose_clips_for_kind is called for all three; each one's
-    # eligibility gate inside short-circuits and returns []. The point of
-    # this test is to verify the gather wiring, not the gate (covered
-    # elsewhere) — so we confirm all three were dispatched.
     assert set(calls) == {"hook", "short", "segment"}
+
+
+@pytest.mark.asyncio
+async def test_index_over_requests_when_existing_then_caps_output(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """When the kind already has cut clips, Claude is asked for base+3
+    candidates (no timestamps to 'avoid'); the output is still capped at the
+    base max after post-LLM dedup/overlap removal."""
+    from yt_scheduler.services import ai, clip_edges, clipper
+
+    units = [
+        clip_edges.ClipUnit(index=i + 1, text=f"unit {i}", start=i * 10.0, end=i * 10 + 8.0, words=[])
+        for i in range(30)
+    ]
+    captured: dict = {}
+    props = [
+        {"first_index": i + 1, "last_index": i + 1, "start_echo": "", "end_echo": "",
+         "title": f"t{i}", "reason": "r", "rating": 4}
+        for i in range(9)
+    ]
+
+    class _Block:
+        type = "tool_use"
+        name = "propose_clips"
+        input = {"proposals": props}
+
+    class _Msg:
+        content = [_Block()]
+
+    def fake_create(**kw):
+        captured["user_text"] = kw["messages"][0]["content"]
+        return _Msg()
+
+    class _Client:
+        class messages:
+            create = staticmethod(fake_create)
+
+    monkeypatch.setattr(ai, "get_client", lambda: _Client())
+
+    async def _model():
+        return "claude-x"
+
+    monkeypatch.setattr(ai, "_resolve_model", _model)
+
+    out = await clipper.propose_clips_for_kind_indexed(
+        kind="hook", units=units, parent_title="P",
+        parent_duration_seconds=600.0,
+        existing_ranges=[(1000.0, 1010.0)],  # non-empty → over-request
+        max_proposals=6,
+    )
+    assert "UP TO 9" in captured["user_text"]  # 6 + 3 bonus
+    assert len(out) == 6  # capped at the base max
+
+
+@pytest.mark.asyncio
+async def test_run_generate_job_fails_loudly_without_transcriber(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+):
+    """No fallback: if the on-device transcriber raises, the job fails with a
+    surfaced error rather than dropping to another backend."""
+    import asyncio
+
+    from yt_scheduler.services import clipper, transcription
+
+    parent = tmp_path / "p.mp4"
+    parent.write_bytes(b"\x00")
+
+    def boom(**kw):
+        raise RuntimeError("no speech backend")
+
+    monkeypatch.setattr(transcription, "transcribe", boom)
+
+    job_id = await clipper.start_generate_job(
+        parent_id="PFAIL00001", project_id=1, parent_video_path=str(parent),
+        parent_title="P", parent_duration_seconds=600.0, kinds=["hook"],
+        crop_vertical_for_kind={"hook": False}, existing_ranges_per_kind={},
+    )
+    for _ in range(200):
+        job = clipper._GENERATE_JOBS.get(job_id)
+        if job and job.get("state") in ("done", "failed"):
+            break
+        await asyncio.sleep(0.01)
+    job = clipper._GENERATE_JOBS.get(job_id)
+    assert job is not None
+    assert job["state"] == "failed"
+    assert "transcription failed" in (job.get("last_error") or "").lower()
+    clipper._GENERATE_JOBS.pop(job_id, None)
 
 
 # --- Generate preview cleanup ---------------------------------------------
@@ -617,7 +438,7 @@ def test_cleanup_generate_previews_removes_only_matching(tmp_path, monkeypatch):
 
     clipper.cleanup_generate_previews(job_id)
 
-    assert keep.exists()       # untouched
+    assert keep.exists()  # untouched
     assert other_job.exists()  # different job_id: untouched
     for p in ours:
         assert not p.exists()  # gone

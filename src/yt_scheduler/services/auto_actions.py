@@ -638,6 +638,39 @@ def _evict_stale_upload_jobs() -> None:
         _UPLOAD_JOBS.pop(job_id, None)
 
 
+def inflight_promo_jobs(parent_id: str, project_id: int) -> list[dict]:
+    """Public snapshot of in-flight promo-chain jobs for a parent.
+
+    Returns every upload/promo-chain job for this parent+project that hasn't
+    reached ``ready`` (still processing, or recently failed) — so the promos
+    page can render a live placeholder card *before* the YouTube upload creates
+    a DB row, and keep showing progress through the (slow) post-upload steps.
+    ``ready`` jobs are omitted because the DB row already covers them.
+    """
+    _evict_stale_upload_jobs()
+    out: list[dict] = []
+    for job in _UPLOAD_JOBS.values():
+        if job.get("parent_id") != parent_id:
+            continue
+        try:
+            if int(job.get("project_id")) != int(project_id):
+                continue
+        except (TypeError, ValueError):
+            continue
+        state = str(job.get("state") or "")
+        if state == PROMO_STATE_READY:
+            continue
+        out.append({
+            "job_id": job.get("job_id"),
+            "video_id": job.get("video_id"),
+            "item_type": job.get("forced_item_type"),
+            "state": state,
+            "title": job.get("title") or job.get("pre_supplied_title") or job.get("filename"),
+            "last_error": job.get("last_error"),
+        })
+    return out
+
+
 def _mark_upload_failed(job: dict, state: str, error: str | None = None) -> None:
     """Stamp the failed-state timestamp + state so eviction can age the job out."""
     import time

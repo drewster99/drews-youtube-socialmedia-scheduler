@@ -1504,10 +1504,17 @@ dialog.modal-xwide {
 .generate-proposal-accept {
     display: inline-flex;
     align-items: center;
-    gap: 0.4rem;
-    font-size: 0.85rem;
-    color: var(--text-muted, #888);
+    gap: 0.5rem;
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--text, inherit);
     margin-bottom: 0.3rem;
+    cursor: pointer;
+}
+.generate-proposal-accept input[type="checkbox"] {
+    width: 1.2rem;
+    height: 1.2rem;
+    cursor: pointer;
 }
 .generate-proposal-title { font-weight: 600; }
 .generate-proposal-preview video,

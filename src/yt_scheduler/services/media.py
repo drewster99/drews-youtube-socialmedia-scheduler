@@ -508,8 +508,16 @@ def extract_clip(
         cmd.extend(["-noaccurate_seek"])
     cmd.extend(["-ss", start, "-to", end, "-i", str(video_path)])
 
+    # Rebase the output PTS so the first frame lands at exactly t=0. A
+    # seek-then-re-encode otherwise leaves the video track starting ~1 frame
+    # late (an edit-list offset, e.g. start_time=0.041s at 24fps); Safari and
+    # the poster-thumbnail render that leading gap as a BLACK first frame even
+    # though the frame data is fine. ``setpts=PTS-STARTPTS`` zeroes it. The
+    # matching audio ``asetpts`` is applied with the fades below.
+    video_filters = ["setpts=PTS-STARTPTS"]
     if vertical_crop:
-        cmd.extend(["-vf", _vertical_crop_filter(x_shift_normalized)])
+        video_filters.append(_vertical_crop_filter(x_shift_normalized))
+    cmd.extend(["-vf", ",".join(video_filters)])
 
     # Probe the source once when we need it for either bitrate selection
     # (hardware encoder, non-cropped) or audio-stream detection (fades).
@@ -530,12 +538,17 @@ def extract_clip(
     # unavailable (has_audio is None) we still emit the filter — unknown
     # audio presence is not the same as confirmed absence.
     source_has_audio = probe.has_audio if probe is not None else None
-    if source_has_audio is False and (audio_fade_in > 0 or audio_fade_out > 0):
+    has_fade = audio_fade_in > 0 or audio_fade_out > 0
+    if source_has_audio is False and has_fade:
         logger.info(
             "Skipping audio fades for %s — source has no audio stream.",
             video_path,
         )
-    else:
+    elif has_fade:
+        # Only touch audio when a fade was requested, so an audio-less source
+        # (or one we couldn't probe) doesn't get an `-af` that fails the filter
+        # graph. The video `setpts` above already fixes the black first frame;
+        # the audio `asetpts` here keeps A/V aligned to that zeroed start.
         clip_duration = _ffmpeg_timestamp_to_seconds(end) - _ffmpeg_timestamp_to_seconds(start)
         # When the probe gives us the real file duration we can derive an
         # upper bound on the actual output duration and clamp the fade-out
@@ -544,14 +557,13 @@ def extract_clip(
             max_out_duration = min(clip_duration, probe.duration_seconds)
         else:
             max_out_duration = clip_duration
-        fades: list[str] = []
+        audio_filters: list[str] = ["asetpts=PTS-STARTPTS"]
         if audio_fade_in > 0:
-            fades.append(f"afade=t=in:curve=cub:st=0:d={audio_fade_in:.4f}")
+            audio_filters.append(f"afade=t=in:curve=cub:st=0:d={audio_fade_in:.4f}")
         if audio_fade_out > 0:
             out_st = max(0.0, max_out_duration - audio_fade_out)
-            fades.append(f"afade=t=out:curve=tri:st={out_st:.4f}:d={audio_fade_out:.4f}")
-        if fades:
-            cmd.extend(["-af", ",".join(fades)])
+            audio_filters.append(f"afade=t=out:curve=tri:st={out_st:.4f}:d={audio_fade_out:.4f}")
+        cmd.extend(["-af", ",".join(audio_filters)])
 
     if use_hardware:
         # Pick the bitrate by what the OUTPUT will actually be: 9:16

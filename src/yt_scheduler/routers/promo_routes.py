@@ -217,7 +217,16 @@ async def list_promos(slug: str, parent_id: str) -> dict:
         tier: _tier_readiness(raw_buckets.get(tier, []))
         for tier in ("segment", "short", "hook")
     }
-    return {"summary": summary, "children": buckets, "readiness": readiness}
+    # In-flight promo-chain jobs (e.g. just-inserted Generate clips still
+    # cutting / uploading / transcribing) so the page can render live
+    # placeholder cards before a DB row exists. Survives reloads / new tabs.
+    pending_jobs = auto_actions.inflight_promo_jobs(parent_id, int(project["id"]))
+    return {
+        "summary": summary,
+        "children": buckets,
+        "readiness": readiness,
+        "pending_jobs": pending_jobs,
+    }
 
 
 @router.post("/upload")
@@ -759,6 +768,28 @@ async def list_generate_rejections(slug: str, parent_id: str) -> dict:
         parent_id=parent_id, project_id=int(project["id"]),
     )
     return {"rejections": rows}
+
+
+@router.post("/generate/rejections")
+async def add_generate_rejections(
+    slug: str, parent_id: str, payload: dict | None = None,
+) -> dict:
+    """Persist one or more dismissed proposals immediately.
+
+    Unlike the rejection-recording side-effect of ``/generate/confirm`` (which
+    only runs when the user accepts at least one clip), this records a dismissal
+    the moment the user dismisses it — so it's remembered regardless of whether
+    anything is ever accepted. Body: ``{"rejected": [<proposal dict>, ...]}``.
+    """
+    project, _parent = await _ensure_primary(slug, parent_id)
+    payload = payload or {}
+    rejected = payload.get("rejected")
+    if not isinstance(rejected, list) or not rejected:
+        raise HTTPException(400, "Body must include a non-empty 'rejected' list.")
+    written = await clipper.store_rejections(
+        parent_id=parent_id, project_id=int(project["id"]), rejected=rejected,
+    )
+    return {"stored": written}
 
 
 @router.delete("/generate/rejections/{rejection_id}")

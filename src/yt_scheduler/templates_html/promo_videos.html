@@ -113,6 +113,9 @@ const PROMO_STEPS_IN_ORDER = [
 // /upload-jobs/{id}; once it lands we switch to polling the video
 // directly (state moves over to the videos.auto_action_state column).
 const activeJobs = new Map();
+// job_ids the user dismissed this session — don't re-seed them from the
+// server's pending_jobs snapshot (it lingers until the failed-job TTL).
+const dismissedJobs = new Set();
 
 function escapeHtml(s) {
     return String(s == null ? '' : s)
@@ -277,6 +280,28 @@ async function loadPromos() {
         return;
     }
     const data = await resp.json();
+    // Seed/refresh in-flight promo-chain jobs from the server so live
+    // placeholder cards appear on ANY load of this page (the Insert redirect,
+    // a reload, another tab) — not only the tab that started them.
+    for (const j of (data.pending_jobs || [])) {
+        if (!j.job_id || dismissedJobs.has(j.job_id)) continue;
+        const existing = activeJobs.get(j.job_id);
+        if (existing) {
+            if (j.state) existing.state = j.state;
+            if (j.video_id) existing.video_id = j.video_id;
+            if (j.title) existing.title = j.title;
+            existing.last_error = j.last_error || existing.last_error || null;
+        } else {
+            activeJobs.set(j.job_id, {
+                job_id: j.job_id,
+                state: j.state || 'cutting',
+                video_id: j.video_id || null,
+                title: j.title || 'New promo',
+                last_error: j.last_error || null,
+                expectedTier: j.item_type || 'short',
+            });
+        }
+    }
     const buckets = data.children || {};
     for (const tier of ['segment', 'short', 'hook']) {
         const list = document.getElementById('promo-list-' + tier);
@@ -318,7 +343,9 @@ function bindRetryButtons() {
         btn.addEventListener('click', (e) => {
             e.preventDefault();
             e.stopPropagation();
-            activeJobs.delete(btn.getAttribute('data-dismiss-job'));
+            const jid = btn.getAttribute('data-dismiss-job');
+            dismissedJobs.add(jid);
+            activeJobs.delete(jid);
             loadPromos();
         });
     }

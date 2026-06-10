@@ -84,7 +84,7 @@
     <div id="gen-proposals"></div>
     <div class="modal-actions" style="margin-top: 0.8rem;">
         <a href="/projects/{{ current_project.slug }}/videos/{{ parent_id }}/promos" class="btn">Cancel</a>
-        <button type="button" class="btn btn-primary" id="gen-confirm">Cut & insert selected</button>
+        <button type="button" class="btn btn-primary" id="gen-confirm">Insert selected</button>
     </div>
 </section>
 
@@ -449,9 +449,8 @@ async function pollJob(jobId, myToken) {
     }
     const labels = {
         pending: 'Queued…',
-        transcribing: 'Transcribing parent video…',
+        transcribing: 'Transcribing on-device (Apple Speech)…',
         proposing: 'Asking Claude to propose clips…',
-        refining_crops: 'Checking framing for vertical crops…',
         cutting_previews: 'Cutting clips…',
         done: 'Done.',
         failed: 'Failed.',
@@ -493,19 +492,73 @@ function renderProposals() {
         grid.className = 'generate-proposal-grid';
         list.forEach((p, idx) => {
             const id = `prop-${kind}-${idx}`;
-            grid.appendChild(buildProposalCard(id, p));
+            grid.appendChild(buildProposalCard(id, p, kind, idx));
         });
         section.appendChild(grid);
         container.appendChild(section);
     }
     const summary = document.getElementById('gen-proposals-summary');
     summary.textContent = total
-        ? `${total} proposal${total === 1 ? '' : 's'}. Uncheck anything you don't want, then Cut & insert.`
+        ? `${total} proposal${total === 1 ? '' : 's'}. Uncheck or Dismiss anything you don't want, then Insert selected.`
         : 'Claude returned no proposals for this video.';
-    document.getElementById('gen-confirm').disabled = !total;
+    updateConfirmState();
 }
 
-function buildProposalCard(id, p) {
+// Cut & insert is only valid when at least one proposal is checked to Include.
+// Driven by p._accept (kept in sync by the checkbox handler), so it survives
+// re-renders without resetting the user's selections.
+function updateConfirmState() {
+    let checked = 0;
+    for (const kind of ['hook', 'short', 'segment']) {
+        (activeProposals[kind] || []).forEach((p) => {
+            if (p._accept !== false) checked += 1;
+        });
+    }
+    document.getElementById('gen-confirm').disabled = (checked === 0);
+}
+
+// Dismiss a single proposal immediately: persist the rejection server-side
+// (so it's remembered no matter what happens next), drop it from the active
+// list, and refresh the "Previously dismissed" section + count.
+async function dismissProposal(kind, idx, p) {
+    const entry = {
+        kind: p.kind,
+        start_seconds: p.start_seconds,
+        end_seconds: p.end_seconds,
+        title: p.title,
+        reason: p.reason || '',
+        vertical_crop: cropFromPickerForKind(p.kind),
+        x_shift_normalized: Number(p.x_shift_normalized || 0),
+        crop_classification: p.crop_classification || null,
+        crop_confidence: Number(p.crop_confidence || 0),
+        audio_fade_in: Number(p.audio_fade_in || 0),
+        audio_fade_out: Number(p.audio_fade_out || 0),
+    };
+    let resp;
+    try {
+        resp = await fetch(
+            `/api/projects/${projectSlug}/videos/${parentId}/promos/generate/rejections`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ rejected: [entry] }),
+            });
+    } catch (e) {
+        showError('Network error dismissing the clip.');
+        return;
+    }
+    if (!resp.ok) {
+        let body = {};
+        try { body = await resp.json(); } catch (e) { /* ignore */ }
+        showError(body.detail || `Could not save dismissal (HTTP ${resp.status}).`);
+        return;
+    }
+    (activeProposals[kind] || []).splice(idx, 1);
+    renderProposals();
+    await loadRejections();
+}
+
+function buildProposalCard(id, p, kind, idx) {
     const card = document.createElement('div');
     card.className = 'generate-proposal-card card';
     let cropBadge = '';
@@ -525,10 +578,14 @@ function buildProposalCard(id, p) {
         ? `<span class="generate-crop-badge" style="background: rgba(88,166,255,0.18); color: var(--info);">Restored</span>`
         : '';
     card.innerHTML = `
-        <label class="generate-proposal-accept">
-            <input type="checkbox" id="${id}-accept" checked>
-            Include
-        </label>
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem;">
+            <label class="generate-proposal-accept">
+                <input type="checkbox" id="${id}-accept" ${p._accept === false ? '' : 'checked'}>
+                Include
+            </label>
+            <button type="button" class="btn" data-dismiss
+                    style="padding:2px 10px; font-size:0.8rem;">Dismiss</button>
+        </div>
         <div class="generate-proposal-title">
             ${escapeHtml(p.title || '(untitled)')}${cropBadge}${restoredBadge}
         </div>
@@ -539,6 +596,17 @@ function buildProposalCard(id, p) {
         ${p.reason ? `<div class="form-hint" style="margin-top:0.25rem;">${escapeHtml(p.reason)}</div>` : ''}
         <div class="generate-proposal-preview" style="margin-top:0.4rem;">${buildProposalPreview(p)}</div>
     `;
+    const acceptCb = card.querySelector('input[type=checkbox]');
+    if (acceptCb) {
+        acceptCb.addEventListener('change', () => {
+            p._accept = acceptCb.checked;
+            updateConfirmState();
+        });
+    }
+    const dismissBtn = card.querySelector('[data-dismiss]');
+    if (dismissBtn) {
+        dismissBtn.addEventListener('click', () => dismissProposal(kind, idx, p));
+    }
     return card;
 }
 
@@ -629,13 +697,13 @@ document.getElementById('gen-confirm').addEventListener('click', async () => {
     } catch (e) {
         showError('Network error submitting.');
         btn.disabled = false;
-        btn.textContent = 'Cut & insert selected';
+        btn.textContent = 'Insert selected';
         return;
     }
     if (!resp.ok) {
         showError(body.detail || `HTTP ${resp.status}`);
         btn.disabled = false;
-        btn.textContent = 'Cut & insert selected';
+        btn.textContent = 'Insert selected';
         return;
     }
     // Back to the Promos page so the user sees the new placeholder cards.

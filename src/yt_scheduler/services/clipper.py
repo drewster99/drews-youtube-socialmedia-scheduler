@@ -54,16 +54,14 @@ ClipKind = Literal["hook", "short", "segment"]
 _PER_KIND_BOUNDS: dict[ClipKind, tuple[float, float | None]] = {
     "hook": (5.0, 30.0),
     "short": (45.0, 75.0),
-    # No hard max for segments — the parent's duration is the cap, which
-    # the caller passes in.
+    # No fixed max for segments — capped at a fraction of the parent instead
+    # (see _SEGMENT_MAX_PARENT_FRACTION) so a segment can be long but not the
+    # whole video.
     "segment": (60.0, None),
 }
 
-_PER_KIND_PROMPT_KEY: dict[ClipKind, str] = {
-    "hook": "promo_clip_proposals_hook",
-    "short": "promo_clip_proposals_short",
-    "segment": "promo_clip_proposals_segment",
-}
+# A "segment" can run long, but not be (nearly) the entire parent video.
+_SEGMENT_MAX_PARENT_FRACTION: float = 0.9
 
 # Parent must be at least kind_max + this much longer than the longest
 # clip we'd cut. Generated promos are most useful when they're materially
@@ -79,6 +77,13 @@ _PARENT_HEADROOM_SECONDS: float = 15.0
 # (also the upper bound on the UI's number input).
 DEFAULT_MAX_PROPOSALS_PER_KIND: int = 8
 MAX_PROPOSALS_PER_KIND_CAP: int = 20
+# Per-kind defaults matching the prototype's KIND_SPEC counts, applied when the
+# caller (the Generate UI) didn't specify a cap for that kind.
+_DEFAULT_MAX_PER_KIND: dict[ClipKind, int] = {"hook": 8, "short": 6, "segment": 6}
+# When a kind already has cut clips on this parent, we ask Claude for a few
+# extra candidates so that after post-LLM dedup/overlap removal we still have a
+# full set of fresh ones. The final output is still capped at the base max.
+_EXISTING_OVERREQUEST_BONUS: int = 3
 # Back-compat alias used by older call sites + tests.
 _OUTPUT_CAP_PER_KIND: int = DEFAULT_MAX_PROPOSALS_PER_KIND
 
@@ -87,21 +92,6 @@ _OUTPUT_CAP_PER_KIND: int = DEFAULT_MAX_PROPOSALS_PER_KIND
 # on purpose: small head/tail overlaps that produce a meaningfully
 # different clip are fine; near-duplicates are not.
 _MAX_OVERLAP_FRACTION: float = 0.5
-
-# Default crop instructions injected when the caller flags a kind as
-# vertically cropped. Lives here rather than in the prompt seed body so
-# the seed stays kind-focused; the block is appended into
-# {{crop_constraints}} via the existing render engine.
-VERTICAL_CROP_PROMPT_BLOCK: str = (
-    "This clip will be hard-cropped to 9:16 vertical by taking the "
-    "center column of the source frame. The left and right thirds "
-    "are discarded. Avoid proposing ranges where the transcript "
-    "implies visual context outside the center: 'as you can see on "
-    "the left', 'look at this chart', a wide shot with two speakers "
-    "side-by-side, on-screen text/captions/graphics that the audio "
-    "refers to, demos / hand actions on one side. When in doubt, skip "
-    "the range — a great hook elsewhere beats a forced one here.\n\n"
-)
 
 
 @dataclass(frozen=True)
@@ -142,38 +132,6 @@ def _format_duration_human(seconds: float) -> str:
     return f"{s}s"
 
 
-def _format_timestamp(seconds: float) -> str:
-    """``MM:SS`` (or ``H:MM:SS`` for ranges past an hour) for the
-    existing-ranges block fed to the prompt."""
-    seconds = max(0.0, float(seconds))
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    if h:
-        return f"{h}:{m:02d}:{s:02d}"
-    return f"{m}:{s:02d}"
-
-
-def _build_existing_ranges_block(
-    existing: list[tuple[float, float]], kind: ClipKind,
-) -> str:
-    """Pre-format the already-cut ranges of this kind for the prompt body.
-
-    Empty list → empty string (the body uses ``{{existing_ranges_block??}}``
-    so the variable substitution renders to nothing without leaving an
-    awkward "Avoid: (none)" line).
-    """
-    if not existing:
-        return ""
-    pretty = ", ".join(
-        f"{_format_timestamp(s)}–{_format_timestamp(e)}" for s, e in existing
-    )
-    return (
-        f"Avoid proposing ranges that overlap these existing {kind}s "
-        f"on this parent: {pretty}.\n\n"
-    )
-
-
 def _overlap_seconds(
     a_start: float, a_end: float, b_start: float, b_end: float,
 ) -> float:
@@ -197,236 +155,6 @@ def _normalize_anchor_text(text: str) -> str:
         return ""
     stripped = _PUNCT_STRIP_RE.sub(" ", text.lower())
     return " ".join(stripped.split())
-
-
-def _resolve_anchor_to_seconds(
-    anchor_text: str,
-    cues: list[tuple[float, float, str]],
-    *,
-    position: str = "start",
-) -> tuple[int, float] | None:
-    """Find the cue that begins (``position='start'``) or ends
-    (``position='end'``) the quoted ``anchor_text``. Returns
-    ``(cue_index, start_seconds)`` or ``None`` when no cue matches.
-
-    The SRT this is built for has dual-speaker / line-wrapped cues
-    that are typically 3-8 words each, and Claude tends to quote
-    multi-cue spans by concatenating the cue text. So a start anchor
-    is "first cue whose text is a PREFIX of the anchor" and an end
-    anchor is "last cue whose text is a SUFFIX of the anchor", with
-    longest match winning to avoid picking a 1-word cue that happens
-    to overlap.
-
-    Strict equality and a tighter substring fallback come first so
-    a single-cue anchor still works without the multi-cue heuristics
-    kicking in.
-    """
-    if not anchor_text or not cues:
-        return None
-    norm = _normalize_anchor_text(anchor_text)
-    if not norm:
-        return None
-
-    # 1) Exact normalized equality — short anchor that landed on one cue.
-    for i, (start, _end, text) in enumerate(cues):
-        if _normalize_anchor_text(text) == norm:
-            return i, start
-
-    # 2) Prefix / suffix match against the multi-cue concatenation.
-    #    For start anchors: find cues whose text is a prefix of the
-    #    anchor; pick the longest match (keeps "fall off a cliff" from
-    #    matching a 2-word cue that happens to share the start word).
-    #    For end anchors: same idea but suffix.
-    best: tuple[int, float, int] | None = None  # (idx, start, length)
-    for i, (start, _end, text) in enumerate(cues):
-        cue_norm = _normalize_anchor_text(text)
-        if not cue_norm:
-            continue
-        if position == "start" and norm.startswith(cue_norm):
-            if best is None or len(cue_norm) > best[2]:
-                best = (i, start, len(cue_norm))
-        elif position == "end" and norm.endswith(cue_norm):
-            if best is None or len(cue_norm) > best[2]:
-                best = (i, start, len(cue_norm))
-    if best is not None:
-        return best[0], best[1]
-
-    # 3) Last-resort fallback: substring match with a minimum cue
-    #    length so we don't latch onto trivial words like "okay" /
-    #    "yeah" that recur throughout the transcript. Longest match
-    #    wins again.
-    MIN_CUE_LEN = 15
-    best = None
-    for i, (start, _end, text) in enumerate(cues):
-        cue_norm = _normalize_anchor_text(text)
-        if len(cue_norm) < MIN_CUE_LEN:
-            continue
-        if cue_norm in norm:
-            if best is None or len(cue_norm) > best[2]:
-                best = (i, start, len(cue_norm))
-    if best is not None:
-        return best[0], best[1]
-
-    return None
-
-
-def _validate_proposals(
-    raw: list[dict],
-    *,
-    kind: ClipKind,
-    parent_duration_seconds: float,
-    existing_ranges: list[tuple[float, float]],
-    cues: list[tuple[float, float, str]] | None = None,
-    max_proposals: int | None = None,
-) -> list[ProposedClip]:
-    """Filter Claude's raw tool output against the kind's contract.
-
-    Quietly drops invalid entries rather than failing the whole call —
-    Claude will sometimes pad slightly past the cap or land just outside
-    the band, and dropping is the right user experience (we show the user
-    the proposals we accepted, not "the model misbehaved"). Caps at
-    ``max_proposals`` (defaulting to
-    :data:`DEFAULT_MAX_PROPOSALS_PER_KIND`) after filtering.
-
-    When ``cues`` is supplied (parsed transcript cues), the proposal's
-    ``start_text_anchor`` / ``end_text_anchor`` fields are resolved
-    back to real start/end times. Proposals whose anchor text can't
-    be found in the cue list are dropped — that's the only way to
-    keep Claude from hallucinating timestamps that don't match any
-    transcript line.
-    """
-    min_s, max_s = _PER_KIND_BOUNDS[kind]
-    effective_max = max_s if max_s is not None else parent_duration_seconds
-    if max_proposals is None or max_proposals <= 0:
-        cap = DEFAULT_MAX_PROPOSALS_PER_KIND
-    else:
-        cap = min(max_proposals, MAX_PROPOSALS_PER_KIND_CAP)
-
-    accepted: list[ProposedClip] = []
-    for entry in raw:
-        try:
-            start = float(entry["start_seconds"])
-            end = float(entry["end_seconds"])
-            title = str(entry.get("title") or "").strip()
-            reason = str(entry.get("reason") or "").strip()
-        except (KeyError, TypeError, ValueError):
-            logger.info("Dropping clip proposal with malformed fields: %r", entry)
-            continue
-
-        # NaN / infinity slip past every numeric comparison below (IEEE
-        # 754: any comparison with NaN is False). They'd then crash
-        # _format_ffmpeg_timestamp(NaN) at cut time with a useless
-        # 'cannot convert float NaN to integer' error. Reject up front.
-        if not (math.isfinite(start) and math.isfinite(end)):
-            logger.info(
-                "Dropping clip proposal with non-finite times: %r", entry,
-            )
-            continue
-
-        # Anchor resolution. When cues are provided, REPLACE start/end
-        # with the resolved cue boundaries. Drop the proposal entirely
-        # if either anchor can't be located — that's a hallucination.
-        if cues is not None:
-            start_anchor = str(entry.get("start_text_anchor") or "").strip()
-            end_anchor = str(entry.get("end_text_anchor") or "").strip()
-            if not start_anchor or not end_anchor:
-                logger.info(
-                    "Dropping clip proposal %r: missing anchor text "
-                    "(start=%r end=%r)", title, start_anchor, end_anchor,
-                )
-                continue
-            start_match = _resolve_anchor_to_seconds(
-                start_anchor, cues, position="start",
-            )
-            end_match = _resolve_anchor_to_seconds(
-                end_anchor, cues, position="end",
-            )
-            if start_match is None:
-                logger.info(
-                    "Dropping clip proposal %r: start anchor not found "
-                    "in transcript — Claude likely hallucinated. "
-                    "anchor=%r", title, start_anchor,
-                )
-                continue
-            if end_match is None:
-                logger.info(
-                    "Dropping clip proposal %r: end anchor not found "
-                    "in transcript — Claude likely hallucinated. "
-                    "anchor=%r", title, end_anchor,
-                )
-                continue
-            start_idx, resolved_start = start_match
-            end_idx, _ = end_match
-            # End time = start of the cue AFTER the end-anchor (so the
-            # anchored line plays in full). When the end anchor is the
-            # last cue, fall back to that cue's own end.
-            if end_idx + 1 < len(cues):
-                resolved_end = cues[end_idx + 1][0]
-            else:
-                resolved_end = cues[end_idx][1]
-            if resolved_end <= resolved_start:
-                logger.info(
-                    "Dropping clip proposal %r: end-anchor cue (%d) "
-                    "precedes or equals start-anchor cue (%d).",
-                    title, end_idx, start_idx,
-                )
-                continue
-            # Log the correction so a reviewer can see Claude's numbers
-            # vs the anchor-resolved truth.
-            if abs(resolved_start - start) > 1.0 or abs(resolved_end - end) > 1.0:
-                logger.info(
-                    "Anchor-resolved %s %r: Claude said %.1f-%.1f, "
-                    "anchors resolved to %.1f-%.1f (delta start=%.1fs "
-                    "end=%.1fs)", kind, title, start, end,
-                    resolved_start, resolved_end,
-                    resolved_start - start, resolved_end - end,
-                )
-            start = resolved_start
-            end = resolved_end
-
-        if not title:
-            logger.info("Dropping clip proposal with empty title: %r", entry)
-            continue
-        if start < 0 or end > parent_duration_seconds + 0.5:
-            logger.info(
-                "Dropping clip proposal outside parent bounds (%.1f-%.1f, parent=%.1f)",
-                start, end, parent_duration_seconds,
-            )
-            continue
-        duration = end - start
-        if duration < min_s or duration > effective_max:
-            logger.info(
-                "Dropping %s proposal of %.1fs (band is %.1f-%.1f)",
-                kind, duration, min_s, effective_max,
-            )
-            continue
-
-        # Same-kind overlap filter.
-        drop = False
-        for ex_start, ex_end in existing_ranges:
-            overlap = _overlap_seconds(start, end, ex_start, ex_end)
-            if overlap / max(duration, 0.001) > _MAX_OVERLAP_FRACTION:
-                logger.info(
-                    "Dropping %s proposal %.1f-%.1f as overlap with existing %.1f-%.1f is %.0f%%",
-                    kind, start, end, ex_start, ex_end, 100 * overlap / duration,
-                )
-                drop = True
-                break
-        if drop:
-            continue
-
-        accepted.append(ProposedClip(
-            kind=kind,
-            start_seconds=start,
-            end_seconds=end,
-            title=title,
-            reason=reason,
-        ))
-
-        if len(accepted) >= cap:
-            break
-
-    return accepted
 
 
 def is_parent_eligible_for_kind(
@@ -560,6 +288,14 @@ _INDEX_PROPOSAL_TOOL = {
                             "type": "integer",
                             "description": "1-based index of the unit where the clip ENDS (inclusive).",
                         },
+                        "start_echo": {
+                            "type": "string",
+                            "description": "First ~6 words of the first unit, verbatim. A cross-check only; the indices are authoritative.",
+                        },
+                        "end_echo": {
+                            "type": "string",
+                            "description": "Last ~6 words of the last unit, verbatim. A cross-check only; the indices are authoritative.",
+                        },
                         "title": {
                             "type": "string",
                             "description": "A punchy working title for the clip (see length/tone guidance).",
@@ -573,7 +309,7 @@ _INDEX_PROPOSAL_TOOL = {
                             "description": "1-4 self-score (4 = best), judging content and title together.",
                         },
                     },
-                    "required": ["first_index", "last_index", "title", "reason", "rating"],
+                    "required": ["first_index", "last_index", "start_echo", "end_echo", "title", "reason", "rating"],
                 },
             },
         },
@@ -588,11 +324,15 @@ _KIND_INDEX_GUIDANCE: dict[ClipKind, dict[str, str]] = {
         "content": (
             "A hook is a single surprising, opinionated, useful, or candid "
             "moment with an immediate payoff — one clear point, no setup."
+            "Since hooks are very short, include only minimal lead-in to "
+            "the main point or punchline - a couple seconds at most. DO"
+            "include reactions afterword, but again, very little beyond that."
+            "The topic should begin right away."
         ),
         "title": (
-            "The title IS the hook: 4-8 words, punchy and a little "
-            "opinionated/divisive (never clickbait like 'You won't believe'); "
-            "state the actual point."
+            "The title IS the hook: 3-4 words ideally, but max 8 words, punchy and a little "
+            "opinionated/divisive or questioning (never clickbait like 'You won't believe'); "
+            "state the point, keep it short - few words - short words"
         ),
     },
     "short": {
@@ -600,19 +340,22 @@ _KIND_INDEX_GUIDANCE: dict[ClipKind, dict[str, str]] = {
         "content": (
             "A short is ONE complete mini-story or explanation: a brief setup "
             "and a satisfying payoff, understandable on its own — one coherent "
-            "idea, not a grab-bag."
+            "idea, not a grab-bag. Include minimal lead-in - a few seconds at most."
+            "DO include reactions afterword, but not much beyond that."
         ),
-        "title": "4-9 words, punchy and clear, mildly opinionated; never clickbait.",
+        "title": "4-9 words, punchy and clear, opinionated or questioning; never clickbait.",
     },
     "segment": {
         "window": "at least 90 seconds (up to several minutes)",
         "content": (
-            "A segment is a full, self-contained discussion of ONE topic from "
+            "A segment is a full, self-contained DISCUSSION of ONE topic from "
             "where it is introduced to where it wraps up, before the next topic."
+            "These can be several minutes, but the sentence that starts the topic"
+            " should begin within 5 seconds of the start of your selection"
         ),
         "title": (
             "5-10 words, clear, descriptive and informative — NOT divisive and "
-            "NOT clickbait; name the topic."
+            "NOT clickbait; name the topic - clear and brief"
         ),
     },
 }
@@ -620,7 +363,6 @@ _KIND_INDEX_GUIDANCE: dict[ClipKind, dict[str, str]] = {
 
 def _build_index_user_text(
     kind: ClipKind, units: list[ClipUnit], *, parent_title: str,
-    existing_ranges: list[tuple[float, float]], crop_vertical: bool,
     max_proposals: int,
 ) -> str:
     """Assemble the instruction block + numbered units the model selects from."""
@@ -635,8 +377,6 @@ def _build_index_user_text(
         "chart, code on screen, a demo, 'look at this', 'right here'). If the "
         "words only make sense with a picture, skip it.\n"
     )
-    crop = (VERTICAL_CROP_PROMPT_BLOCK if crop_vertical else "")
-    avoid = _build_existing_ranges_block(existing_ranges, kind)
     return (
         f"You select {kind} clips from a podcast transcript of "
         f"\"{parent_title}\" for posting as standalone vertical videos.\n\n"
@@ -659,8 +399,11 @@ def _build_index_user_text(
         "the maximum, drop units from the end; if below the minimum, extend. As "
         f"a rough guide that window is about {lo_units}-{hi_units} units here. A "
         "clip outside the length window is REJECTED, not trimmed for you.\n\n"
+        "## Cross-check\nFor each clip also copy start_echo (the first ~6 words "
+        "of first_index, verbatim) and end_echo (the last ~6 words of "
+        "last_index, verbatim). These are a sanity check only — the indices are "
+        "authoritative.\n\n"
         f"## Rating\nRate each clip 1-4 (4 = best), content and title together.\n\n"
-        f"{crop}{avoid}"
         f"Propose UP TO {max_proposals} clips. Return FEWER (even zero) if there "
         "aren't that many strong ones — do not pad, do not overlap.\n\n"
         "## Transcript\n"
@@ -668,13 +411,34 @@ def _build_index_user_text(
     )
 
 
+def _echo_matches(echo: str, unit_text: str) -> bool:
+    """Loose verbatim cross-check between a model echo and a unit's text.
+
+    Normalizes both (lower-case, drop non-word punctuation, collapse runs) and
+    returns True when the echo is a substring of the unit text. A failed match
+    is only a logged sanity signal — the indices remain authoritative.
+    """
+    def norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9 ]", "", s.lower())
+    e = re.sub(r"\s+", " ", norm(echo)).strip()
+    u = re.sub(r"\s+", " ", norm(unit_text)).strip()
+    if not e:
+        return True
+    return e in u or u in e
+
+
 def _validate_indexed_proposals(
     raw_proposals: list[dict], *, kind: ClipKind, units: list[ClipUnit],
     existing_ranges: list[tuple[float, float]], max_proposals: int,
+    parent_duration_seconds: float,
 ) -> list[ProposedClip]:
     """Resolve index ranges to clips: drop bad/duplicate indices and any clip
     outside the kind's duration window; compute the gap-ramp edges."""
     min_s, max_s = _PER_KIND_BOUNDS[kind]
+    # Segments have no fixed upper bound — cap at 90% of the parent so a
+    # "segment" can run long but can't just be (nearly) the whole video.
+    if max_s is None and parent_duration_seconds > 0:
+        max_s = _SEGMENT_MAX_PARENT_FRACTION * parent_duration_seconds
     out: list[ProposedClip] = []
     accepted: list[tuple[float, float]] = []
     for entry in raw_proposals:
@@ -700,6 +464,20 @@ def _validate_indexed_proposals(
                 title, resolved.duration, min_s, max_s,
             )
             continue
+        # Echo cross-check (prototype parity): a mismatch is logged but not
+        # rejected — the unit indices are authoritative.
+        start_echo = str(entry.get("start_echo") or "")
+        end_echo = str(entry.get("end_echo") or "")
+        if start_echo and not _echo_matches(start_echo, units[first_index - 1].text):
+            logger.info(
+                "Clip proposal %r: start_echo %r doesn't match unit %d; trusting index.",
+                title, start_echo[:60], first_index,
+            )
+        if end_echo and not _echo_matches(end_echo, units[last_index - 1].text):
+            logger.info(
+                "Clip proposal %r: end_echo %r doesn't match unit %d; trusting index.",
+                title, end_echo[:60], last_index,
+            )
         edges = clip_edges.compute_edges(units, first_index, last_index)
         # Overlap guard — against already-cut clips and earlier proposals in
         # this same batch (the model is told not to overlap; enforce it).
@@ -733,7 +511,6 @@ async def propose_clips_for_kind_indexed(
     parent_title: str,
     parent_duration_seconds: float,
     existing_ranges: list[tuple[float, float]],
-    crop_vertical: bool,
     max_proposals: int | None = None,
 ) -> list[ProposedClip]:
     """Word-stream proposal: one per-kind Claude call over the numbered units."""
@@ -741,13 +518,20 @@ async def propose_clips_for_kind_indexed(
         return []
 
     if max_proposals is None or max_proposals <= 0:
-        effective_max = DEFAULT_MAX_PROPOSALS_PER_KIND
+        base_max = _DEFAULT_MAX_PER_KIND.get(kind, DEFAULT_MAX_PROPOSALS_PER_KIND)
     else:
-        effective_max = min(max_proposals, MAX_PROPOSALS_PER_KIND_CAP)
+        base_max = min(max_proposals, MAX_PROPOSALS_PER_KIND_CAP)
+
+    # Over-request a few extra candidates when this kind already has cut clips on
+    # the parent: the new prompt gives Claude only unit indices + spans (no
+    # timestamps), so we can't tell it which ranges to avoid — instead we ask for
+    # more and drop duplicates/overlaps post-LLM, capping the output at base_max.
+    ask_max = base_max
+    if existing_ranges:
+        ask_max = min(base_max + _EXISTING_OVERREQUEST_BONUS, MAX_PROPOSALS_PER_KIND_CAP)
 
     user_text = _build_index_user_text(
-        kind, units, parent_title=parent_title, existing_ranges=existing_ranges,
-        crop_vertical=crop_vertical, max_proposals=effective_max,
+        kind, units, parent_title=parent_title, max_proposals=ask_max,
     )
 
     model = await ai._resolve_model()
@@ -778,279 +562,12 @@ async def propose_clips_for_kind_indexed(
 
     proposals = _validate_indexed_proposals(
         raw_proposals, kind=kind, units=units,
-        existing_ranges=existing_ranges, max_proposals=effective_max,
-    )
-    logger.info("Clip-proposal (index) for %s: %d raw -> %d accepted",
-                kind, len(raw_proposals), len(proposals))
-    return proposals
-
-
-async def propose_clips_for_kind(
-    *,
-    kind: ClipKind,
-    transcript_srt: str,
-    parent_title: str,
-    parent_duration_seconds: float,
-    existing_ranges: list[tuple[float, float]],
-    crop_vertical: bool,
-    project_id: int,
-    max_proposals: int | None = None,
-) -> list[ProposedClip]:
-    """Single per-kind Claude call. See module docstring for contract.
-
-    ``existing_ranges`` is a list of (start_seconds, end_seconds) tuples for
-    clips already cut from this parent under this same kind — fed to the
-    prompt so Claude doesn't re-propose them, then enforced server-side.
-
-    ``max_proposals`` is the per-kind cap the user picked in the UI;
-    rendered into the prompt's ``{{max_proposals}}`` variable and also
-    enforced server-side by :func:`_validate_proposals` so a prompt-edit
-    can't raise it past ``MAX_PROPOSALS_PER_KIND_CAP``.
-    """
-    from yt_scheduler.services import prompts as prompt_service
-    from yt_scheduler.services import transcripts as transcript_service
-
-    if not is_parent_eligible_for_kind(parent_duration_seconds, kind):
-        return []
-
-    if max_proposals is None or max_proposals <= 0:
-        effective_max_proposals = DEFAULT_MAX_PROPOSALS_PER_KIND
-    else:
-        effective_max_proposals = min(
-            max_proposals, MAX_PROPOSALS_PER_KIND_CAP,
-        )
-
-    # Flatten the SRT into a single chronological [MM:SS] timeline.
-    # Dual-mic podcast SRTs have overlapping cues (each speaker
-    # separately transcribed and interleaved) — cue index doesn't
-    # track time, adjacent cues can have negative start deltas, and
-    # Claude was hallucinating timestamps that didn't match the
-    # transcript content because of it. The normalised form has one
-    # cue per line, sorted by start, with the cue number / end-time
-    # dropped.
-    transcript_for_llm = transcript_service.srt_to_llm_timeline(transcript_srt)
-    # Parsed cues are passed to _validate_proposals so anchor texts
-    # the model quotes can be resolved back to real cue boundaries.
-    transcript_cues = transcript_service.parse_srt_cues(transcript_srt)
-    # Keep cues sorted by start time — _resolve_anchor_to_seconds walks
-    # them in order and the order-preserving "end = next cue's start"
-    # rule depends on chronological ordering.
-    transcript_cues.sort(key=lambda c: c[0])
-
-    prompt = await prompt_service.get_prompt_with_fallback(
-        _PER_KIND_PROMPT_KEY[kind], project_id=project_id,
-    )
-    # _PER_KIND_BOUNDS is the single source of truth for the length
-    # band — render the numbers into the prompt body via variables so a
-    # future bound change updates the prompt and the validator together.
-    # Segments have no fixed max; we render an empty string so the
-    # prompt's "No fixed maximum" prose still reads cleanly.
-    min_s, max_s = _PER_KIND_BOUNDS[kind]
-    rendered_body = await ai._render_template_body(
-        prompt["body"],
-        {
-            "parent_title": parent_title,
-            "parent_duration_human": _format_duration_human(parent_duration_seconds),
-            "existing_ranges_block": _build_existing_ranges_block(
-                existing_ranges, kind,
-            ),
-            "crop_constraints": (
-                VERTICAL_CROP_PROMPT_BLOCK if crop_vertical else ""
-            ),
-            "min_seconds": f"{int(min_s)}",
-            "max_seconds": f"{int(max_s)}" if max_s is not None else "",
-            "max_proposals": str(effective_max_proposals),
-        },
-    )
-
-    # The rendered body may embed the transcript inline via a literal
-    # ``{{parent_transcript}}`` placeholder (which the template renderer
-    # leaves untouched because ``parent_transcript`` is intentionally not
-    # in the variables dict — it's a system-managed input, not
-    # user-substituted). Split around the placeholder so we can put the
-    # SRT in its own cache-controlled block. When the placeholder is
-    # missing (custom user-edited prompt that dropped it), fall back to
-    # prepending the transcript as block 0 so the call still works.
-    user_content = _build_proposal_user_content(rendered_body, transcript_for_llm)
-
-    model = await ai._resolve_model()
-    kwargs: dict[str, object] = {
-        "model": model,
-        "max_tokens": 2048,
-        "messages": [{"role": "user", "content": user_content}],
-        "tools": [_PROPOSAL_TOOL],
-        "tool_choice": {"type": "tool", "name": "propose_clips"},
-    }
-    if prompt["system"]:
-        kwargs["system"] = prompt["system"]
-
-    _log_proposal_request(kind, model, kwargs, user_content)
-
-    client = ai.get_client()
-    try:
-        message = await asyncio.to_thread(client.messages.create, **kwargs)
-    except Exception as exc:
-        logger.warning("Claude clip-proposal call failed for %s: %s", kind, exc)
-        return []
-
-    raw_proposals: list[dict] = []
-    for block in getattr(message, "content", []) or []:
-        if getattr(block, "type", None) == "tool_use" and getattr(block, "name", "") == "propose_clips":
-            tool_input = getattr(block, "input", None) or {}
-            entries = tool_input.get("proposals")
-            if isinstance(entries, list):
-                raw_proposals = [e for e in entries if isinstance(e, dict)]
-            break
-
-    _log_proposal_response(kind, message, raw_proposals)
-
-    return _validate_proposals(
-        raw_proposals,
-        kind=kind,
+        existing_ranges=existing_ranges, max_proposals=base_max,
         parent_duration_seconds=parent_duration_seconds,
-        existing_ranges=existing_ranges,
-        cues=transcript_cues if transcript_cues else None,
-        max_proposals=effective_max_proposals,
     )
-
-
-# Sentinel placeholders authors can put in their prompt body. The
-# renderer is configured to leave unknown placeholders literal
-# (templates.py:350), so the substring survives template rendering
-# and we split on whichever one appears first.
-_TRANSCRIPT_PLACEHOLDERS: tuple[str, ...] = (
-    "{{parent_transcript}}",
-    "{{transcript}}",
-)
-
-
-def _build_proposal_user_content(
-    rendered_body: str, transcript_srt: str,
-) -> list[dict]:
-    """Construct the two-block user content for a clip-proposal call.
-
-    When the rendered body contains ``{{parent_transcript}}`` (or its
-    alias ``{{transcript}}``) we split there so the transcript ends in
-    its own cache-controlled block (shared across the three parallel
-    per-kind calls). When neither appears we prepend the transcript
-    ourselves with a brief header so the model still sees it.
-    """
-    # Pick whichever recognised placeholder appears first in the body.
-    earliest_idx = -1
-    earliest_marker = ""
-    for marker in _TRANSCRIPT_PLACEHOLDERS:
-        idx = rendered_body.find(marker)
-        if idx != -1 and (earliest_idx == -1 or idx < earliest_idx):
-            earliest_idx = idx
-            earliest_marker = marker
-    if earliest_marker:
-        prefix, _, suffix = rendered_body.partition(earliest_marker)
-        blocks: list[dict] = [
-            {
-                "type": "text",
-                "text": prefix + transcript_srt,
-                "cache_control": {"type": "ephemeral"},
-            },
-        ]
-        if suffix:
-            blocks.append({"type": "text", "text": suffix})
-        return blocks
-    # Backwards-compat fallback for custom prompts that omit the
-    # placeholder. Same shape as before this commit.
-    return [
-        {
-            "type": "text",
-            "text": (
-                "Below is the SRT transcript of the parent video. Use the "
-                "timestamps as anchor points for any ranges you propose.\n\n"
-                + transcript_srt
-            ),
-            "cache_control": {"type": "ephemeral"},
-        },
-        {"type": "text", "text": rendered_body},
-    ]
-
-
-def _log_proposal_request(
-    kind: ClipKind, model: str, kwargs: dict, user_content: list[dict],
-) -> None:
-    """Dump the full Anthropic request for a clip-proposal call at INFO.
-
-    Delimited so the block is grep-able. The transcript can be ~10k
-    tokens; we log it in full so a problem with the prompt is visible
-    without guesswork. Operators can rotate / size logs accordingly.
-    """
-    import json as _json
-    try:
-        system_str = kwargs.get("system") or ""
-        # Serialize user_content for the log; cache_control etc. are
-        # included so a reader can confirm the cache marker is on the
-        # right block.
-        uc_str = _json.dumps(user_content, ensure_ascii=False, indent=2)
-        tool_str = _json.dumps(kwargs.get("tools") or [], ensure_ascii=False)
-        logger.info(
-            "===== Claude clip-proposal REQUEST [%s] =====\n"
-            "model=%s tool_choice=%s max_tokens=%s\n"
-            "----- system -----\n%s\n"
-            "----- user content (%d blocks) -----\n%s\n"
-            "----- tools -----\n%s\n"
-            "===== end Claude clip-proposal REQUEST [%s] =====",
-            kind,
-            model,
-            kwargs.get("tool_choice"),
-            kwargs.get("max_tokens"),
-            system_str,
-            len(user_content),
-            uc_str,
-            tool_str,
-            kind,
-        )
-    except Exception:  # noqa: BLE001 — logging must never break the call
-        logger.warning(
-            "Failed to log Claude clip-proposal request for %s", kind,
-            exc_info=True,
-        )
-
-
-def _log_proposal_response(
-    kind: ClipKind, message, raw_proposals: list[dict],
-) -> None:
-    """Dump the full Anthropic response for a clip-proposal call at INFO."""
-    import json as _json
-    try:
-        usage = getattr(message, "usage", None)
-        usage_dict = {
-            "input_tokens": getattr(usage, "input_tokens", None),
-            "output_tokens": getattr(usage, "output_tokens", None),
-            "cache_creation_input_tokens": getattr(
-                usage, "cache_creation_input_tokens", None,
-            ),
-            "cache_read_input_tokens": getattr(
-                usage, "cache_read_input_tokens", None,
-            ),
-        } if usage is not None else {}
-        content_types = [
-            getattr(b, "type", type(b).__name__)
-            for b in (getattr(message, "content", []) or [])
-        ]
-        logger.info(
-            "===== Claude clip-proposal RESPONSE [%s] =====\n"
-            "stop_reason=%s content_blocks=%s usage=%s\n"
-            "----- raw proposals (n=%d) -----\n%s\n"
-            "===== end Claude clip-proposal RESPONSE [%s] =====",
-            kind,
-            getattr(message, "stop_reason", None),
-            content_types,
-            _json.dumps(usage_dict),
-            len(raw_proposals),
-            _json.dumps(raw_proposals, ensure_ascii=False, indent=2),
-            kind,
-        )
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "Failed to log Claude clip-proposal response for %s", kind,
-            exc_info=True,
-        )
+    logger.info("Clip-proposal (index) for %s: %d raw -> %d accepted (asked up to %d)",
+                kind, len(raw_proposals), len(proposals), ask_max)
+    return proposals
 
 
 # Cap on simultaneously-running ffmpeg cut jobs. Precise cuts re-encode
@@ -1684,14 +1201,12 @@ def cleanup_orphan_generate_previews() -> int:
 async def propose_all_clips(
     *,
     kinds: list[ClipKind],
-    crop_vertical_for_kind: dict[ClipKind, bool],
-    transcript_srt: str,
+    units: list[ClipUnit],
     parent_title: str,
     parent_duration_seconds: float,
     existing_ranges_per_kind: dict[ClipKind, list[tuple[float, float]]],
     project_id: int,
     max_per_kind: dict[ClipKind, int] | None = None,
-    units: list[ClipUnit] | None = None,
 ) -> dict[ClipKind, list[ProposedClip]]:
     """Fan out one Claude call per requested kind, in parallel.
 
@@ -1700,13 +1215,10 @@ async def propose_all_clips(
     UI can render "0 proposals" rather than the request silently
     disappearing.
 
-    ``max_per_kind`` is the user-selected cap per kind from the
-    Generate-from-source UI. When ``None`` (or a kind missing from it),
-    falls back to :data:`DEFAULT_MAX_PROPOSALS_PER_KIND`.
-
-    ``units`` is the word-stream segmentation. When supplied (word-level
-    transcription was available) the index-based proposal path is used; when
-    ``None`` we fall back to the legacy anchor-text path over the SRT.
+    ``units`` is the word-stream segmentation built from the on-device
+    transcriber's word timing — always the index-based proposal path (there is
+    no anchor-text fallback). ``max_per_kind`` is the user-selected per-kind
+    cap; when ``None`` (or a kind missing from it) the per-kind default applies.
     """
     if not kinds:
         return {}
@@ -1714,27 +1226,14 @@ async def propose_all_clips(
     caps = max_per_kind or {}
 
     async def _one(k: ClipKind) -> tuple[ClipKind, list[ProposedClip]]:
-        if units is not None:
-            proposals = await propose_clips_for_kind_indexed(
-                kind=k,
-                units=units,
-                parent_title=parent_title,
-                parent_duration_seconds=parent_duration_seconds,
-                existing_ranges=existing_ranges_per_kind.get(k, []),
-                crop_vertical=crop_vertical_for_kind.get(k, False),
-                max_proposals=caps.get(k),
-            )
-        else:
-            proposals = await propose_clips_for_kind(
-                kind=k,
-                transcript_srt=transcript_srt,
-                parent_title=parent_title,
-                parent_duration_seconds=parent_duration_seconds,
-                existing_ranges=existing_ranges_per_kind.get(k, []),
-                crop_vertical=crop_vertical_for_kind.get(k, False),
-                project_id=project_id,
-                max_proposals=caps.get(k),
-            )
+        proposals = await propose_clips_for_kind_indexed(
+            kind=k,
+            units=units,
+            parent_title=parent_title,
+            parent_duration_seconds=parent_duration_seconds,
+            existing_ranges=existing_ranges_per_kind.get(k, []),
+            max_proposals=caps.get(k),
+        )
         return k, proposals
 
     results = await asyncio.gather(*(_one(k) for k in kinds))
@@ -1976,7 +1475,9 @@ async def start_generate_job(
         if isinstance(raw, int) and raw > 0:
             normalised_max[k] = min(raw, MAX_PROPOSALS_PER_KIND_CAP)
         else:
-            normalised_max[k] = DEFAULT_MAX_PROPOSALS_PER_KIND
+            normalised_max[k] = _DEFAULT_MAX_PER_KIND.get(
+                k, DEFAULT_MAX_PROPOSALS_PER_KIND
+            )
     _GENERATE_JOBS[job_id] = {
         "job_id": job_id,
         "parent_id": parent_id,
@@ -2000,161 +1501,74 @@ async def start_generate_job(
 
 
 async def _run_generate_job(job_id: str) -> None:
-    """Background task: ensure transcript, fan out per-kind proposals,
-    write the result onto the job dict for the polling endpoint."""
-    from yt_scheduler.database import get_db
-    from yt_scheduler.services import transcripts as transcript_service
-
+    """Background task: transcribe the parent on-device for fresh word timing,
+    fan out per-kind index proposals, cut previews, and write the result onto
+    the job dict for the polling endpoint."""
     job = _GENERATE_JOBS.get(job_id)
     if job is None:
         return
 
     try:
-        # Read the latest transcript off the parent row. The row state
-        # may have changed since the preview endpoint took the snapshot
-        # (e.g. another flow finished transcribing), so do the recheck
-        # under the same task rather than trusting the captured value.
-        db = await get_db()
-        rows = await db.execute_fetchall(
-            "SELECT transcript, transcript_source FROM videos WHERE id = ?",
-            (job["parent_id"],),
-        )
-        transcript = ""
-        if rows:
-            transcript = rows[0]["transcript"] or ""
+        # Always re-transcribe the parent on-device with Apple SpeechAnalyzer to
+        # get FRESH word-level timing. The stored transcript only carries
+        # cue-level timing, and we deliberately never persist word timing (it's
+        # cheap to re-derive). There is intentionally NO fallback to another
+        # backend: if the on-device transcriber is unavailable or fails, the job
+        # fails loudly rather than silently producing lower-quality clips.
+        job["state"] = "transcribing"
+        job["progress_message"] = "Transcribing on-device (Apple Speech)…"
+        from yt_scheduler.services import transcription
 
-        # Captures the fresh TranscriptionResult when we transcribe below, so we
-        # can reuse its word-level timing for the index proposal path without a
-        # second transcription pass.
-        fresh_result = None
-
-        if not transcript_service.has_timestamps(transcript):
-            # Inline auto-transcribe. Single path — we don't try to detect
-            # an in-progress transcription started by another flow. Worst
-            # case the user wastes a whisper cycle; the result upserts
-            # into the same transcripts.text column.
-            job["state"] = "transcribing"
-            job["progress_message"] = "Transcribing parent video…"
-            from yt_scheduler.services import transcription
-
-            try:
-                result = await asyncio.to_thread(
-                    transcription.transcribe,
-                    video_path=job["parent_video_path"],
-                    model="large-v3",
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Generate-from-source transcription failed for %s: %s",
-                    job["parent_id"], exc,
-                )
-                job["state"] = "failed"
-                job["last_error"] = (
-                    f"Could not auto-transcribe the parent video ({exc})."
-                )
-                return
-
-            fresh_result = result
-            srt = result.to_srt()
-            # Persist so the next Generate run on this parent doesn't
-            # have to re-transcribe — same upsert path the manual
-            # transcribe endpoint uses. Map result.backend to the
-            # canonical source enum; an unknown backend stays
-            # 'machine_unknown' rather than silently masquerading as
-            # 'user_edited' (which would mis-key the dedup upsert).
-            backend_to_source = {
-                "mlx-whisper": "mlx_whisper",
-                "whisper.cpp": "whispercpp",
-                "macos-speech": "apple_speech",
-            }
-            source = backend_to_source.get(result.backend)
-            if source is None:
-                logger.warning(
-                    "Generate-from-source: unknown transcription backend %r; "
-                    "persisting as mlx_whisper as a safe default.",
-                    result.backend,
-                )
-                source = "mlx_whisper"
-            transcript_id = await transcript_service.upsert_transcript_for_source(
-                job["parent_id"], source, srt,
+        try:
+            result = await asyncio.to_thread(
+                transcription.transcribe,
+                video_path=job["parent_video_path"],
+                backend="macos-speech",
+                language="en",
             )
-            # Re-read the row before mirroring whisper output onto it: a
-            # concurrent flow (the user manually picking another
-            # transcript while ours ran for minutes) could have changed
-            # the active transcript. Only overwrite when the active
-            # transcript is still empty / non-edited / our own source.
-            cur_rows = await db.execute_fetchall(
-                "SELECT transcript_id, transcript_source, transcript_is_edited "
-                "FROM videos WHERE id = ?",
-                (job["parent_id"],),
+        except Exception as exc:
+            logger.warning(
+                "Generate-from-source on-device transcription failed for %s: %s",
+                job["parent_id"], exc,
             )
-            cur = dict(cur_rows[0]) if cur_rows else {}
-            cur_edited = bool(cur.get("transcript_is_edited"))
-            cur_id = cur.get("transcript_id")
-            if cur_edited or (
-                cur_id is not None and cur_id != transcript_id
-            ):
-                logger.info(
-                    "Generate-from-source: parent transcript changed during "
-                    "whisper run; leaving the user's selection in place "
-                    "and using our fresh SRT only for the in-flight job.",
-                )
-            else:
-                await db.execute(
-                    """UPDATE videos SET
-                        transcript = ?,
-                        transcript_id = ?,
-                        transcript_source = ?,
-                        transcript_updated_at = datetime('now'),
-                        transcript_is_edited = 0,
-                        updated_at = datetime('now')
-                    WHERE id = ?""",
-                    (srt, transcript_id, source, job["parent_id"]),
-                )
-                await db.commit()
-            transcript = srt
+            job["state"] = "failed"
+            job["last_error"] = (
+                f"On-device transcription failed ({exc}). Enable Speech "
+                "Recognition for this app in System Settings → Privacy & "
+                "Security → Speech Recognition, then try again."
+            )
+            _mark_terminal(job)
+            return
 
-        # Word-stream units for the index proposal path. Prefer the fresh
-        # transcription's word timing; if a stored (timestamped) transcript was
-        # used instead, transcribe now purely to obtain word timing — the
-        # transcribers are fast enough (Apple SpeechAnalyzer ~70x realtime) to
-        # do this at the point we need it rather than persisting word data.
-        # When no word timing is available the proposer falls back to the
-        # legacy anchor path over the SRT.
-        units = None
-        word_result = fresh_result
-        if word_result is None:
-            from yt_scheduler.services import transcription
-            try:
-                word_result = await asyncio.to_thread(
-                    transcription.transcribe,
-                    video_path=job["parent_video_path"],
-                    model="large-v3",
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Generate-from-source: word-timing transcription failed "
-                    "(%s); using the anchor path.", exc,
-                )
-                word_result = None
-        if word_result is not None and word_result.has_word_timestamps:
-            units = clip_edges.build_units(word_result.all_words) or None
-            logger.info("Generate-from-source: %d word-stream units (%s).",
-                        len(units) if units else 0, word_result.backend)
+        if not result.has_word_timestamps:
+            job["state"] = "failed"
+            job["last_error"] = (
+                "On-device transcription returned no word-level timing, which "
+                "Generate-from-source requires."
+            )
+            _mark_terminal(job)
+            return
 
-        # Proposing — fan out the per-kind calls.
+        units = clip_edges.build_units(result.all_words) or None
+        if not units:
+            job["state"] = "failed"
+            job["last_error"] = "Transcription produced no usable speech units."
+            _mark_terminal(job)
+            return
+        logger.info("Generate-from-source: %d word-stream units (%s).",
+                    len(units), result.backend)
+
+        # Proposing — fan out the per-kind index calls.
         job["state"] = "proposing"
         job["progress_message"] = "Asking Claude to propose clips…"
         proposals = await propose_all_clips(
             kinds=job["kinds"],
-            crop_vertical_for_kind=job["crop_vertical"],
-            transcript_srt=transcript,
+            units=units,
             parent_title=job["parent_title"],
             parent_duration_seconds=job["parent_duration_seconds"],
             existing_ranges_per_kind=job["existing_ranges_per_kind"],
             project_id=int(job["project_id"]),
             max_per_kind=job.get("max_per_kind"),
-            units=units,
         )
 
         # Refinement — for kinds the user toggled for vertical crop,
@@ -2163,7 +1577,12 @@ async def _run_generate_job(job_id: str) -> None:
         # across all (kind, proposal) pairs that need it; per-call
         # failure falls back to a neutral assessment (centered, no
         # shift) so we never block a proposal on a flaky vision call.
-        crop_for_kind = job["crop_vertical"]
+        # Vertical 9:16 crop is deferred to a separate later post-processing
+        # step, so Generate cuts the clips uncropped (like the prototype). With
+        # every kind forced non-crop here, the keyframe vision pass below never
+        # runs and the cuts apply no crop; the crop infrastructure stays in the
+        # tree for that later step.
+        crop_for_kind = {k: False for k in proposals}
         refinement_tasks: list[tuple[str, int, asyncio.Task]] = []
         for k, props in proposals.items():
             if not crop_for_kind.get(k, False):

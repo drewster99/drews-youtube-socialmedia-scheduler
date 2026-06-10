@@ -144,30 +144,38 @@ def test_public_dict_with_off_center_above_threshold():
 # --- assess_crop_for_proposal: failure modes return neutral ------------
 
 @pytest.mark.asyncio
-async def test_run_generate_job_skips_vision_for_crop_off_kinds(
+async def test_run_generate_job_transcribes_on_device_and_skips_vision(
     monkeypatch: pytest.MonkeyPatch, tmp_path,
 ):
-    """When crop_vertical is False for a kind, no vision call must fire
-    for its proposals — vision spend is real money per Generate.
-
-    Exercises _run_generate_job directly with stubbed propose_all_clips
-    + a captured assess_crop_for_proposal counter, so we don't need an
-    actual API key or a real parent video file.
+    """_run_generate_job transcribes the parent on-device with Apple Speech
+    (never large-v3), and — because vertical crop is deferred to a separate
+    later step — never fires a vision call. Vision spend is real money.
     """
-    from yt_scheduler.services import clipper
+    from yt_scheduler.services import clip_edges, clipper, transcription
 
     parent_path = tmp_path / "parent.mp4"
     parent_path.write_bytes(b"\x00" * 16)
+
+    # Capture the transcription request to assert the backend/model.
+    transcribe_kwargs: dict = {}
+
+    class _FakeResult:
+        has_word_timestamps = True
+        all_words = ["w"]
+        backend = "macos-speech"
+
+    def fake_transcribe(*, video_path, backend=None, language=None, model=None):
+        transcribe_kwargs.update(backend=backend, model=model)
+        return _FakeResult()
+
+    monkeypatch.setattr(transcription, "transcribe", fake_transcribe)
+    monkeypatch.setattr(clip_edges, "build_units", lambda words: ["unit"])
 
     async def fake_propose(**kw):
         return {
             "hook": [clipper.ProposedClip(
                 kind="hook", start_seconds=5, end_seconds=20,
                 title="h1", reason="x",
-            )],
-            "short": [clipper.ProposedClip(
-                kind="short", start_seconds=30, end_seconds=85,
-                title="s1", reason="x",
             )],
             "segment": [clipper.ProposedClip(
                 kind="segment", start_seconds=120, end_seconds=300,
@@ -185,55 +193,28 @@ async def test_run_generate_job_skips_vision_for_crop_off_kinds(
 
     monkeypatch.setattr(clipper, "assess_crop_for_proposal", fake_assess)
 
-    # Patch transcript_service.has_timestamps to short-circuit the
-    # whisper branch; the test parent's transcript is plain SRT.
-    from yt_scheduler.services import transcripts as ts
-    monkeypatch.setattr(ts, "has_timestamps", lambda _t: True)
+    # Avoid real ffmpeg: stand in for the per-proposal preview cut.
+    async def fake_cut(*, job_id, parent_video_path, proposal, idx, **kw):
+        out = tmp_path / f"prev_{proposal.kind}_{idx}.mp4"
+        out.write_bytes(b"\x00")
+        return out
 
-    # Stub get_db so the database read inside _run_generate_job returns
-    # a row with a timestamped transcript.
-    from yt_scheduler import database
+    monkeypatch.setattr(clipper, "cut_preview_for_proposal", fake_cut)
 
-    class _FakeCursor:
-        def __init__(self, rows): self._rows = rows
-        async def fetchall(self): return self._rows
-        def __aiter__(self): return self
-        async def __anext__(self):
-            if not self._rows:
-                raise StopAsyncIteration
-            return self._rows.pop(0)
-
-    class _FakeDB:
-        async def execute_fetchall(self, *a, **k):
-            return [{
-                "transcript": (
-                    "1\n00:00:00,000 --> 00:00:05,000\nhello\n"
-                ),
-                "transcript_source": "mlx_whisper",
-            }]
-        async def execute(self, *a, **k): return _FakeCursor([])
-        async def commit(self): pass
-
-    async def fake_get_db(): return _FakeDB()
-
-    monkeypatch.setattr(database, "get_db", fake_get_db)
-
-    # Crop on for hook + short, OFF for segment. Vision should fire for
-    # the 2 cropped proposals only — never for segment.
+    # Crop requested on hook, but it must be deferred (no vision fires).
     job_id = await clipper.start_generate_job(
         parent_id="PARENT00001",
         project_id=1,
         parent_video_path=str(parent_path),
         parent_title="Parent",
         parent_duration_seconds=600.0,
-        kinds=["hook", "short", "segment"],
-        crop_vertical_for_kind={"hook": True, "short": True, "segment": False},
+        kinds=["hook", "segment"],
+        crop_vertical_for_kind={"hook": True, "segment": False},
         existing_ranges_per_kind={},
     )
 
-    # Drain the background task.
     import asyncio
-    for _ in range(100):
+    for _ in range(200):
         job = clipper._GENERATE_JOBS.get(job_id)
         if job and job.get("state") in ("done", "failed"):
             break
@@ -242,10 +223,10 @@ async def test_run_generate_job_skips_vision_for_crop_off_kinds(
     job = clipper._GENERATE_JOBS.get(job_id)
     assert job is not None
     assert job["state"] == "done", job.get("last_error")
-    # Vision called for hook + short (both crop=True), not segment.
-    assert sorted(vision_calls) == ["hook", "short"]
+    assert transcribe_kwargs.get("backend") == "macos-speech"
+    assert transcribe_kwargs.get("model") is None  # never large-v3
+    assert vision_calls == []  # crop deferred → no vision spend
 
-    # Cleanup so we don't pollute the global dict across tests.
     clipper._GENERATE_JOBS.pop(job_id, None)
 
 
