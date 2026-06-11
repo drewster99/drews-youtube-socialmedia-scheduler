@@ -1182,22 +1182,25 @@ def cleanup_generate_previews(job_id: str) -> None:
 
 
 def cleanup_orphan_generate_previews() -> int:
-    """Delete every ``gen_preview_*.mp4`` file in UPLOAD_DIR regardless
-    of job_id. Run on startup so previews that survived a previous
-    process being killed (``_GENERATE_JOBS`` is in-memory; restart
-    wipes the dict and there's no list of job_ids to glob against)
-    don't accumulate on disk forever.
+    """Delete every ``gen_preview_*.mp4`` preview and every ``.cutpart_*.mp4``
+    cut temp in UPLOAD_DIR, regardless of job_id. Run on startup so files that
+    survived a previous process being killed (``_GENERATE_JOBS`` is in-memory;
+    restart wipes the dict and there's no list of job_ids to glob against)
+    don't accumulate on disk forever. The ``.cutpart_*`` temps are the
+    in-progress cut files written by ``media.extract_clip`` before its atomic
+    rename — only ones leaked by a killed process reach here.
 
     Returns the number of files removed (for logging).
     """
     removed = 0
     try:
-        for path in UPLOAD_DIR.glob(f"{_PREVIEW_PREFIX}*.mp4"):
-            try:
-                path.unlink()
-                removed += 1
-            except OSError as exc:
-                logger.debug("Could not remove orphan preview %s: %s", path, exc)
+        for pattern in (f"{_PREVIEW_PREFIX}*.mp4", ".cutpart_*.mp4"):
+            for path in UPLOAD_DIR.glob(pattern):
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError as exc:
+                    logger.debug("Could not remove orphan cut file %s: %s", path, exc)
     except OSError as exc:
         logger.debug("Orphan preview sweep failed: %s", exc)
     return removed

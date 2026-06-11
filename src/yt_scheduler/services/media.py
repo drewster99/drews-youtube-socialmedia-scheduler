@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import secrets
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -482,6 +483,17 @@ def extract_clip(
         output_name = f"{video_path.stem}_clip_{start.replace(':', '')}-{end.replace(':', '')}.mp4"
 
     output = UPLOAD_DIR / output_name
+    # Encode to a temp sibling, then atomically rename to the final name only
+    # after ffmpeg fully succeeds (including the slow ``+faststart`` moov-shift
+    # pass). The temp's ``.cutpart_*`` name deliberately does NOT match the
+    # ``gen_preview_*`` / clip cleanup globs, so a preview-cleanup sweep (on
+    # confirm, job eviction, cancellation, or a startup orphan sweep after a
+    # restart) can't delete the file out from under a still-running ffmpeg — the
+    # race that produced "Unable to re-open output file for shifting data /
+    # No such file or directory" once cuts from a large 4K master got slow
+    # enough to widen the window. Keep the ``.mp4`` extension so ffmpeg still
+    # picks the mp4 muxer. Orphaned temps are reaped by the startup sweep.
+    tmp_output = UPLOAD_DIR / f".cutpart_{secrets.token_hex(8)}.mp4"
 
     use_hardware = False
     if encoder == "hardware":
@@ -594,7 +606,7 @@ def extract_clip(
             "-b:v", bitrate,
             "-c:a", "aac",
             "-movflags", "+faststart",
-            str(output),
+            str(tmp_output),
         ])
     else:
         cmd.extend(["-c:v", "libx264"])
@@ -603,7 +615,7 @@ def extract_clip(
         cmd.extend([
             "-c:a", "aac",
             "-movflags", "+faststart",
-            str(output),
+            str(tmp_output),
         ])
 
     try:
@@ -612,10 +624,10 @@ def extract_clip(
             timeout=_FFMPEG_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        # Belt-and-braces cleanup of the half-written output so it doesn't
+        # Belt-and-braces cleanup of the half-written temp so it doesn't
         # masquerade as a usable file. The caller will see the exception
         # and treat the cut as failed.
-        Path(output).unlink(missing_ok=True)
+        Path(tmp_output).unlink(missing_ok=True)
         raise
     except subprocess.CalledProcessError as exc:
         # Default str(CalledProcessError) just shows the argv and exit
@@ -624,7 +636,7 @@ def extract_clip(
         # the last few lines of stderr appended so callers (and the
         # UI's preview_error display) see the actual reason instead
         # of "non-zero exit status N".
-        Path(output).unlink(missing_ok=True)
+        Path(tmp_output).unlink(missing_ok=True)
         stderr_text = (exc.stderr or b"").decode("utf-8", errors="replace")
         # The bottom of ffmpeg's stderr is almost always the error
         # message (preceded by status spam). Last ~6 non-empty lines
@@ -637,6 +649,13 @@ def extract_clip(
             f"ffmpeg exit {exc.returncode}: {tail or 'no stderr captured'}"
         ) from exc
 
+    # ffmpeg fully succeeded (including faststart) — atomically publish the
+    # finished file under its final name. os.replace is atomic within a dir.
+    try:
+        tmp_output.replace(output)
+    except OSError:
+        Path(tmp_output).unlink(missing_ok=True)
+        raise
     return output
 
 
