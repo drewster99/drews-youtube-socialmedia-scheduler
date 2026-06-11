@@ -114,6 +114,37 @@ def media_url(path: str | None) -> str | None:
     return f"{MEDIA_URL_PREFIX}/{urllib.parse.quote(name)}"
 
 
+def is_managed_media_path(path: str | None) -> bool:
+    """True iff ``path`` resolves to a location inside ``UPLOAD_DIR``.
+
+    Symlink-safe: ``resolve()`` follows links on both sides, so a link planted
+    inside ``UPLOAD_DIR`` that points outside is rejected. A relative path
+    resolves against the process CWD (outside ``UPLOAD_DIR``) and is rejected.
+    Empty/``None`` is ``False``. Existence is NOT required here — containment is
+    the security invariant; existence is checked separately at send time.
+    """
+    if not path:
+        return False
+    try:
+        base = UPLOAD_DIR.resolve()
+        target = Path(path).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return target.is_relative_to(base)
+
+
+def require_managed_media_paths(paths: list[str]) -> None:
+    """Raise ``ValueError`` naming the first path that is not inside
+    ``UPLOAD_DIR``. An empty list is allowed. Used to keep client-supplied
+    attachment paths from pointing at arbitrary files on disk that would then
+    be uploaded to a social platform."""
+    for p in paths:
+        if not is_managed_media_path(p):
+            raise ValueError(
+                f"media path is not inside the managed media directory: {p!r}"
+            )
+
+
 def safe_upload_ext(filename: str | None, default: str = ".mp4") -> str:
     """A safe, lowercase file extension derived from a client-supplied
     filename — used to name on-disk upload copies.

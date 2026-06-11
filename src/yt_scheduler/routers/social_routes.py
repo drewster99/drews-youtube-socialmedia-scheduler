@@ -8,7 +8,12 @@ import re
 
 from fastapi import APIRouter, HTTPException, Query
 
-from yt_scheduler.config import media_filename, media_url
+from yt_scheduler.config import (
+    is_managed_media_path,
+    media_filename,
+    media_url,
+    require_managed_media_paths,
+)
 from yt_scheduler.database import get_db
 from yt_scheduler.services import events, social, templates as tmpl, youtube
 from yt_scheduler.services.scheduler import cancel_scheduled_post, get_publish_lock
@@ -737,14 +742,27 @@ async def update_post(post_id: int, data: dict):
         updates.append("status = ?")
         params.append(status)
     if "media_path" in data:
+        # Reject any path outside the managed media dir: these become files we
+        # upload to social platforms, so an absolute/traversal path would let a
+        # client publish an arbitrary readable file (keys, secrets) to an account.
+        single = data["media_path"]
+        if single and not is_managed_media_path(single):
+            raise HTTPException(
+                400,
+                f"media_path must be inside the managed media directory: {single!r}",
+            )
         updates.append("media_path = ?")
-        params.append(data["media_path"])
+        params.append(single)
     if "media_paths" in data:
         # Accept a list (re-attach a different set) or null/[] (clear). Keep
         # the legacy single-string ``media_path`` column in sync so old read
         # paths and the duplicate matcher don't see a stale attachment.
         raw = data["media_paths"]
         cleaned = [p for p in raw if p] if isinstance(raw, list) else []
+        try:
+            require_managed_media_paths(cleaned)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
         updates.append("media_paths = ?")
         params.append(json.dumps(cleaned) if cleaned else None)
         updates.append("media_path = ?")

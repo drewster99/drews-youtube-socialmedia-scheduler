@@ -351,6 +351,24 @@ class SocialPoster:
         return paths, alts
 
     @staticmethod
+    def _require_paths_managed(paths: list[str], platform: str) -> None:
+        """Refuse to upload any attachment that lives outside the managed media
+        directory. Defense-in-depth behind the write-boundary check in
+        ``update_post``: a row poisoned by a direct DB edit, an old import, or a
+        future code path must never cause an arbitrary on-disk file to be
+        published to a social account."""
+        from yt_scheduler import config
+
+        bad = [p for p in paths if not config.is_managed_media_path(p)]
+        if bad:
+            names = ", ".join(Path(p).name for p in bad)
+            raise MediaUploadError(
+                f"Can't post to {platform}: attachment{'s' if len(bad) > 1 else ''} "
+                f"outside the managed media directory — {names}. Re-attach from "
+                "the media library, then retry. Nothing was posted."
+            )
+
+    @staticmethod
     def _require_paths_exist(paths: list[str], platform: str) -> None:
         """Abort the post if any requested attachment is gone from disk.
 
@@ -358,6 +376,9 @@ class SocialPoster:
         is worse than not posting — surface it so they can re-attach or drop
         it and retry.
         """
+        # Containment is checked first: an out-of-tree path is reported as a
+        # policy violation rather than (if it happens to exist) being read.
+        SocialPoster._require_paths_managed(paths, platform)
         missing = [p for p in paths if not Path(p).exists()]
         if missing:
             names = ", ".join(Path(p).name for p in missing)
