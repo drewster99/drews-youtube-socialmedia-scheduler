@@ -43,11 +43,13 @@ async def test_running_again_is_idempotent(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_existing_db_stamped_at_baseline(tmp_path: Path) -> None:
-    """A pre-existing DB created via raw CREATE TABLE should be stamped, not re-run.
+async def test_existing_db_runs_idempotent_baseline(tmp_path: Path) -> None:
+    """A pre-existing DB created via raw CREATE TABLE migrates cleanly.
 
-    Baseline (v1) is recorded as applied without re-executing its SQL; later
-    migrations apply normally on top.
+    The baseline (v1) is entirely CREATE TABLE IF NOT EXISTS, so it re-runs as a
+    no-op and is recorded; later migrations apply normally on top. (We no longer
+    stamp v1 by table-name match, which could falsely mark a partial schema as
+    migrated.)
     """
     db_path = tmp_path / "publisher.db"
     async with aiosqlite.connect(str(db_path)) as conn:
@@ -56,16 +58,17 @@ async def test_existing_db_stamped_at_baseline(tmp_path: Path) -> None:
         await conn.executescript(baseline_sql)
         await conn.commit()
 
-        applied = await apply_migrations(conn)
-        # Baseline must NOT appear in newly_applied (it was stamped, not re-run).
-        assert 1 not in applied
+        await apply_migrations(conn)
         cursor = await conn.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         )
         rows = await cursor.fetchall()
         recorded = [row[0] for row in rows]
-        assert recorded[0] == 1
+        assert recorded[0] == 1  # baseline recorded
         assert sorted(recorded) == recorded  # contiguous, sorted
+        # Schema still intact and usable after the idempotent re-run.
+        cursor = await conn.execute("SELECT COUNT(*) FROM videos")
+        assert (await cursor.fetchone())[0] == 0
 
 
 @pytest.mark.asyncio
@@ -106,6 +109,41 @@ def test_discover_rejects_duplicate_version(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="Duplicate"):
         discover_migrations(tmp_path)
+
+
+def test_split_statements_handles_semicolons_in_literals() -> None:
+    """A semicolon or `--` inside a string literal (e.g. a seeded prompt body)
+    must not mis-split the statement."""
+    from yt_scheduler.migrations import _split_statements
+
+    sql = (
+        "PRAGMA foreign_keys = OFF;\n"
+        "CREATE TABLE t (id INTEGER, body TEXT);\n"
+        "INSERT INTO t (id, body) VALUES (1, 'Step 1; do X -- not a comment');\n"
+        "PRAGMA foreign_keys = ON;\n"
+    )
+    leading, txn = _split_statements(sql)
+    assert any(s.upper().startswith("PRAGMA") and "OFF" in s.upper() for s in leading)
+    insert_stmts = [s for s in txn if s.upper().startswith("INSERT")]
+    assert len(insert_stmts) == 1
+    assert "'Step 1; do X -- not a comment'" in insert_stmts[0]
+    # Trailing PRAGMA ON is excluded (restored by the finally block instead).
+    assert not any("ON" in s.upper() and s.upper().startswith("PRAGMA") for s in txn)
+
+
+def test_split_statements_classifies_pragma_after_comment() -> None:
+    """A leading `-- comment` line before PRAGMA foreign_keys=OFF must still be
+    classified as a leading PRAGMA (run outside the transaction)."""
+    from yt_scheduler.migrations import _split_statements
+
+    sql = (
+        "-- rebuild needs FKs off\n"
+        "PRAGMA foreign_keys = OFF;\n"
+        "CREATE TABLE t (id INTEGER);\n"
+    )
+    leading, txn = _split_statements(sql)
+    assert len(leading) == 1 and leading[0].upper().startswith("PRAGMA")
+    assert any(s.upper().startswith("CREATE TABLE") for s in txn)
 
 
 def test_discover_returns_sorted(tmp_path: Path) -> None:

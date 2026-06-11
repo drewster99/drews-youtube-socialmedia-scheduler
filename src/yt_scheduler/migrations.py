@@ -14,9 +14,11 @@ issued inside an active transaction. The runner therefore executes any
 foreign_keys`` is restored to ON unconditionally in the ``finally`` block
 regardless of success or failure.
 
-A pre-existing database whose tables already match `001_baseline.sql` is stamped
-at version 1 without re-running the statements (so we don't trip over the
-implicit `IF NOT EXISTS` baseline that earlier code created).
+On a pre-existing database, ``001_baseline.sql`` simply re-runs: it is entirely
+``CREATE TABLE IF NOT EXISTS`` (no indexes/triggers), so it is a no-op for tables
+that already exist and is then recorded as version 1. We do not stamp it by
+table-name match — that would falsely mark a partially-built schema as fully
+migrated.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -60,11 +63,6 @@ def _resolve_migrations_dir() -> Path:
 
 MIGRATIONS_DIR = _resolve_migrations_dir()
 
-# Tables that, if all present, indicate a database matching the baseline schema.
-_BASELINE_TABLES = {
-    "videos", "social_posts", "templates", "blocklist", "moderation_log", "settings",
-}
-
 
 @dataclass(frozen=True)
 class Migration:
@@ -97,26 +95,40 @@ def _split_statements(sql: str) -> tuple[list[str], list[str]]:
     re-enable the very CASCADE deletions that ``PRAGMA foreign_keys = OFF``
     was meant to suppress.
 
-    Strips ``--`` comments (both full-line and inline) before splitting on
-    semicolons, so semicolons that appear inside comment text don't produce
-    spurious fragments.  This is correct for this codebase because no migration
-    uses string literals that contain semicolons or ``--`` sequences.
+    Statements are split with ``sqlite3.complete_statement`` rather than a naive
+    ``;`` split, so a semicolon (or ``--``) inside a string literal — e.g. a
+    seeded prompt-template body like ``'Step 1; do X'`` — no longer mis-splits a
+    statement. (Assumes at most one statement per physical line, which holds for
+    every migration here; two statements jammed onto one line would surface as a
+    loud "execute one statement at a time" error rather than silent corruption.)
     """
-    # Strip inline and full-line -- comments from each line before splitting.
-    # This prevents semicolons inside comment text from creating bogus fragments.
-    stripped_lines = []
-    for line in sql.splitlines():
-        comment_pos = line.find("--")
-        if comment_pos != -1:
-            line = line[:comment_pos]
-        stripped_lines.append(line)
-    stripped_sql = "\n".join(stripped_lines)
+    def _strip_leading_comments(stmt: str) -> str:
+        # complete_statement keeps comments, but a standalone `-- ...` line
+        # accumulates onto the FOLLOWING statement. Drop leading comment/blank
+        # lines so PRAGMA classification (below) sees the real first keyword;
+        # inline comments after the first token are left for SQLite to parse.
+        lines = stmt.splitlines()
+        i = 0
+        while i < len(lines) and (not lines[i].strip() or lines[i].strip().startswith("--")):
+            i += 1
+        return "\n".join(lines[i:]).strip()
 
     all_stmts: list[str] = []
-    for raw in stripped_sql.split(";"):
-        stmt = raw.strip()
-        if stmt:
-            all_stmts.append(stmt)
+    buffer = ""
+    for line in sql.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            stmt = _strip_leading_comments(buffer)
+            if stmt:
+                all_stmts.append(stmt)
+            buffer = ""
+    tail = _strip_leading_comments(buffer)
+    if tail:
+        # A non-empty, non-comment leftover never completed: a final statement
+        # missing its trailing ';' (every migration here ends in ';', so this is
+        # rare). Keep it so a genuinely malformed migration fails loudly instead
+        # of silently dropping DDL.
+        all_stmts.append(tail)
 
     # Collect leading PRAGMAs (before the first non-PRAGMA statement).
     leading_pragmas: list[str] = []
@@ -203,14 +215,6 @@ async def _applied_versions(conn: aiosqlite.Connection) -> dict[int, str]:
     return {int(row[0]): row[1] for row in rows}
 
 
-async def _table_names(conn: aiosqlite.Connection) -> set[str]:
-    cursor = await conn.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-    )
-    rows = await cursor.fetchall()
-    return {row[0] for row in rows}
-
-
 async def apply_migrations(
     conn: aiosqlite.Connection,
     directory: Path = MIGRATIONS_DIR,
@@ -218,9 +222,9 @@ async def apply_migrations(
 ) -> list[int]:
     """Apply pending migrations against `conn`.
 
-    Returns the list of versions that were applied during this call. Existing
-    databases whose schema already matches the baseline are stamped at version 1
-    without re-running the SQL.
+    Returns the list of versions that were applied during this call. On a
+    pre-existing database the idempotent baseline (001) re-runs as a no-op and is
+    recorded like any other migration.
 
     ``target_version`` is a test hook: when set, migrations newer than that
     version are skipped, letting tests assert behaviour from a specific
@@ -242,20 +246,12 @@ async def apply_migrations(
     await _ensure_meta_table(conn)
     applied = await _applied_versions(conn)
 
-    # Stamp baseline if the DB already matches but isn't recorded.
-    if 1 not in applied:
-        existing = await _table_names(conn)
-        if _BASELINE_TABLES.issubset(existing):
-            baseline = next((m for m in migrations if m.version == 1), None)
-            if baseline is not None:
-                await conn.execute(
-                    "INSERT INTO schema_migrations (version, name, checksum) "
-                    "VALUES (?, ?, ?)",
-                    (baseline.version, baseline.name, baseline.checksum),
-                )
-                await conn.commit()
-                applied = await _applied_versions(conn)
-                logger.info("Stamped existing database at baseline migration 001")
+    # 001_baseline.sql is entirely `CREATE TABLE IF NOT EXISTS` (no indexes or
+    # triggers), so on a pre-existing DB it re-runs as a harmless no-op and is
+    # then recorded as version 1. We deliberately do NOT stamp version 1 by
+    # table-name match: a partially-built DB that merely had the baseline table
+    # *names* (but missing columns) would be falsely marked fully migrated, and
+    # every later migration would then run against an incomplete schema.
 
     newly_applied: list[int] = []
     for migration in migrations:
