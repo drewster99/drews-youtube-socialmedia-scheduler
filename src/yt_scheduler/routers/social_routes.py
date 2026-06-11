@@ -1208,6 +1208,9 @@ async def send_all_posts(
                 WHERE id = ?""",
                 (result.get("url", ""), post["id"]),
             )
+            # Commit each post's terminal state inside the loop so a crash
+            # part-way through a batch can't lose an already-sent post's status.
+            await db.commit()
             results[post["platform"]] = {
                 "status": "posted", "url": result.get("url", ""), "warning": result.get("warning"),
             }
@@ -1230,6 +1233,7 @@ async def send_all_posts(
                 "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
                 (f"Credential needs re-auth: {e}", post["id"]),
             )
+            await db.commit()
             results[post["platform"]] = {
                 "status": "needs_reauth",
                 "error": "Credential needs re-authentication. Reconnect from Settings.",
@@ -1240,6 +1244,7 @@ async def send_all_posts(
                 "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
                 (str(e), post["id"]),
             )
+            await db.commit()
             results[post["platform"]] = {"status": "failed", "error": str(e)}
 
     await db.commit()

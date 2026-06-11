@@ -308,10 +308,15 @@ async def publish_video_job(video_id: str) -> dict:
                 )
                 await db.execute(
                     """UPDATE social_posts
-                    SET status = 'posted', posted_at = datetime('now'), post_url = ?
+                    SET status = 'posted', posted_at = datetime('now'), post_url = ?,
+                        scheduled_at = NULL, scheduler_job_id = NULL
                     WHERE id = ?""",
                     (post_result.get("url", ""), post_id),
                 )
+                # Commit each terminal state inside the loop so a crash mid-batch
+                # can't lose an already-sent post's 'posted' status (which would
+                # otherwise leave it re-claimable and risk a re-send).
+                await db.commit()
                 results["social_results"][platform].append({
                     "post_id": post_id,
                     "status": "posted",
@@ -338,6 +343,9 @@ async def publish_video_job(video_id: str) -> dict:
                     "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
                     (str(e), post_id),
                 )
+                # Commit the terminal 'failed' state immediately so a stranded
+                # 'sending' row can't survive a mid-batch crash.
+                await db.commit()
                 results["social_results"][platform].append(
                     {"post_id": post_id, "status": "failed", "error": str(e)}
                 )
@@ -478,9 +486,13 @@ async def _send_scheduled_post(post_id: int) -> None:
                 "duplicate guard — clearing stale job id: %s",
                 post_id, reschedule_exc,
             )
+            # Set scheduled_at to the FUTURE retry time so restore re-creates a
+            # future-dated job (the `when > now` branch) instead of treating it
+            # as a missed window and firing it immediately on next startup.
             await db.execute(
-                "UPDATE social_posts SET scheduler_job_id = NULL WHERE id = ?",
-                (post_id,),
+                "UPDATE social_posts SET scheduler_job_id = NULL, scheduled_at = ? "
+                "WHERE id = ?",
+                (retry_at.isoformat(), post_id),
             )
             await db.commit()
         return
@@ -496,7 +508,15 @@ async def _send_scheduled_post(post_id: int) -> None:
                 (post_id,),
             )
             row = await cursor.fetchone()
-            project_id = int(row["project_id"]) if row else 1
+            if row is None or row["project_id"] is None:
+                # Don't fall back to the default project (id 1) — that would send
+                # from the wrong account. A missing video link is a real fault;
+                # the except below marks the post failed and surfaces it.
+                raise ValueError(
+                    f"could not resolve a project for post {post_id} — its video "
+                    "link is missing"
+                )
+            project_id = int(row["project_id"])
             cursor = await db.execute(
                 "SELECT social_account_id FROM project_social_defaults "
                 "WHERE project_id = ? AND platform = ?",
@@ -532,7 +552,7 @@ async def _send_scheduled_post(post_id: int) -> None:
         )
         await db.execute(
             "UPDATE social_posts SET status = 'posted', posted_at = datetime('now'), "
-            "post_url = ?, scheduler_job_id = NULL WHERE id = ?",
+            "post_url = ?, scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
             (result.get("url", ""), post_id),
         )
         await db.commit()
@@ -664,14 +684,33 @@ async def cancel_scheduled_post(post_id: int) -> bool:
         return True
 
 
+_MISSED_POST_STAGGER_SECONDS = 5
+
+
 async def restore_scheduled_posts() -> None:
     """Re-register pending per-post jobs after a server restart."""
     db = await get_db()
+    # On a fresh process nothing is sending yet, so any post still marked
+    # 'sending' was stranded by a crash/kill mid-send. Reset it to 'approved'
+    # so it can be re-claimed and retried — otherwise both publish_video_job
+    # (filters status='approved') and _send_scheduled_post (early-returns on
+    # 'sending') would skip it forever and it would silently never send.
+    cursor = await db.execute(
+        "UPDATE social_posts SET status = 'approved' WHERE status = 'sending'"
+    )
+    await db.commit()
+    if cursor.rowcount:
+        logger.warning(
+            "Recovered %d post(s) stranded in 'sending' by a previous shutdown",
+            cursor.rowcount,
+        )
+
     rows = await db.execute_fetchall(
         "SELECT id, scheduled_at FROM social_posts "
         "WHERE scheduled_at IS NOT NULL AND status != 'posted'"
     )
     now = datetime.now(timezone.utc)
+    missed_index = 0
     for row in rows:
         when = _parse_iso_datetime(row["scheduled_at"])
         if when is None:
@@ -684,8 +723,28 @@ async def restore_scheduled_posts() -> None:
             if when > now:
                 await schedule_social_post(int(row["id"]), when)
             else:
-                # Missed window — fire immediately.
-                await _send_scheduled_post(int(row["id"]))
+                # Missed window — schedule an immediate, staggered recovery job
+                # rather than awaiting inline. Mirrors the missed-publish path:
+                # startup completes without waiting on platform I/O, and one
+                # hung send can't block the others or the rest of restore.
+                run_at = now + timedelta(
+                    seconds=missed_index * _MISSED_POST_STAGGER_SECONDS
+                )
+                missed_index += 1
+                scheduler.add_job(
+                    _send_scheduled_post,
+                    "date",
+                    run_date=run_at,
+                    args=[int(row["id"])],
+                    id=f"missed_social_post_{row['id']}",
+                    replace_existing=True,
+                    misfire_grace_time=300,
+                    coalesce=True,
+                )
+                logger.warning(
+                    "Missed post window for %s, scheduled recovery job at %s",
+                    row["id"], run_at.isoformat(),
+                )
         except Exception as exc:
             logger.error("Failed to restore scheduled post %s: %s", row["id"], exc)
 
