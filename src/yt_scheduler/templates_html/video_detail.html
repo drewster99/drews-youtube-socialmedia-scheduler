@@ -3202,21 +3202,36 @@ async function refreshFileInfo() {
 // the chunked and Safari-multipart paths flip this at the right
 // moments via setReplaceVerifying().
 let fiReplaceVerifying = false;
+// True for the whole replace operation — from the moment bytes start
+// moving (Preparing/Uploading) through the server-side verify/finalize.
+// Distinct from fiReplaceVerifying, which only covers the no-abort
+// server window. Both must keep the Replace button disabled so a second
+// pick can't start a concurrent upload.
+let fiReplaceUploading = false;
+
+function _syncReplaceButtonDisabled() {
+    const replaceBtn = document.getElementById('fi-replace');
+    if (replaceBtn) {
+        replaceBtn.disabled = fiReplaceUploading || fiReplaceVerifying;
+    }
+}
+
+function setReplaceUploading(uploading) {
+    fiReplaceUploading = !!uploading;
+    _syncReplaceButtonDisabled();
+}
 
 function setReplaceVerifying(verifying) {
     fiReplaceVerifying = !!verifying;
     const closeBtn = document.getElementById('fi-close');
-    const replaceBtn = document.getElementById('fi-replace');
     if (closeBtn) {
         closeBtn.disabled = fiReplaceVerifying;
         closeBtn.title = fiReplaceVerifying
             ? 'Cannot close while the server is finalizing the upload'
             : '';
     }
-    if (replaceBtn) {
-        // Stop a second upload from racing with the in-flight finalize.
-        replaceBtn.disabled = fiReplaceVerifying;
-    }
+    // Stop a second upload from racing with the in-flight finalize.
+    _syncReplaceButtonDisabled();
 }
 
 function closeFileInfoModal() {
@@ -3274,7 +3289,12 @@ document.getElementById('fi-replace-input').addEventListener('change', async (ev
     const file = input.files && input.files[0];
     input.value = '';
     if (!file) return;
-    await uploadReplacementSource(file);
+    setReplaceUploading(true);
+    try {
+        await uploadReplacementSource(file);
+    } finally {
+        setReplaceUploading(false);
+    }
 });
 
 function formatReplacementIssue(issue) {
@@ -3423,14 +3443,19 @@ async function _uploadReplacementSafariMultipart(file) {
     status.style.display = '';
     status.style.color = '';
     progress.style.display = '';
-    progress.value = 0;
+    // Indeterminate while WebKit assembles the multipart body from the
+    // file on disk. No byte-level progress is observable from JS until
+    // the first upload.progress event fires, so an animated bar is the
+    // honest signal that work is happening — faking a percentage here
+    // would be a lie. The first progress event flips it to determinate.
+    progress.removeAttribute('value');
 
     const sizeMb = (file.size / (1024 * 1024)).toFixed(0);
     // Multi-GB uploads can sit on this status for a minute or two
     // before the browser starts streaming bytes — the helpful info
     // is the size, not the wait. Plain copy avoids reading
     // "unprofessional" and avoids implying the wait is a bug.
-    status.textContent = `Preparing upload: ${file.name} (${sizeMb} MB)…`;
+    status.textContent = `Preparing upload: ${file.name} (${sizeMb} MB)… reading file`;
 
     const xhrResult = await new Promise((resolve) => {
         const xhr = new XMLHttpRequest();
