@@ -2,6 +2,24 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Working agreement (read first)
+
+These are hard rules from repeated, explicit user feedback. Follow them every session.
+
+**A. NEVER run the app, server, tests, or any project Python.** Do not run `yt-scheduler`, the server, `pytest` (whole suite or a single file), `.venv/bin/python -m yt_scheduler...`, or any one-off script that imports `yt_scheduler`. Running unsigned code hits the real macOS Keychain and fires password prompts that disrupt the user mid-work. The user runs the app and tests; you do not — not "to verify", not "just one file", not ever. Verify instead at the static level: read the code and trace the logic, `ruff check`, `python -m py_compile`, `node --check`, Jinja2 `get_template` parse, and grep the source. (`ffmpeg`/`sqlite3` against scratch data is fine ONLY if it does not import `yt_scheduler`.) When verification truly requires execution, hand it to the user. Note: a running server on `:8008` is the bundled macOS app's Python and won't reflect source edits until the user rebuilds.
+
+**B. No fallbacks, no silent defaults.** If a value the current code always populates is missing, raise and name it — never `x.get(k, default)` / `|| default` / a default model/codec/etc. "for convenience". A wrong default is worse than a loud error. Legitimate back-compat fallbacks (e.g. a column that is NULL only on pre-migration rows) are fine — say so in a comment.
+
+**C. Surface errors — never a misleading "fine" state.** Every server-side failure (preview cuts, transcription, generation, sends, anything a user action kicks off) must surface in the UI with the real error. Never a silent fallback that shows different/wrong content, and never log-only. The render path checks the error field BEFORE any fallback chain.
+
+**D. Follow the agreed plan/prototype.** When a plan or prototype already exists (e.g. `clip_proto/`), implement THAT — don't invent a different design or "optimize away" deliberate decisions. Read the plan first; if production diverges from it, report the divergence and align to the plan rather than improvising a third option.
+
+**E. Secrets only in the Keychain.** The Anthropic key and OAuth/YouTube tokens live only in the macOS Keychain (encrypted-JSON fallback on other platforms), set via Settings. Never read or store them from env vars, `.env`, or anywhere on disk in plaintext, and never add an env-var fallback. Non-secret config (host/port/intervals/model name) in `.env` is fine.
+
+**F. Frontend ↔ server contract.** The web UI talks to `/api/...` for everything (all reads and writes). The ONLY direct file access is read-only `GET /uploads/<name>`. The server vends ready URLs and owns naming/sanitization — never hand the browser absolute filesystem paths, and don't add `StaticFiles` mounts over data dirs.
+
+**G. Git / scope discipline.** Don't auto-create branches — ask first (this includes the "branch before committing on the default branch" default). Commit/push only when asked. In audit/analysis workflows (e.g. `/stupid`), spawned agents propose only; apply edits only for items the user green-lights.
+
 ## Plan
 
 - Always plan your work. Don't just start coding.
@@ -40,6 +58,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Drew's Video + Socials Scheduler is a local web application for managing the YouTube video publishing workflow. It uploads videos as unlisted drafts, generates SEO descriptions via Claude AI from auto-captions, creates platform-specific social media posts, supports scheduled publishing, and performs background comment moderation. Written in Python 3.11+ with FastAPI, SQLite (async via aiosqlite), and Jinja2 templates.
 
 ## Development Commands
+
+These document how **the user** runs and tests the app. Per Working agreement rule A, you (Claude) do not run any of them — not `yt-scheduler`, not `pytest`, not the CLI subcommands. They're listed here for reference and for the user's use.
 
 ```bash
 # Setup

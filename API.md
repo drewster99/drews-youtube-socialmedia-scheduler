@@ -728,7 +728,7 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 { "model": "large-v3", "language": "en", "backend": "mlx-whisper" }
 ```
 
-`model` defaults to `large-v3`. `language` is auto-detected when omitted. `backend` forces a specific backend (`mlx-whisper`, `whisper.cpp`, `macos-speech`); otherwise the service picks the best available.
+`model` defaults to `large-v3` only when a bare API call omits it (the UI always sends an explicit model from its dropdown). `language` is auto-detected when omitted. `backend` forces a specific backend (`mlx-whisper`, `whisper.cpp`, `macos-speech`); otherwise the service picks the best available. The response echoes the resolved `model` so the choice is never invisible.
 
 **Response 200**:
 
@@ -736,6 +736,7 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 {
   "status": "ok",
   "backend": "mlx-whisper",
+  "model": "large-v3",
   "language": "en",
   "segments": 152,
   "word_count": 1840,
@@ -1126,11 +1127,13 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 
 **Purpose** — Edit a draft social post in place.
 
-**Request body** — Any subset of `{"content": str, "status": str, "media_path": str, "media_paths": list[str] | null}`. `content` is auto-trimmed of leading/trailing whitespace at write time. `media_paths` accepts a list (replace the attachment set) or `[]`/`null` (clear all attachments); writing it also rewrites the legacy `media_path` column to the first entry (or null) so the two stay in sync.
+**Request body** — Any subset of `{"content": str, "status": str, "media_path": str, "media_paths": list[str] | null}`. `content` is auto-trimmed of leading/trailing whitespace at write time. `media_paths` accepts a list (replace the attachment set) or `[]`/`null` (clear all attachments); writing it also rewrites the legacy `media_path` column to the first entry (or null) so the two stay in sync. Every supplied media path must resolve inside `UPLOAD_DIR` (symlink-safe) — a path outside the managed media directory is rejected so a client can't attach an arbitrary on-disk file that would then be uploaded to a social platform.
 
-**Note on media** — The `social_posts` table now has both `media_path` (legacy single-string column, kept for backwards compat) and `media_paths` (JSON array column, the canonical form). The post-generation paths and PUT endpoint write both. The send paths read `media_paths` first and fall back to `media_path`. Once all writers stop touching the legacy column it'll be dropped in a follow-up migration.
+**Note on media** — The `social_posts` table now has both `media_path` (legacy single-string column, kept for backwards compat) and `media_paths` (JSON array column, the canonical form). The post-generation paths and PUT endpoint write both. The send paths read `media_paths` first and fall back to `media_path`; the poster also re-checks containment before reading any attachment. Once all writers stop touching the legacy column it'll be dropped in a follow-up migration.
 
 **Response 200** — `{"status": "ok"}`.
+
+**Errors** — `400` (a `media_path`/`media_paths` entry is outside `UPLOAD_DIR`, or an invalid `status`).
 
 ### `POST /api/social/posts/{post_id}/shorten`
 
@@ -1515,11 +1518,13 @@ Source: `src/yt_scheduler/routers/settings_routes.py`
 
 ### `PUT /api/settings`
 
-**Purpose** — Upsert a flat key/value blob.
+**Purpose** — Upsert a flat key/value blob (only keys on the server allowlist; `anthropic_model` is excluded — it has its own endpoint).
 
-**Request body** — Any object; values are stringified before storage.
+**Request body** — An object whose keys are all on the allowlist; values are stringified before storage. The `comment_check_interval` / `caption_check_interval` keys must be a whole number of minutes between 1 and 1440 — they're validated at write time so a bad value can't be stored and then silently reverted to the config default at boot.
 
 **Response 200** — `{"status": "ok"}`.
+
+**Errors** — `400` (an unknown/disallowed key, or an interval that isn't a whole number of minutes in 1–1440).
 
 ### `GET /api/settings/anthropic`
 
