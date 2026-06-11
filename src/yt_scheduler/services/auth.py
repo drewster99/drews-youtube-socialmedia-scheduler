@@ -23,6 +23,7 @@ import json
 import logging
 from pathlib import Path
 
+from google.auth.exceptions import RefreshError, TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -177,8 +178,26 @@ def get_credentials(project_slug: str = DEFAULT_PROJECT_SLUG) -> Credentials | N
         try:
             creds.refresh(Request())
             _save_credentials(project_slug, creds)
-        except Exception as exc:
-            logger.warning("Failed to refresh credentials for %s: %s", project_slug, exc)
+        except RefreshError as exc:
+            # Terminal: Google rejected the refresh token (revoked / invalid_grant).
+            # The user genuinely needs to reconnect.
+            logger.warning(
+                "Credentials for %s rejected by Google — re-auth needed: %s",
+                project_slug, exc,
+            )
+            return None
+        except TransportError as exc:
+            # Transient: network/5xx. Distinguish it in the log so a flaky
+            # connection isn't diagnosed as the user being logged out.
+            logger.warning(
+                "Transient error refreshing credentials for %s (temporarily "
+                "unavailable, not logged out): %s", project_slug, exc,
+            )
+            return None
+        except Exception:
+            # An unexpected error is a bug, not a credential state — keep the
+            # traceback instead of hiding it behind a generic warning.
+            logger.exception("Unexpected error refreshing credentials for %s", project_slug)
             return None
 
     if creds and creds.valid:

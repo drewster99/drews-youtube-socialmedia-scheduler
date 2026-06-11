@@ -579,8 +579,12 @@ def _try_macos_speech(audio_path: Path, language: str | None) -> TranscriptionRe
             language=locale,
             has_word_timestamps=True,
         )
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception) as e:
-        logger.warning("SpeechAnalyzer failed: %s", e)
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError, OSError) as e:
+        # Environmental failures (helper not installed, timeout, bad JSON) mean
+        # "backend unavailable" — return None so the auto chain tries the next.
+        # A programming error is NOT caught here: it propagates with a traceback
+        # rather than masquerading as "backend unavailable".
+        logger.warning("SpeechAnalyzer unavailable: %s: %s", type(e).__name__, e)
         return None
 
 

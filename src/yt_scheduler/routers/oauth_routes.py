@@ -147,6 +147,7 @@ async def linkedin_callback(code: str | None = None, state: str | None = None, e
                 },
             )
     except Exception as e:
+        logger.exception("LinkedIn token exchange request failed")
         return _result_page(False, f"Network error contacting LinkedIn: {e}")
 
     if token_resp.status_code != 200:
@@ -288,6 +289,7 @@ async def threads_callback(code: str | None = None, state: str | None = None, er
                 },
             )
     except Exception as e:
+        logger.exception("Threads token exchange request failed")
         return _result_page(False, f"Network error contacting Threads: {e}", platform="threads")
 
     if short_resp.status_code != 200:
@@ -631,6 +633,7 @@ async def twitter_callback(
                 auth=auth,
             )
     except Exception as exc:
+        logger.exception("Twitter token exchange request failed")
         return _result_page(False, f"Network error: {exc}", platform="twitter")
 
     if token_resp.status_code != 200:
@@ -825,6 +828,7 @@ async def mastodon_callback(
                 data=token_body,
             )
     except Exception as exc:
+        logger.exception("Mastodon token exchange request failed")
         return _result_page(False, f"Network error: {exc}", platform="mastodon")
     if token_resp.status_code != 200:
         logger.warning(

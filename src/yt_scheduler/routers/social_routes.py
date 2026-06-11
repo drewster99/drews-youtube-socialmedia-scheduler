@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 
 from fastapi import APIRouter, HTTPException, Query
@@ -34,6 +35,8 @@ def _tier_from_iso_duration(iso: str | None) -> str:
     return tiers.tier_for_duration(seconds) or ""
 
 router = APIRouter(prefix="/api/social", tags=["social"])
+
+logger = logging.getLogger(__name__)
 
 # {{video}} on a Threads slot: the Threads API only accepts media by public URL,
 # which a localhost app can't provide, so we skip the slot instead of silently
@@ -137,7 +140,11 @@ async def _build_render_context(db, video: dict) -> dict:
             yt = await asyncio.to_thread(youtube.get_video, video_id)
             iso_dur = (yt or {}).get("contentDetails", {}).get("duration")
             tier = _tier_from_iso_duration(iso_dur)
-        except Exception:
+        except Exception as exc:
+            # Best-effort enrichment: leaving {{tier}} empty is acceptable, but
+            # log so a real failure (expired creds, quota, a bug) is diagnosable
+            # rather than silently rendering the wrong/empty tier.
+            logger.warning("Tier lookup failed for video %s; leaving tier empty: %s", video_id, exc)
             tier = ""
 
     description = video.get("description") or ""
@@ -1070,6 +1077,7 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
             "Reconnect from Settings.",
         ) from e
     except Exception as e:
+        logger.exception("Send failed for post %s", post_id)
         await db.execute(
             "UPDATE social_posts SET status = 'failed', error = ?, "
             "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
@@ -1239,6 +1247,7 @@ async def send_all_posts(
                 "error": "Credential needs re-authentication. Reconnect from Settings.",
             }
         except Exception as e:
+            logger.exception("Send failed for post %s", post["id"])
             await db.execute(
                 "UPDATE social_posts SET status = 'failed', error = ?, "
                 "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",

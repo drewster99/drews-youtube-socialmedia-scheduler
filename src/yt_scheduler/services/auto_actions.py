@@ -222,9 +222,12 @@ async def _maybe_extract_thumbnail(video_id: str, video_file_path: str | None) -
             capture_output=True, text=True, timeout=30,
         )
         duration = float(probe.stdout.strip()) if probe.returncode == 0 else None
-    except Exception:
+    except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
+        logger.warning("ffprobe duration probe failed for %s: %s", video_id, exc)
         duration = None
 
+    if duration is None:
+        logger.info("Duration unknown for %s; using a 1.0s thumbnail offset", video_id)
     target_seconds = (duration * 0.25) if duration else 1.0
     target = UPLOAD_DIR / f"{video_id}_auto_thumb.jpg"
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -237,6 +240,11 @@ async def _maybe_extract_thumbnail(video_id: str, video_file_path: str | None) -
             capture_output=True, timeout=60,
         )
         if result.returncode != 0:
+            logger.warning(
+                "ffmpeg auto-thumbnail extract for %s exited %s: %s",
+                video_id, result.returncode,
+                (result.stderr or b"")[-400:].decode("utf-8", "replace"),
+            )
             return
     except Exception as exc:
         logger.warning("ffmpeg keyframe extract failed: %s", exc)
