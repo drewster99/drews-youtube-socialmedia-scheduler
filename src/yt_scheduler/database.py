@@ -5,7 +5,10 @@ Schema lives in `migrations/NNN_*.sql` and is applied via `yt_scheduler.migratio
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 
 import aiosqlite
 
@@ -73,3 +76,52 @@ async def close_db() -> None:
     if _db is not None:
         await _db.close()
         _db = None
+
+
+# Serializes write_transaction() critical sections. Not reentrant — the
+# ContextVar below lets a nested call join the outer transaction instead of
+# re-acquiring (which would deadlock).
+_write_lock = asyncio.Lock()
+_in_write_txn: ContextVar[bool] = ContextVar("_in_write_txn", default=False)
+
+
+@asynccontextmanager
+async def write_transaction():
+    """Run a read-modify-write critical section as one serialized, isolated unit.
+
+    The app shares a SINGLE aiosqlite connection across all request handlers and
+    background jobs, and that connection has no per-coroutine transaction: any
+    coroutine's ``commit()`` durably flushes every other coroutine's in-flight
+    writes. This context manager holds a process-wide async lock AND an explicit
+    ``BEGIN IMMEDIATE``/``COMMIT`` (``ROLLBACK`` on error) so the enclosed
+    statements commit or roll back atomically and can't be interleaved by
+    another ``write_transaction``.
+
+    IRON RULES:
+      * NEVER ``await`` a network / ``to_thread`` call inside the block — that
+        would serialize all writes behind one slow round-trip. Do that work
+        before/after, passing values in/out.
+      * Isolation is only complete once EVERY write site goes through this (or no
+        bare ``commit()`` runs while a block is open). It is the tool for that
+        conversion; on its own it does not make the rest of the codebase safe.
+
+    Nesting is allowed and joins the outer transaction (no nested ``BEGIN``, no
+    re-acquire), so it can't self-deadlock on the non-reentrant lock.
+    """
+    db = await get_db()
+    if _in_write_txn.get():
+        # Already inside an enclosing write_transaction on this task — join it.
+        yield db
+        return
+    async with _write_lock:
+        token = _in_write_txn.set(True)
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                yield db
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+        finally:
+            _in_write_txn.reset(token)
