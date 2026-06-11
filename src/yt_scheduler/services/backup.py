@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import base64
 import datetime as _dt
+import io
 import json
 import logging
 import os
@@ -72,6 +73,9 @@ def _derive_key(passphrase: str, salt: bytes, iterations: int) -> bytes:
 
 
 def _encrypt_stream(src, dst, key: bytes, chunk_bytes: int) -> None:
+    """v1 AEAD framing (random nonce, AAD = chunk index). Retained so that
+    bundles written by this format can still be produced/read; new exports use
+    the v2 framing below, which also detects boundary truncation."""
     aead = AESGCM(key)
     index = 0
     while True:
@@ -84,6 +88,31 @@ def _encrypt_stream(src, dst, key: bytes, chunk_bytes: int) -> None:
         dst.write(nonce)
         dst.write(ct)
         index += 1
+
+
+def _encrypt_stream_v2(src, dst, key: bytes, chunk_bytes: int) -> None:
+    """v2 AEAD framing: deterministic counter nonce + a final-chunk flag bound
+    into the GCM associated data, so a bundle truncated at a record boundary
+    fails to decrypt instead of silently restoring an incomplete archive. The
+    key is single-use per bundle (fresh salt), so a per-bundle counter nonce is
+    collision-free. Read-ahead by one chunk to know which record is last."""
+    aead = AESGCM(key)
+    index = 0
+    prev = src.read(chunk_bytes)
+    if not prev:
+        return  # empty input -> no records; decrypt raises "contains no data"
+    while True:
+        nxt = src.read(chunk_bytes)
+        is_final = 0 if nxt else 1
+        nonce = struct.pack(">I", 0) + struct.pack(">Q", index)
+        ct = aead.encrypt(nonce, prev, struct.pack(">QB", index, is_final))
+        dst.write(struct.pack(">I", len(nonce) + len(ct)))
+        dst.write(nonce)
+        dst.write(ct)
+        index += 1
+        if is_final:
+            break
+        prev = nxt
 
 
 def _read_exactly(src, n: int) -> bytes:
@@ -117,6 +146,40 @@ def _decrypt_stream(src, dst, key: bytes) -> None:
         raise BackupError("Backup file contains no data")
 
 
+def _decrypt_stream_v2(src, dst, key: bytes) -> None:
+    """Decrypt v2 framing, verifying the final-chunk flag. We learn whether a
+    record is the last by peeking at the next length prefix: at genuine EOF the
+    last record was flagged final and matches; if the stream was truncated at a
+    boundary, a record that was NOT final is now last, so is_final=1 won't match
+    its AAD and decryption fails — surfacing the truncation."""
+    aead = AESGCM(key)
+    index = 0
+    length_prefix = src.read(4)
+    if not length_prefix:
+        raise BackupError("Backup file contains no data")
+    while length_prefix:
+        if len(length_prefix) != 4:
+            raise BackupError("Backup file is truncated or corrupt")
+        (record_len,) = struct.unpack(">I", length_prefix)
+        if record_len <= NONCE_BYTES:
+            raise BackupError("Backup file is corrupt")
+        record = _read_exactly(src, record_len)
+        nonce, ct = record[:NONCE_BYTES], record[NONCE_BYTES:]
+        next_prefix = src.read(4)
+        if next_prefix and len(next_prefix) != 4:
+            raise BackupError("Backup file is truncated or corrupt")
+        is_final = 0 if next_prefix else 1
+        try:
+            plaintext = aead.decrypt(nonce, ct, struct.pack(">QB", index, is_final))
+        except InvalidTag as exc:
+            raise BackupError(
+                "Wrong passphrase, or the backup file is corrupt or truncated"
+            ) from exc
+        dst.write(plaintext)
+        index += 1
+        length_prefix = next_prefix
+
+
 # --- inner archive ---
 
 
@@ -140,6 +203,16 @@ def _snapshot_db(dest: Path) -> bool:
     return True
 
 
+def _add_bytes(tar: tarfile.TarFile, arcname: str, payload: bytes) -> None:
+    """Add an in-memory payload to ``tar`` as a 0600 regular file, so secrets
+    never land on disk as a standalone cleartext file during export."""
+    info = tarfile.TarInfo(name=arcname)
+    info.size = len(payload)
+    info.mode = 0o600
+    info.mtime = int(_dt.datetime.now(_dt.timezone.utc).timestamp())
+    tar.addfile(info, io.BytesIO(payload))
+
+
 def _build_inner_archive(tar_path: Path) -> dict:
     data_dir = config.DATA_DIR
     summary = {"data_files": 0, "secret_count": 0, "includes_db": False}
@@ -151,8 +224,7 @@ def _build_inner_archive(tar_path: Path) -> dict:
 
         secrets = keychain.export_all_secrets()
         summary["secret_count"] = sum(len(v) for v in secrets.values())
-        secrets_path = scratch_dir / "keychain-secrets.json"
-        secrets_path.write_text(json.dumps(secrets, indent=2))
+        secrets_bytes = json.dumps(secrets).encode("utf-8")
 
         manifest = {
             "app": config.BUNDLE_ID,
@@ -161,12 +233,11 @@ def _build_inner_archive(tar_path: Path) -> dict:
             "host": os.uname().nodename,
             "includes_db": has_db,
         }
-        manifest_path = scratch_dir / "manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2))
+        manifest_bytes = json.dumps(manifest).encode("utf-8")
 
         with tarfile.open(tar_path, "w:gz") as tar:
-            tar.add(manifest_path, arcname="manifest.json")
-            tar.add(secrets_path, arcname="keychain-secrets.json")
+            _add_bytes(tar, "manifest.json", manifest_bytes)
+            _add_bytes(tar, "keychain-secrets.json", secrets_bytes)
             if has_db:
                 tar.add(db_snapshot, arcname="data/publisher.db")
             if data_dir.exists():
@@ -199,6 +270,9 @@ def export_bundle(out_path: Path, passphrase: str) -> dict:
             "iterations": PBKDF2_ITERATIONS,
             "salt": base64.b64encode(salt).decode("ascii"),
             "chunk_bytes": CHUNK_BYTES,
+            # v2 framing adds boundary-truncation detection; absent in old
+            # bundles, which _parse_header reads as v1 for backward compatibility.
+            "aead_version": 2,
         },
         separators=(",", ":"),
     ).encode("ascii")
@@ -213,7 +287,7 @@ def export_bundle(out_path: Path, passphrase: str) -> dict:
                 dst.write(header)
                 dst.write(b"\n")
                 with open(tar_path, "rb") as src:
-                    _encrypt_stream(src, dst, key, CHUNK_BYTES)
+                    _encrypt_stream_v2(src, dst, key, CHUNK_BYTES)
             os.replace(tmp_out, out_path)
         except BaseException:
             tmp_out.unlink(missing_ok=True)
@@ -243,10 +317,17 @@ def _parse_header(src) -> dict:
         header = json.loads(bytes(line).decode("ascii"))
         header["_salt_bytes"] = base64.b64decode(header["salt"])
         header["_iterations"] = int(header["iterations"])
+        # Old bundles have no aead_version field -> treat as v1 (random nonce,
+        # index-only AAD, EOF-terminated) so they still import unchanged.
+        header["_aead_version"] = int(header.get("aead_version", 1))
     except (ValueError, KeyError) as exc:
         raise BackupError("Backup file header is malformed") from exc
     if not (1_000 <= header["_iterations"] <= 10_000_000) or not (8 <= len(header["_salt_bytes"]) <= 1_024):
         raise BackupError("Backup file header is malformed")
+    if header["_aead_version"] not in (1, 2):
+        raise BackupError(
+            f"Unsupported backup AEAD version: {header['_aead_version']}"
+        )
     return header
 
 
@@ -284,19 +365,35 @@ def import_bundle(in_path: Path, passphrase: str) -> dict:
             header = _parse_header(src)
             key = _derive_key(passphrase, header["_salt_bytes"], header["_iterations"])
             with open(tar_path, "wb") as dst:
-                _decrypt_stream(src, dst, key)
+                if header["_aead_version"] == 2:
+                    _decrypt_stream_v2(src, dst, key)
+                else:
+                    _decrypt_stream(src, dst, key)
 
         extracted = scratch_dir / "extracted"
         extracted.mkdir()
         with tarfile.open(tar_path, "r:gz") as tar:
-            _safe_extract(tar, extracted)
+            # Read the secrets straight from the tar stream — never extract them
+            # to disk as a standalone cleartext file.
+            try:
+                secrets_member = tar.getmember("keychain-secrets.json")
+                fh = tar.extractfile(secrets_member)
+                if fh is None:
+                    raise KeyError("keychain-secrets.json")
+                secrets = json.loads(fh.read().decode("utf-8"))
+            except (KeyError, ValueError, OSError) as exc:
+                raise BackupError(
+                    "Backup is missing or has a malformed secrets file"
+                ) from exc
+            # Extract only the manifest + data/ members to disk (everything else,
+            # i.e. the secrets file, stays in memory).
+            to_extract = [
+                m for m in tar.getmembers()
+                if m.name == "manifest.json" or m.name == "data"
+                or m.name.startswith("data/")
+            ]
+            _safe_extract(tar, extracted, members=to_extract)
         _extracted_data_root(extracted)
-
-        secrets_path = extracted / "keychain-secrets.json"
-        try:
-            secrets = json.loads(secrets_path.read_text())
-        except (OSError, ValueError) as exc:
-            raise BackupError("Backup is missing or has a malformed secrets file") from exc
 
         new_data = extracted / "data"
         if not new_data.is_dir():
@@ -326,17 +423,24 @@ def import_bundle(in_path: Path, passphrase: str) -> dict:
     }
 
 
-def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
-    """Extract ``tar`` into ``dest``, rejecting paths that escape ``dest``."""
+def _safe_extract(
+    tar: tarfile.TarFile, dest: Path, members: list[tarfile.TarInfo] | None = None
+) -> None:
+    """Extract ``members`` (or all) into ``dest``, rejecting escaping paths/links.
+
+    The zip-slip/symlink check runs over the SAME list that is extracted, so a
+    filtered extraction can't bypass the safety check.
+    """
     dest = dest.resolve()
-    for member in tar.getmembers():
+    member_list = tar.getmembers() if members is None else members
+    for member in member_list:
         target = (dest / member.name).resolve()
         if not (target == dest or dest in target.parents):
             raise BackupError(f"Backup contains an unsafe path: {member.name}")
         if member.issym() or member.islnk():
             raise BackupError(f"Backup contains a link, which is not allowed: {member.name}")
     try:
-        tar.extractall(dest, filter="data")
+        tar.extractall(dest, members=member_list, filter="data")
     except TypeError:
         # `filter=` predates Python 3.11.4; our own checks above already cover safety.
-        tar.extractall(dest)
+        tar.extractall(dest, members=member_list)

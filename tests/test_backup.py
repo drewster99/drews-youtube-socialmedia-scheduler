@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import importlib
+import json
+import os
 import sqlite3
+import struct
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -99,3 +104,69 @@ def test_tampered_bundle_rejected(env) -> None:
     out.write_bytes(bytes(raw))
     with pytest.raises(backup.BackupError):
         backup.import_bundle(out, "pw")
+
+
+def _record_offsets(backup, raw: bytes) -> list[int]:
+    """Byte offsets where each AEAD record (its 4-byte length prefix) begins."""
+    pos = raw.index(b"\n", len(backup.MAGIC)) + 1  # past MAGIC + header line
+    offsets = []
+    while pos < len(raw):
+        offsets.append(pos)
+        (rlen,) = struct.unpack(">I", raw[pos:pos + 4])
+        pos += 4 + rlen
+    return offsets
+
+
+def test_truncated_v2_bundle_rejected(env, monkeypatch) -> None:
+    """A v2 bundle truncated at a record boundary (last chunk dropped) must fail
+    to decrypt rather than silently restoring an incomplete archive."""
+    config, keychain, backup, tmp_path = env
+    # Force multiple records so there is a non-final record to strip.
+    monkeypatch.setattr(backup, "CHUNK_BYTES", 256)
+    (config.UPLOAD_DIR / "big.bin").write_bytes(os.urandom(4096))
+    _seed(config, keychain)
+    out = tmp_path / "b.dysbak"
+    backup.export_bundle(out, "pw")
+
+    raw = out.read_bytes()
+    offsets = _record_offsets(backup, raw)
+    assert len(offsets) >= 2  # otherwise the truncation isn't at a boundary
+    out.write_bytes(raw[: offsets[-1]])  # drop the final record
+
+    with pytest.raises(backup.BackupError):
+        backup.import_bundle(out, "pw")
+
+
+def test_v1_bundle_still_imports(env) -> None:
+    """A bundle written in the legacy v1 framing (no aead_version, random nonce)
+    must still import unchanged."""
+    config, keychain, backup, tmp_path = env
+    _seed(config, keychain)
+
+    out = tmp_path / "v1.dysbak"
+    salt = os.urandom(backup.SALT_BYTES)
+    key = backup._derive_key("pw", salt, backup.PBKDF2_ITERATIONS)
+    header = json.dumps(
+        {
+            "kdf": "pbkdf2-sha256",
+            "iterations": backup.PBKDF2_ITERATIONS,
+            "salt": base64.b64encode(salt).decode("ascii"),
+            "chunk_bytes": backup.CHUNK_BYTES,
+        },
+        separators=(",", ":"),
+    ).encode("ascii")
+    with tempfile.TemporaryDirectory() as scratch:
+        tar_path = Path(scratch) / "inner.tar.gz"
+        backup._build_inner_archive(tar_path)
+        with open(out, "wb") as dst:
+            dst.write(backup.MAGIC)
+            dst.write(header)
+            dst.write(b"\n")
+            with open(tar_path, "rb") as src:
+                backup._encrypt_stream(src, dst, key, backup.CHUNK_BYTES)
+
+    keychain.delete_secret("anthropic", "api_key")
+    backup.import_bundle(out, "pw")
+    assert keychain.load_secret("anthropic", "api_key") == "sk-ant-secret-123"
+    with sqlite3.connect(str(config.DB_PATH)) as db:
+        assert db.execute("SELECT v FROM t").fetchone()[0] == "hello"
