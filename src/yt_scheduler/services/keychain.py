@@ -213,6 +213,7 @@ def _keychain_set(service: str, account: str, value: str) -> bool:
         subprocess.run(
             ["security", "delete-generic-password", "-s", service, "-a", account],
             capture_output=True,
+            timeout=15,
         )
         result = subprocess.run(
             [
@@ -223,9 +224,13 @@ def _keychain_set(service: str, account: str, value: str) -> bool:
             ],
             capture_output=True,
             text=True,
+            timeout=15,
         )
         return result.returncode == 0
     except FileNotFoundError:
+        return False
+    except subprocess.TimeoutExpired:
+        logger.warning("security add-generic-password timed out for %s/%s", service, account)
         return False
 
 
@@ -246,6 +251,7 @@ def _keychain_get_cli(service: str, account: str) -> str | None:
             ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
             capture_output=True,
             text=True,
+            timeout=15,
         )
         if result.returncode == 0:
             # `security` appends exactly one trailing newline; remove only that.
@@ -253,6 +259,9 @@ def _keychain_get_cli(service: str, account: str) -> str | None:
             return raw[:-1] if raw.endswith("\n") else raw
         return None
     except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning("security find-generic-password timed out for %s/%s", service, account)
         return None
 
 
@@ -270,6 +279,7 @@ def _keychain_set_cli_trusted(service: str, account: str, value: str) -> bool:
         subprocess.run(
             ["security", "delete-generic-password", "-s", service, "-a", account],
             capture_output=True,
+            timeout=15,
         )
         result = subprocess.run(
             [
@@ -280,9 +290,13 @@ def _keychain_set_cli_trusted(service: str, account: str, value: str) -> bool:
             ],
             capture_output=True,
             text=True,
+            timeout=15,
         )
         return result.returncode == 0
     except FileNotFoundError:
+        return False
+    except subprocess.TimeoutExpired:
+        logger.warning("security add-generic-password (trusted) timed out for %s/%s", service, account)
         return False
 
 
@@ -334,9 +348,13 @@ def _keychain_delete(service: str, account: str) -> bool:
         result = subprocess.run(
             ["security", "delete-generic-password", "-s", service, "-a", account],
             capture_output=True,
+            timeout=15,
         )
         return result.returncode == 0
     except FileNotFoundError:
+        return False
+    except subprocess.TimeoutExpired:
+        logger.warning("security delete-generic-password timed out for %s/%s", service, account)
         return False
 
 
