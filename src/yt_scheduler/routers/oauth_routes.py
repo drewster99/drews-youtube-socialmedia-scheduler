@@ -74,6 +74,17 @@ def _gc_pending() -> None:
     stale = [s for s, p in _pending.items() if now - p["ts"] > _PENDING_TTL_SECONDS]
     for s in stale:
         _pending.pop(s, None)
+    # Sweep abandoned Bluesky flows too — their PendingAuth holds a private-key
+    # PEM and PKCE verifier, so a flow the user never finishes would otherwise
+    # leak that key material in memory indefinitely (the dict has no TTL of its
+    # own). Defined later in the module; resolved at call time.
+    stale_bsky = [
+        s for s, ts in _bluesky_pending_ts.items()
+        if now - ts > _PENDING_TTL_SECONDS
+    ]
+    for s in stale_bsky:
+        _bluesky_pending.pop(s, None)
+        _bluesky_pending_ts.pop(s, None)
 
 
 @router.post("/linkedin/start")
@@ -1372,6 +1383,8 @@ BLUESKY_REDIRECT_PATH = "/api/oauth/bluesky/callback"
 # Pending Bluesky auth state, keyed by ``state``. Held in-process only;
 # server restarts between start and callback force a re-auth.
 _bluesky_pending: dict[str, bluesky_oauth.PendingAuth] = {}
+# Parallel creation timestamps so _gc_pending() can TTL-expire abandoned flows.
+_bluesky_pending_ts: dict[str, float] = {}
 
 
 @router.post("/bluesky/start")
@@ -1430,6 +1443,7 @@ async def bluesky_start(data: dict):
 
     _gc_pending()
     _bluesky_pending[state] = pending
+    _bluesky_pending_ts[state] = time.time()
 
     auth_url = bluesky_oauth.authorization_redirect_url(pending, request_uri)
     return {"auth_url": auth_url}
@@ -1453,6 +1467,7 @@ async def bluesky_callback(
         return _result_page(False, "Missing code or state.", platform="bluesky")
 
     pending = _bluesky_pending.pop(state, None)
+    _bluesky_pending_ts.pop(state, None)
     if pending is None:
         return _result_page(
             False,

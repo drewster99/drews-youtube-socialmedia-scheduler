@@ -76,6 +76,26 @@ async def update_settings(data: dict):
             f"Unknown or disallowed settings key(s): {unknown}. "
             f"Allowed: {sorted(_SETTINGS_ALLOWLIST)}",
         )
+    # Validate the poll-interval keys at the write boundary so a non-integer can
+    # never be stored. Otherwise the scheduler silently reverts to the config
+    # default at boot while the Settings field still shows the saved value — a
+    # hidden default the user can't see.
+    for interval_key in ("comment_check_interval", "caption_check_interval"):
+        if interval_key in data:
+            try:
+                minutes = int(data[interval_key])
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    400,
+                    f"{interval_key} must be a whole number of minutes "
+                    f"(got {data[interval_key]!r}).",
+                ) from None
+            if not (1 <= minutes <= 1440):
+                raise HTTPException(
+                    400,
+                    f"{interval_key} must be between 1 and 1440 minutes.",
+                )
+            data[interval_key] = minutes
     db = await get_db()
     for key, value in data.items():
         await db.execute(

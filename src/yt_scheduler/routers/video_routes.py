@@ -953,10 +953,15 @@ async def transcribe_video(
         # and stalling concurrent requests; that was the source of the
         # "Network error: Load failed" the client saw on a long
         # first-run download.
+        # Surface the resolved model in the response (and below) so the choice —
+        # including the heavyweight default when a caller omits it — is never
+        # invisible. The frontend always sends an explicit model from its
+        # dropdown; this default only applies to a bare API call.
+        resolved_model = opts.get("model") or "large-v3"
         result = await asyncio.to_thread(
             transcription.transcribe,
             video_path=video_file,
-            model=opts.get("model", "large-v3"),
+            model=resolved_model,
             language=opts.get("language"),
             backend=opts.get("backend"),
         )
@@ -1014,6 +1019,7 @@ async def transcribe_video(
     return {
         "status": "ok",
         "backend": result.backend,
+        "model": resolved_model,
         "language": result.language,
         "segments": len(result.segments),
         "word_count": len(result.all_words),
