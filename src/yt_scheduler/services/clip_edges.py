@@ -17,6 +17,7 @@ ffmpeg cut that consumes its output lives in ``media.py``.
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 
@@ -90,6 +91,14 @@ def build_units(words: list[TranscriptWord]) -> list[ClipUnit]:
     word with a real timestamp.
     """
     words = collapse_repeat_loops(words)
+    # Last line of defense before the cut math: a non-finite or out-of-order
+    # stamp here would flow into ClipUnit.start/end and then into the ffmpeg
+    # -ss/-to timestamps as "nan". The transcriber should already drop these,
+    # but build_units is the boundary that feeds media.py so guard it too.
+    words = [
+        w for w in words
+        if math.isfinite(w.start) and math.isfinite(w.end) and w.end >= w.start
+    ]
     units: list[ClipUnit] = []
     cur: list[TranscriptWord] = []
 

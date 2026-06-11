@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -372,8 +373,14 @@ def _vertical_crop_filter(x_shift_normalized: float) -> str:
     upscale from 720p is soft (we warn about that in the source-quality
     UI).
     """
-    # Clamp the shift so the crop never walks off the source frame.
-    shift = max(-1.0, min(1.0, float(x_shift_normalized)))
+    # Clamp the shift so the crop never walks off the source frame. A NaN/Inf
+    # (e.g. from a malformed model proposal) survives min()/max() unchanged and
+    # would be formatted into the crop expression as the literal "nan", making
+    # ffmpeg fail to parse the filter — coerce it to a centered crop instead.
+    raw_shift = float(x_shift_normalized)
+    if not math.isfinite(raw_shift):
+        raw_shift = 0.0
+    shift = max(-1.0, min(1.0, raw_shift))
     # Force the crop width to an even integer ≤ the ideal 9:16 width.
     # ffmpeg's crop filter rejects non-integer dims, and libx264 (the
     # YUV 4:2:0 default) needs both width and height even.
@@ -400,7 +407,10 @@ def _ffmpeg_timestamp_to_seconds(ts: str) -> float:
     """Parse an ffmpeg timestamp (``"SS.mmm"``, ``"MM:SS"``, ``"HH:MM:SS.mmm"``)
     into seconds. Used to position the audio fade-out from the clip duration."""
     parts = ts.split(":")
-    return sum(float(p) * (60 ** i) for i, p in enumerate(reversed(parts)))
+    try:
+        return sum(float(p) * (60 ** i) for i, p in enumerate(reversed(parts)))
+    except ValueError as exc:
+        raise ValueError(f"malformed ffmpeg timestamp: {ts!r}") from exc
 
 
 def extract_clip(
@@ -648,41 +658,47 @@ def extract_gif(
     # Two-pass for better quality GIFs
     palette = UPLOAD_DIR / f"{video_path.stem}_palette.png"
 
-    # Pass 1: generate palette
-    subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-hwaccel", "auto",
-            "-ss", start, "-to", end,
-            "-i", str(video_path),
-            "-vf", f"fps={fps},scale={width}:-1:flags=lanczos,palettegen",
-            str(palette),
-        ],
-        check=True,
-        capture_output=True,
-        timeout=_FFMPEG_TIMEOUT_SECONDS,
-    )
+    # The palette is an intermediate that's always removed (finally), and a
+    # failure in either pass must not leave a half-written .gif behind that a
+    # later consumer treats as valid — mirror extract_clip's cleanup-on-error.
+    try:
+        # Pass 1: generate palette
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-hwaccel", "auto",
+                "-ss", start, "-to", end,
+                "-i", str(video_path),
+                "-vf", f"fps={fps},scale={width}:-1:flags=lanczos,palettegen",
+                str(palette),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=_FFMPEG_TIMEOUT_SECONDS,
+        )
 
-    # Pass 2: create GIF with palette. ``-hwaccel auto`` precedes only the
-    # video ``-i`` so it accelerates that decode; the palette PNG input is
-    # untouched by it.
-    subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-hwaccel", "auto",
-            "-ss", start, "-to", end,
-            "-i", str(video_path),
-            "-i", str(palette),
-            "-lavfi", f"fps={fps},scale={width}:-1:flags=lanczos [x]; [x][1:v] paletteuse",
-            str(output),
-        ],
-        check=True,
-        capture_output=True,
-        timeout=_FFMPEG_TIMEOUT_SECONDS,
-    )
-
-    # Clean up palette
-    palette.unlink(missing_ok=True)
+        # Pass 2: create GIF with palette. ``-hwaccel auto`` precedes only the
+        # video ``-i`` so it accelerates that decode; the palette PNG input is
+        # untouched by it.
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-hwaccel", "auto",
+                "-ss", start, "-to", end,
+                "-i", str(video_path),
+                "-i", str(palette),
+                "-lavfi", f"fps={fps},scale={width}:-1:flags=lanczos [x]; [x][1:v] paletteuse",
+                str(output),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=_FFMPEG_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        Path(output).unlink(missing_ok=True)
+        raise
+    finally:
+        palette.unlink(missing_ok=True)
 
     return output
 
@@ -867,19 +883,25 @@ def generate_thumbnail(
 
     output = UPLOAD_DIR / output_name
 
-    subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-hwaccel", "auto",
-            "-ss", timestamp,
-            "-i", str(video_path),
-            "-vframes", "1",
-            "-q:v", "2",
-            str(output),
-        ],
-        check=True,
-        capture_output=True,
-        timeout=_FFMPEG_FRAME_TIMEOUT_SECONDS,
-    )
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-hwaccel", "auto",
+                "-ss", timestamp,
+                "-i", str(video_path),
+                "-vframes", "1",
+                "-q:v", "2",
+                str(output),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=_FFMPEG_FRAME_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        # Don't leave a truncated/partial .jpg behind that a later consumer
+        # would treat as a valid thumbnail.
+        Path(output).unlink(missing_ok=True)
+        raise
 
     return output

@@ -818,7 +818,10 @@ def _apply_assessment_shift(assessment: CropAssessment) -> float:
     if assessment.classification != "off_center":
         return 0.0
     shift = assessment.x_shift_normalized
-    if abs(shift) < _MIN_SHIFT_TO_APPLY:
+    # Defense-in-depth: a non-finite shift survives min()/max() unchanged and
+    # would reach the ffmpeg crop expression as "nan". assess_crop already
+    # rejects these, but a CropAssessment built elsewhere shouldn't be trusted.
+    if not math.isfinite(shift) or abs(shift) < _MIN_SHIFT_TO_APPLY:
         return 0.0
     return max(-1.0, min(1.0, shift))
 
@@ -911,10 +914,12 @@ async def assess_crop_for_proposal(
                     "falling back to neutral.", classification,
                 )
                 return _NEUTRAL_ASSESSMENT
-            try:
-                shift = float(tool_input.get("x_shift_normalized", 0.0))
-                confidence = float(tool_input.get("confidence", 0.0))
-            except (TypeError, ValueError):
+            # Reject non-finite numbers (json accepts bare NaN/Infinity, and a
+            # NaN here survives the downstream clamp and lands as "nan" in the
+            # ffmpeg crop expression) — treat a malformed proposal as neutral.
+            shift = _maybe_float(tool_input.get("x_shift_normalized"))
+            confidence = _maybe_float(tool_input.get("confidence"))
+            if shift is None or confidence is None:
                 return _NEUTRAL_ASSESSMENT
             return CropAssessment(
                 classification=classification,

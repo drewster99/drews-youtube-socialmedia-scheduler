@@ -174,11 +174,17 @@ def update_video_metadata(
         raise ValueError(f"Video {video_id} not found")
 
     item = current["items"][0]
+    snippet_src = item.get("snippet")
+    status = item.get("status")
+    if snippet_src is None or status is None:
+        raise ValueError(
+            f"Video {video_id} response is missing its snippet/status block; "
+            "cannot update."
+        )
     # Only keep mutable snippet fields — sending read-only fields (thumbnails,
     # channelTitle, localized, etc.) causes the YouTube API to reject the update.
     allowed_snippet = {"title", "description", "tags", "categoryId", "defaultLanguage", "defaultAudioLanguage"}
-    snippet = {k: v for k, v in item["snippet"].items() if k in allowed_snippet}
-    status = item["status"]
+    snippet = {k: v for k, v in snippet_src.items() if k in allowed_snippet}
 
     if title is not None:
         snippet["title"] = title
@@ -329,7 +335,10 @@ def list_channel_videos(max_results: int = 25) -> list[dict]:
     if not channels.get("items"):
         return []
 
-    uploads_playlist = channels["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
+    details = channels["items"][0].get("contentDetails") or {}
+    uploads_playlist = (details.get("relatedPlaylists") or {}).get("uploads")
+    if not uploads_playlist:
+        raise ValueError("Channel response has no uploads playlist.")
 
     # List videos from uploads playlist
     items = []

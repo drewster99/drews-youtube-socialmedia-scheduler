@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -304,10 +305,14 @@ def _try_whisper_cpp(audio_path: Path, model: str, language: str | None) -> Tran
 
     segments = []
     for item in data.get("transcription", []):
+        timestamps = item.get("timestamps") or {}
+        frm, to = timestamps.get("from"), timestamps.get("to")
+        if frm is None or to is None:
+            raise ValueError("whisper.cpp segment missing timestamps.from/to")
         segments.append(TranscriptSegment(
-            start=_parse_whisper_cpp_time(item["timestamps"]["from"]),
-            end=_parse_whisper_cpp_time(item["timestamps"]["to"]),
-            text=item["text"],
+            start=_parse_whisper_cpp_time(frm),
+            end=_parse_whisper_cpp_time(to),
+            text=item.get("text", ""),
         ))
 
     return TranscriptionResult(segments=segments, backend="whisper.cpp")
@@ -461,12 +466,29 @@ def _macos_words_to_segments(raw_words: list[dict]) -> list[TranscriptSegment]:
     regardless, so the index clip path (which re-segments from the flat word
     stream) is unaffected by how cues are grouped here.
     """
-    words: list[TranscriptWord] = [
-        TranscriptWord(
-            start=float(w["start"]), end=float(w["end"]),
-            word=str(w.get("word", "")), probability=1.0)
-        for w in raw_words
-    ]
+    # Drop words with missing/non-numeric/non-finite/out-of-order stamps rather
+    # than letting a single bad frame raise (which the broad backend except would
+    # turn into a silent "backend unavailable") or propagate a NaN into the cue/
+    # clip math, where it would reach the ffmpeg -ss/-to args as "nan".
+    words: list[TranscriptWord] = []
+    dropped = 0
+    for w in raw_words:
+        try:
+            start = float(w["start"])
+            end = float(w["end"])
+        except (KeyError, TypeError, ValueError):
+            dropped += 1
+            continue
+        if not (math.isfinite(start) and math.isfinite(end)) or end < start:
+            dropped += 1
+            continue
+        words.append(TranscriptWord(
+            start=start, end=end, word=str(w.get("word", "")), probability=1.0))
+    if dropped:
+        logger.warning(
+            "Dropped %d of %d word(s) with bad start/end stamps from the "
+            "SpeechAnalyzer output", dropped, len(raw_words),
+        )
 
     segments: list[TranscriptSegment] = []
     cur: list[TranscriptWord] = []

@@ -456,6 +456,13 @@ async def upload_video(payload: dict = Body(...)):
             publish_at=publish_at or None,
         )
     except Exception as e:
+        # The bytes are on disk as upload_<hex> files with no DB row and no
+        # video_id-keyed name, so the orphan sweeps can't reclaim them — clean
+        # up here (error path only, before any row exists) so a failed upload
+        # doesn't permanently leak a full-size video + thumbnail into UPLOAD_DIR.
+        video_path.unlink(missing_ok=True)
+        if thumbnail_path is not None:
+            thumbnail_path.unlink(missing_ok=True)
         raise HTTPException(500, f"Upload failed: {e}")
 
     video_id = result["id"]
@@ -1418,19 +1425,34 @@ async def set_thumbnail(video_id: str, file: UploadFile = File(...)):
     resolved = path.resolve()
     if UPLOAD_DIR.resolve() not in resolved.parents:
         raise HTTPException(400, "Invalid thumbnail path")
+    # Write to a temp sibling and only promote it onto the canonical
+    # <video_id>_thumb path AFTER YouTube accepts it. Writing the canonical
+    # path directly (as before) would overwrite a previous good thumbnail in
+    # place even when the YouTube push later fails.
+    tmp_path = UPLOAD_DIR / f"{video_id}_thumb_{secrets.token_hex(8)}{thumb_ext}"
+
     # Offload the blocking file copy to a worker thread so the event loop
     # is not stalled during the I/O transfer.
     def _copy_thumbnail(src, dest: Path) -> None:
         with open(dest, "wb") as fh:
             shutil.copyfileobj(src, fh)
 
-    await asyncio.to_thread(_copy_thumbnail, file.file, path)
+    await asyncio.to_thread(_copy_thumbnail, file.file, tmp_path)
 
     await _bind_project_for_video(video_id)
     try:
-        await asyncio.to_thread(youtube.set_thumbnail, video_id, path)
+        await asyncio.to_thread(youtube.set_thumbnail, video_id, tmp_path)
     except Exception as e:
+        tmp_path.unlink(missing_ok=True)
         raise HTTPException(500, f"Failed to set thumbnail: {e}")
+
+    # YouTube accepted it — atomically promote the temp file onto the canonical
+    # path (only now that we know the new thumbnail is good).
+    try:
+        tmp_path.replace(path)
+    except OSError as e:
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(500, f"Could not finalize thumbnail: {e}")
 
     # The user just made our local thumbnail the truth, so it's a
     # 'user' source again, and any stored compare verdict is stale —
