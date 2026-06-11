@@ -74,11 +74,18 @@ async def get_db() -> aiosqlite.Connection:
         # write_transaction (with a stack) so a real run names the sites still
         # needing conversion. Installed AFTER migrations so their DDL doesn't
         # warn. Off by default → zero effect on normal use.
-        if os.environ.get("DYS_DB_WRITE_GUARD") == "1":
+        # Enable via env var OR a marker file in the data dir (easy to toggle on
+        # the bundled app without touching its launch environment: just create
+        # `<DATA_DIR>/.db_write_guard` and relaunch).
+        guard_on = (
+            os.environ.get("DYS_DB_WRITE_GUARD") == "1"
+            or (DB_PATH.parent / ".db_write_guard").exists()
+        )
+        if guard_on:
             _install_write_guard(_db)
             logger.warning(
-                "DB write-guard ENABLED (DYS_DB_WRITE_GUARD=1): writes outside "
-                "write_transaction will be logged with a stack."
+                "DB write-guard ENABLED: writes outside write_transaction will "
+                "be logged with a stack (DYS_DB_WRITE_GUARD or .db_write_guard)."
             )
     return _db
 
