@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 
@@ -67,7 +69,63 @@ async def get_db() -> aiosqlite.Connection:
                 actual_mode,
             )
         await apply_migrations(_db)
+        # Optional diagnostic for the transaction-isolation rollout: when
+        # DYS_DB_WRITE_GUARD=1, log every data-modifying statement run OUTSIDE a
+        # write_transaction (with a stack) so a real run names the sites still
+        # needing conversion. Installed AFTER migrations so their DDL doesn't
+        # warn. Off by default → zero effect on normal use.
+        if os.environ.get("DYS_DB_WRITE_GUARD") == "1":
+            _install_write_guard(_db)
+            logger.warning(
+                "DB write-guard ENABLED (DYS_DB_WRITE_GUARD=1): writes outside "
+                "write_transaction will be logged with a stack."
+            )
     return _db
+
+
+# Heuristic match on the leading keyword (after whitespace / line comments) of a
+# data-modifying statement, for the optional write-guard above.
+_WRITE_STMT_RE = re.compile(
+    r"\s*(?:--[^\n]*\n\s*)*(?:INSERT|UPDATE|DELETE|REPLACE)\b",
+    re.IGNORECASE,
+)
+
+
+def _install_write_guard(db: aiosqlite.Connection) -> None:
+    """Wrap execute/executemany with transparent logging wrappers.
+
+    aiosqlite's execute/executemany are sync functions (decorated with its own
+    ``@contextmanager``) that return a ``Result`` — both awaitable and an async
+    context manager. A sync wrapper that logs then returns the original result
+    unchanged preserves BOTH ``await db.execute(...)`` and
+    ``async with db.execute(...)``. The wrapper only fires for writes run while
+    no ``write_transaction`` is active on the current task.
+    """
+    orig_execute = db.execute
+    orig_executemany = db.executemany
+
+    def _warn_if_bare(sql: object) -> None:
+        if (
+            isinstance(sql, str)
+            and _WRITE_STMT_RE.match(sql)
+            and not _in_write_txn.get()
+        ):
+            logger.warning(
+                "DB write outside write_transaction: %s",
+                " ".join(sql.split())[:200],
+                stack_info=True,
+            )
+
+    def guarded_execute(sql, parameters=None):
+        _warn_if_bare(sql)
+        return orig_execute(sql, parameters)
+
+    def guarded_executemany(sql, parameters):
+        _warn_if_bare(sql)
+        return orig_executemany(sql, parameters)
+
+    db.execute = guarded_execute  # type: ignore[method-assign]
+    db.executemany = guarded_executemany  # type: ignore[method-assign]
 
 
 async def close_db() -> None:
