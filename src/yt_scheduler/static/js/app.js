@@ -99,13 +99,21 @@ function showToast(message, type = 'info') {
     };
 
     function showBuildMismatchBanner(oldId, newId) {
+        // Built from DOM nodes (not innerHTML) so the build-id strings are set
+        // as text, never parsed as HTML, and the Reload handler is attached
+        // without an inline onclick.
         const banner = document.createElement('div');
         banner.id = 'build-mismatch-banner';
-        banner.innerHTML = `
-            <span>The server was rebuilt — this page is out of sync. Reload to load the new UI.</span>
-            <button onclick="window.location.reload()">Reload</button>
-            <span class="build-ids">${oldId.slice(0, 8)} → ${newId.slice(0, 8)}</span>
-        `;
+        const msg = document.createElement('span');
+        msg.textContent = 'The server was rebuilt — this page is out of sync. Reload to load the new UI.';
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = 'Reload';
+        btn.addEventListener('click', () => window.location.reload());
+        const ids = document.createElement('span');
+        ids.className = 'build-ids';
+        ids.textContent = `${String(oldId).slice(0, 8)} → ${String(newId).slice(0, 8)}`;
+        banner.append(msg, btn, ids);
         document.body.appendChild(banner);
     }
 })();
@@ -159,17 +167,35 @@ async function checkAuth() {
         // When we're on a project page, label the indicator with the
         // project name so a casual glance tells the user *which*
         // project's connection is being reported.
+        // The project name is user-controlled, so build the indicator from DOM
+        // nodes and set the label via textContent — never innerHTML — so a name
+        // like `<img src=x onerror=...>` can't execute as stored DOM XSS.
         const label = projectEl ? projectEl.textContent.trim() : 'YouTube';
+        const dot = document.createElement('span');
+        dot.className = 'status-dot';
+        el.replaceChildren();
         if (data.authenticated) {
-            el.innerHTML = `<span class="status-dot" style="background: #2ea043;"></span><span>${label} • Connected</span>`;
+            dot.style.background = '#2ea043';
+            const text = document.createElement('span');
+            text.textContent = `${label} • Connected`;
+            el.append(dot, text);
         } else if (!slug) {
             // No project in scope (Home / General settings): YouTube auth is
             // per-project, so don't raise a red "not connected" alarm here —
             // just note it neutrally and point at where projects live.
-            el.innerHTML = `<span class="status-dot" style="background: var(--text-muted, #717171);"></span><a href="/" style="color: var(--text-muted, #717171);">YouTube • per project</a>`;
+            dot.style.background = 'var(--text-muted, #717171)';
+            const link = document.createElement('a');
+            link.href = '/';
+            link.style.color = 'var(--text-muted, #717171)';
+            link.textContent = 'YouTube • per project';
+            el.append(dot, link);
         } else {
-            const settingsHref = `/projects/${encodeURIComponent(slug)}/settings`;
-            el.innerHTML = `<span class="status-dot" style="background: #f85149;"></span><a href="${settingsHref}" style="color: #f85149;">${label} • Not connected</a>`;
+            dot.style.background = '#f85149';
+            const link = document.createElement('a');
+            link.href = `/projects/${encodeURIComponent(slug)}/settings`;
+            link.style.color = '#f85149';
+            link.textContent = `${label} • Not connected`;
+            el.append(dot, link);
         }
     } catch {
         // Ignore
