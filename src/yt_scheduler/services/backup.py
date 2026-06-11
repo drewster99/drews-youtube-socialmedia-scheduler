@@ -126,7 +126,11 @@ def _snapshot_db(dest: Path) -> bool:
         return False
     # Open the live DB (read/write is fine — .backup() never modifies the source)
     # and snapshot it; this is consistent even if the server is using it.
-    src = sqlite3.connect(str(config.DB_PATH))
+    # busy_timeout is per-connection: under WAL a live server may hold the write
+    # lock, so without it a concurrent `export-all` would fail instantly with
+    # "database is locked" instead of waiting for the lock to clear.
+    src = sqlite3.connect(str(config.DB_PATH), timeout=5.0)
+    src.execute("PRAGMA busy_timeout = 5000")
     dst = sqlite3.connect(str(dest))
     try:
         src.backup(dst)
