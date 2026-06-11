@@ -1042,7 +1042,10 @@ async def generate_description(video_id: str, data: dict | None = None):
         raise HTTPException(404, "Video not found")
 
     video = dict(rows[0])
-    project_id = int(video.get("project_id") or 1)
+    project_id = video.get("project_id")
+    if project_id in (None, 0):
+        raise HTTPException(409, f"Video {video_id} has no project_id (data integrity error).")
+    project_id = int(project_id)
     transcript = video.get("transcript", "")
     extra = (data or {}).get("extra_instructions", "")
     mode = ((data or {}).get("mode") or "auto").strip()
@@ -1147,7 +1150,10 @@ async def generate_tags(video_id: str, data: dict | None = None):
         raise HTTPException(404, "Video not found")
 
     video = dict(rows[0])
-    project_id = int(video.get("project_id") or 1)
+    project_id = video.get("project_id")
+    if project_id in (None, 0):
+        raise HTTPException(409, f"Video {video_id} has no project_id (data integrity error).")
+    project_id = int(project_id)
     mode = ((data or {}).get("mode") or "metadata").strip()
 
     try:

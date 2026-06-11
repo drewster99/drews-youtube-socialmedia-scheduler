@@ -13,7 +13,6 @@ from pathlib import Path
 import httpx
 
 from yt_scheduler.services.keychain import (
-    load_all_secrets_async,
     store_secret_async,
 )
 
@@ -288,18 +287,34 @@ class SocialPoster:
 
     async def _get_creds(self) -> dict[str, str]:
         """Return the bundle this poster is bound to, falling back to the
-        first active credential bundle for the platform when none is set.
+        platform's first active credential bundle when none is set.
+
+        The fallback resolves deterministically (oldest active credential by id,
+        the same ordering the send-path pre-check uses) and never merges keys
+        across accounts — the old behaviour picked whichever ``cred.*`` entry
+        happened to JSON-parse first in Keychain dict order, or blended every
+        account's keys into one synthetic bundle, either of which could post
+        from / with the wrong account. No credential → empty dict, so
+        ``is_configured()`` reports "not configured" rather than raising.
         """
         if self._bundle is not None:
             return self._bundle
-        secrets = await load_all_secrets_async(self.platform)
-        for key, value in secrets.items():
-            if key.startswith("cred."):
-                try:
-                    return json.loads(value)
-                except json.JSONDecodeError:
-                    continue
-        return {k: v for k, v in secrets.items() if k != "_migrated_v8"}
+        from yt_scheduler.services.social_credentials import (
+            get_first_active_credential,
+            load_bundle,
+        )
+
+        cred = await get_first_active_credential(self.platform)
+        if cred is None:
+            return {}
+        bundle = await load_bundle(self.platform, cred["uuid"])
+        if bundle is None:
+            logger.warning(
+                "First active %s credential %s has no readable bundle",
+                self.platform, str(cred.get("uuid"))[:8],
+            )
+            return {}
+        return bundle
 
     @classmethod
     def bundle_is_configured(cls, bundle: dict) -> bool:

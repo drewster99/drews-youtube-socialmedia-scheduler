@@ -64,7 +64,16 @@ async def _build_render_context(db, video: dict) -> dict:
         ``images``      — pre-sorted ``item_images`` rows for ``{{image:*}}``.
     """
     video_id = video["id"]
-    project_id = int(video.get("project_id") or 1)
+    # project_id is NOT NULL in the schema; a missing/zero value is a
+    # data-integrity fault. Surface it rather than silently rendering with the
+    # default project's URL/prompts (the old `or 1`), which would produce a post
+    # with the wrong channel's links and voice.
+    project_id = video.get("project_id")
+    if project_id in (None, 0):
+        raise HTTPException(
+            409, f"Video {video_id} has no project_id (data integrity error)."
+        )
+    project_id = int(project_id)
 
     proj_rows = await db.execute_fetchall(
         "SELECT id, project_url, youtube_channel_id FROM projects WHERE id = ?",
@@ -317,7 +326,10 @@ async def generate_posts(
     unresolved_ack = bool(opts.get("unresolved_ack")) or ("unresolved" in opts)
 
     video = dict(rows[0])
-    project_id = int(video.get("project_id") or 1)
+    project_id = video.get("project_id")
+    if project_id in (None, 0):
+        raise HTTPException(409, "Video has no project_id (data integrity error).")
+    project_id = int(project_id)
     template = await tmpl.get_template(template_name, project_id=project_id)
     if not template:
         raise HTTPException(404, f"Template '{template_name}' not found")
@@ -857,6 +869,31 @@ async def shorten_post(post_id: int, data: dict | None = None):
     return {"content": new, "previous": old, "char_count": len(new), "warning": warning}
 
 
+async def _project_id_for_post(db, post: dict) -> int:
+    """Resolve the project that owns ``post`` via its video.
+
+    Raises ``ValueError`` if the post's video link can't be resolved. We must
+    NOT silently fall back to the default project (id 1) here: that would route
+    the post — and its send credential — to the wrong account. ``project_id`` is
+    NOT NULL in the schema and ``social_posts.video_id`` is a NOT NULL FK, so a
+    missing row is a data-integrity fault worth surfacing, not papering over.
+    """
+    cursor = await db.execute(
+        "SELECT v.project_id "
+        "FROM social_posts sp JOIN videos v ON v.id = sp.video_id "
+        "WHERE sp.id = ?",
+        (post["id"],),
+    )
+    row = await cursor.fetchone()
+    if row is None or row["project_id"] is None:
+        raise ValueError(
+            f"could not resolve a project for post {post['id']} — its video link "
+            "is missing. Bind the post to a social account or fix its video link, "
+            "then retry."
+        )
+    return int(row["project_id"])
+
+
 async def _resolve_poster_for_post(post: dict) -> social.SocialPoster:
     """Pick the right poster for a row in ``social_posts``.
 
@@ -871,14 +908,7 @@ async def _resolve_poster_for_post(post: dict) -> social.SocialPoster:
         return await social.get_poster_for_account(int(sa_id))
 
     db = await get_db()
-    cursor = await db.execute(
-        "SELECT v.project_id "
-        "FROM social_posts sp JOIN videos v ON v.id = sp.video_id "
-        "WHERE sp.id = ?",
-        (post["id"],),
-    )
-    row = await cursor.fetchone()
-    project_id = int(row["project_id"]) if row is not None else 1
+    project_id = await _project_id_for_post(db, post)
 
     cursor = await db.execute(
         "SELECT social_account_id FROM project_social_defaults "
@@ -907,13 +937,14 @@ async def _credential_for_post(post: dict) -> dict | None:
     if sa_id:
         return await get_credential_by_id(int(sa_id))
 
-    cursor = await db.execute(
-        "SELECT v.project_id FROM social_posts sp "
-        "JOIN videos v ON v.id = sp.video_id WHERE sp.id = ?",
-        (post["id"],),
-    )
-    row = await cursor.fetchone()
-    project_id = int(row["project_id"]) if row is not None else 1
+    try:
+        project_id = await _project_id_for_post(db, post)
+    except ValueError:
+        # Best-effort pre-check only: if the project can't be resolved we return
+        # None (skip the pre-check) rather than route to the wrong account. The
+        # real send via _resolve_poster_for_post raises the same error and
+        # surfaces it to the user.
+        return None
     cursor = await db.execute(
         "SELECT social_account_id FROM project_social_defaults "
         "WHERE project_id = ? AND platform = ?",
