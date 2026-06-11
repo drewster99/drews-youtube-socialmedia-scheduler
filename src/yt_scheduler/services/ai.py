@@ -9,10 +9,13 @@ missing (e.g. install hasn't applied the migration yet).
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import anthropic
 
 from yt_scheduler.config import ANTHROPIC_MODEL, get_anthropic_api_key
+
+logger = logging.getLogger(__name__)
 
 
 def get_client() -> anthropic.Anthropic:
@@ -93,30 +96,39 @@ _active_model_cache: str | None = None
 
 
 def _resolve_model_sync() -> str:
-    """Synchronous read of the active model with cache + DB fallback to env var.
+    """Synchronous read of the active model for the sync template-render path.
 
-    Uses a short-lived sqlite3 connection to dodge the async aiosqlite layer.
-    Concurrent reads are safe in default journal mode; the catch-all silently
-    falls back to ``ANTHROPIC_MODEL`` if the DB is unavailable or busy.
+    ``templates.render`` → ``call_ai_block`` runs on a worker thread with no
+    event loop, so it can't use the async connection. Uses a short-lived
+    sqlite3 connection; WAL (set on the file) lets this read without blocking
+    the live writer, and the busy_timeout waits out a writer lock instead of
+    failing instantly. A genuinely-absent setting falls back to the configured
+    ``ANTHROPIC_MODEL`` default; a real DB error is logged (not silently
+    swallowed) before falling back.
     """
     global _active_model_cache
     if _active_model_cache is not None:
         return _active_model_cache
     import sqlite3
+    from contextlib import closing
 
     from yt_scheduler.config import DB_PATH
 
     try:
-        with sqlite3.connect(str(DB_PATH)) as conn:
+        with closing(sqlite3.connect(str(DB_PATH), timeout=5.0)) as conn:
+            conn.execute("PRAGMA busy_timeout = 5000")
             row = conn.execute(
                 "SELECT value FROM settings WHERE key = 'anthropic_model'"
             ).fetchone()
-        if row and row[0]:
-            _active_model_cache = row[0]
-            return _active_model_cache
-    except Exception:
-        pass
-    _active_model_cache = ANTHROPIC_MODEL
+    except sqlite3.Error as exc:
+        logger.warning(
+            "Could not read anthropic_model setting (%s); falling back to %s",
+            exc,
+            ANTHROPIC_MODEL,
+        )
+        _active_model_cache = ANTHROPIC_MODEL
+        return _active_model_cache
+    _active_model_cache = row[0] if row and row[0] else ANTHROPIC_MODEL
     return _active_model_cache
 
 
@@ -127,8 +139,25 @@ def invalidate_model_cache() -> None:
 
 
 async def _resolve_model() -> str:
-    """Async wrapper that delegates to the sync resolver."""
-    return _resolve_model_sync()
+    """Async read of the active model: cache → settings table → env default.
+
+    Reads through the shared async connection rather than opening a second
+    sqlite3 connection, so it can't contend with the live writer. A DB error
+    propagates (no silent fallback) — only a genuinely-absent setting falls
+    back to the configured ``ANTHROPIC_MODEL`` default.
+    """
+    global _active_model_cache
+    if _active_model_cache is not None:
+        return _active_model_cache
+    from yt_scheduler.database import get_db
+
+    db = await get_db()
+    async with db.execute(
+        "SELECT value FROM settings WHERE key = 'anthropic_model'"
+    ) as cursor:
+        row = await cursor.fetchone()
+    _active_model_cache = row[0] if row and row[0] else ANTHROPIC_MODEL
+    return _active_model_cache
 
 
 async def _render_template_body(body: str, variables: dict[str, str]) -> str:

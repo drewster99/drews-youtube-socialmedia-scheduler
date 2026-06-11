@@ -9,6 +9,7 @@ Supports:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import html
@@ -1023,14 +1024,19 @@ async def youtube_callback(
         verifier = pending.get("code_verifier")
         if verifier:
             flow.code_verifier = verifier
-        flow.fetch_token(code=code)
+        # fetch_token does a blocking token-exchange HTTP round-trip; keep it
+        # off the event loop so it can't stall every other request/job.
+        await asyncio.to_thread(flow.fetch_token, code=code)
         creds = flow.credentials
     except Exception as exc:
         return _result_page(
             False, f"Token exchange failed: {exc}", platform="youtube"
         )
 
-    channel_id, channel_title, channel_handle = channel_id_from_credentials(creds)
+    # channel_id_from_credentials issues a synchronous YouTube API call; offload it.
+    channel_id, channel_title, channel_handle = await asyncio.to_thread(
+        channel_id_from_credentials, creds
+    )
     if not channel_id:
         return _result_page(
             False,
@@ -1095,7 +1101,7 @@ async def youtube_callback(
         )
         await db.commit()
         project_id = int(cursor.lastrowid)
-        store_credentials(slug, creds)
+        await asyncio.to_thread(store_credentials, slug, creds)
 
         from yt_scheduler.services.templates import ensure_default_template
 
@@ -1170,7 +1176,7 @@ async def youtube_callback(
         )
         await db.commit()
 
-    store_credentials(project_slug, creds)
+    await asyncio.to_thread(store_credentials, project_slug, creds)
     return _result_page(
         True,
         f"{project['name']} re-connected to {channel_title or channel_id}.",

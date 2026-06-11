@@ -422,14 +422,16 @@ async def get_project_youtube(slug: str) -> dict:
         raise HTTPException(404, f"Project '{slug}' not found")
 
     channel_id = project.get("youtube_channel_id")
-    authenticated = is_authenticated(project["slug"])
+    # is_authenticated/get_credentials do a blocking Keychain read and may fire a
+    # blocking token refresh — keep them off the event loop.
+    authenticated = await asyncio.to_thread(is_authenticated, project["slug"])
     needs_reauth = bool(channel_id) and not authenticated
 
     title = ""
     handle = ""
     if authenticated:
         try:
-            creds = get_credentials(project["slug"])
+            creds = await asyncio.to_thread(get_credentials, project["slug"])
             if creds is not None:
                 from googleapiclient.discovery import build
 
@@ -486,10 +488,11 @@ async def refresh_channel_url(slug: str) -> dict:
             f"Project '{slug}' has no YouTube channel bound. "
             "Connect via OAuth first.",
         )
-    if not is_authenticated(slug):
+    # Blocking Keychain read (+ possible token refresh) — keep off the loop.
+    if not await asyncio.to_thread(is_authenticated, slug):
         raise HTTPException(401, "YouTube credentials missing or expired.")
 
-    creds = get_credentials(slug)
+    creds = await asyncio.to_thread(get_credentials, slug)
     if creds is None:
         raise HTTPException(401, "YouTube credentials missing or expired.")
 
