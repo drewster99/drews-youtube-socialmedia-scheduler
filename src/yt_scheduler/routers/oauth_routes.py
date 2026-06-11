@@ -150,12 +150,19 @@ async def linkedin_callback(code: str | None = None, state: str | None = None, e
         return _result_page(False, f"Network error contacting LinkedIn: {e}")
 
     if token_resp.status_code != 200:
-        return _result_page(False, f"Token exchange failed ({token_resp.status_code}): {token_resp.text}")
+        logger.warning(
+            "LinkedIn token exchange failed: status=%s body=%s",
+            token_resp.status_code, token_resp.text,
+        )
+        return _result_page(False, f"Token exchange failed (status {token_resp.status_code}). See server log for details.")
 
     token_data = token_resp.json()
     access_token = token_data.get("access_token")
     if not access_token:
-        return _result_page(False, f"LinkedIn response missing access_token: {token_data}")
+        # token_data can legitimately hold token material — log only its key
+        # names, never the dict, and never echo it to the browser.
+        logger.warning("LinkedIn token response missing access_token; keys=%s", sorted(token_data.keys()))
+        return _result_page(False, "LinkedIn token exchange succeeded but the response had no access_token. See server log.")
 
     # Look up Person URN via userinfo
     try:
@@ -284,13 +291,18 @@ async def threads_callback(code: str | None = None, state: str | None = None, er
         return _result_page(False, f"Network error contacting Threads: {e}", platform="threads")
 
     if short_resp.status_code != 200:
-        return _result_page(False, f"Token exchange failed ({short_resp.status_code}): {short_resp.text}", platform="threads")
+        logger.warning(
+            "Threads short-token exchange failed: status=%s body=%s",
+            short_resp.status_code, short_resp.text,
+        )
+        return _result_page(False, f"Token exchange failed (status {short_resp.status_code}). See server log for details.", platform="threads")
 
     short_data = short_resp.json()
     short_token = short_data.get("access_token")
     user_id = short_data.get("user_id")
     if not short_token:
-        return _result_page(False, f"Threads response missing access_token: {short_data}", platform="threads")
+        logger.warning("Threads token response missing access_token; keys=%s", sorted(short_data.keys()))
+        return _result_page(False, "Threads token exchange succeeded but the response had no access_token. See server log.", platform="threads")
 
     # Exchange short-lived (~1h) for long-lived (~60d)
     try:
@@ -307,7 +319,11 @@ async def threads_callback(code: str | None = None, state: str | None = None, er
         return _result_page(False, f"Network error upgrading to long-lived token: {e}", platform="threads")
 
     if long_resp.status_code != 200:
-        return _result_page(False, f"Long-lived token exchange failed ({long_resp.status_code}): {long_resp.text}", platform="threads")
+        logger.warning(
+            "Threads long-token exchange failed: status=%s body=%s",
+            long_resp.status_code, long_resp.text,
+        )
+        return _result_page(False, f"Long-lived token exchange failed (status {long_resp.status_code}). See server log for details.", platform="threads")
 
     access_token = long_resp.json().get("access_token") or short_token
 
@@ -402,12 +418,17 @@ async def threads_exchange(data: dict):
         raise HTTPException(502, f"Network error exchanging token: {e}")
 
     if long_resp.status_code != 200:
-        raise HTTPException(long_resp.status_code, f"Exchange failed: {long_resp.text}")
+        logger.warning(
+            "Threads token exchange failed: status=%s body=%s",
+            long_resp.status_code, long_resp.text,
+        )
+        raise HTTPException(long_resp.status_code, f"Token exchange failed (status {long_resp.status_code}). See server log.")
 
     long_data = long_resp.json()
     access_token = long_data.get("access_token")
     if not access_token:
-        raise HTTPException(502, f"Response missing access_token: {long_data}")
+        logger.warning("Threads token response missing access_token; keys=%s", sorted(long_data.keys()))
+        raise HTTPException(502, "Token exchange response had no access_token. See server log.")
 
     try:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -613,13 +634,18 @@ async def twitter_callback(
         return _result_page(False, f"Network error: {exc}", platform="twitter")
 
     if token_resp.status_code != 200:
-        return _result_page(False, f"Token exchange failed ({token_resp.status_code}): {token_resp.text}", platform="twitter")
+        logger.warning(
+            "Twitter token exchange failed: status=%s body=%s",
+            token_resp.status_code, token_resp.text,
+        )
+        return _result_page(False, f"Token exchange failed (status {token_resp.status_code}). See server log for details.", platform="twitter")
 
     token_data = token_resp.json()
     access_token = token_data.get("access_token")
     refresh_token = token_data.get("refresh_token", "")
     if not access_token:
-        return _result_page(False, f"Missing access_token: {token_data}", platform="twitter")
+        logger.warning("Twitter token response missing access_token; keys=%s", sorted(token_data.keys()))
+        return _result_page(False, "Twitter token exchange succeeded but the response had no access_token. See server log.", platform="twitter")
 
     # Fetch the @handle + numeric id so we can identify the account stably,
     # plus verified_type — 'blue'/'business'/'government' (anything but 'none')
@@ -729,13 +755,19 @@ async def mastodon_start(data: dict):
     except Exception as exc:
         raise HTTPException(502, f"Could not register app on {instance}: {exc}") from exc
     if register.status_code != 200:
-        raise HTTPException(register.status_code, f"App registration failed: {register.text}")
+        logger.warning(
+            "Mastodon app registration failed on %s: status=%s body=%s",
+            instance, register.status_code, register.text,
+        )
+        raise HTTPException(register.status_code, f"App registration failed (status {register.status_code}). See server log.")
 
     creds = register.json()
     client_id = creds.get("client_id")
     client_secret = creds.get("client_secret")
     if not client_id or not client_secret:
-        raise HTTPException(502, f"Mastodon registration response missing client_id/secret: {creds}")
+        # creds contains the client_secret by definition — log only key names.
+        logger.warning("Mastodon registration response missing client_id/secret; keys=%s", sorted(creds.keys()))
+        raise HTTPException(502, "Mastodon app registration response was incomplete. See server log.")
 
     _pending[state] = {
         "platform": "mastodon",
@@ -795,7 +827,11 @@ async def mastodon_callback(
     except Exception as exc:
         return _result_page(False, f"Network error: {exc}", platform="mastodon")
     if token_resp.status_code != 200:
-        return _result_page(False, f"Token exchange failed ({token_resp.status_code}): {token_resp.text}", platform="mastodon")
+        logger.warning(
+            "Mastodon token exchange failed: status=%s body=%s",
+            token_resp.status_code, token_resp.text,
+        )
+        return _result_page(False, f"Token exchange failed (status {token_resp.status_code}). See server log for details.", platform="mastodon")
 
     access_token = token_resp.json().get("access_token")
     if not access_token:
