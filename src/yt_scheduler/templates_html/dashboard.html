@@ -234,9 +234,12 @@ async function loadAvailableImports() {
         }
         const primaries = primariesResp.ok ? await primariesResp.json() : [];
         const parentOptions = ['<option value="">(none / standalone)</option>']
-            .concat(primaries.map(p =>
-                `<option value="${escapeAttr(p.id)}">${escapeAttr(p.title)}</option>`
-            )).join('');
+            .concat(primaries.map(p => {
+                const epPrefix = (p.episode_number != null && p.episode_number !== '')
+                    ? `Ep ${p.episode_number} — `
+                    : '';
+                return `<option value="${escapeAttr(p.id)}">${escapeAttr(epPrefix + p.title)}</option>`;
+            })).join('');
         container.innerHTML = items.map(v => {
             const embed = v.embeddable
                 ? `<iframe src="https://www.youtube.com/embed/${v.video_id}" frameborder="0" allowfullscreen></iframe>`
