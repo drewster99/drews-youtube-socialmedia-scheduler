@@ -38,6 +38,25 @@ SECRETS_FILE = DATA_DIR / "secrets.json"
 # index file mutations inside the public helpers.
 _secrets_file_lock = threading.Lock()
 
+# Serializes EVERY in-process Security.framework (SecKeychain*) call. Apple's
+# legacy SecKeychain* API is not safe for concurrent use from multiple threads
+# in one process: two threads inside it at once can wedge on Keychain's internal
+# object mutex and never return, freezing every caller. We hit exactly this in
+# 2026-06 — the asyncio event loop in SecKeychainAddGenericPassword (a synchronous
+# token store) and an upload worker thread in SecKeychainItemModifyAttributesAndData
+# (a YouTube credential-refresh write), both parked forever on __psynch_mutexwait,
+# which froze the whole server. Holding this lock across each framework critical
+# section guarantees only one thread is ever inside Security.framework, removing
+# the precondition for that deadlock. Reentrant so a nested framework call on the
+# same thread can't self-deadlock.
+_keychain_framework_lock = threading.RLock()
+
+# Upper bound on how long to wait for `_keychain_framework_lock` before giving up.
+# A healthy keychain op completes in well under a second; a wait longer than this
+# means the current holder is wedged, and blocking the caller (often the event
+# loop) forever is worse than a logged fallback to the CLI/file path.
+_KEYCHAIN_FRAMEWORK_LOCK_TIMEOUT_SECS = 20.0
+
 
 # --- macOS Keychain ---
 
@@ -162,49 +181,62 @@ def _keychain_set(service: str, account: str, value: str) -> bool:
 
     lib = _get_sec_lib()
     if lib is not None:
-        try:
-            status = lib.SecKeychainAddGenericPassword(
-                None,
-                len(svc_b), svc_b,
-                len(acct_b), acct_b,
-                len(val_b), val_b,
-                None,
-            )
-            if status == _ERR_SEC_DUPLICATE_ITEM:
-                # Item already exists; find it and overwrite the password data.
-                pw_len = ctypes.c_uint32(0)
-                pw_data = ctypes.c_void_p(None)
-                item_ref = ctypes.c_void_p(None)
-                find_status = lib.SecKeychainFindGenericPassword(
+        if _keychain_framework_lock.acquire(
+            timeout=_KEYCHAIN_FRAMEWORK_LOCK_TIMEOUT_SECS
+        ):
+            try:
+                status = lib.SecKeychainAddGenericPassword(
                     None,
                     len(svc_b), svc_b,
                     len(acct_b), acct_b,
-                    ctypes.byref(pw_len),
-                    ctypes.byref(pw_data),
-                    ctypes.byref(item_ref),
+                    len(val_b), val_b,
+                    None,
                 )
-                if find_status != 0:
-                    logger.warning("SecKeychainFindGenericPassword returned %d for %s/%s", find_status, service, account)
-                    return False
-                try:
-                    lib.SecKeychainItemFreeContent(None, pw_data)
-                    mod_status = lib.SecKeychainItemModifyAttributesAndData(
-                        item_ref, None, len(val_b), val_b,
+                if status == _ERR_SEC_DUPLICATE_ITEM:
+                    # Item already exists; find it and overwrite the password data.
+                    pw_len = ctypes.c_uint32(0)
+                    pw_data = ctypes.c_void_p(None)
+                    item_ref = ctypes.c_void_p(None)
+                    find_status = lib.SecKeychainFindGenericPassword(
+                        None,
+                        len(svc_b), svc_b,
+                        len(acct_b), acct_b,
+                        ctypes.byref(pw_len),
+                        ctypes.byref(pw_data),
+                        ctypes.byref(item_ref),
                     )
-                    if mod_status != 0:
-                        logger.warning("SecKeychainItemModifyAttributesAndData returned %d for %s/%s", mod_status, service, account)
+                    if find_status != 0:
+                        logger.warning("SecKeychainFindGenericPassword returned %d for %s/%s", find_status, service, account)
                         return False
-                finally:
-                    # itemRef is CF_RETURNS_RETAINED — release it so the update
-                    # path doesn't leak a keychain item ref on every refresh.
-                    _cf_release(item_ref)
-            elif status != 0:
-                logger.warning("SecKeychainAddGenericPassword returned %d for %s/%s", status, service, account)
+                    try:
+                        lib.SecKeychainItemFreeContent(None, pw_data)
+                        mod_status = lib.SecKeychainItemModifyAttributesAndData(
+                            item_ref, None, len(val_b), val_b,
+                        )
+                        if mod_status != 0:
+                            logger.warning("SecKeychainItemModifyAttributesAndData returned %d for %s/%s", mod_status, service, account)
+                            return False
+                    finally:
+                        # itemRef is CF_RETURNS_RETAINED — release it so the update
+                        # path doesn't leak a keychain item ref on every refresh.
+                        _cf_release(item_ref)
+                elif status != 0:
+                    logger.warning("SecKeychainAddGenericPassword returned %d for %s/%s", status, service, account)
+                    return False
+                return True
+            except Exception:
+                logger.exception("Security framework call failed for %s/%s", service, account)
                 return False
-            return True
-        except Exception:
-            logger.exception("Security framework call failed for %s/%s", service, account)
-            return False
+            finally:
+                _keychain_framework_lock.release()
+        else:
+            # Another framework call is wedged. Don't pile on (that's how the
+            # original deadlock spread); log and fall through to the CLI path.
+            logger.error(
+                "Keychain framework lock not acquired within %.0fs for set %s/%s; "
+                "another keychain call appears wedged — using CLI fallback",
+                _KEYCHAIN_FRAMEWORK_LOCK_TIMEOUT_SECS, service, account,
+            )
 
     # Fallback path: Security framework unavailable.
     # The secret is still on argv here — this path should never be reached on macOS.
@@ -316,28 +348,39 @@ def _keychain_get(service: str, account: str) -> str | None:
 
     lib = _get_sec_lib()
     if lib is not None:
-        try:
-            pw_len = ctypes.c_uint32(0)
-            pw_data = ctypes.c_void_p(None)
-            status = lib.SecKeychainFindGenericPassword(
-                None,
-                len(svc_b), svc_b,
-                len(acct_b), acct_b,
-                ctypes.byref(pw_len),
-                ctypes.byref(pw_data),
-                None,  # itemRef not requested → nothing retained, nothing to release
-            )
-            if status != 0:
-                # errSecItemNotFound (-25300) or any other lookup failure → absent.
-                return None
+        if _keychain_framework_lock.acquire(
+            timeout=_KEYCHAIN_FRAMEWORK_LOCK_TIMEOUT_SECS
+        ):
             try:
-                raw = ctypes.string_at(pw_data, pw_len.value) if pw_data.value else b""
+                pw_len = ctypes.c_uint32(0)
+                pw_data = ctypes.c_void_p(None)
+                status = lib.SecKeychainFindGenericPassword(
+                    None,
+                    len(svc_b), svc_b,
+                    len(acct_b), acct_b,
+                    ctypes.byref(pw_len),
+                    ctypes.byref(pw_data),
+                    None,  # itemRef not requested → nothing retained, nothing to release
+                )
+                if status != 0:
+                    # errSecItemNotFound (-25300) or any other lookup failure → absent.
+                    return None
+                try:
+                    raw = ctypes.string_at(pw_data, pw_len.value) if pw_data.value else b""
+                finally:
+                    lib.SecKeychainItemFreeContent(None, pw_data)
+                return raw.decode("utf-8")
+            except Exception:
+                logger.exception("Security framework read failed for %s/%s; trying CLI", service, account)
+                # fall through to the CLI fallback
             finally:
-                lib.SecKeychainItemFreeContent(None, pw_data)
-            return raw.decode("utf-8")
-        except Exception:
-            logger.exception("Security framework read failed for %s/%s; trying CLI", service, account)
-            # fall through to the CLI fallback
+                _keychain_framework_lock.release()
+        else:
+            logger.error(
+                "Keychain framework lock not acquired within %.0fs for get %s/%s; "
+                "another keychain call appears wedged — using CLI fallback",
+                _KEYCHAIN_FRAMEWORK_LOCK_TIMEOUT_SECS, service, account,
+            )
 
     return _keychain_get_cli(service, account)
 
