@@ -18,6 +18,8 @@ import platform
 import re
 import subprocess
 import tempfile
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -367,6 +369,11 @@ import CoreMedia
 
 func log(_ s: String) { FileHandle.standardError.write(Data("[apple-speech] \\(s)\\n".utf8)) }
 
+// Progress marker parsed by the Python side: finalized audio seconds + total.
+func progress(_ done: Double, _ total: Double) {
+    FileHandle.standardError.write(Data("[apple-speech] @@PROGRESS@@ \\(done) \\(total)\\n".utf8))
+}
+
 let env = ProcessInfo.processInfo.environment
 guard let audioPath = env["SPEECH_AUDIO_PATH"], !audioPath.isEmpty else {
     log("ERROR: SPEECH_AUDIO_PATH not set"); exit(1)
@@ -411,15 +418,27 @@ func run() async throws {
     let analyzer = SpeechAnalyzer(modules: [transcriber])
     let audioFile = try AVAudioFile(forReading: URL(fileURLWithPath: audioPath))
 
+    let sampleRate = audioFile.fileFormat.sampleRate
+    let totalSeconds = sampleRate > 0 ? Double(audioFile.length) / sampleRate : 0.0
+    progress(0.0, totalSeconds)
+
     let collector = Task { () -> [[String: Any]] in
         var words: [[String: Any]] = []
+        var lastEmitted = -1.0
         for try await result in transcriber.results {
             let attr = result.text
             for run in attr.runs {
                 guard let range = run.audioTimeRange else { continue }
                 let word = String(attr[run.range].characters)
                 if word.trimmingCharacters(in: .whitespaces).isEmpty { continue }
-                words.append(["start": range.start.seconds, "end": range.end.seconds, "word": word])
+                let endSec = range.end.seconds
+                words.append(["start": range.start.seconds, "end": endSec, "word": word])
+                // Emit progress as finalized audio advances; throttled so a
+                // burst of short words doesn't flood stderr.
+                if endSec - lastEmitted >= 0.5 {
+                    progress(endSec, totalSeconds)
+                    lastEmitted = endSec
+                }
             }
         }
         return words
@@ -520,13 +539,46 @@ def _macos_words_to_segments(raw_words: list[dict]) -> list[TranscriptSegment]:
     return segments
 
 
-def _try_macos_speech(audio_path: Path, language: str | None) -> TranscriptionResult | None:
+# Progress markers the SpeechAnalyzer helper writes to stderr, e.g.
+# "[apple-speech] @@PROGRESS@@ 12.5 240.0" (finalized seconds, total seconds).
+_SPEECH_PROGRESS_RE = re.compile(r"@@PROGRESS@@\s+([0-9.]+)\s+([0-9.]+)")
+
+
+def _parse_speech_progress(line: str) -> tuple[float, float] | None:
+    """Parse a SpeechAnalyzer progress marker into ``(finalized, total)`` seconds.
+
+    Returns ``None`` for any non-progress line or unparseable/garbage numbers, so
+    the caller treats it as ordinary diagnostic output instead of progress.
+    """
+    match = _SPEECH_PROGRESS_RE.search(line)
+    if match is None:
+        return None
+    try:
+        done = float(match.group(1))
+        total = float(match.group(2))
+    except ValueError:
+        return None
+    if not (math.isfinite(done) and math.isfinite(total)):
+        return None
+    return (done, total)
+
+
+def _try_macos_speech(
+    audio_path: Path,
+    language: str | None,
+    progress_callback: Callable[[float, float], None] | None = None,
+) -> TranscriptionResult | None:
     """Transcribe with Apple's on-device Speech framework.
 
     Uses the macOS 26 ``SpeechAnalyzer`` / ``SpeechTranscriber`` API (NOT the
     legacy ``SFSpeechRecognizer``). The modern API transcribes long-form audio in
     one pass — no sliding-window truncation — and exposes per-word timing via the
     ``.audioTimeRange`` attribute, which we surface as ``TranscriptWord`` stamps.
+
+    ``progress_callback``: when given, invoked as ``(finalized_seconds,
+    total_seconds)`` each time the helper reports how far into the audio it has
+    finalized, so the caller can render real progress. Runs on this thread (the
+    one driving the subprocess); keep it cheap and non-blocking.
     """
     if platform.system() != "Darwin":
         return None
@@ -547,45 +599,117 @@ def _try_macos_speech(audio_path: Path, language: str | None) -> TranscriptionRe
     # interpolating them into Swift source, so no filesystem path character
     # or locale string can break out of a string literal in the generated code.
     child_env = {**os.environ, "SPEECH_AUDIO_PATH": str(audio_path), "SPEECH_LOCALE_ID": locale}
+    timeout_secs = _macos_speech_timeout_seconds(audio_path)
 
+    # Stream rather than buffer-until-exit (the old subprocess.run) so progress
+    # markers on stderr reach the caller live. stdout (the JSON word list) is
+    # drained on its own thread so a large payload can't deadlock the pipe while
+    # we read stderr line-by-line; a watchdog timer enforces the same
+    # audio-proportional timeout the buffered call had.
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             ["swift", "-"],
-            input=swift_code,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=_macos_speech_timeout_seconds(audio_path),
             env=child_env,
         )
-
-        if result.stderr:
-            for line in result.stderr.splitlines():
-                if line.strip():
-                    logger.info("SpeechAnalyzer: %s", line)
-
-        if result.returncode != 0:
-            logger.warning("SpeechAnalyzer exited rc=%s: %s", result.returncode, result.stderr[-400:])
-            return None
-
-        raw_words = json.loads(result.stdout.strip() or "[]")
-        if not raw_words:
-            logger.warning("SpeechAnalyzer returned no words")
-            return None
-
-        segments = _macos_words_to_segments(raw_words)
-        return TranscriptionResult(
-            segments=segments,
-            backend="macos-speech",
-            language=locale,
-            has_word_timestamps=True,
-        )
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError, OSError) as e:
-        # Environmental failures (helper not installed, timeout, bad JSON) mean
-        # "backend unavailable" — return None so the auto chain tries the next.
-        # A programming error is NOT caught here: it propagates with a traceback
-        # rather than masquerading as "backend unavailable".
+    except (FileNotFoundError, OSError) as e:
         logger.warning("SpeechAnalyzer unavailable: %s: %s", type(e).__name__, e)
         return None
+
+    stdout_chunks: list[str] = []
+
+    def _drain_stdout() -> None:
+        try:
+            if proc.stdout is not None:
+                stdout_chunks.append(proc.stdout.read())
+        except (OSError, ValueError):
+            pass
+
+    out_thread = threading.Thread(
+        target=_drain_stdout, name="apple-speech-stdout", daemon=True
+    )
+
+    timed_out = threading.Event()
+
+    def _kill_on_timeout() -> None:
+        timed_out.set()
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+    timer = threading.Timer(timeout_secs, _kill_on_timeout)
+
+    stderr_tail: list[str] = []
+    rc: int | None = None
+    try:
+        timer.start()
+        out_thread.start()
+        try:
+            if proc.stdin is not None:
+                proc.stdin.write(swift_code)
+                proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+        if proc.stderr is not None:
+            for raw in proc.stderr:
+                line = raw.rstrip("\n")
+                if not line:
+                    continue
+                parsed = _parse_speech_progress(line)
+                if parsed is not None:
+                    if progress_callback is not None:
+                        try:
+                            progress_callback(parsed[0], parsed[1])
+                        except Exception:
+                            logger.exception("SpeechAnalyzer progress callback raised")
+                    continue
+                logger.info("SpeechAnalyzer: %s", line)
+                stderr_tail.append(line)
+                if len(stderr_tail) > 20:
+                    stderr_tail.pop(0)
+
+        rc = proc.wait()
+    finally:
+        timer.cancel()
+        out_thread.join(timeout=10)
+        if proc.poll() is None:
+            # Loop exited without the child being reaped — don't leak it.
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.wait()
+
+    if timed_out.is_set():
+        logger.warning("SpeechAnalyzer timed out after %ss", timeout_secs)
+        return None
+    if rc != 0:
+        logger.warning(
+            "SpeechAnalyzer exited rc=%s: %s", rc, " | ".join(stderr_tail[-5:])
+        )
+        return None
+
+    try:
+        raw_words = json.loads("".join(stdout_chunks).strip() or "[]")
+    except json.JSONDecodeError as e:
+        logger.warning("SpeechAnalyzer unavailable: %s: %s", type(e).__name__, e)
+        return None
+    if not raw_words:
+        logger.warning("SpeechAnalyzer returned no words")
+        return None
+
+    segments = _macos_words_to_segments(raw_words)
+    return TranscriptionResult(
+        segments=segments,
+        backend="macos-speech",
+        language=locale,
+        has_word_timestamps=True,
+    )
 
 
 # --- Public API ---
@@ -600,6 +724,7 @@ def transcribe(
     model: str = DEFAULT_MODEL,
     language: str | None = None,
     backend: str | None = None,
+    progress_callback: Callable[[float, float], None] | None = None,
 ) -> TranscriptionResult:
     """Transcribe a video file.
 
@@ -609,6 +734,9 @@ def transcribe(
         language: Language code (e.g., "en"). None for auto-detect.
         backend: Force a specific backend. None for auto-detect order:
                  mlx-whisper → whisper.cpp → macos-speech
+        progress_callback: Optional ``(finalized_seconds, total_seconds)`` hook
+                 for live progress. Only the ``macos-speech`` backend reports it;
+                 the Whisper backends ignore it.
 
     Returns:
         TranscriptionResult with segments, timestamps, and text.
@@ -635,7 +763,7 @@ def transcribe(
         backends = [
             ("mlx-whisper", lambda: _try_mlx_whisper(audio_path, model, language)),
             ("whisper.cpp", lambda: _try_whisper_cpp(audio_path, model, language)),
-            ("macos-speech", lambda: _try_macos_speech(audio_path, language)),
+            ("macos-speech", lambda: _try_macos_speech(audio_path, language, progress_callback)),
         ]
 
         if backend:

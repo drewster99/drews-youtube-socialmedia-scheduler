@@ -1530,12 +1530,24 @@ async def _run_generate_job(job_id: str) -> None:
         job["progress_message"] = "Transcribing on-device (Apple Speech)…"
         from yt_scheduler.services import transcription
 
+        def _on_transcribe_progress(done_seconds: float, total_seconds: float) -> None:
+            # Runs on the transcription worker thread; a dict assignment is the
+            # only shared-state write and is atomic under the GIL, so the polling
+            # endpoint reads a consistent message. Bakes the percent into the
+            # existing progress_message channel — no route/UI change needed.
+            if total_seconds > 0:
+                pct = max(0, min(100, int(round(done_seconds / total_seconds * 100))))
+                job["progress_message"] = (
+                    f"Transcribing on-device (Apple Speech)… {pct}%"
+                )
+
         try:
             result = await asyncio.to_thread(
                 transcription.transcribe,
                 video_path=job["parent_video_path"],
                 backend="macos-speech",
                 language="en",
+                progress_callback=_on_transcribe_progress,
             )
         except Exception as exc:
             logger.warning(
