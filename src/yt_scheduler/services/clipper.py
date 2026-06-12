@@ -632,11 +632,14 @@ def _get_hardware_cut_semaphore() -> asyncio.Semaphore:
 #   install. With single-user usage and one Generate per parent video,
 #   even a one-hour TTL keeps the dict to maybe a dozen entries.
 #
-# 30 minutes is the compromise: covers slow review without bloating
-# memory. _evict_stale_generate_jobs runs on every read/write of the
-# dict, so no separate timer is needed.
+# 6 hours: a leisurely review (and stepping away from it) must NOT evict the
+# job and delete the preview files out from under the still-open review page,
+# which would leave the proposal cards showing empty/404 video players. The dict
+# stays tiny on single-user usage, so the generous window costs nothing.
+# _evict_stale_generate_jobs runs on every read/write of the dict, so no
+# separate timer is needed.
 _GENERATE_JOBS: dict[str, dict] = {}
-_GENERATE_JOB_TTL_SECONDS: float = 30 * 60  # 30 minutes
+_GENERATE_JOB_TTL_SECONDS: float = 6 * 60 * 60  # 6 hours
 
 
 def _evict_stale_generate_jobs() -> None:
