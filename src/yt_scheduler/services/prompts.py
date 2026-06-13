@@ -18,7 +18,7 @@ import json
 from dataclasses import dataclass
 from typing import Iterable
 
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 
 
 class EmptyPromptBodyError(ValueError):
@@ -597,20 +597,19 @@ async def upsert_prompt_template(
     string only when you want to suppress the system prompt entirely
     (which the UI offers as "Clear system prompt" — distinct from "reset").
     """
-    db = await get_db()
-    cursor = await db.execute(
-        """
-        INSERT INTO prompt_templates (
-            project_id, key, name, body, system_body, applies_to
-        ) VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(project_id, key) DO UPDATE SET
-            name        = excluded.name,
-            body        = excluded.body,
-            system_body = excluded.system_body,
-            applies_to  = excluded.applies_to,
-            updated_at  = datetime('now')
-        """,
-        (project_id, key, name, body, system, json.dumps(list(applies_to))),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO prompt_templates (
+                project_id, key, name, body, system_body, applies_to
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, key) DO UPDATE SET
+                name        = excluded.name,
+                body        = excluded.body,
+                system_body = excluded.system_body,
+                applies_to  = excluded.applies_to,
+                updated_at  = datetime('now')
+            """,
+            (project_id, key, name, body, system, json.dumps(list(applies_to))),
+        )
     return int(cursor.lastrowid or 0)

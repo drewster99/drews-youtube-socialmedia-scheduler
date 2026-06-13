@@ -11,7 +11,7 @@ import json
 import math
 from typing import Any
 
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 
 # Defaults expressed as Python objects; serialised to JSON when stored.
 AUTO_ACTION_DEFAULTS_UPLOAD = {
@@ -74,13 +74,12 @@ async def get_setting(project_id: int, key: str) -> str | None:
 
 
 async def set_setting(project_id: int, key: str, value: str) -> None:
-    db = await get_db()
-    await db.execute(
-        "INSERT INTO project_settings (project_id, key, value) VALUES (?, ?, ?) "
-        "ON CONFLICT(project_id, key) DO UPDATE SET value = excluded.value",
-        (project_id, key, value),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "INSERT INTO project_settings (project_id, key, value) VALUES (?, ?, ?) "
+            "ON CONFLICT(project_id, key) DO UPDATE SET value = excluded.value",
+            (project_id, key, value),
+        )
 
 
 async def get_json(project_id: int, key: str, default: Any = None) -> Any:

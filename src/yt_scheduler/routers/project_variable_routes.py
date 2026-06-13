@@ -10,7 +10,7 @@ import re
 
 from fastapi import APIRouter, HTTPException
 
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.services import projects as project_service
 
 router = APIRouter(
@@ -58,14 +58,13 @@ async def upsert_project_variable(slug: str, key: str, payload: dict) -> dict:
     if not isinstance(value, str):
         raise HTTPException(400, "'value' must be a string.")
     project_id = await _resolve_project_id(slug)
-    db = await get_db()
-    await db.execute(
-        "INSERT INTO project_variables (project_id, key, value) VALUES (?, ?, ?) "
-        "ON CONFLICT(project_id, key) DO UPDATE SET "
-        "  value = excluded.value, updated_at = datetime('now')",
-        (project_id, key, value),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "INSERT INTO project_variables (project_id, key, value) VALUES (?, ?, ?) "
+            "ON CONFLICT(project_id, key) DO UPDATE SET "
+            "  value = excluded.value, updated_at = datetime('now')",
+            (project_id, key, value),
+        )
     rows = await db.execute_fetchall(
         "SELECT id, key, value, created_at, updated_at FROM project_variables "
         "WHERE project_id = ? AND key = ?",
@@ -79,10 +78,9 @@ async def upsert_project_variable(slug: str, key: str, payload: dict) -> dict:
 @router.delete("/{key}")
 async def delete_project_variable(slug: str, key: str) -> dict:
     project_id = await _resolve_project_id(slug)
-    db = await get_db()
-    await db.execute(
-        "DELETE FROM project_variables WHERE project_id = ? AND key = ?",
-        (project_id, key),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "DELETE FROM project_variables WHERE project_id = ? AND key = ?",
+            (project_id, key),
+        )
     return {"status": "ok"}

@@ -22,19 +22,18 @@ from __future__ import annotations
 import json
 from typing import Any, Iterable
 
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 
 EventType = str  # See module docstring for the canonical set.
 
 
 async def record_event(video_id: str, type: EventType, payload: dict | None = None) -> int:
     """Record a single event row; returns its id."""
-    db = await get_db()
-    cursor = await db.execute(
-        "INSERT INTO video_events (video_id, type, payload_json) VALUES (?, ?, ?)",
-        (video_id, type, json.dumps(payload or {})),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            "INSERT INTO video_events (video_id, type, payload_json) VALUES (?, ?, ?)",
+            (video_id, type, json.dumps(payload or {})),
+        )
     return int(cursor.lastrowid)
 
 

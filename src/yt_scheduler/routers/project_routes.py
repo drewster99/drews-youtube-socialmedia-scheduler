@@ -385,23 +385,22 @@ async def set_social_default(slug: str, platform: str, payload: dict) -> dict:
                 f"Credential platform '{cred['platform']}' does not match path '{platform}'",
             )
 
-    from yt_scheduler.database import get_db
+    from yt_scheduler.database import write_transaction
 
-    db = await get_db()
-    if sa_id is None:
-        await db.execute(
-            "DELETE FROM project_social_defaults "
-            "WHERE project_id = ? AND platform = ?",
-            (project["id"], platform),
-        )
-    else:
-        await db.execute(
-            "INSERT INTO project_social_defaults (project_id, platform, social_account_id) "
-            "VALUES (?, ?, ?) "
-            "ON CONFLICT(project_id, platform) DO UPDATE SET social_account_id = excluded.social_account_id",
-            (project["id"], platform, sa_id),
-        )
-    await db.commit()
+    async with write_transaction() as db:
+        if sa_id is None:
+            await db.execute(
+                "DELETE FROM project_social_defaults "
+                "WHERE project_id = ? AND platform = ?",
+                (project["id"], platform),
+            )
+        else:
+            await db.execute(
+                "INSERT INTO project_social_defaults (project_id, platform, social_account_id) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(project_id, platform) DO UPDATE SET social_account_id = excluded.social_account_id",
+                (project["id"], platform, sa_id),
+            )
     return await get_social_defaults(slug)
 
 
@@ -475,7 +474,7 @@ async def refresh_channel_url(slug: str) -> dict:
     bind, which only seeds ``project_url`` when NULL.
     """
     from googleapiclient.discovery import build
-    from yt_scheduler.database import get_db
+    from yt_scheduler.database import write_transaction
     from yt_scheduler.services import youtube as yt_service
     from yt_scheduler.services.auth import get_credentials, is_authenticated
 
@@ -512,12 +511,11 @@ async def refresh_channel_url(slug: str) -> dict:
     handle = snippet.get("customUrl") or ""
     new_url = yt_service.compose_channel_url(handle, project["youtube_channel_id"])
 
-    db = await get_db()
-    await db.execute(
-        "UPDATE projects SET project_url = ?, updated_at = datetime('now') WHERE id = ?",
-        (new_url, project["id"]),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE projects SET project_url = ?, updated_at = datetime('now') WHERE id = ?",
+            (new_url, project["id"]),
+        )
 
     return {"project_url": new_url, "channel_handle": handle}
 

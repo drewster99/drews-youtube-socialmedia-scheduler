@@ -12,7 +12,7 @@ import re
 
 from fastapi import APIRouter, HTTPException
 
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 
 router = APIRouter(prefix="/api/global-variables", tags=["global-variables"])
 
@@ -50,14 +50,13 @@ async def upsert_global(key: str, payload: dict) -> dict:
     value = payload.get("value")
     if not isinstance(value, str):
         raise HTTPException(400, "'value' must be a string.")
-    db = await get_db()
-    await db.execute(
-        "INSERT INTO global_variables (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET "
-        "  value = excluded.value, updated_at = datetime('now')",
-        (key, value),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "INSERT INTO global_variables (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "  value = excluded.value, updated_at = datetime('now')",
+            (key, value),
+        )
     rows = await db.execute_fetchall(
         "SELECT id, key, value, created_at, updated_at FROM global_variables "
         "WHERE key = ?",
@@ -70,7 +69,6 @@ async def upsert_global(key: str, payload: dict) -> dict:
 
 @router.delete("/{key}")
 async def delete_global(key: str) -> dict:
-    db = await get_db()
-    await db.execute("DELETE FROM global_variables WHERE key = ?", (key,))
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute("DELETE FROM global_variables WHERE key = ?", (key,))
     return {"status": "ok"}

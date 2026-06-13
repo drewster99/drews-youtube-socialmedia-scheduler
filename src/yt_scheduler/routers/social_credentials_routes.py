@@ -86,12 +86,11 @@ async def refresh_credential_username(uuid: str):
     if not new_username or new_username == cred["username"]:
         return {"changed": False, "username": cred["username"]}
 
-    from yt_scheduler.database import get_db
+    from yt_scheduler.database import write_transaction
 
-    db = await get_db()
-    await db.execute(
-        "UPDATE social_accounts SET username = ? WHERE uuid = ?",
-        (new_username, uuid),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE social_accounts SET username = ? WHERE uuid = ?",
+            (new_username, uuid),
+        )
     return {"changed": True, "username": new_username}
