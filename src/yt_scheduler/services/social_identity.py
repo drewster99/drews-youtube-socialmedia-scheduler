@@ -124,7 +124,7 @@ async def upsert_social_account(platform: str, *, project_id: int) -> int | None
     ``social_accounts`` (and link it to the given project) so the per-project
     UX can list real accounts. Returns the social_account id, or None if the
     platform has no credentials."""
-    from yt_scheduler.database import get_db
+    from yt_scheduler.database import write_transaction
     from yt_scheduler.services.social import get_poster
 
     poster = get_poster(platform)
@@ -133,28 +133,28 @@ async def upsert_social_account(platform: str, *, project_id: int) -> int | None
 
     username = await resolve_username(platform) or platform  # last-ditch fallback
 
-    db = await get_db()
-    cursor = await db.execute(
-        "SELECT id FROM social_accounts WHERE platform = ? AND username = ?",
-        (platform, username),
-    )
-    row = await cursor.fetchone()
-    if row is not None:
-        account_id = int(row[0])
-    else:
+    # resolve_username (network) is done above, outside the lock. The whole
+    # find-or-create + project-attach is one atomic critical section.
+    async with write_transaction() as db:
         cursor = await db.execute(
-            "INSERT INTO social_accounts (platform, username, credentials_ref) "
-            "VALUES (?, ?, ?)",
-            (platform, username, f"{platform}:{username}"),
+            "SELECT id FROM social_accounts WHERE platform = ? AND username = ?",
+            (platform, username),
         )
-        await db.commit()
-        account_id = int(cursor.lastrowid)
+        row = await cursor.fetchone()
+        if row is not None:
+            account_id = int(row[0])
+        else:
+            cursor = await db.execute(
+                "INSERT INTO social_accounts (platform, username, credentials_ref) "
+                "VALUES (?, ?, ?)",
+                (platform, username, f"{platform}:{username}"),
+            )
+            account_id = int(cursor.lastrowid)
 
-    # Attach to the requested project (idempotent)
-    await db.execute(
-        "INSERT OR IGNORE INTO project_social_accounts (project_id, social_account_id) "
-        "VALUES (?, ?)",
-        (project_id, account_id),
-    )
-    await db.commit()
+        # Attach to the requested project (idempotent)
+        await db.execute(
+            "INSERT OR IGNORE INTO project_social_accounts (project_id, social_account_id) "
+            "VALUES (?, ?)",
+            (project_id, account_id),
+        )
     return account_id

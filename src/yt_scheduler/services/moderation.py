@@ -6,7 +6,7 @@ import asyncio
 import logging
 import re
 
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.services import youtube
 
 logger = logging.getLogger(__name__)
@@ -38,23 +38,21 @@ async def add_keyword(keyword: str, *, is_regex: bool = False, project_id: int) 
         except re.error as exc:
             raise ValueError(f"Invalid regex pattern: {exc}") from exc
 
-    db = await get_db()
-    await db.execute(
-        "INSERT OR IGNORE INTO blocklist (project_id, keyword, is_regex) "
-        "VALUES (?, ?, ?)",
-        (project_id, keyword, int(is_regex)),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO blocklist (project_id, keyword, is_regex) "
+            "VALUES (?, ?, ?)",
+            (project_id, keyword, int(is_regex)),
+        )
 
 
 async def remove_keyword(keyword_id: int, project_id: int) -> None:
     """Remove a keyword from a project's blocklist."""
-    db = await get_db()
-    await db.execute(
-        "DELETE FROM blocklist WHERE id = ? AND project_id = ?",
-        (keyword_id, project_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "DELETE FROM blocklist WHERE id = ? AND project_id = ?",
+            (keyword_id, project_id),
+        )
 
 
 def _matches_blocklist_sync(text: str, blocklist: list[dict]) -> str | None:
@@ -136,7 +134,9 @@ async def check_video_comments(video_id: str, *, project_id: int, blocklist: lis
                 await _process_one(db, project_id, video_id, reply, blocklist)
             )
 
-    await db.commit()
+    # Each _process_one self-commits its own moderation_log row (right after the
+    # YouTube moderate call), so the log always reflects exactly what was acted
+    # on even if the loop is interrupted. No batch commit here.
     return actions
 
 
@@ -177,13 +177,15 @@ async def _process_one(
         action = "error"
         error = f"{type(exc).__name__}: {exc}"
     # Log the attempt either way so the user can see why moderation 'didn't
-    # work' — silently swallowing the failure was the historical bug.
-    await db.execute(
-        """INSERT INTO moderation_log
-        (project_id, video_id, comment_id, author, comment_text, matched_keyword, action)
-        VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (project_id, video_id, comment_id, author, text[:500], matched, action),
-    )
+    # work' — silently swallowing the failure was the historical bug. The
+    # YouTube moderate call (above) is already done, OUTSIDE this transaction.
+    async with write_transaction() as wdb:
+        await wdb.execute(
+            """INSERT INTO moderation_log
+            (project_id, video_id, comment_id, author, comment_text, matched_keyword, action)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (project_id, video_id, comment_id, author, text[:500], matched, action),
+        )
     return [{
         "comment_id": comment_id,
         "author": author,

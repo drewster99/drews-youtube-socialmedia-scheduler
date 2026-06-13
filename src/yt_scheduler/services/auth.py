@@ -405,7 +405,7 @@ async def backfill_channel_ids() -> None:
     credentials, resolve the channel id and stamp it. Refuses to assign a
     channel id that's already claimed by another project — those projects
     are left ``NULL`` and the UI will prompt re-auth."""
-    from yt_scheduler.database import get_db
+    from yt_scheduler.database import get_db, write_transaction
 
     db = await get_db()
     cursor = await db.execute(
@@ -445,12 +445,12 @@ async def backfill_channel_ids() -> None:
             )
             continue
 
-        await db.execute(
-            "UPDATE projects SET youtube_channel_id = ?, updated_at = datetime('now') "
-            "WHERE id = ?",
-            (channel_id, project["id"]),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE projects SET youtube_channel_id = ?, updated_at = datetime('now') "
+                "WHERE id = ?",
+                (channel_id, project["id"]),
+            )
         logger.info("Stamped project %s with YouTube channel %s", slug, channel_id)
 
 
@@ -460,7 +460,7 @@ async def backfill_channel_assets() -> None:
     one of the URL columns is NULL — once cached, there's no automatic
     refresh path; the user can clear and re-auth to refresh, or we can
     add an explicit "refresh assets" button later."""
-    from yt_scheduler.database import get_db
+    from yt_scheduler.database import get_db, write_transaction
     from yt_scheduler.services import youtube as _youtube
 
     db = await get_db()
@@ -489,10 +489,10 @@ async def backfill_channel_assets() -> None:
             banner = assets.get("banner_url") or project["channel_banner_url"]
             if not thumb and not banner:
                 continue
-            await db.execute(
-                "UPDATE projects SET channel_thumbnail_url = ?, "
-                "channel_banner_url = ?, updated_at = datetime('now') WHERE id = ?",
-                (thumb, banner, project["id"]),
-            )
-            await db.commit()
+            async with write_transaction() as db:
+                await db.execute(
+                    "UPDATE projects SET channel_thumbnail_url = ?, "
+                    "channel_banner_url = ?, updated_at = datetime('now') WHERE id = ?",
+                    (thumb, banner, project["id"]),
+                )
             logger.info("Cached channel assets for project %s", slug)

@@ -1353,55 +1353,53 @@ async def store_rejections(
     Returns the count of entries actually written (rows where the
     required fields were valid).
     """
-    from yt_scheduler.database import get_db
+    from yt_scheduler.database import write_transaction
 
     if not rejected:
         return 0
-    db = await get_db()
     written = 0
-    for entry in rejected:
-        if not isinstance(entry, dict):
-            continue
-        kind = entry.get("kind")
-        if kind not in ("hook", "short", "segment"):
-            continue
-        try:
-            start = float(entry["start_seconds"])
-            end = float(entry["end_seconds"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        # Same defensive non-finite guard the cut path uses.
-        if not (math.isfinite(start) and math.isfinite(end)):
-            continue
-        if end <= start:
-            continue
+    async with write_transaction() as db:
+        for entry in rejected:
+            if not isinstance(entry, dict):
+                continue
+            kind = entry.get("kind")
+            if kind not in ("hook", "short", "segment"):
+                continue
+            try:
+                start = float(entry["start_seconds"])
+                end = float(entry["end_seconds"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            # Same defensive non-finite guard the cut path uses.
+            if not (math.isfinite(start) and math.isfinite(end)):
+                continue
+            if end <= start:
+                continue
 
-        await db.execute(
-            """INSERT INTO generate_rejections (
-                parent_id, project_id, kind, start_seconds, end_seconds,
-                title, reason, x_shift_normalized,
-                crop_classification, crop_confidence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(parent_id, project_id, kind, start_seconds, end_seconds)
-            DO UPDATE SET
-                title = excluded.title,
-                reason = excluded.reason,
-                x_shift_normalized = excluded.x_shift_normalized,
-                crop_classification = excluded.crop_classification,
-                crop_confidence = excluded.crop_confidence,
-                rejected_at = datetime('now')""",
-            (
-                parent_id, project_id, kind, start, end,
-                str(entry.get("title") or "").strip() or None,
-                str(entry.get("reason") or "").strip() or None,
-                _maybe_float(entry.get("x_shift_normalized")),
-                _maybe_str(entry.get("crop_classification")),
-                _maybe_float(entry.get("crop_confidence")),
-            ),
-        )
-        written += 1
-    if written:
-        await db.commit()
+            await db.execute(
+                """INSERT INTO generate_rejections (
+                    parent_id, project_id, kind, start_seconds, end_seconds,
+                    title, reason, x_shift_normalized,
+                    crop_classification, crop_confidence
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(parent_id, project_id, kind, start_seconds, end_seconds)
+                DO UPDATE SET
+                    title = excluded.title,
+                    reason = excluded.reason,
+                    x_shift_normalized = excluded.x_shift_normalized,
+                    crop_classification = excluded.crop_classification,
+                    crop_confidence = excluded.crop_confidence,
+                    rejected_at = datetime('now')""",
+                (
+                    parent_id, project_id, kind, start, end,
+                    str(entry.get("title") or "").strip() or None,
+                    str(entry.get("reason") or "").strip() or None,
+                    _maybe_float(entry.get("x_shift_normalized")),
+                    _maybe_str(entry.get("crop_classification")),
+                    _maybe_float(entry.get("crop_confidence")),
+                ),
+            )
+            written += 1
     return written
 
 
@@ -1446,13 +1444,12 @@ async def delete_rejection(*, rejection_id: int) -> bool:
     existed); False when the id was unknown. The caller's HTTP layer
     can map that to a 404 if it wants strictness, or just shrug.
     """
-    from yt_scheduler.database import get_db
+    from yt_scheduler.database import write_transaction
 
-    db = await get_db()
-    cursor = await db.execute(
-        "DELETE FROM generate_rejections WHERE id = ?", (int(rejection_id),),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            "DELETE FROM generate_rejections WHERE id = ?", (int(rejection_id),),
+        )
     return bool(cursor.rowcount)
 
 

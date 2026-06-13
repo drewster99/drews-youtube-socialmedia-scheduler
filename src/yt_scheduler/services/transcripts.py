@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 
 
 _SRT_TIMESTAMP_RE = re.compile(
@@ -186,13 +186,12 @@ async def add_transcript(
         raise ValueError(f"Invalid transcript source: {source}")
     if not text.strip():
         raise ValueError("Transcript text is required")
-    db = await get_db()
-    cursor = await db.execute(
-        "INSERT INTO transcripts (video_id, source, source_detail, text) "
-        "VALUES (?, ?, ?, ?)",
-        (video_id, source, source_detail, text),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            "INSERT INTO transcripts (video_id, source, source_detail, text) "
+            "VALUES (?, ?, ?, ?)",
+            (video_id, source, source_detail, text),
+        )
     return int(cursor.lastrowid)
 
 
@@ -209,20 +208,19 @@ async def upsert_transcript_for_source(
     duplicate rows. The matching rule is exact ``(video_id, source,
     source_detail)``.
     """
-    db = await get_db()
-    cursor = await db.execute(
-        "SELECT id FROM transcripts "
-        "WHERE video_id = ? AND source = ? AND COALESCE(source_detail, '') = COALESCE(?, '')",
-        (video_id, source, source_detail),
-    )
-    row = await cursor.fetchone()
-    if row is not None:
-        await db.execute(
-            "UPDATE transcripts SET text = ?, created_at = datetime('now') WHERE id = ?",
-            (text, int(row[0])),
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            "SELECT id FROM transcripts "
+            "WHERE video_id = ? AND source = ? AND COALESCE(source_detail, '') = COALESCE(?, '')",
+            (video_id, source, source_detail),
         )
-        await db.commit()
-        return int(row[0])
+        row = await cursor.fetchone()
+        if row is not None:
+            await db.execute(
+                "UPDATE transcripts SET text = ?, created_at = datetime('now') WHERE id = ?",
+                (text, int(row[0])),
+            )
+            return int(row[0])
     return await add_transcript(video_id, source, text, source_detail=source_detail)
 
 
@@ -250,29 +248,28 @@ async def set_active_transcript(
     if transcript["video_id"] != video_id:
         raise ValueError("Transcript does not belong to this video")
 
-    db = await get_db()
-    await db.execute(
-        """
-        UPDATE videos SET
-            transcript = ?,
-            transcript_id = ?,
-            transcript_source = ?,
-            transcript_created_at = COALESCE(transcript_created_at, ?),
-            transcript_updated_at = datetime('now'),
-            transcript_is_edited = ?,
-            updated_at = datetime('now')
-        WHERE id = ?
-        """,
-        (
-            text,
-            transcript_id,
-            transcript["source"],
-            transcript["created_at"],
-            1 if is_edited else 0,
-            video_id,
-        ),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            """
+            UPDATE videos SET
+                transcript = ?,
+                transcript_id = ?,
+                transcript_source = ?,
+                transcript_created_at = COALESCE(transcript_created_at, ?),
+                transcript_updated_at = datetime('now'),
+                transcript_is_edited = ?,
+                updated_at = datetime('now')
+            WHERE id = ?
+            """,
+            (
+                text,
+                transcript_id,
+                transcript["source"],
+                transcript["created_at"],
+                1 if is_edited else 0,
+                video_id,
+            ),
+        )
     # When the active transcript text was edited away from any source, also
     # persist that edit as a user_edited transcript row so it survives a
     # subsequent re-selection of a different source. The source row may not
@@ -280,12 +277,12 @@ async def set_active_transcript(
     # user_edited row separately rather than trying to UPDATE by transcript_id.
     if is_edited:
         await ensure_user_edited_row(video_id, text)
-        await db.execute(
-            "UPDATE transcripts SET text = ?, created_at = datetime('now') "
-            "WHERE video_id = ? AND source = 'user_edited'",
-            (text, video_id),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE transcripts SET text = ?, created_at = datetime('now') "
+                "WHERE video_id = ? AND source = 'user_edited'",
+                (text, video_id),
+            )
 
     rows = await db.execute_fetchall(
         "SELECT transcript_id, transcript_source, transcript_created_at, "
