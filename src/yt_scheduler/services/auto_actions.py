@@ -701,6 +701,71 @@ def get_upload_job(job_id: str) -> dict | None:
     return {k: v for k, v in job.items() if k in public_keys}
 
 
+async def _persist_pending_promo_job(job: dict) -> None:
+    """Record a pre-INSERT promo job to ``pending_promo_jobs`` so a restart can
+    resume it (the in-memory ``_UPLOAD_JOBS`` entry dies with the process).
+
+    Best-effort: a tracking write must never abort the chain it's tracking, so
+    failures are logged and swallowed — the job then merely lacks restart
+    survival, which is the pre-migration-030 behaviour."""
+    try:
+        db = await get_db()
+        await db.execute(
+            """INSERT INTO pending_promo_jobs (
+                job_id, project_id, parent_id, forced_item_type, original_filename,
+                title, parent_video_path, local_path,
+                cut_start_seconds, cut_end_seconds, vertical_crop,
+                x_shift_normalized, audio_fade_in, audio_fade_out,
+                status, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', datetime('now'))""",
+            (
+                job["job_id"], int(job["project_id"]), job.get("parent_id"),
+                job.get("forced_item_type"), job.get("filename"),
+                job.get("pre_supplied_title") or job.get("title"),
+                job.get("parent_video_path"), job.get("local_path"),
+                job.get("cut_start_seconds"), job.get("cut_end_seconds"),
+                1 if job.get("vertical_crop") else 0,
+                float(job.get("x_shift_normalized") or 0.0),
+                float(job.get("audio_fade_in") or 0.0),
+                float(job.get("audio_fade_out") or 0.0),
+            ),
+        )
+        await db.commit()
+    except Exception as exc:
+        logger.warning(
+            "Could not persist pending promo job %s: %s", job.get("job_id"), exc
+        )
+
+
+async def _mark_pending_promo_job(
+    job_id: str, *, status: str | None = None,
+    youtube_video_id: str | None = None, last_error: str | None = None,
+) -> None:
+    """Update a persisted promo job's progress/terminal fields. Best-effort —
+    these are bookkeeping writes; never let one break the chain."""
+    assignments = ["updated_at = datetime('now')"]
+    params: list[object] = []
+    if status is not None:
+        assignments.append("status = ?")
+        params.append(status)
+    if youtube_video_id is not None:
+        assignments.append("youtube_video_id = ?")
+        params.append(youtube_video_id)
+    if last_error is not None:
+        assignments.append("last_error = ?")
+        params.append(last_error[:500])
+    params.append(job_id)
+    try:
+        db = await get_db()
+        await db.execute(
+            f"UPDATE pending_promo_jobs SET {', '.join(assignments)} WHERE job_id = ?",
+            params,
+        )
+        await db.commit()
+    except Exception as exc:
+        logger.warning("Could not update pending promo job %s: %s", job_id, exc)
+
+
 async def start_promo_upload(
     *,
     local_path: Path,
@@ -723,6 +788,7 @@ async def start_promo_upload(
         "last_error": None,
         "title": None,
     }
+    await _persist_pending_promo_job(_UPLOAD_JOBS[job_id])
     spawn_background(_run_promo_chain(job_id), name=f"promo-upload:{job_id}")
     return job_id
 
@@ -794,8 +860,95 @@ async def start_promo_from_cut(
         "audio_fade_in": float(audio_fade_in),
         "audio_fade_out": float(audio_fade_out),
     }
+    await _persist_pending_promo_job(_UPLOAD_JOBS[job_id])
     spawn_background(_run_promo_chain(job_id), name=f"promo-from-cut:{job_id}")
     return job_id
+
+
+async def resume_pending_promo_jobs(*, window_hours: int) -> int:
+    """Re-spawn promo chains that were persisted before the last restart but
+    never inserted a videos row. Called at startup, after the videos-row-based
+    resume (which covers everything from the INSERT onward).
+
+    Safety rules:
+      * A job whose upload already finalized (``youtube_video_id`` set) is NOT
+        re-uploaded — that would duplicate the YouTube video. It's flagged for
+        the user to import from the dashboard instead.
+      * A job whose cut file is gone is re-cut from the parent when the cut
+        params are present; otherwise it's flagged failed (can't reconstruct).
+    Nothing is deleted — terminal jobs are marked ``done``/``failed``.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        f"""SELECT * FROM pending_promo_jobs
+            WHERE status = 'pending'
+            AND created_at >= datetime('now', '-{int(window_hours)} hours')
+            ORDER BY created_at"""
+    )
+    resumed = 0
+    for row in rows:
+        record = dict(row)
+        job_id = record["job_id"]
+        if job_id in _UPLOAD_JOBS:
+            continue  # already live this process — don't double-spawn
+
+        youtube_video_id = record.get("youtube_video_id")
+        if youtube_video_id:
+            await _mark_pending_promo_job(
+                job_id, status="failed",
+                last_error=(
+                    f"uploaded to YouTube as {youtube_video_id} but the row INSERT "
+                    "did not complete before restart; import it from the dashboard"
+                ),
+            )
+            logger.warning(
+                "Promo job %s uploaded as %s but never inserted a row; left for "
+                "manual import (NOT re-uploaded).", job_id, youtube_video_id,
+            )
+            continue
+
+        local_path = record.get("local_path")
+        if local_path and not Path(local_path).exists():
+            local_path = None  # cut file gone — fall back to re-cutting
+        can_recut = bool(record.get("parent_video_path")) and (
+            record.get("cut_start_seconds") is not None
+        )
+        if not local_path and not can_recut:
+            await _mark_pending_promo_job(
+                job_id, status="failed",
+                last_error="cut file missing and no parent cut params to re-cut",
+            )
+            continue
+
+        _UPLOAD_JOBS[job_id] = {
+            "job_id": job_id,
+            "filename": record.get("original_filename"),
+            "local_path": local_path,
+            "parent_id": record.get("parent_id"),
+            "project_id": int(record["project_id"]),
+            "forced_item_type": record.get("forced_item_type"),
+            "video_id": None,
+            "state": PROMO_STATE_CUTTING if record.get("parent_video_path") else PROMO_STATE_PENDING,
+            "last_error": None,
+            "title": record.get("title"),
+            "pre_supplied_title": record.get("title"),
+            "cut_start_seconds": record.get("cut_start_seconds"),
+            "cut_end_seconds": record.get("cut_end_seconds"),
+            "parent_video_path": record.get("parent_video_path"),
+            "vertical_crop": bool(record.get("vertical_crop")),
+            "x_shift_normalized": float(record.get("x_shift_normalized") or 0.0),
+            "audio_fade_in": float(record.get("audio_fade_in") or 0.0),
+            "audio_fade_out": float(record.get("audio_fade_out") or 0.0),
+        }
+        spawn_background(_run_promo_chain(job_id), name=f"promo-resume:{job_id}")
+        resumed += 1
+
+    if resumed:
+        logger.info(
+            "Re-spawned %d pending Promo chain(s) from before the last restart.",
+            resumed,
+        )
+    return resumed
 
 
 async def retry_promo_step(video_id: str, step: str) -> None:
@@ -920,6 +1073,9 @@ async def _run_promo_chain_inner(job_id: str) -> None:
                 job.get("parent_id"), job.get("cut_start_seconds"),
                 job.get("cut_end_seconds"), exc, exc_info=True,
             )
+            await _mark_pending_promo_job(
+                job_id, status="failed", last_error=f"{type(exc).__name__}: {exc}",
+            )
             return
         job["local_path"] = str(cut_path)
 
@@ -988,10 +1144,17 @@ async def _run_promo_chain_inner(job_id: str) -> None:
             job["filename"], local_path, exc,
             exc_info=True,
         )
+        await _mark_pending_promo_job(
+            job_id, status="failed", last_error=f"{type(exc).__name__}: {exc}",
+        )
         return
 
     video_id = result["id"]
     youtube_url = f"https://youtu.be/{video_id}"
+    # Stamp the YouTube id BEFORE the row INSERT so a restart in this narrow
+    # window recognises the clip already uploaded and does NOT re-upload it
+    # (which would create a duplicate — the exact thing we're trying to avoid).
+    await _mark_pending_promo_job(job_id, youtube_video_id=video_id)
 
     duration = tiers.probe_local_duration(local_path)
     derived_tier = tiers.tier_for_duration(duration)
@@ -1045,6 +1208,9 @@ async def _run_promo_chain_inner(job_id: str) -> None:
     )
     await db.commit()
     job["video_id"] = video_id
+    # The videos row now exists; its auto_action_state drives resume from here,
+    # so this pre-INSERT record has done its job.
+    await _mark_pending_promo_job(job_id, status="done")
 
     await events.record_event(
         video_id, "created", {"tier": derived_tier, "item_type": item_type}

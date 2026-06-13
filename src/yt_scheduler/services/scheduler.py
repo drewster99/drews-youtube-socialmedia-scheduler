@@ -1151,6 +1151,15 @@ async def restore_pending_auto_actions() -> None:
             restored, _AUTO_ACTION_RESUME_WINDOW_HOURS,
         )
 
+    # Resume Promo chains that crashed/stopped BEFORE inserting a videos row
+    # (cut → title → upload). That pre-INSERT state lives in pending_promo_jobs,
+    # not the videos table, so the row-based resume below can't see it.
+    from yt_scheduler.services.auto_actions import resume_pending_promo_jobs
+    try:
+        await resume_pending_promo_jobs(window_hours=_AUTO_ACTION_RESUME_WINDOW_HOURS)
+    except Exception as exc:
+        logger.warning("Could not resume pending promo jobs: %s", exc)
+
     # Resume Promo Videos chains that were mid-step at shutdown. Same
     # window cap as the standard chain, so an idle box can't burn its
     # OAuth tokens / quota replaying historic chains. Promo state lives
