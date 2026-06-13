@@ -22,7 +22,7 @@ from yt_scheduler.config import (
     safe_upload_ext,
     sanitized_original_filename,
 )
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.services import (
     ai, auto_actions, chunked_uploads, events, media as media_service, tiers,
     transcripts as transcript_service, youtube,
@@ -264,11 +264,11 @@ async def get_video(video_id: str):
         if updates:
             sets = ", ".join(f"{col} = ?" for col in updates)
             params = list(updates.values()) + [video_id]
-            await db.execute(
-                f"UPDATE videos SET {sets}, updated_at = datetime('now') WHERE id = ?",
-                params,
-            )
-            await db.commit()
+            async with write_transaction() as db:
+                await db.execute(
+                    f"UPDATE videos SET {sets}, updated_at = datetime('now') WHERE id = ?",
+                    params,
+                )
             rows = await db.execute_fetchall(
                 "SELECT * FROM videos WHERE id = ?", (video_id,)
             )
@@ -412,8 +412,6 @@ async def upload_video(payload: dict = Body(...)):
         if not parent_check:
             raise HTTPException(400, f"parent_item_id {parent_item_id!r} not found")
 
-    db = await get_db()
-
     # Pull the bytes off the chunked-upload table. They're already on
     # disk at upload_<id>.<ext> — we just rename to a name we control
     # (collision-resistant random hex) before handing to YouTube.
@@ -502,32 +500,32 @@ async def upload_video(payload: dict = Body(...)):
     # are set from the form so the type-aware publish flow knows what to
     # do at publish time.
     youtube_url = f"https://youtu.be/{video_id}"
-    await db.execute(
-        """INSERT INTO videos (id, project_id, title, description, tags, privacy_status, publish_at,
-           thumbnail_path, video_file_path, video_file_original_name, pinned_links, status,
-           duration_seconds, tier,
-           item_type, parent_item_id, url, source_file_origin)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uploaded', ?, ?, ?, ?, ?, 'uploaded')""",
-        (
-            video_id,
-            project["id"],
-            title,
-            description,
-            json.dumps(tag_list),
-            privacy_status,
-            publish_at or None,
-            str(thumbnail_path) if thumbnail_path else None,
-            str(video_path),
-            video_original_name,
-            pinned_links,
-            duration,
-            tier,
-            item_type,
-            parent_item_id or None,
-            youtube_url,
-        ),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            """INSERT INTO videos (id, project_id, title, description, tags, privacy_status, publish_at,
+               thumbnail_path, video_file_path, video_file_original_name, pinned_links, status,
+               duration_seconds, tier,
+               item_type, parent_item_id, url, source_file_origin)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uploaded', ?, ?, ?, ?, ?, 'uploaded')""",
+            (
+                video_id,
+                project["id"],
+                title,
+                description,
+                json.dumps(tag_list),
+                privacy_status,
+                publish_at or None,
+                str(thumbnail_path) if thumbnail_path else None,
+                str(video_path),
+                video_original_name,
+                pinned_links,
+                duration,
+                tier,
+                item_type,
+                parent_item_id or None,
+                youtube_url,
+            ),
+        )
 
     await events.record_event(video_id, "created", {"tier": tier, "item_type": item_type})
     await events.record_event(
@@ -644,31 +642,30 @@ async def create_non_youtube_item(payload: dict = Body(...)):
     duration = tiers.probe_local_duration(video_path) if video_path else 0.0
     tier = tiers.tier_for_duration(duration) if duration else ""
 
-    db = await get_db()
-    await db.execute(
-        """INSERT INTO videos (id, project_id, title, description, tags,
-           thumbnail_path, video_file_path, video_file_original_name, status,
-           duration_seconds, tier,
-           item_type, parent_item_id, url, source_file_origin)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?)""",
-        (
-            video_id,
-            project["id"],
-            title,
-            description,
-            json.dumps(tag_list),
-            str(thumbnail_path) if thumbnail_path else None,
-            str(video_path) if video_path else None,
-            video_original_name,
-            duration,
-            tier,
-            item_type,
-            parent_item_id,
-            (url or "").strip() or None,
-            "uploaded" if video_path else None,
-        ),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            """INSERT INTO videos (id, project_id, title, description, tags,
+               thumbnail_path, video_file_path, video_file_original_name, status,
+               duration_seconds, tier,
+               item_type, parent_item_id, url, source_file_origin)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?)""",
+            (
+                video_id,
+                project["id"],
+                title,
+                description,
+                json.dumps(tag_list),
+                str(thumbnail_path) if thumbnail_path else None,
+                str(video_path) if video_path else None,
+                video_original_name,
+                duration,
+                tier,
+                item_type,
+                parent_item_id,
+                (url or "").strip() or None,
+                "uploaded" if video_path else None,
+            ),
+        )
     await events.record_event(
         video_id, "created", {"tier": tier, "item_type": item_type}
     )
@@ -803,10 +800,10 @@ async def update_video(video_id: str, data: dict):
     if updates:
         updates.append("updated_at = datetime('now')")
         params.append(video_id)
-        await db.execute(
-            f"UPDATE videos SET {', '.join(updates)} WHERE id = ?", params
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                f"UPDATE videos SET {', '.join(updates)} WHERE id = ?", params
+            )
 
     # publish_at changes route through apply_user_reschedule so the
     # APScheduler job actually re-registers, publish_at_manual flips
@@ -899,20 +896,20 @@ async def transcribe_video(
             # Match the metadata-edit path: when privacy drops away from
             # public, the lifecycle ``status`` column must follow or the
             # video lingers in 'published' with mismatched privacy.
-            if (video.get("status") or "") == "published":
-                await db.execute(
-                    "UPDATE videos SET privacy_status = 'unlisted', "
-                    "status = 'ready', updated_at = datetime('now') "
-                    "WHERE id = ?",
-                    (video_id,),
-                )
-            else:
-                await db.execute(
-                    "UPDATE videos SET privacy_status = 'unlisted', "
-                    "updated_at = datetime('now') WHERE id = ?",
-                    (video_id,),
-                )
-            await db.commit()
+            async with write_transaction() as db:
+                if (video.get("status") or "") == "published":
+                    await db.execute(
+                        "UPDATE videos SET privacy_status = 'unlisted', "
+                        "status = 'ready', updated_at = datetime('now') "
+                        "WHERE id = ?",
+                        (video_id,),
+                    )
+                else:
+                    await db.execute(
+                        "UPDATE videos SET privacy_status = 'unlisted', "
+                        "updated_at = datetime('now') WHERE id = ?",
+                        (video_id,),
+                    )
 
         try:
             downloaded = await asyncio.to_thread(
@@ -937,12 +934,12 @@ async def transcribe_video(
             ) from exc
 
         video_file = str(downloaded)
-        await db.execute(
-            "UPDATE videos SET video_file_path = ?, updated_at = datetime('now') "
-            "WHERE id = ?",
-            (video_file, video_id),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE videos SET video_file_path = ?, updated_at = datetime('now') "
+                "WHERE id = ?",
+                (video_file, video_id),
+            )
 
     opts = data or {}
     try:
@@ -994,20 +991,20 @@ async def transcribe_video(
         source_detail=source_detail,
     )
 
-    await db.execute(
-        """UPDATE videos SET
-            transcript = ?,
-            transcript_id = ?,
-            transcript_source = ?,
-            transcript_created_at = COALESCE(transcript_created_at, datetime('now')),
-            transcript_updated_at = datetime('now'),
-            transcript_is_edited = 0,
-            status = 'captioned',
-            updated_at = datetime('now')
-        WHERE id = ?""",
-        (canonical_transcript, transcript_id, source, video_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            """UPDATE videos SET
+                transcript = ?,
+                transcript_id = ?,
+                transcript_source = ?,
+                transcript_created_at = COALESCE(transcript_created_at, datetime('now')),
+                transcript_updated_at = datetime('now'),
+                transcript_is_edited = 0,
+                status = 'captioned',
+                updated_at = datetime('now')
+            WHERE id = ?""",
+            (canonical_transcript, transcript_id, source, video_id),
+        )
 
     if old_transcript != canonical_transcript:
         await events.record_event(
@@ -1130,11 +1127,11 @@ async def generate_description(video_id: str, data: dict | None = None):
     full_description = f"{description}\n\n{pinned}" if pinned else description
 
     # Store generated description
-    await db.execute(
-        "UPDATE videos SET generated_description = ?, updated_at = datetime('now') WHERE id = ?",
-        (full_description, video_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE videos SET generated_description = ?, updated_at = datetime('now') WHERE id = ?",
+            (full_description, video_id),
+        )
 
     return {"description": full_description, "raw_ai_description": description}
 
@@ -1232,13 +1229,13 @@ async def apply_description(video_id: str):
     await asyncio.to_thread(youtube.update_video_metadata, video_id, description=desc)
 
     old_description = video.get("description") or ""
-    await db.execute(
-        "UPDATE videos SET description = ?, status = 'ready', "
-        "description_generated_at = datetime('now'), updated_at = datetime('now') "
-        "WHERE id = ?",
-        (desc, video_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE videos SET description = ?, status = 'ready', "
+            "description_generated_at = datetime('now'), updated_at = datetime('now') "
+            "WHERE id = ?",
+            (desc, video_id),
+        )
 
     if old_description != desc:
         await events.record_event(
@@ -1464,14 +1461,13 @@ async def set_thumbnail(video_id: str, file: UploadFile = File(...)):
     # 'user' source again, and any stored compare verdict is stale —
     # the next get_video will refresh youtube_thumbnail_url and ask
     # Claude again.
-    db = await get_db()
-    await db.execute(
-        "UPDATE videos SET thumbnail_path = ?, thumbnail_source = 'user', "
-        "thumbnail_compare_verdict = NULL, thumbnail_compared_at = NULL, "
-        "updated_at = datetime('now') WHERE id = ?",
-        (str(path), video_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE videos SET thumbnail_path = ?, thumbnail_source = 'user', "
+            "thumbnail_compare_verdict = NULL, thumbnail_compared_at = NULL, "
+            "updated_at = datetime('now') WHERE id = ?",
+            (str(path), video_id),
+        )
 
     return {"status": "ok"}
 
@@ -1496,13 +1492,13 @@ async def use_youtube_thumbnail(video_id: str):
             "No cached YouTube thumbnail to promote. Open the video so the "
             "thumbnail-sync background task can fetch one.",
         )
-    await db.execute(
-        "UPDATE videos SET thumbnail_path = ?, thumbnail_source = 'youtube', "
-        "thumbnail_compare_verdict = 'same', thumbnail_compared_at = datetime('now'), "
-        "updated_at = datetime('now') WHERE id = ?",
-        (yt_local, video_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE videos SET thumbnail_path = ?, thumbnail_source = 'youtube', "
+            "thumbnail_compare_verdict = 'same', thumbnail_compared_at = datetime('now'), "
+            "updated_at = datetime('now') WHERE id = ?",
+            (yt_local, video_id),
+        )
     return {"status": "ok"}
 
 
@@ -1530,13 +1526,13 @@ async def push_thumbnail_to_youtube(video_id: str):
     except Exception as exc:
         raise HTTPException(500, f"Failed to push thumbnail: {exc}") from exc
 
-    await db.execute(
-        "UPDATE videos SET thumbnail_compare_verdict = 'same', "
-        "thumbnail_compared_at = datetime('now'), "
-        "updated_at = datetime('now') WHERE id = ?",
-        (video_id,),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE videos SET thumbnail_compare_verdict = 'same', "
+            "thumbnail_compared_at = datetime('now'), "
+            "updated_at = datetime('now') WHERE id = ?",
+            (video_id,),
+        )
     return {"status": "ok"}
 
 
@@ -1709,7 +1705,6 @@ async def _apply_source_swap(
     against the incoming file; presence of ``duration_mismatch`` here
     triggers the transcript wipe.
     """
-    db = await get_db()
     force_past_duration = any(i["code"] == "duration_mismatch" for i in issues)
 
     # probe_is_video(None) → True (when ffprobe isn't installed we
@@ -1728,37 +1723,37 @@ async def _apply_source_swap(
         new_height = incoming_probe.height
         new_bitrate = incoming_probe.bitrate_bps
         new_size = incoming_probe.size_bytes
-    if force_past_duration:
-        await db.execute(
-            """UPDATE videos SET
-                video_file_path = ?,
-                video_file_original_name = ?,
-                duration_seconds = ?,
-                source_file_origin = 'user_attached',
-                video_file_download_state = NULL,
-                transcript = NULL,
-                transcript_id = NULL,
-                transcript_source = NULL,
-                transcript_created_at = NULL,
-                transcript_updated_at = NULL,
-                transcript_is_edited = 0,
-                updated_at = datetime('now')
-            WHERE id = ?""",
-            (str(incoming_path), new_original, new_duration, video_id),
-        )
-    else:
-        await db.execute(
-            """UPDATE videos SET
-                video_file_path = ?,
-                video_file_original_name = ?,
-                duration_seconds = ?,
-                source_file_origin = 'user_attached',
-                video_file_download_state = NULL,
-                updated_at = datetime('now')
-            WHERE id = ?""",
-            (str(incoming_path), new_original, new_duration, video_id),
-        )
-    await db.commit()
+    async with write_transaction() as db:
+        if force_past_duration:
+            await db.execute(
+                """UPDATE videos SET
+                    video_file_path = ?,
+                    video_file_original_name = ?,
+                    duration_seconds = ?,
+                    source_file_origin = 'user_attached',
+                    video_file_download_state = NULL,
+                    transcript = NULL,
+                    transcript_id = NULL,
+                    transcript_source = NULL,
+                    transcript_created_at = NULL,
+                    transcript_updated_at = NULL,
+                    transcript_is_edited = 0,
+                    updated_at = datetime('now')
+                WHERE id = ?""",
+                (str(incoming_path), new_original, new_duration, video_id),
+            )
+        else:
+            await db.execute(
+                """UPDATE videos SET
+                    video_file_path = ?,
+                    video_file_original_name = ?,
+                    duration_seconds = ?,
+                    source_file_origin = 'user_attached',
+                    video_file_download_state = NULL,
+                    updated_at = datetime('now')
+                WHERE id = ?""",
+                (str(incoming_path), new_original, new_duration, video_id),
+            )
 
     await events.record_event(
         video_id,
