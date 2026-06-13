@@ -16,6 +16,7 @@ from pathlib import Path
 import aiosqlite
 import pytest
 
+import yt_scheduler.database as database
 from yt_scheduler.migrations import apply_migrations
 
 
@@ -83,10 +84,10 @@ async def test_uploaded_but_uninserted_is_not_re_uploaded(wired, tmp_path, monke
     aa, spawned = wired
     conn = await _make_conn(tmp_path)
 
-    async def _fake_get_db():
-        return conn
-
-    monkeypatch.setattr(aa, "get_db", _fake_get_db)
+    # Make the migrated temp connection the module singleton so BOTH the
+    # reads (auto_actions.get_db) AND the writes (write_transaction, which
+    # calls database.get_db internally) operate on the same DB.
+    monkeypatch.setattr(database, "_db", conn)
     await _insert_pending(conn, youtube_video_id="YTVIDEO123")
 
     resumed = await aa.resume_pending_promo_jobs(window_hours=24)
@@ -102,10 +103,10 @@ async def test_clean_pending_job_is_respawned(wired, tmp_path, monkeypatch):
     aa, spawned = wired
     conn = await _make_conn(tmp_path)
 
-    async def _fake_get_db():
-        return conn
-
-    monkeypatch.setattr(aa, "get_db", _fake_get_db)
+    # Make the migrated temp connection the module singleton so BOTH the
+    # reads (auto_actions.get_db) AND the writes (write_transaction, which
+    # calls database.get_db internally) operate on the same DB.
+    monkeypatch.setattr(database, "_db", conn)
     cut_file = tmp_path / "clip.mp4"
     cut_file.write_bytes(b"\x00" * 16)
     await _insert_pending(conn, local_path=str(cut_file))
@@ -126,10 +127,10 @@ async def test_missing_cut_file_and_no_recut_params_is_failed(wired, tmp_path, m
     aa, spawned = wired
     conn = await _make_conn(tmp_path)
 
-    async def _fake_get_db():
-        return conn
-
-    monkeypatch.setattr(aa, "get_db", _fake_get_db)
+    # Make the migrated temp connection the module singleton so BOTH the
+    # reads (auto_actions.get_db) AND the writes (write_transaction, which
+    # calls database.get_db internally) operate on the same DB.
+    monkeypatch.setattr(database, "_db", conn)
     # No parent_video_path and a local_path that doesn't exist -> can't recut.
     await _insert_pending(
         conn, parent_video_path=None, cut_start_seconds=None,
