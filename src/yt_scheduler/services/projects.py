@@ -11,7 +11,7 @@ import re
 
 import aiosqlite
 
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 
 DEFAULT_PROJECT_SLUG = "default"
 _SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -33,11 +33,11 @@ async def ensure_default_project() -> int:
     if row is not None:
         return int(row[0])
 
-    cursor = await db.execute(
-        "INSERT INTO projects (name, slug) VALUES (?, ?)",
-        ("Default", DEFAULT_PROJECT_SLUG),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            "INSERT INTO projects (name, slug) VALUES (?, ?)",
+            ("Default", DEFAULT_PROJECT_SLUG),
+        )
     return int(cursor.lastrowid)
 
 
@@ -122,13 +122,12 @@ async def create_project(
             "lowercase letters, digits, and hyphens"
         )
 
-    db = await get_db()
     try:
-        cursor = await db.execute(
-            "INSERT INTO projects (name, slug, project_url) VALUES (?, ?, ?)",
-            (name, chosen_slug, (project_url or "").strip() or None),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            cursor = await db.execute(
+                "INSERT INTO projects (name, slug, project_url) VALUES (?, ?, ?)",
+                (name, chosen_slug, (project_url or "").strip() or None),
+            )
     except aiosqlite.IntegrityError as exc:
         raise ValueError(f"A project with slug '{chosen_slug}' already exists") from exc
 
@@ -159,12 +158,11 @@ async def update_project_url(project_id: int, project_url: str | None) -> dict:
     ``{{project_url}}`` in templates). Pass ``None`` or empty string to
     clear."""
     cleaned = (project_url or "").strip() or None
-    db = await get_db()
-    await db.execute(
-        "UPDATE projects SET project_url = ?, updated_at = datetime('now') WHERE id = ?",
-        (cleaned, project_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE projects SET project_url = ?, updated_at = datetime('now') WHERE id = ?",
+            (cleaned, project_id),
+        )
     project = await get_project_by_id(project_id)
     if project is None:
         raise ValueError(f"Project {project_id} not found")
@@ -176,12 +174,11 @@ async def rename_project(project_id: int, name: str) -> dict:
     name = name.strip()
     if not name:
         raise ValueError("Project name is required")
-    db = await get_db()
-    await db.execute(
-        "UPDATE projects SET name = ?, updated_at = datetime('now') WHERE id = ?",
-        (name, project_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE projects SET name = ?, updated_at = datetime('now') WHERE id = ?",
+            (name, project_id),
+        )
     project = await get_project_by_id(project_id)
     if project is None:
         raise ValueError(f"Project {project_id} not found")
@@ -195,16 +192,14 @@ async def delete_project(project_id: int) -> None:
         return
     if project["slug"] == DEFAULT_PROJECT_SLUG:
         raise ValueError("The Default project cannot be deleted")
-    db = await get_db()
-    await db.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute("DELETE FROM projects WHERE id = ?", (project_id,))
 
 
 async def set_project_youtube_channel(project_id: int, channel_id: str | None) -> None:
-    db = await get_db()
-    await db.execute(
-        "UPDATE projects SET youtube_channel_id = ?, updated_at = datetime('now') "
-        "WHERE id = ?",
-        (channel_id, project_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE projects SET youtube_channel_id = ?, updated_at = datetime('now') "
+            "WHERE id = ?",
+            (channel_id, project_id),
+        )
