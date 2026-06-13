@@ -15,7 +15,7 @@ from yt_scheduler.config import (
     media_url,
     require_managed_media_paths,
 )
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.services import events, social, templates as tmpl, youtube
 from yt_scheduler.services.scheduler import cancel_scheduled_post, get_publish_lock
 from yt_scheduler.services.transcripts import srt_to_plain_text
@@ -640,61 +640,64 @@ async def generate_posts(
         # an active send. Approved rows on OTHER slots also stay, which
         # is the bug fix: a single-slot regenerate must not delete the
         # user's previously-approved rows on neighboring slots.
-        await db.execute(
-            f"DELETE FROM social_posts "
-            f"WHERE video_id = ? AND {match_clause} "
-            f"AND status NOT IN ('posted', 'sending')",
-            (video_id, *match_params),
-        )
-
-        generated: list[dict] = []
-        for item in prepared:
-            slot = item["slot"]
-            platform = item["platform"]
-            sa_id = slot.get("social_account_id") or defaults.get(platform)
-            media = slot.get("media", "thumbnail")
-            media_paths = item["media_paths"]
-            media_paths_json = json.dumps(media_paths) if media_paths else None
-            primary_media = media_paths[0] if media_paths else None
-
-            slot_id_for_insert = slot.get("id")
-            cur = await db.execute(
-                """INSERT INTO social_posts
-                       (video_id, platform, content, media_path, media_paths,
-                        media_type, status, social_account_id, max_chars,
-                        slot_id)
-                VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)""",
-                (
-                    video_id, platform, item["rendered"],
-                    primary_media, media_paths_json,
-                    media, sa_id, item["max_chars"],
-                    int(slot_id_for_insert) if slot_id_for_insert is not None else None,
-                ),
+        # Rendering (to_thread) already happened; this whole regenerate —
+        # delete old drafts + insert the new slot posts and their traces — is
+        # one atomic DB-only critical section.
+        async with write_transaction() as db:
+            await db.execute(
+                f"DELETE FROM social_posts "
+                f"WHERE video_id = ? AND {match_clause} "
+                f"AND status NOT IN ('posted', 'sending')",
+                (video_id, *match_params),
             )
-            post_id = cur.lastrowid
 
-            # Persist the per-slot debug trace (F2). Cascade-deleted with
-            # the post; pruned by the scheduler job to keep ~24h worth.
-            slot_trace = item.get("trace")
-            if slot_trace and post_id is not None:
-                await db.execute(
-                    "INSERT INTO social_post_traces (post_id, trace_json) "
-                    "VALUES (?, ?)",
-                    (int(post_id), json.dumps(slot_trace)),
+            generated: list[dict] = []
+            for item in prepared:
+                slot = item["slot"]
+                platform = item["platform"]
+                sa_id = slot.get("social_account_id") or defaults.get(platform)
+                media = slot.get("media", "thumbnail")
+                media_paths = item["media_paths"]
+                media_paths_json = json.dumps(media_paths) if media_paths else None
+                primary_media = media_paths[0] if media_paths else None
+
+                slot_id_for_insert = slot.get("id")
+                cur = await db.execute(
+                    """INSERT INTO social_posts
+                           (video_id, platform, content, media_path, media_paths,
+                            media_type, status, social_account_id, max_chars,
+                            slot_id)
+                    VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)""",
+                    (
+                        video_id, platform, item["rendered"],
+                        primary_media, media_paths_json,
+                        media, sa_id, item["max_chars"],
+                        int(slot_id_for_insert) if slot_id_for_insert is not None else None,
+                    ),
                 )
+                post_id = cur.lastrowid
 
-            generated.append({
-                "slot_id": slot.get("id"),
-                "platform": platform,
-                "content": item["rendered"],
-                "media": media,
-                "media_urls": [media_url(p) for p in media_paths],
-                "media_filenames": [media_filename(p) for p in media_paths],
-                "max_chars": item["max_chars"],
-                "social_account_id": sa_id,
-            })
+                # Persist the per-slot debug trace (F2). Cascade-deleted with
+                # the post; pruned by the scheduler job to keep ~24h worth.
+                slot_trace = item.get("trace")
+                if slot_trace and post_id is not None:
+                    await db.execute(
+                        "INSERT INTO social_post_traces (post_id, trace_json) "
+                        "VALUES (?, ?)",
+                        (int(post_id), json.dumps(slot_trace)),
+                    )
 
-        await db.commit()
+                generated.append({
+                    "slot_id": slot.get("id"),
+                    "platform": platform,
+                    "content": item["rendered"],
+                    "media": media,
+                    "media_urls": [media_url(p) for p in media_paths],
+                    "media_filenames": [media_filename(p) for p in media_paths],
+                    "max_chars": item["max_chars"],
+                    "social_account_id": sa_id,
+                })
+
         return {"posts": generated, "warnings": warnings}
 
 
@@ -789,10 +792,10 @@ async def update_post(post_id: int, data: dict):
 
     if updates:
         params.append(post_id)
-        await db.execute(
-            f"UPDATE social_posts SET {', '.join(updates)} WHERE id = ?", params
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                f"UPDATE social_posts SET {', '.join(updates)} WHERE id = ?", params
+            )
 
     return {"status": "ok"}
 
@@ -871,8 +874,8 @@ async def shorten_post(post_id: int, data: dict | None = None):
     if orig_urls and not orig_urls.issubset(set(re.findall(r"https?://\S+", new))):
         warning = "A link may have changed — double-check before posting."
 
-    await db.execute("UPDATE social_posts SET content = ? WHERE id = ?", (new, post_id))
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute("UPDATE social_posts SET content = ? WHERE id = ?", (new, post_id))
     return {"content": new, "previous": old, "char_count": len(new), "warning": warning}
 
 
@@ -1042,14 +1045,14 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
         # the schedule columns so the future job-id can't reference a
         # post that's already done, and so the UI doesn't show "still
         # scheduled" alongside a posted_at timestamp.
-        await db.execute(
-            """UPDATE social_posts
-            SET status = 'posted', posted_at = datetime('now'), post_url = ?,
-                scheduler_job_id = NULL, scheduled_at = NULL
-            WHERE id = ?""",
-            (result.get("url", ""), post_id),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                """UPDATE social_posts
+                SET status = 'posted', posted_at = datetime('now'), post_url = ?,
+                    scheduler_job_id = NULL, scheduled_at = NULL
+                WHERE id = ?""",
+                (result.get("url", ""), post_id),
+            )
         from datetime import datetime as _dt, timezone as _tz
         await events.record_event(
             post["video_id"],
@@ -1065,12 +1068,12 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
     except social.CredentialAuthError as e:
         if e.uuid:
             await mark_needs_reauth(e.uuid)
-        await db.execute(
-            "UPDATE social_posts SET status = 'failed', error = ?, "
-            "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
-            (f"Credential needs re-auth: {e}", post_id),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE social_posts SET status = 'failed', error = ?, "
+                "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
+                (f"Credential needs re-auth: {e}", post_id),
+            )
         raise HTTPException(
             401,
             f"{post['platform']} credential needs re-authentication. "
@@ -1078,12 +1081,12 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
         ) from e
     except Exception as e:
         logger.exception("Send failed for post %s", post_id)
-        await db.execute(
-            "UPDATE social_posts SET status = 'failed', error = ?, "
-            "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
-            (str(e), post_id),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE social_posts SET status = 'failed', error = ?, "
+                "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
+                (str(e), post_id),
+            )
         raise HTTPException(500, str(e))
 
 
@@ -1209,16 +1212,16 @@ async def send_all_posts(
                 media_paths=_decode_media_paths(post),
             )
             # Same supersede-the-schedule reasoning as send_post.
-            await db.execute(
-                """UPDATE social_posts
-                SET status = 'posted', posted_at = datetime('now'), post_url = ?,
-                    scheduler_job_id = NULL, scheduled_at = NULL
-                WHERE id = ?""",
-                (result.get("url", ""), post["id"]),
-            )
             # Commit each post's terminal state inside the loop so a crash
             # part-way through a batch can't lose an already-sent post's status.
-            await db.commit()
+            async with write_transaction() as db:
+                await db.execute(
+                    """UPDATE social_posts
+                    SET status = 'posted', posted_at = datetime('now'), post_url = ?,
+                        scheduler_job_id = NULL, scheduled_at = NULL
+                    WHERE id = ?""",
+                    (result.get("url", ""), post["id"]),
+                )
             results[post["platform"]] = {
                 "status": "posted", "url": result.get("url", ""), "warning": result.get("warning"),
             }
@@ -1236,25 +1239,24 @@ async def send_all_posts(
         except social.CredentialAuthError as e:
             if e.uuid:
                 await mark_needs_reauth(e.uuid)
-            await db.execute(
-                "UPDATE social_posts SET status = 'failed', error = ?, "
-                "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
-                (f"Credential needs re-auth: {e}", post["id"]),
-            )
-            await db.commit()
+            async with write_transaction() as db:
+                await db.execute(
+                    "UPDATE social_posts SET status = 'failed', error = ?, "
+                    "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
+                    (f"Credential needs re-auth: {e}", post["id"]),
+                )
             results[post["platform"]] = {
                 "status": "needs_reauth",
                 "error": "Credential needs re-authentication. Reconnect from Settings.",
             }
         except Exception as e:
             logger.exception("Send failed for post %s", post["id"])
-            await db.execute(
-                "UPDATE social_posts SET status = 'failed', error = ?, "
-                "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
-                (str(e), post["id"]),
-            )
-            await db.commit()
+            async with write_transaction() as db:
+                await db.execute(
+                    "UPDATE social_posts SET status = 'failed', error = ?, "
+                    "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
+                    (str(e), post["id"]),
+                )
             results[post["platform"]] = {"status": "failed", "error": str(e)}
 
-    await db.commit()
     return results
