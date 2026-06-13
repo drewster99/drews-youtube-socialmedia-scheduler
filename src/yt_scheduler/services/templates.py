@@ -15,7 +15,7 @@ import re
 
 import aiosqlite
 
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.services.ai import DEFAULT_AI_SYSTEM_PROMPT, call_ai_block
 from yt_scheduler.services.social import ALL_PLATFORMS
 
@@ -633,21 +633,20 @@ async def set_template_test_variables(
     a JSON object on ``templates.test_variables``. Passing an empty
     dict clears the column back to NULL so the front-end falls back to
     its seeded defaults."""
-    db = await get_db()
-    cursor = await db.execute(
-        "SELECT id FROM templates WHERE project_id = ? AND name = ?",
-        (project_id, name),
-    )
-    row = await cursor.fetchone()
-    if row is None:
-        raise ValueError(f"Template '{name}' not found")
-    encoded = json.dumps(variables) if variables else None
-    await db.execute(
-        "UPDATE templates SET test_variables = ?, updated_at = datetime('now') "
-        "WHERE id = ?",
-        (encoded, int(row["id"])),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            "SELECT id FROM templates WHERE project_id = ? AND name = ?",
+            (project_id, name),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise ValueError(f"Template '{name}' not found")
+        encoded = json.dumps(variables) if variables else None
+        await db.execute(
+            "UPDATE templates SET test_variables = ?, updated_at = datetime('now') "
+            "WHERE id = ?",
+            (encoded, int(row["id"])),
+        )
 
 
 async def list_templates(project_id: int) -> list[dict]:
@@ -682,28 +681,30 @@ async def _set_builtin_slot(
 ) -> None:
     """Upsert a single built-in slot. Built-in slots are unique per
     (template_id, platform)."""
-    db = await get_db()
-    cursor = await db.execute(
-        "SELECT id FROM template_slots "
-        "WHERE template_id = ? AND platform = ? AND is_builtin = 1",
-        (template_id, platform),
-    )
-    row = await cursor.fetchone()
-    if row is not None:
-        await db.execute(
-            "UPDATE template_slots "
-            "SET body = ?, media = ?, max_chars = ?, updated_at = datetime('now') "
-            "WHERE id = ?",
-            (body, media, int(max_chars), int(row["id"])),
+    # Reentrant: when called inside save_template's transaction this joins it
+    # (one atomic write across all slots); called standalone it's its own.
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            "SELECT id FROM template_slots "
+            "WHERE template_id = ? AND platform = ? AND is_builtin = 1",
+            (template_id, platform),
         )
-    else:
-        await db.execute(
-            "INSERT INTO template_slots "
-            "(template_id, platform, social_account_id, is_builtin, is_disabled, "
-            " order_index, body, media, max_chars) "
-            "VALUES (?, ?, NULL, 1, 0, 0, ?, ?, ?)",
-            (template_id, platform, body, media, int(max_chars)),
-        )
+        row = await cursor.fetchone()
+        if row is not None:
+            await db.execute(
+                "UPDATE template_slots "
+                "SET body = ?, media = ?, max_chars = ?, updated_at = datetime('now') "
+                "WHERE id = ?",
+                (body, media, int(max_chars), int(row["id"])),
+            )
+        else:
+            await db.execute(
+                "INSERT INTO template_slots "
+                "(template_id, platform, social_account_id, is_builtin, is_disabled, "
+                " order_index, body, media, max_chars) "
+                "VALUES (?, ?, NULL, 1, 0, 0, ?, ?, ?)",
+                (template_id, platform, body, media, int(max_chars)),
+            )
 
 
 async def save_template(
@@ -724,22 +725,21 @@ async def save_template(
     if not tiers:
         raise ValueError("applies_to must include at least one tier")
 
-    db = await get_db()
     is_builtin_flag = 1 if name in BUILTIN_TEMPLATE_NAMES else 0
     try:
-        await db.execute(
-            "INSERT INTO templates (project_id, name, description, applies_to, is_builtin) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(project_id, name) DO UPDATE SET "
-            "  description = excluded.description, "
-            "  applies_to  = excluded.applies_to, "
-            "  is_builtin  = excluded.is_builtin OR templates.is_builtin, "
-            "  updated_at  = datetime('now')",
-            (project_id, name, description, json.dumps(tiers), is_builtin_flag),
-        )
+        async with write_transaction() as db:
+            await db.execute(
+                "INSERT INTO templates (project_id, name, description, applies_to, is_builtin) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(project_id, name) DO UPDATE SET "
+                "  description = excluded.description, "
+                "  applies_to  = excluded.applies_to, "
+                "  is_builtin  = excluded.is_builtin OR templates.is_builtin, "
+                "  updated_at  = datetime('now')",
+                (project_id, name, description, json.dumps(tiers), is_builtin_flag),
+            )
     except aiosqlite.IntegrityError as exc:
         raise ValueError(str(exc)) from exc
-    await db.commit()
 
     cursor = await db.execute(
         "SELECT id FROM templates WHERE project_id = ? AND name = ?",
@@ -750,17 +750,19 @@ async def save_template(
         raise RuntimeError("Failed to read back saved template row")
     template_id = int(row["id"])
 
-    for platform_name, config in (platforms or {}).items():
-        if platform_name not in ALL_PLATFORMS:
-            continue
-        await _set_builtin_slot(
-            template_id,
-            platform_name,
-            body=str(config.get("template", "")),
-            media=str(config.get("media", "thumbnail")),
-            max_chars=int(config.get("max_chars", 500)),
-        )
-    await db.commit()
+    # One atomic transaction for all built-in slots; each _set_builtin_slot's
+    # own write_transaction joins this one (reentrant).
+    async with write_transaction() as db:
+        for platform_name, config in (platforms or {}).items():
+            if platform_name not in ALL_PLATFORMS:
+                continue
+            await _set_builtin_slot(
+                template_id,
+                platform_name,
+                body=str(config.get("template", "")),
+                media=str(config.get("media", "thumbnail")),
+                max_chars=int(config.get("max_chars", 500)),
+            )
 
     saved = await get_template(name, project_id=project_id)
     if saved is None:
@@ -773,12 +775,11 @@ async def delete_template(name: str, *, project_id: int) -> None:
     templates by name."""
     if name in BUILTIN_TEMPLATE_NAMES:
         raise ValueError(f"Cannot delete built-in template '{name}'")
-    db = await get_db()
-    await db.execute(
-        "DELETE FROM templates WHERE project_id = ? AND name = ?",
-        (project_id, name),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "DELETE FROM templates WHERE project_id = ? AND name = ?",
+            (project_id, name),
+        )
 
 
 async def duplicate_template(
@@ -803,52 +804,53 @@ async def duplicate_template(
     if source is None:
         raise ValueError(f"Template '{source_name}' not found")
 
-    db = await get_db()
-    cursor = await db.execute(
-        "SELECT id FROM templates WHERE project_id = ? AND name = ?",
-        (project_id, new_name),
-    )
-    if await cursor.fetchone() is not None:
-        raise ValueError(f"A template named '{new_name}' already exists")
-
-    # Copy test_variables along with the rest of the template so the
-    # duplicate opens in the editor with the same Preview fixtures the
-    # source had. An empty dict from the source stays NULL on the copy.
-    source_test_vars = source.get("test_variables") or {}
-    test_vars_json = json.dumps(source_test_vars) if source_test_vars else None
-    try:
+    # Whole copy (name-collision check + template INSERT + every slot) is one
+    # atomic critical section — no network awaits here.
+    async with write_transaction() as db:
         cursor = await db.execute(
-            "INSERT INTO templates "
-            "(project_id, name, description, applies_to, is_builtin, test_variables) "
-            "VALUES (?, ?, ?, ?, 0, ?)",
-            (
-                project_id, new_name, source["description"],
-                json.dumps(source["applies_to"]), test_vars_json,
-            ),
+            "SELECT id FROM templates WHERE project_id = ? AND name = ?",
+            (project_id, new_name),
         )
-    except aiosqlite.IntegrityError as exc:
-        raise ValueError(str(exc)) from exc
-    new_template_id = int(cursor.lastrowid)
+        if await cursor.fetchone() is not None:
+            raise ValueError(f"A template named '{new_name}' already exists")
 
-    for slot in source["slots"]:
-        await db.execute(
-            "INSERT INTO template_slots "
-            "(template_id, platform, social_account_id, is_builtin, is_disabled, "
-            " order_index, body, media, max_chars) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                new_template_id,
-                slot["platform"],
-                slot["social_account_id"],
-                1 if slot["is_builtin"] else 0,
-                1 if slot["is_disabled"] else 0,
-                int(slot["order_index"]),
-                slot["body"],
-                slot["media"],
-                int(slot["max_chars"]),
-            ),
-        )
-    await db.commit()
+        # Copy test_variables along with the rest of the template so the
+        # duplicate opens in the editor with the same Preview fixtures the
+        # source had. An empty dict from the source stays NULL on the copy.
+        source_test_vars = source.get("test_variables") or {}
+        test_vars_json = json.dumps(source_test_vars) if source_test_vars else None
+        try:
+            cursor = await db.execute(
+                "INSERT INTO templates "
+                "(project_id, name, description, applies_to, is_builtin, test_variables) "
+                "VALUES (?, ?, ?, ?, 0, ?)",
+                (
+                    project_id, new_name, source["description"],
+                    json.dumps(source["applies_to"]), test_vars_json,
+                ),
+            )
+        except aiosqlite.IntegrityError as exc:
+            raise ValueError(str(exc)) from exc
+        new_template_id = int(cursor.lastrowid)
+
+        for slot in source["slots"]:
+            await db.execute(
+                "INSERT INTO template_slots "
+                "(template_id, platform, social_account_id, is_builtin, is_disabled, "
+                " order_index, body, media, max_chars) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    new_template_id,
+                    slot["platform"],
+                    slot["social_account_id"],
+                    1 if slot["is_builtin"] else 0,
+                    1 if slot["is_disabled"] else 0,
+                    int(slot["order_index"]),
+                    slot["body"],
+                    slot["media"],
+                    int(slot["max_chars"]),
+                ),
+            )
 
     copied = await get_template(new_name, project_id=project_id)
     if copied is None:
@@ -915,34 +917,35 @@ async def add_slot(
     if max_chars < 1:
         raise ValueError("max_chars must be positive")
 
-    db = await get_db()
-    cursor = await db.execute(
-        "SELECT id FROM templates WHERE id = ?", (template_id,)
-    )
-    if await cursor.fetchone() is None:
-        raise ValueError(f"Template {template_id} not found")
-
-    if order_index is None:
+    # Existence check + next-order-index read + INSERT are one atomic section
+    # so two concurrent add_slot calls can't pick the same order_index.
+    async with write_transaction() as db:
         cursor = await db.execute(
-            "SELECT COALESCE(MAX(order_index), -1) + 1 AS next "
-            "FROM template_slots WHERE template_id = ?",
-            (template_id,),
+            "SELECT id FROM templates WHERE id = ?", (template_id,)
         )
-        next_row = await cursor.fetchone()
-        order_index = int(next_row["next"]) if next_row else 0
+        if await cursor.fetchone() is None:
+            raise ValueError(f"Template {template_id} not found")
 
-    cursor = await db.execute(
-        "INSERT INTO template_slots "
-        "(template_id, platform, social_account_id, is_builtin, is_disabled, "
-        " order_index, body, media, max_chars) "
-        "VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)",
-        (
-            template_id, platform, social_account_id,
-            1 if is_disabled else 0, int(order_index),
-            body, media, int(max_chars),
-        ),
-    )
-    await db.commit()
+        if order_index is None:
+            cursor = await db.execute(
+                "SELECT COALESCE(MAX(order_index), -1) + 1 AS next "
+                "FROM template_slots WHERE template_id = ?",
+                (template_id,),
+            )
+            next_row = await cursor.fetchone()
+            order_index = int(next_row["next"]) if next_row else 0
+
+        cursor = await db.execute(
+            "INSERT INTO template_slots "
+            "(template_id, platform, social_account_id, is_builtin, is_disabled, "
+            " order_index, body, media, max_chars) "
+            "VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)",
+            (
+                template_id, platform, social_account_id,
+                1 if is_disabled else 0, int(order_index),
+                body, media, int(max_chars),
+            ),
+        )
     slot = await get_slot(int(cursor.lastrowid))
     if slot is None:
         raise RuntimeError("Saved slot disappeared between write and read")
@@ -1006,12 +1009,11 @@ async def update_slot(
     updates.append("updated_at = datetime('now')")
     params.append(slot_id)
 
-    db = await get_db()
-    await db.execute(
-        f"UPDATE template_slots SET {', '.join(updates)} WHERE id = ?",
-        params,
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            f"UPDATE template_slots SET {', '.join(updates)} WHERE id = ?",
+            params,
+        )
 
     refreshed = await get_slot(slot_id)
     if refreshed is None:
@@ -1027,9 +1029,8 @@ async def delete_slot(slot_id: int) -> None:
         raise ValueError(f"Slot {slot_id} not found")
     if existing["is_builtin"]:
         raise ValueError("Cannot delete a built-in slot — disable it instead")
-    db = await get_db()
-    await db.execute("DELETE FROM template_slots WHERE id = ?", (slot_id,))
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute("DELETE FROM template_slots WHERE id = ?", (slot_id,))
 
 
 async def ensure_default_template(project_id: int = 1) -> None:
