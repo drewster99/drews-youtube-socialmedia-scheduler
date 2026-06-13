@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from yt_scheduler.config import CAPTION_CHECK_INTERVAL_MINUTES, COMMENT_CHECK_INTERVAL_MINUTES
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.services import events, moderation, transcripts as transcript_service, youtube
 from yt_scheduler.services._keyed_locks import KeyedLocks
 from yt_scheduler.services.auth import set_active_project
@@ -68,13 +68,12 @@ async def _claim_post_for_send(post_id: int) -> bool:
     both posted to the platform, both wrote ``status='posted'`` (1 DB row,
     2 actual social posts).
     """
-    db = await get_db()
-    cursor = await db.execute(
-        "UPDATE social_posts SET status = 'sending' "
-        "WHERE id = ? AND status = 'approved'",
-        (post_id,),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            "UPDATE social_posts SET status = 'sending' "
+            "WHERE id = ? AND status = 'approved'",
+            (post_id,),
+        )
     return cursor.rowcount > 0
 
 
@@ -86,13 +85,12 @@ async def _release_post_to_approved(post_id: int) -> None:
     Credential auth errors keep the 'failed' status because retrying
     won't help until the user re-OAuths.
     """
-    db = await get_db()
-    await db.execute(
-        "UPDATE social_posts SET status = 'approved' "
-        "WHERE id = ? AND status = 'sending'",
-        (post_id,),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE social_posts SET status = 'approved' "
+            "WHERE id = ? AND status = 'sending'",
+            (post_id,),
+        )
 
 
 async def publish_video_job(video_id: str) -> dict:
@@ -167,12 +165,12 @@ async def publish_video_job(video_id: str) -> dict:
                     youtube.update_video_metadata,
                     video_id, privacy_status="public",
                 )
-                await db.execute(
-                    """UPDATE videos SET privacy_status = 'public', status = 'published',
-                    updated_at = datetime('now') WHERE id = ?""",
-                    (video_id,),
-                )
-                await db.commit()
+                async with write_transaction() as db:
+                    await db.execute(
+                        """UPDATE videos SET privacy_status = 'public', status = 'published',
+                        updated_at = datetime('now') WHERE id = ?""",
+                        (video_id,),
+                    )
                 results["published"] = True
                 await events.record_event(
                     video_id,
@@ -207,12 +205,12 @@ async def publish_video_job(video_id: str) -> dict:
             # Item type doesn't require YouTube; mark the local row published
             # so the same downstream UI ("video is published") works
             # uniformly for non-YT items.
-            await db.execute(
-                """UPDATE videos SET status = 'published',
-                updated_at = datetime('now') WHERE id = ?""",
-                (video_id,),
-            )
-            await db.commit()
+            async with write_transaction() as db:
+                await db.execute(
+                    """UPDATE videos SET status = 'published',
+                    updated_at = datetime('now') WHERE id = ?""",
+                    (video_id,),
+                )
             results["published"] = True
             results["youtube_skipped"] = True
             await events.record_event(
@@ -306,17 +304,17 @@ async def publish_video_job(video_id: str) -> dict:
                     post["content"],
                     media_paths=decode_media_paths(post),
                 )
-                await db.execute(
-                    """UPDATE social_posts
-                    SET status = 'posted', posted_at = datetime('now'), post_url = ?,
-                        scheduled_at = NULL, scheduler_job_id = NULL
-                    WHERE id = ?""",
-                    (post_result.get("url", ""), post_id),
-                )
                 # Commit each terminal state inside the loop so a crash mid-batch
                 # can't lose an already-sent post's 'posted' status (which would
                 # otherwise leave it re-claimable and risk a re-send).
-                await db.commit()
+                async with write_transaction() as db:
+                    await db.execute(
+                        """UPDATE social_posts
+                        SET status = 'posted', posted_at = datetime('now'), post_url = ?,
+                            scheduled_at = NULL, scheduler_job_id = NULL
+                        WHERE id = ?""",
+                        (post_result.get("url", ""), post_id),
+                    )
                 results["social_results"][platform].append({
                     "post_id": post_id,
                     "status": "posted",
@@ -339,19 +337,18 @@ async def publish_video_job(video_id: str) -> dict:
 
                 if isinstance(e, CredentialAuthError) and e.uuid:
                     await mark_needs_reauth(e.uuid)
-                await db.execute(
-                    "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
-                    (str(e), post_id),
-                )
                 # Commit the terminal 'failed' state immediately so a stranded
                 # 'sending' row can't survive a mid-batch crash.
-                await db.commit()
+                async with write_transaction() as db:
+                    await db.execute(
+                        "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
+                        (str(e), post_id),
+                    )
                 results["social_results"][platform].append(
                     {"post_id": post_id, "status": "failed", "error": str(e)}
                 )
                 logger.error(f"Failed to post to {platform}: {e}")
 
-        await db.commit()
         return results
 
 
@@ -409,12 +406,12 @@ async def _send_scheduled_post(post_id: int) -> None:
                 "refusing to post a link to a non-public video. "
                 "Re-publish the video and use Send to retry."
             )
-            await db.execute(
-                "UPDATE social_posts SET status = 'failed', error = ?, "
-                "scheduler_job_id = NULL WHERE id = ?",
-                (err, post_id),
-            )
-            await db.commit()
+            async with write_transaction() as db:
+                await db.execute(
+                    "UPDATE social_posts SET status = 'failed', error = ?, "
+                    "scheduler_job_id = NULL WHERE id = ?",
+                    (err, post_id),
+                )
             await events.record_event(
                 video_id,
                 "social_post_failed_video_not_public",
@@ -489,12 +486,12 @@ async def _send_scheduled_post(post_id: int) -> None:
             # Set scheduled_at to the FUTURE retry time so restore re-creates a
             # future-dated job (the `when > now` branch) instead of treating it
             # as a missed window and firing it immediately on next startup.
-            await db.execute(
-                "UPDATE social_posts SET scheduler_job_id = NULL, scheduled_at = ? "
-                "WHERE id = ?",
-                (retry_at.isoformat(), post_id),
-            )
-            await db.commit()
+            async with write_transaction() as db:
+                await db.execute(
+                    "UPDATE social_posts SET scheduler_job_id = NULL, scheduled_at = ? "
+                    "WHERE id = ?",
+                    (retry_at.isoformat(), post_id),
+                )
         return
 
     try:
@@ -528,21 +525,21 @@ async def _send_scheduled_post(post_id: int) -> None:
             else:
                 poster = get_poster(post["platform"])
     except ValueError as exc:
-        await db.execute(
-            "UPDATE social_posts SET status = 'failed', error = ?, "
-            "scheduler_job_id = NULL WHERE id = ?",
-            (f"credential resolution failed: {exc}", post_id),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE social_posts SET status = 'failed', error = ?, "
+                "scheduler_job_id = NULL WHERE id = ?",
+                (f"credential resolution failed: {exc}", post_id),
+            )
         return
 
     if not await poster.is_configured():
-        await db.execute(
-            "UPDATE social_posts SET status = 'failed', error = ?, "
-            "scheduler_job_id = NULL WHERE id = ?",
-            (f"{post['platform']} not configured", post_id),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE social_posts SET status = 'failed', error = ?, "
+                "scheduler_job_id = NULL WHERE id = ?",
+                (f"{post['platform']} not configured", post_id),
+            )
         return
     try:
         from yt_scheduler.services.social import decode_media_paths
@@ -550,12 +547,12 @@ async def _send_scheduled_post(post_id: int) -> None:
             post["content"],
             media_paths=decode_media_paths(post),
         )
-        await db.execute(
-            "UPDATE social_posts SET status = 'posted', posted_at = datetime('now'), "
-            "post_url = ?, scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
-            (result.get("url", ""), post_id),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE social_posts SET status = 'posted', posted_at = datetime('now'), "
+                "post_url = ?, scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
+                (result.get("url", ""), post_id),
+            )
         await events.record_event(
             post["video_id"],
             "social_post_published",
@@ -596,12 +593,12 @@ async def _send_scheduled_post(post_id: int) -> None:
                 },
             )
         logger.error("Failed to send scheduled post %s: %s", post_id, exc)
-        await db.execute(
-            "UPDATE social_posts SET status = 'failed', error = ?, "
-            "scheduler_job_id = NULL WHERE id = ?",
-            (str(exc), post_id),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE social_posts SET status = 'failed', error = ?, "
+                "scheduler_job_id = NULL WHERE id = ?",
+                (str(exc), post_id),
+            )
 
 
 async def schedule_social_post(post_id: int, when: datetime) -> str:
@@ -644,12 +641,12 @@ async def schedule_social_post(post_id: int, when: datetime) -> str:
             coalesce=True,
         )
 
-        await db.execute(
-            "UPDATE social_posts SET scheduled_at = ?, scheduler_job_id = ?, "
-            "status = 'approved' WHERE id = ?",
-            (when.isoformat(), job_id, post_id),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE social_posts SET scheduled_at = ?, scheduler_job_id = ?, "
+                "status = 'approved' WHERE id = ?",
+                (when.isoformat(), job_id, post_id),
+            )
         await events.record_event(
             rows[0]["video_id"],
             "social_post_scheduled",
@@ -675,12 +672,12 @@ async def cancel_scheduled_post(post_id: int) -> bool:
         existing = scheduler.get_job(job_id)
         if existing:
             scheduler.remove_job(job_id)
-        await db.execute(
-            "UPDATE social_posts SET scheduled_at = NULL, scheduler_job_id = NULL "
-            "WHERE id = ?",
-            (post_id,),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE social_posts SET scheduled_at = NULL, scheduler_job_id = NULL "
+                "WHERE id = ?",
+                (post_id,),
+            )
         return True
 
 
@@ -689,16 +686,15 @@ _MISSED_POST_STAGGER_SECONDS = 5
 
 async def restore_scheduled_posts() -> None:
     """Re-register pending per-post jobs after a server restart."""
-    db = await get_db()
     # On a fresh process nothing is sending yet, so any post still marked
     # 'sending' was stranded by a crash/kill mid-send. Reset it to 'approved'
     # so it can be re-claimed and retried — otherwise both publish_video_job
     # (filters status='approved') and _send_scheduled_post (early-returns on
     # 'sending') would skip it forever and it would silently never send.
-    cursor = await db.execute(
-        "UPDATE social_posts SET status = 'approved' WHERE status = 'sending'"
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            "UPDATE social_posts SET status = 'approved' WHERE status = 'sending'"
+        )
     if cursor.rowcount:
         logger.warning(
             "Recovered %d post(s) stranded in 'sending' by a previous shutdown",
@@ -821,19 +817,19 @@ async def schedule_publish(
         coalesce=True,
     )
 
-    if manual is None:
-        await db.execute(
-            "UPDATE videos SET publish_at = ?, status = 'scheduled', "
-            "updated_at = datetime('now') WHERE id = ?",
-            (publish_at.isoformat(), video_id),
-        )
-    else:
-        await db.execute(
-            "UPDATE videos SET publish_at = ?, publish_at_manual = ?, "
-            "status = 'scheduled', updated_at = datetime('now') WHERE id = ?",
-            (publish_at.isoformat(), 1 if manual else 0, video_id),
-        )
-    await db.commit()
+    async with write_transaction() as db:
+        if manual is None:
+            await db.execute(
+                "UPDATE videos SET publish_at = ?, status = 'scheduled', "
+                "updated_at = datetime('now') WHERE id = ?",
+                (publish_at.isoformat(), video_id),
+            )
+        else:
+            await db.execute(
+                "UPDATE videos SET publish_at = ?, publish_at_manual = ?, "
+                "status = 'scheduled', updated_at = datetime('now') WHERE id = ?",
+                (publish_at.isoformat(), 1 if manual else 0, video_id),
+            )
 
     # Stagger using the project's posting settings. Same math the
     # Socials Compose page uses, so the two scheduling paths produce
@@ -1025,11 +1021,11 @@ async def cancel_scheduled_publish(video_id: str) -> bool:
     if existing:
         scheduler.remove_job(job_id)
 
-    await db.execute(
-        "UPDATE videos SET publish_at = NULL, status = 'ready', updated_at = datetime('now') WHERE id = ?",
-        (video_id,),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE videos SET publish_at = NULL, status = 'ready', updated_at = datetime('now') WHERE id = ?",
+            (video_id,),
+        )
     logger.info(f"Cancelled scheduled publish for {video_id}")
     return True
 
@@ -1247,19 +1243,19 @@ async def check_captions_job() -> None:
                     transcript_id = await transcript_service.upsert_transcript_for_source(
                         video_id, "youtube", caption_text
                     )
-                    await db.execute(
-                        """UPDATE videos SET
-                            transcript = ?,
-                            transcript_id = ?,
-                            transcript_source = 'youtube',
-                            transcript_created_at = COALESCE(transcript_created_at, datetime('now')),
-                            transcript_updated_at = datetime('now'),
-                            status = 'captioned',
-                            updated_at = datetime('now')
-                        WHERE id = ?""",
-                        (caption_text, transcript_id, video_id),
-                    )
-                    await db.commit()
+                    async with write_transaction() as db:
+                        await db.execute(
+                            """UPDATE videos SET
+                                transcript = ?,
+                                transcript_id = ?,
+                                transcript_source = 'youtube',
+                                transcript_created_at = COALESCE(transcript_created_at, datetime('now')),
+                                transcript_updated_at = datetime('now'),
+                                status = 'captioned',
+                                updated_at = datetime('now')
+                            WHERE id = ?""",
+                            (caption_text, transcript_id, video_id),
+                        )
                     logger.info(f"Captions ready for video {video_id} (project {slug}): {row['title']}")
             except Exception as e:
                 logger.warning(f"Failed to check captions for {video_id} (project {slug}): {e}")
@@ -1384,12 +1380,11 @@ _TRACE_TTL_HOURS = 24
 
 
 async def prune_social_post_traces_job() -> None:
-    db = await get_db()
-    cur = await db.execute(
-        f"DELETE FROM social_post_traces "
-        f"WHERE created_at < datetime('now', '-{_TRACE_TTL_HOURS} hours')"
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        cur = await db.execute(
+            f"DELETE FROM social_post_traces "
+            f"WHERE created_at < datetime('now', '-{_TRACE_TTL_HOURS} hours')"
+        )
     if getattr(cur, "rowcount", 0):
         logger.info(
             "Trace pruning: removed %d social_post_traces older than %dh",
@@ -1908,11 +1903,11 @@ async def cascade_children_on_parent_shift(
         # itself doesn't touch the column. Without this, a user-driven
         # cascade would leave the column as it was before — fine in this
         # path but cleaner to be explicit.
-        await db.execute(
-            "UPDATE videos SET publish_at_manual = 0 WHERE id = ?",
-            (child["id"],),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE videos SET publish_at_manual = 0 WHERE id = ?",
+                (child["id"],),
+            )
         shifted.append(child["id"])
     return shifted
 
@@ -1967,11 +1962,11 @@ async def cascade_siblings_on_shift(
             continue
         target = existing + delta
         await schedule_publish(sibling["id"], target)
-        await db.execute(
-            "UPDATE videos SET publish_at_manual = 0 WHERE id = ?",
-            (sibling["id"],),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE videos SET publish_at_manual = 0 WHERE id = ?",
+                (sibling["id"],),
+            )
         shifted.append(sibling["id"])
     return shifted
 
@@ -2100,11 +2095,11 @@ async def schedule_promo_batch(
         await schedule_publish(parent_id, parent_publish_at)
         # Schedule-all batches are auto-anchored; mark the parent so a
         # future cascade still moves it.
-        await db.execute(
-            "UPDATE videos SET publish_at_manual = 0 WHERE id = ?",
-            (parent_id,),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE videos SET publish_at_manual = 0 WHERE id = ?",
+                (parent_id,),
+            )
         scheduled.append({
             "video_id": parent_id, "publish_at": parent_publish_at.isoformat(),
         })
@@ -2121,11 +2116,11 @@ async def schedule_promo_batch(
             await schedule_publish(row["video_id"], target)
             # Batch-scheduled children are "auto", not "manual"; the
             # cascade routines will sweep them on the next parent move.
-            await db.execute(
-                "UPDATE videos SET publish_at_manual = 0 WHERE id = ?",
-                (row["video_id"],),
-            )
-            await db.commit()
+            async with write_transaction() as db:
+                await db.execute(
+                    "UPDATE videos SET publish_at_manual = 0 WHERE id = ?",
+                    (row["video_id"],),
+                )
         except Exception as exc:
             # Collect and keep going — don't strand the rest of the batch.
             errors.append({"video_id": row["video_id"], "error": str(exc)})
