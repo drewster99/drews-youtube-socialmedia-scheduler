@@ -28,7 +28,7 @@ from yt_scheduler.config import (
     YOUTUBE_SCOPES,
     resolve_oauth_origin,
 )
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.services.auth import (
     channel_id_from_credentials,
     get_client_secret_dict,
@@ -1145,12 +1145,12 @@ async def youtube_callback(
         # the channel has no published custom URL.
         project_url = _youtube.compose_channel_url(channel_handle, channel_id)
 
-        cursor = await db.execute(
-            "INSERT INTO projects (name, slug, youtube_channel_id, project_url) "
-            "VALUES (?, ?, ?, ?)",
-            (name, slug, channel_id, project_url),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            cursor = await db.execute(
+                "INSERT INTO projects (name, slug, youtube_channel_id, project_url) "
+                "VALUES (?, ?, ?, ?)",
+                (name, slug, channel_id, project_url),
+            )
         project_id = int(cursor.lastrowid)
         await asyncio.to_thread(store_credentials, slug, creds)
 
@@ -1207,25 +1207,25 @@ async def youtube_callback(
         # PATCH the project; the OAuth flow stops mutating it after that.
         composed_url = _youtube.compose_channel_url(channel_handle, channel_id)
         canonical_channel_id_url = f"https://www.youtube.com/channel/{channel_id}"
-        await db.execute(
-            "UPDATE projects "
-            "SET youtube_channel_id = ?, "
-            "    project_url = CASE "
-            "        WHEN project_url IS NULL THEN ? "
-            "        WHEN project_url = ? THEN ? "
-            "        ELSE project_url "
-            "    END, "
-            "    updated_at = datetime('now') "
-            "WHERE id = ?",
-            (
-                channel_id,
-                composed_url,
-                canonical_channel_id_url,
-                composed_url,
-                project["id"],
-            ),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE projects "
+                "SET youtube_channel_id = ?, "
+                "    project_url = CASE "
+                "        WHEN project_url IS NULL THEN ? "
+                "        WHEN project_url = ? THEN ? "
+                "        ELSE project_url "
+                "    END, "
+                "    updated_at = datetime('now') "
+                "WHERE id = ?",
+                (
+                    channel_id,
+                    composed_url,
+                    canonical_channel_id_url,
+                    composed_url,
+                    project["id"],
+                ),
+            )
 
     await asyncio.to_thread(store_credentials, project_slug, creds)
     return _result_page(
@@ -1333,13 +1333,13 @@ async def _bind_project_default(
         logger.info("project default binding skipped: unknown slug %s", project_slug)
         return
     project_id = int(row["id"])
-    await db.execute(
-        "INSERT INTO project_social_defaults (project_id, platform, social_account_id) "
-        "VALUES (?, ?, ?) "
-        "ON CONFLICT(project_id, platform) DO UPDATE SET social_account_id = excluded.social_account_id",
-        (project_id, platform, social_account_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "INSERT INTO project_social_defaults (project_id, platform, social_account_id) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(project_id, platform) DO UPDATE SET social_account_id = excluded.social_account_id",
+            (project_id, platform, social_account_id),
+        )
 
 
 async def _persist_oauth_credential(

@@ -10,7 +10,7 @@ import logging
 import httpx
 
 from yt_scheduler.config import UPLOAD_DIR
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.services import (
     auto_actions, events, tiers,
     transcripts as transcript_service, youtube,
@@ -94,12 +94,12 @@ async def list_available_imports(project_id: int, max_results: int = 50) -> list
         # Bulk update the youtube_deleted flag for any DB videos that the
         # channel's uploads playlist now flags as deleted.
         placeholders = ",".join(["?"] * len(deleted_known))
-        await db.execute(
-            f"UPDATE videos SET youtube_deleted = 1, updated_at = datetime('now') "
-            f"WHERE id IN ({placeholders})",
-            deleted_known,
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                f"UPDATE videos SET youtube_deleted = 1, updated_at = datetime('now') "
+                f"WHERE id IN ({placeholders})",
+                deleted_known,
+            )
 
     # Batch-fetch contentDetails + liveStreamingDetails for the candidate
     # set so each card can show duration + a coarse kind (video / short /
@@ -231,22 +231,22 @@ async def import_video(
     else:
         item_type_value = "episode"
 
-    await db.execute(
-        """INSERT INTO videos (
-            id, project_id, title, description, tags, privacy_status,
-            thumbnail_path, status, imported_from_youtube,
-            duration_seconds, tier, youtube_kind, url,
-            thumbnail_source, youtube_thumbnail_path, youtube_thumbnail_url,
-            item_type, parent_item_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'uploaded', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            video_id, project_id, title, description, json.dumps(tags_list),
-            privacy, thumbnail_path, duration, tier, youtube_kind, youtube_url,
-            thumbnail_source_value, youtube_thumbnail_path_value, youtube_thumbnail_url_value,
-            item_type_value, parent_item_id or None,
-        ),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            """INSERT INTO videos (
+                id, project_id, title, description, tags, privacy_status,
+                thumbnail_path, status, imported_from_youtube,
+                duration_seconds, tier, youtube_kind, url,
+                thumbnail_source, youtube_thumbnail_path, youtube_thumbnail_url,
+                item_type, parent_item_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'uploaded', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                video_id, project_id, title, description, json.dumps(tags_list),
+                privacy, thumbnail_path, duration, tier, youtube_kind, youtube_url,
+                thumbnail_source_value, youtube_thumbnail_path_value, youtube_thumbnail_url_value,
+                item_type_value, parent_item_id or None,
+            ),
+        )
 
     await events.record_event(
         video_id, "imported",
@@ -274,34 +274,34 @@ async def import_video(
             transcript_id = await transcript_service.upsert_transcript_for_source(
                 video_id, "youtube", text
             )
-            await db.execute(
-                """UPDATE videos SET
-                    transcript = ?,
-                    transcript_id = ?,
-                    transcript_source = 'youtube',
-                    transcript_created_at = datetime('now'),
-                    transcript_updated_at = datetime('now'),
-                    status = 'captioned',
-                    youtube_transcript_state = 'fetched'
-                WHERE id = ?""",
-                (text, transcript_id, video_id),
-            )
-            await db.commit()
+            async with write_transaction() as db:
+                await db.execute(
+                    """UPDATE videos SET
+                        transcript = ?,
+                        transcript_id = ?,
+                        transcript_source = 'youtube',
+                        transcript_created_at = datetime('now'),
+                        transcript_updated_at = datetime('now'),
+                        status = 'captioned',
+                        youtube_transcript_state = 'fetched'
+                    WHERE id = ?""",
+                    (text, transcript_id, video_id),
+                )
         else:
+            async with write_transaction() as db:
+                await db.execute(
+                    "UPDATE videos SET youtube_transcript_state = 'unavailable' "
+                    "WHERE id = ?",
+                    (video_id,),
+                )
+    except Exception as exc:
+        logger.info("No YouTube transcript available for %s: %s", video_id, exc)
+        async with write_transaction() as db:
             await db.execute(
                 "UPDATE videos SET youtube_transcript_state = 'unavailable' "
                 "WHERE id = ?",
                 (video_id,),
             )
-            await db.commit()
-    except Exception as exc:
-        logger.info("No YouTube transcript available for %s: %s", video_id, exc)
-        await db.execute(
-            "UPDATE videos SET youtube_transcript_state = 'unavailable' "
-            "WHERE id = ?",
-            (video_id,),
-        )
-        await db.commit()
 
     # Run the import-column auto-actions in the background.
     await auto_actions.run_post_create_actions(

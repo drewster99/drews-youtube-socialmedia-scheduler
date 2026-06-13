@@ -40,7 +40,7 @@ from pathlib import Path
 import httpx
 
 from yt_scheduler.config import UPLOAD_DIR
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.services import ai
 
 logger = logging.getLogger(__name__)
@@ -208,15 +208,15 @@ async def maybe_refresh_youtube_thumbnail(
                 video_id, new_url, exc,
             )
             return
-        await db.execute(
-            "UPDATE videos SET youtube_thumbnail_path = ?, "
-            "youtube_thumbnail_url = ?, youtube_thumbnail_etag = ?, "
-            "thumbnail_compare_verdict = NULL, "
-            "thumbnail_compared_at = NULL, "
-            "updated_at = datetime('now') WHERE id = ?",
-            (str(target), new_url, new_etag, video_id),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE videos SET youtube_thumbnail_path = ?, "
+                "youtube_thumbnail_url = ?, youtube_thumbnail_etag = ?, "
+                "thumbnail_compare_verdict = NULL, "
+                "thumbnail_compared_at = NULL, "
+                "updated_at = datetime('now') WHERE id = ?",
+                (str(target), new_url, new_etag, video_id),
+            )
         row["youtube_thumbnail_path"] = str(target)
         row["youtube_thumbnail_url"] = new_url
         row["youtube_thumbnail_etag"] = new_etag
@@ -261,15 +261,15 @@ async def maybe_refresh_youtube_thumbnail(
         logger.warning("Claude thumbnail compare failed for %s: %s", video_id, exc)
         return
 
-    await db.execute(
-        "UPDATE videos SET thumbnail_compare_verdict = ?, "
-        "thumbnail_compare_local_sha = ?, "
-        "thumbnail_compare_youtube_sha = ?, "
-        "thumbnail_compared_at = datetime('now'), "
-        "updated_at = datetime('now') WHERE id = ?",
-        (verdict, local_sha, yt_sha, video_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE videos SET thumbnail_compare_verdict = ?, "
+            "thumbnail_compare_local_sha = ?, "
+            "thumbnail_compare_youtube_sha = ?, "
+            "thumbnail_compared_at = datetime('now'), "
+            "updated_at = datetime('now') WHERE id = ?",
+            (verdict, local_sha, yt_sha, video_id),
+        )
 
 
 # YouTube serves a predictable thumbnail URL per video id. maxres often
@@ -322,12 +322,12 @@ async def backfill_thumbnail(video_id: str) -> bool:
     # Mirror the import path: thumbnail_source='youtube', and seed the
     # dual-thumbnail columns so a later maybe_refresh doesn't re-download
     # an identical image just to find nothing changed.
-    await db.execute(
-        "UPDATE videos SET thumbnail_path = ?, thumbnail_source = 'youtube', "
-        "youtube_thumbnail_path = ?, youtube_thumbnail_url = ?, "
-        "updated_at = datetime('now') WHERE id = ?",
-        (str(target), str(target), source_url, video_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE videos SET thumbnail_path = ?, thumbnail_source = 'youtube', "
+            "youtube_thumbnail_path = ?, youtube_thumbnail_url = ?, "
+            "updated_at = datetime('now') WHERE id = ?",
+            (str(target), str(target), source_url, video_id),
+        )
     logger.info("Backfilled YouTube thumbnail for %s", video_id)
     return True

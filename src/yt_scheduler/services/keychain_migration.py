@@ -27,7 +27,7 @@ import uuid as uuidlib
 
 import httpx
 
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.services.keychain import (
     delete_secret_async,
     load_all_secrets_async,
@@ -143,12 +143,12 @@ async def _migrate_platform(platform: str) -> None:
         # Nothing in Keychain to migrate. If 008 SQL created a placeholder
         # row for this platform anyway (because there was a 002-era row),
         # drop it -- it can't be reconciled to any real credentials.
-        await db.execute(
-            "DELETE FROM social_accounts "
-            "WHERE platform = ? AND uuid LIKE '__pending__:%'",
-            (platform,),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                "DELETE FROM social_accounts "
+                "WHERE platform = ? AND uuid LIKE '__pending__:%'",
+                (platform,),
+            )
         await store_secret_async(platform, MIGRATION_MARKER_KEY, "1")
         return
 
@@ -234,26 +234,28 @@ async def _migrate_platform(platform: str) -> None:
         platform, f"{CREDENTIAL_KEY_PREFIX}{new_uuid}", json.dumps(bundle)
     )
 
-    if placeholder is not None:
-        row_id = int(placeholder[0])
-        await db.execute(
-            "UPDATE social_accounts "
-            "SET uuid = ?, provider_account_id = ?, username = ?, "
-            "    credentials_ref = ?, is_nickname = ?, deleted_at = NULL "
-            "WHERE id = ?",
-            (new_uuid, final_provider_id, username,
-             f"{CREDENTIAL_KEY_PREFIX}{new_uuid}", is_nickname, row_id),
-        )
-    else:
-        cursor = await db.execute(
-            "INSERT INTO social_accounts "
-            "(uuid, platform, provider_account_id, username, credentials_ref, is_nickname) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (new_uuid, platform, final_provider_id, username,
-             f"{CREDENTIAL_KEY_PREFIX}{new_uuid}", is_nickname),
-        )
-        row_id = int(cursor.lastrowid)
-    await db.commit()
+    # The bundle store_secret_async (above) is already done, OUTSIDE this
+    # transaction; only the DB write is wrapped.
+    async with write_transaction() as db:
+        if placeholder is not None:
+            row_id = int(placeholder[0])
+            await db.execute(
+                "UPDATE social_accounts "
+                "SET uuid = ?, provider_account_id = ?, username = ?, "
+                "    credentials_ref = ?, is_nickname = ?, deleted_at = NULL "
+                "WHERE id = ?",
+                (new_uuid, final_provider_id, username,
+                 f"{CREDENTIAL_KEY_PREFIX}{new_uuid}", is_nickname, row_id),
+            )
+        else:
+            cursor = await db.execute(
+                "INSERT INTO social_accounts "
+                "(uuid, platform, provider_account_id, username, credentials_ref, is_nickname) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (new_uuid, platform, final_provider_id, username,
+                 f"{CREDENTIAL_KEY_PREFIX}{new_uuid}", is_nickname),
+            )
+            row_id = int(cursor.lastrowid)
 
     for key in legacy:
         await delete_secret_async(platform, key)
@@ -301,17 +303,19 @@ async def _wipe_bluesky_app_password_bundles() -> None:
         if keep:
             continue
         await delete_secret_async("bluesky", f"{CREDENTIAL_KEY_PREFIX}{uuid}")
-        await db.execute(
-            "UPDATE social_accounts SET deleted_at = datetime('now') WHERE id = ?",
-            (int(row["id"]),),
-        )
-        await db.execute(
-            "DELETE FROM project_social_defaults WHERE social_account_id = ?",
-            (int(row["id"]),),
-        )
+        # delete_secret_async (network) done above, outside; the two row writes
+        # commit together per credential.
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE social_accounts SET deleted_at = datetime('now') WHERE id = ?",
+                (int(row["id"]),),
+            )
+            await db.execute(
+                "DELETE FROM project_social_defaults WHERE social_account_id = ?",
+                (int(row["id"]),),
+            )
         wiped += 1
     if wiped:
-        await db.commit()
         logger.info(
             "Bluesky OAuth migration: soft-deleted %d app-password credential(s)",
             wiped,
