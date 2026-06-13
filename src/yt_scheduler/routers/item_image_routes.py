@@ -14,7 +14,7 @@ import shutil
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from yt_scheduler.config import UPLOAD_DIR, media_filename, media_url, safe_upload_ext
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 
 router = APIRouter(prefix="/api/videos/{video_id}/images", tags=["item-images"])
 
@@ -90,13 +90,13 @@ async def upload_item_image(
 
     db = await get_db()
     try:
-        cursor = await db.execute(
-            """INSERT INTO item_images
-                   (video_id, shortname, path, alt_text, order_index)
-            VALUES (?, ?, ?, ?, ?)""",
-            (video_id, shortname, str(dest), alt_text, int(order_index)),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            cursor = await db.execute(
+                """INSERT INTO item_images
+                       (video_id, shortname, path, alt_text, order_index)
+                VALUES (?, ?, ?, ?, ?)""",
+                (video_id, shortname, str(dest), alt_text, int(order_index)),
+            )
     except Exception as exc:
         # Most likely a UNIQUE(video_id, shortname) violation; surface as 400
         # so the UI can prompt the user to pick a different shortname.
@@ -156,10 +156,10 @@ async def update_item_image(video_id: str, image_id: int, payload: dict) -> dict
 
     params.append(image_id)
     try:
-        await db.execute(
-            f"UPDATE item_images SET {', '.join(updates)} WHERE id = ?", params
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                f"UPDATE item_images SET {', '.join(updates)} WHERE id = ?", params
+            )
     except Exception as exc:
         raise HTTPException(400, f"Could not update image: {exc}") from exc
 
@@ -182,9 +182,9 @@ async def delete_item_image(video_id: str, image_id: int) -> dict:
     if not rows:
         raise HTTPException(404, f"Image {image_id} not found on video {video_id}")
 
-    await db.execute(
-        "DELETE FROM item_images WHERE id = ? AND video_id = ?",
-        (image_id, video_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "DELETE FROM item_images WHERE id = ? AND video_id = ?",
+            (image_id, video_id),
+        )
     return {"status": "ok"}

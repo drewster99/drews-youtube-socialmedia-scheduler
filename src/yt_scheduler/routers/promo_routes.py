@@ -36,7 +36,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pathlib import Path
 
 from yt_scheduler.config import UPLOAD_DIR, safe_upload_ext
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.routers.video_routes import _resolve_video_file, _video_public
 from yt_scheduler.services import (
     auto_actions,
@@ -268,12 +268,12 @@ async def archive_promo(slug: str, parent_id: str, video_id: str) -> dict:
     )
     if not rows:
         raise HTTPException(404, "Promo clip not found under this parent")
-    await db.execute(
-        "UPDATE videos SET archived = 1, archived_at = datetime('now'), "
-        "updated_at = datetime('now') WHERE id = ?",
-        (video_id,),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE videos SET archived = 1, archived_at = datetime('now'), "
+            "updated_at = datetime('now') WHERE id = ?",
+            (video_id,),
+        )
     return {"archived": True, "video_id": video_id}
 
 
@@ -288,12 +288,12 @@ async def unarchive_promo(slug: str, parent_id: str, video_id: str) -> dict:
     )
     if not rows:
         raise HTTPException(404, "Promo clip not found under this parent")
-    await db.execute(
-        "UPDATE videos SET archived = 0, archived_at = NULL, "
-        "updated_at = datetime('now') WHERE id = ?",
-        (video_id,),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE videos SET archived = 0, archived_at = NULL, "
+            "updated_at = datetime('now') WHERE id = ?",
+            (video_id,),
+        )
     return {"archived": False, "video_id": video_id}
 
 
@@ -881,13 +881,12 @@ async def delete_generate_rejection(
     disappear between checks.
     """
     project, _parent = await _ensure_primary(slug, parent_id)
-    db = await get_db()
-    cursor = await db.execute(
-        "DELETE FROM generate_rejections "
-        "WHERE id = ? AND parent_id = ? AND project_id = ?",
-        (rejection_id, parent_id, int(project["id"])),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            "DELETE FROM generate_rejections "
+            "WHERE id = ? AND parent_id = ? AND project_id = ?",
+            (rejection_id, parent_id, int(project["id"])),
+        )
     return {"deleted": bool(cursor.rowcount)}
 
 

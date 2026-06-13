@@ -11,7 +11,7 @@ from yt_scheduler.config import (
     ANTHROPIC_NAMESPACE,
     get_anthropic_api_key,
 )
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.services import moderation
 from yt_scheduler.services import oauth_clients
 from yt_scheduler.services.keychain import (
@@ -96,13 +96,12 @@ async def update_settings(data: dict):
                     f"{interval_key} must be between 1 and 1440 minutes.",
                 )
             data[interval_key] = minutes
-    db = await get_db()
-    for key, value in data.items():
-        await db.execute(
-            "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?",
-            (key, str(value), str(value)),
-        )
-    await db.commit()
+    async with write_transaction() as db:
+        for key, value in data.items():
+            await db.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?",
+                (key, str(value), str(value)),
+            )
     return {"status": "ok"}
 
 
@@ -132,20 +131,17 @@ async def get_anthropic_status():
 @router.put("/anthropic")
 async def update_anthropic_key(data: dict):
     """Save Anthropic API key + optional model name."""
-    from yt_scheduler.database import get_db
-
     api_key = (data.get("api_key") or "").strip()
     model = (data.get("model") or "").strip()
     if api_key:
         await store_secret_async(ANTHROPIC_NAMESPACE, ANTHROPIC_API_KEY_FIELD, api_key)
     if model:
-        db = await get_db()
-        await db.execute(
-            "INSERT INTO settings (key, value) VALUES ('anthropic_model', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (model,),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                "INSERT INTO settings (key, value) VALUES ('anthropic_model', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (model,),
+            )
         # Bust the in-process cache so existing connections pick up the change
         # without needing a restart.
         from yt_scheduler.services.ai import invalidate_model_cache
