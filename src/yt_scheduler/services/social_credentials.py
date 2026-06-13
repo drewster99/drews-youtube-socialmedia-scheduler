@@ -18,7 +18,7 @@ import json
 import logging
 import uuid as uuidlib
 
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.services._keyed_locks import KeyedLocks
 from yt_scheduler.services.keychain import (
     delete_secret_async,
@@ -205,16 +205,18 @@ async def upsert_credential(
             platform, existing_uuid,
             dict(bundle, provider_account_id=provider_account_id, username=username),
         )
-        # Clear needs_reauth: the user just successfully re-OAuthed.
-        await db.execute(
-            "UPDATE social_accounts "
-            "SET username = ?, display_name = ?, is_nickname = ?, "
-            "    deleted_at = NULL, needs_reauth = 0, "
-            "    verified_type = COALESCE(?, verified_type) "
-            "WHERE id = ?",
-            (username, display_name, 1 if is_nickname else 0, verified_type, existing_id),
-        )
-        await db.commit()
+        # Clear needs_reauth: the user just successfully re-OAuthed. The
+        # save_bundle (Keychain, above) stays OUTSIDE the transaction — never
+        # await a network/to_thread call while holding the write lock.
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE social_accounts "
+                "SET username = ?, display_name = ?, is_nickname = ?, "
+                "    deleted_at = NULL, needs_reauth = 0, "
+                "    verified_type = COALESCE(?, verified_type) "
+                "WHERE id = ?",
+                (username, display_name, 1 if is_nickname else 0, verified_type, existing_id),
+            )
         return await get_credential_by_id(existing_id)  # type: ignore[return-value]
 
     new_uuid = uuidlib.uuid4().hex
@@ -224,17 +226,17 @@ async def upsert_credential(
         platform, new_uuid,
         dict(bundle, provider_account_id=provider_account_id, username=username),
     )
-    cursor = await db.execute(
-        "INSERT INTO social_accounts "
-        "(uuid, platform, provider_account_id, username, display_name, "
-        " is_nickname, credentials_ref, verified_type) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            new_uuid, platform, provider_account_id, username, display_name,
-            1 if is_nickname else 0, f"{CREDENTIAL_KEY_PREFIX}{new_uuid}", verified_type,
-        ),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            "INSERT INTO social_accounts "
+            "(uuid, platform, provider_account_id, username, display_name, "
+            " is_nickname, credentials_ref, verified_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                new_uuid, platform, provider_account_id, username, display_name,
+                1 if is_nickname else 0, f"{CREDENTIAL_KEY_PREFIX}{new_uuid}", verified_type,
+            ),
+        )
     new_id = int(cursor.lastrowid)
     return await get_credential_by_id(new_id)  # type: ignore[return-value]
 
@@ -246,11 +248,10 @@ async def mark_needs_reauth(uuid: str) -> None:
     flag is cleared on the next successful :func:`upsert_credential`
     (re-OAuth) or :func:`clear_needs_reauth` (a successful token refresh).
     """
-    db = await get_db()
-    await db.execute(
-        "UPDATE social_accounts SET needs_reauth = 1 WHERE uuid = ?", (uuid,)
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE social_accounts SET needs_reauth = 1 WHERE uuid = ?", (uuid,)
+        )
 
 
 async def clear_needs_reauth(uuid: str) -> None:
@@ -258,12 +259,11 @@ async def clear_needs_reauth(uuid: str) -> None:
     token refresh, so a credential flagged by a transient blip self-heals
     without forcing the user through the OAuth flow again. No-op if the
     flag wasn't set."""
-    db = await get_db()
-    await db.execute(
-        "UPDATE social_accounts SET needs_reauth = 0 WHERE uuid = ? AND needs_reauth = 1",
-        (uuid,),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE social_accounts SET needs_reauth = 0 WHERE uuid = ? AND needs_reauth = 1",
+            (uuid,),
+        )
 
 
 async def soft_delete_credential(uuid: str) -> dict | None:
@@ -279,14 +279,14 @@ async def soft_delete_credential(uuid: str) -> dict | None:
     if cred is None or cred["deleted_at"] is not None:
         return cred
 
-    db = await get_db()
     # Attempt the Keychain delete BEFORE committing the DB soft-delete so that
     # a crash between the two leaves a harmless orphaned secret rather than a
     # committed "deleted" row whose secret can never be cleaned up. A failed
     # delete is logged but does not block the DB update — the secret can't be
     # loaded via load_bundle once deleted_at is set (the row is excluded from
     # list_credentials and the bundle ref is gone from the UI), so it only
-    # wastes Keychain space, not a security concern.
+    # wastes Keychain space, not a security concern. The Keychain call stays
+    # OUTSIDE the write transaction (never await a network call under the lock).
     try:
         await delete_secret_async(cred["platform"], f"{CREDENTIAL_KEY_PREFIX}{uuid}")
     except Exception:
@@ -295,15 +295,15 @@ async def soft_delete_credential(uuid: str) -> dict | None:
             "orphaned secret may remain in Keychain",
             cred["platform"], uuid[:8],
         )
-    await db.execute(
-        "UPDATE social_accounts SET deleted_at = datetime('now') WHERE uuid = ?",
-        (uuid,),
-    )
-    await db.execute(
-        "DELETE FROM project_social_defaults WHERE social_account_id = ?",
-        (cred["id"],),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE social_accounts SET deleted_at = datetime('now') WHERE uuid = ?",
+            (uuid,),
+        )
+        await db.execute(
+            "DELETE FROM project_social_defaults WHERE social_account_id = ?",
+            (cred["id"],),
+        )
     return await get_credential_by_uuid(uuid)
 
 
