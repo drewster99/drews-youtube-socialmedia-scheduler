@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Literal
 
 from yt_scheduler.config import UPLOAD_DIR, sanitized_original_filename
-from yt_scheduler.database import get_db
+from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.services import (
     ai,
     events,
@@ -143,13 +143,12 @@ async def _run_chain(video_id: str, project_id: int, source: Source) -> None:
 
 
 async def _set_download_state(video_id: str, state: str | None) -> None:
-    db = await get_db()
-    await db.execute(
-        "UPDATE videos SET video_file_download_state = ?, updated_at = datetime('now') "
-        "WHERE id = ?",
-        (state, video_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE videos SET video_file_download_state = ?, updated_at = datetime('now') "
+            "WHERE id = ?",
+            (state, video_id),
+        )
 
 
 async def _maybe_download_video_file(video_id: str) -> None:
@@ -198,14 +197,13 @@ async def _maybe_download_video_file(video_id: str) -> None:
         await _set_download_state(video_id, "failed")
         return
 
-    db = await get_db()
-    await db.execute(
-        "UPDATE videos SET video_file_path = ?, video_file_download_state = NULL, "
-        "source_file_origin = 'youtube_download', updated_at = datetime('now') "
-        "WHERE id = ?",
-        (str(downloaded), video_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE videos SET video_file_path = ?, video_file_download_state = NULL, "
+            "source_file_origin = 'youtube_download', updated_at = datetime('now') "
+            "WHERE id = ?",
+            (str(downloaded), video_id),
+        )
 
 
 async def _maybe_extract_thumbnail(video_id: str, video_file_path: str | None) -> None:
@@ -250,13 +248,12 @@ async def _maybe_extract_thumbnail(video_id: str, video_file_path: str | None) -
         logger.warning("ffmpeg keyframe extract failed: %s", exc)
         return
 
-    db = await get_db()
-    cursor = await db.execute(
-        "UPDATE videos SET thumbnail_path = ?, updated_at = datetime('now') "
-        "WHERE id = ? AND (thumbnail_path IS NULL OR thumbnail_path = '')",
-        (str(target), video_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            "UPDATE videos SET thumbnail_path = ?, updated_at = datetime('now') "
+            "WHERE id = ? AND (thumbnail_path IS NULL OR thumbnail_path = '')",
+            (str(target), video_id),
+        )
 
     # If a concurrent path already set thumbnail_path (e.g. user uploaded one
     # while ffmpeg was running), the WHERE guard above made the update a
@@ -306,21 +303,20 @@ async def _maybe_transcribe(
         video_id, source, canonical, source_detail=model,
     )
 
-    db = await get_db()
-    await db.execute(
-        """UPDATE videos SET
-            transcript = ?,
-            transcript_id = ?,
-            transcript_source = ?,
-            transcript_created_at = COALESCE(transcript_created_at, datetime('now')),
-            transcript_updated_at = datetime('now'),
-            transcript_is_edited = 0,
-            status = 'captioned',
-            updated_at = datetime('now')
-        WHERE id = ?""",
-        (canonical, transcript_id, source, video_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            """UPDATE videos SET
+                transcript = ?,
+                transcript_id = ?,
+                transcript_source = ?,
+                transcript_created_at = COALESCE(transcript_created_at, datetime('now')),
+                transcript_updated_at = datetime('now'),
+                transcript_is_edited = 0,
+                status = 'captioned',
+                updated_at = datetime('now')
+            WHERE id = ?""",
+            (canonical, transcript_id, source, video_id),
+        )
     await events.record_event(
         video_id, "metadata_updated",
         {"transcript": {"old": "", "new": canonical}},
@@ -376,13 +372,12 @@ async def _maybe_generate_tags(video: dict, project_id: int, column: dict) -> No
                 seen.add(tag.lower())
                 merged.append(tag)
 
-    db = await get_db()
-    await db.execute(
-        "UPDATE videos SET tags = ?, tags_generated_at = datetime('now'), "
-        "updated_at = datetime('now') WHERE id = ?",
-        (json.dumps(merged), video["id"]),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE videos SET tags = ?, tags_generated_at = datetime('now'), "
+            "updated_at = datetime('now') WHERE id = ?",
+            (json.dumps(merged), video["id"]),
+        )
     await events.record_event(
         video["id"], "metadata_updated",
         {"tags": {"old": existing, "new": merged}},
@@ -403,17 +398,16 @@ async def _maybe_generate_description(video: dict, project_id: int) -> str | Non
         logger.warning("auto-description failed: %s", exc)
         return None
 
-    db = await get_db()
-    await db.execute(
-        """UPDATE videos SET
-            description = ?,
-            description_generated_at = datetime('now'),
-            status = 'ready',
-            updated_at = datetime('now')
-        WHERE id = ?""",
-        (description, video["id"]),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            """UPDATE videos SET
+                description = ?,
+                description_generated_at = datetime('now'),
+                status = 'ready',
+                updated_at = datetime('now')
+            WHERE id = ?""",
+            (description, video["id"]),
+        )
     await events.record_event(
         video["id"], "metadata_updated",
         {"description": {"old": video.get("description") or "", "new": description}},
@@ -523,19 +517,21 @@ async def _maybe_generate_socials(
         # that produced it so a later partial regenerate can target
         # this one specifically (two same-platform multi-account slots
         # are routed independently).
-        await db.execute(
-            """INSERT INTO social_posts
-                   (video_id, platform, content, media_path, media_paths,
-                    media_type, status, social_account_id, max_chars, slot_id)
-            VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)""",
-            (
-                video_id, platform, rendered,
-                primary_media, media_paths_json,
-                media_type, sa_id, int(slot_max),
-                int(slot_id) if slot_id is not None else None,
-            ),
-        )
-    await db.commit()
+        # async_render (AI) for this slot is already done above, outside the
+        # lock; persist each slot's post on its own.
+        async with write_transaction() as db:
+            await db.execute(
+                """INSERT INTO social_posts
+                       (video_id, platform, content, media_path, media_paths,
+                        media_type, status, social_account_id, max_chars, slot_id)
+                VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)""",
+                (
+                    video_id, platform, rendered,
+                    primary_media, media_paths_json,
+                    media_type, sa_id, int(slot_max),
+                    int(slot_id) if slot_id is not None else None,
+                ),
+            )
 
 
 # --- Promo Videos auto-action chain --------------------------------------
@@ -709,28 +705,27 @@ async def _persist_pending_promo_job(job: dict) -> None:
     failures are logged and swallowed — the job then merely lacks restart
     survival, which is the pre-migration-030 behaviour."""
     try:
-        db = await get_db()
-        await db.execute(
-            """INSERT INTO pending_promo_jobs (
-                job_id, project_id, parent_id, forced_item_type, original_filename,
-                title, parent_video_path, local_path,
-                cut_start_seconds, cut_end_seconds, vertical_crop,
-                x_shift_normalized, audio_fade_in, audio_fade_out,
-                status, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', datetime('now'))""",
-            (
-                job["job_id"], int(job["project_id"]), job.get("parent_id"),
-                job.get("forced_item_type"), job.get("filename"),
-                job.get("pre_supplied_title") or job.get("title"),
-                job.get("parent_video_path"), job.get("local_path"),
-                job.get("cut_start_seconds"), job.get("cut_end_seconds"),
-                1 if job.get("vertical_crop") else 0,
-                float(job.get("x_shift_normalized") or 0.0),
-                float(job.get("audio_fade_in") or 0.0),
-                float(job.get("audio_fade_out") or 0.0),
-            ),
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                """INSERT INTO pending_promo_jobs (
+                    job_id, project_id, parent_id, forced_item_type, original_filename,
+                    title, parent_video_path, local_path,
+                    cut_start_seconds, cut_end_seconds, vertical_crop,
+                    x_shift_normalized, audio_fade_in, audio_fade_out,
+                    status, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', datetime('now'))""",
+                (
+                    job["job_id"], int(job["project_id"]), job.get("parent_id"),
+                    job.get("forced_item_type"), job.get("filename"),
+                    job.get("pre_supplied_title") or job.get("title"),
+                    job.get("parent_video_path"), job.get("local_path"),
+                    job.get("cut_start_seconds"), job.get("cut_end_seconds"),
+                    1 if job.get("vertical_crop") else 0,
+                    float(job.get("x_shift_normalized") or 0.0),
+                    float(job.get("audio_fade_in") or 0.0),
+                    float(job.get("audio_fade_out") or 0.0),
+                ),
+            )
     except Exception as exc:
         logger.warning(
             "Could not persist pending promo job %s: %s", job.get("job_id"), exc
@@ -756,12 +751,11 @@ async def _mark_pending_promo_job(
         params.append(last_error[:500])
     params.append(job_id)
     try:
-        db = await get_db()
-        await db.execute(
-            f"UPDATE pending_promo_jobs SET {', '.join(assignments)} WHERE job_id = ?",
-            params,
-        )
-        await db.commit()
+        async with write_transaction() as db:
+            await db.execute(
+                f"UPDATE pending_promo_jobs SET {', '.join(assignments)} WHERE job_id = ?",
+                params,
+            )
     except Exception as exc:
         logger.warning("Could not update pending promo job %s: %s", job_id, exc)
 
@@ -983,13 +977,12 @@ async def retry_promo_step(video_id: str, step: str) -> None:
 async def _set_promo_state(
     video_id: str, state: str | None, *, error: str | None = None
 ) -> None:
-    db = await get_db()
-    await db.execute(
-        "UPDATE videos SET auto_action_state = ?, auto_action_last_error = ?, "
-        "updated_at = datetime('now') WHERE id = ?",
-        (state, error, video_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE videos SET auto_action_state = ?, auto_action_last_error = ?, "
+            "updated_at = datetime('now') WHERE id = ?",
+            (state, error, video_id),
+        )
 
 
 async def _load_parent_context(parent_id: str | None) -> dict:
@@ -1177,36 +1170,35 @@ async def _run_promo_chain_inner(job_id: str) -> None:
     # cut's own dimensions.
     file_origin = "generated_clip" if job.get("parent_video_path") else "uploaded"
 
-    db = await get_db()
-    await db.execute(
-        """INSERT INTO videos (
-            id, project_id, title, description, tags, privacy_status,
-            video_file_path, video_file_original_name, status,
-            duration_seconds, tier,
-            item_type, parent_item_id, url,
-            auto_action_state, source_file_origin,
-            cut_start_seconds, cut_end_seconds
-        ) VALUES (?, ?, ?, ?, '[]', 'unlisted', ?, ?, 'uploaded',
-                  ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            video_id,
-            project_id,
-            title,
-            "Description pending generation.",
-            str(local_path),
-            sanitized_original_filename(job.get("filename")),
-            duration,
-            derived_tier,
-            item_type,
-            job.get("parent_id") or None,
-            youtube_url,
-            PROMO_STATE_PROBING,
-            file_origin,
-            job.get("cut_start_seconds"),
-            job.get("cut_end_seconds"),
-        ),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            """INSERT INTO videos (
+                id, project_id, title, description, tags, privacy_status,
+                video_file_path, video_file_original_name, status,
+                duration_seconds, tier,
+                item_type, parent_item_id, url,
+                auto_action_state, source_file_origin,
+                cut_start_seconds, cut_end_seconds
+            ) VALUES (?, ?, ?, ?, '[]', 'unlisted', ?, ?, 'uploaded',
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                video_id,
+                project_id,
+                title,
+                "Description pending generation.",
+                str(local_path),
+                sanitized_original_filename(job.get("filename")),
+                duration,
+                derived_tier,
+                item_type,
+                job.get("parent_id") or None,
+                youtube_url,
+                PROMO_STATE_PROBING,
+                file_origin,
+                job.get("cut_start_seconds"),
+                job.get("cut_end_seconds"),
+            ),
+        )
     job["video_id"] = video_id
     # The videos row now exists; its auto_action_state drives resume from here,
     # so this pre-INSERT record has done its job.
@@ -1263,8 +1255,6 @@ async def _resume_promo_chain(
     if start_idx < PROMO_STEP_ORDER.index(PROMO_STATE_TRANSCRIBING):
         start_idx = PROMO_STEP_ORDER.index(PROMO_STATE_TRANSCRIBING)
 
-    db = await get_db()
-
     for step in PROMO_STEP_ORDER[start_idx:]:
         await _set_promo_state(video_id, step, error=None)
         try:
@@ -1287,12 +1277,12 @@ async def _resume_promo_chain(
     # Refresh videos.status to 'ready' so the existing schedule paths see
     # the row as eligible (matches what _maybe_generate_description does
     # for the standard upload/import chain).
-    await db.execute(
-        "UPDATE videos SET status = 'ready', updated_at = datetime('now') "
-        "WHERE id = ? AND status != 'published'",
-        (video_id,),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE videos SET status = 'ready', updated_at = datetime('now') "
+            "WHERE id = ? AND status != 'published'",
+            (video_id,),
+        )
 
 
 async def _promo_step_transcribe(video_id: str) -> None:
@@ -1355,12 +1345,12 @@ async def _promo_step_description(video_id: str, project_id: int) -> None:
             title=title, frames=frames, project_id=project_id,
         )
 
-    await db.execute(
-        """UPDATE videos SET description = ?, description_generated_at = datetime('now'),
-           updated_at = datetime('now') WHERE id = ?""",
-        (description, video_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            """UPDATE videos SET description = ?, description_generated_at = datetime('now'),
+               updated_at = datetime('now') WHERE id = ?""",
+            (description, video_id),
+        )
     await events.record_event(
         video_id, "metadata_updated",
         {"description": {"old": row.get("description") or "", "new": description}},
@@ -1417,12 +1407,12 @@ async def _promo_step_tags(video_id: str, project_id: int) -> None:
             project_id=project_id,
         )
 
-    await db.execute(
-        "UPDATE videos SET tags = ?, tags_generated_at = datetime('now'), "
-        "updated_at = datetime('now') WHERE id = ?",
-        (json.dumps(new_tags), video_id),
-    )
-    await db.commit()
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE videos SET tags = ?, tags_generated_at = datetime('now'), "
+            "updated_at = datetime('now') WHERE id = ?",
+            (json.dumps(new_tags), video_id),
+        )
     await events.record_event(
         video_id, "metadata_updated", {"tags": {"old": existing, "new": new_tags}},
     )
