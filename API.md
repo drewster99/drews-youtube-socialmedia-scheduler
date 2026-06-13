@@ -2008,9 +2008,27 @@ Bulk-upload promo children under a primary video. Each upload runs through the m
 
 **Purpose** — List the parent's children, bucketed by `item_type`.
 
-**Response 200** — `{"summary": {"segment": N, "short": N, "hook": N}, "children": {"segment": [...], "short": [...], "hook": [...]}, "readiness": {"segment": {"count": N, "line": "...", "state": "..."}, "short": {...}, "hook": {...}}, "pending_jobs": [{"job_id": str, "video_id": str|null, "item_type": "segment"|"short"|"hook"|null, "state": str, "title": str|null, "last_error": str|null}, ...]}`. Each child entry is the `_video_public` projection. `readiness` is a per-tier one-line summary for the parent's Promo videos card: `line` is human-readable (e.g. `"4 need thumbnail · 1 ready"`, `"all ready"`); `state` is one of `empty | ready | working | attention` (drives the card's status dot). `pending_jobs` lists in-flight promo-chain jobs for this parent that haven't reached `ready` (e.g. just-inserted Generate clips still cutting/uploading/transcribing) — surfaced from the in-memory job table so the page renders live placeholder cards before a DB row exists, on any load. `state` is one of the promo-chain states (`pending`, `cutting`, `uploading`, `transcribing`, `generating_desc`, …) or `failed:<step>`.
+**Query params** — `include_archived` (bool, default `false`): when `true`, archived clips are included in `children` (each carries `archived: 1` and `archived_at`); when `false` they're omitted. `summary`/`readiness` always count active clips only, regardless of this flag.
+
+**Response 200** — `{"summary": {"segment": N, "short": N, "hook": N}, "children": {"segment": [...], "short": [...], "hook": [...]}, "readiness": {"segment": {"count": N, "line": "...", "state": "..."}, "short": {...}, "hook": {...}}, "pending_jobs": [{"job_id": str, "video_id": str|null, "item_type": "segment"|"short"|"hook"|null, "state": str, "title": str|null, "last_error": str|null}, ...], "archived_count": N}`. Each child entry is the `_video_public` projection. `archived_count` is the number of archived clips on this parent (drives the page's "Show N archived" toggle). `readiness` is a per-tier one-line summary for the parent's Promo videos card: `line` is human-readable (e.g. `"4 need thumbnail · 1 ready"`, `"all ready"`); `state` is one of `empty | ready | working | attention` (drives the card's status dot). `pending_jobs` lists in-flight promo-chain jobs for this parent that haven't reached `ready` (e.g. just-inserted Generate clips still cutting/uploading/transcribing) — surfaced from the in-memory job table so the page renders live placeholder cards before a DB row exists, on any load. `state` is one of the promo-chain states (`pending`, `cutting`, `uploading`, `transcribing`, `generating_desc`, …) or `failed:<step>`.
 
 **Errors** — `404` (project or parent video not found in project), `400` (parent is itself a child — only one level of parenting is supported).
+
+### `POST /api/projects/{slug}/videos/{parent_id}/promos/{video_id}/archive`
+
+**Purpose** — Archive a promo clip: hide it from the Promo Videos page without deleting it. The `videos` row and the YouTube video both remain; sets `archived = 1` and `archived_at`. Reversible via the unarchive endpoint. Used to clear duplicates (e.g. an imported clip that duplicates a generated one) non-destructively.
+
+**Response 200** — `{"archived": true, "video_id": str}`.
+
+**Errors** — `404` (project/parent not found, or `video_id` is not a clip under this parent).
+
+### `POST /api/projects/{slug}/videos/{parent_id}/promos/{video_id}/unarchive`
+
+**Purpose** — Restore an archived promo clip back onto the page (`archived = 0`, `archived_at = NULL`).
+
+**Response 200** — `{"archived": false, "video_id": str}`.
+
+**Errors** — `404` (project/parent not found, or `video_id` is not a clip under this parent).
 
 ### `POST /api/projects/{slug}/videos/{parent_id}/promos/upload`
 

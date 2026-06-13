@@ -187,7 +187,9 @@ def _tier_readiness(children: list[dict]) -> dict:
 
 
 @router.get("")
-async def list_promos(slug: str, parent_id: str) -> dict:
+async def list_promos(
+    slug: str, parent_id: str, include_archived: bool = False
+) -> dict:
     """Return per-tier counts, the children themselves, and a per-tier
     readiness summary.
 
@@ -219,13 +221,23 @@ async def list_promos(slug: str, parent_id: str) -> dict:
     )
     buckets: dict[str, list[dict]] = {"segment": [], "short": [], "hook": []}
     raw_buckets: dict[str, list[dict]] = {"segment": [], "short": [], "hook": []}
+    archived_count = 0
     for row in rows:
         raw = dict(row)
+        is_archived = bool(raw.get("archived"))
+        if is_archived:
+            archived_count += 1
+            # Hidden from the page unless the user opts to view archived clips.
+            if not include_archived:
+                continue
         item = _video_public(dict(row))
         bucket = item.get("item_type") or item.get("tier") or "short"
         buckets.setdefault(bucket, []).append(item)
-        raw_buckets.setdefault(bucket, []).append(raw)
-    summary = {k: len(v) for k, v in buckets.items() if k in {"segment", "short", "hook"}}
+        # Summary + readiness reflect ACTIVE clips only, even when archived
+        # ones are shown, so an archived dup doesn't inflate the "ready" count.
+        if not is_archived:
+            raw_buckets.setdefault(bucket, []).append(raw)
+    summary = {k: len(v) for k, v in raw_buckets.items() if k in {"segment", "short", "hook"}}
     readiness = {
         tier: _tier_readiness(raw_buckets.get(tier, []))
         for tier in ("segment", "short", "hook")
@@ -239,7 +251,50 @@ async def list_promos(slug: str, parent_id: str) -> dict:
         "children": buckets,
         "readiness": readiness,
         "pending_jobs": pending_jobs,
+        "archived_count": archived_count,
     }
+
+
+@router.post("/{video_id}/archive")
+async def archive_promo(slug: str, parent_id: str, video_id: str) -> dict:
+    """Archive a promo clip: hide it from the page without deleting it. The
+    videos row and the YouTube video both remain; it can be restored via
+    :func:`unarchive_promo`."""
+    project, _parent = await _ensure_primary(slug, parent_id)
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id FROM videos WHERE id = ? AND parent_item_id = ? AND project_id = ?",
+        (video_id, parent_id, project["id"]),
+    )
+    if not rows:
+        raise HTTPException(404, "Promo clip not found under this parent")
+    await db.execute(
+        "UPDATE videos SET archived = 1, archived_at = datetime('now'), "
+        "updated_at = datetime('now') WHERE id = ?",
+        (video_id,),
+    )
+    await db.commit()
+    return {"archived": True, "video_id": video_id}
+
+
+@router.post("/{video_id}/unarchive")
+async def unarchive_promo(slug: str, parent_id: str, video_id: str) -> dict:
+    """Restore an archived promo clip back onto the page."""
+    project, _parent = await _ensure_primary(slug, parent_id)
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id FROM videos WHERE id = ? AND parent_item_id = ? AND project_id = ?",
+        (video_id, parent_id, project["id"]),
+    )
+    if not rows:
+        raise HTTPException(404, "Promo clip not found under this parent")
+    await db.execute(
+        "UPDATE videos SET archived = 0, archived_at = NULL, "
+        "updated_at = datetime('now') WHERE id = ?",
+        (video_id,),
+    )
+    await db.commit()
+    return {"archived": False, "video_id": video_id}
 
 
 @router.post("/upload")

@@ -13,6 +13,7 @@
     <div style="display:flex; gap:0.5rem;">
         <a class="btn btn-secondary" href="/projects/{{ current_project.slug }}/videos/{{ parent_id }}/promos/generate">Generate from source</a>
         <button type="button" class="btn btn-secondary" id="schedule-all-btn">Schedule all</button>
+        <button type="button" class="btn btn-secondary" id="toggle-archived-btn" style="display:none;"></button>
         <label for="add-files-all" class="btn btn-primary" id="add-files-all-label">
             + Add videos
             <input type="file" id="add-files-all" accept="video/*" multiple style="display:none;">
@@ -210,8 +211,9 @@ function renderChildCard(child) {
     // click to the outer anchor regardless of stopPropagation, so the
     // Retry never fires). Split the card so only the thumbnail and the
     // title are individual <a>s; the Retry button sits as a sibling.
+    let cardHtml;
     if (failed) {
-        return `
+        cardHtml = `
             <div class="video-card promo-card${editable}" data-child-id="${escapeHtml(child.id)}">
                 <a href="${href}" class="video-thumb promo-thumb-link">${thumb}</a>
                 <div class="video-info">
@@ -221,20 +223,31 @@ function renderChildCard(child) {
                 </div>
             </div>
         `;
+    } else {
+        // Whole card is the link (matches the dashboard) when there's no
+        // inner button to compete for the click.
+        cardHtml = `
+            <a href="${href}"
+               class="video-card promo-card${editable}" data-child-id="${escapeHtml(child.id)}">
+                <div class="video-thumb">${thumb}</div>
+                <div class="video-info">
+                    <h3>${escapeHtml(child.title)}</h3>
+                    ${statusStripFor(child)}
+                    ${meta}
+                </div>
+            </a>
+        `;
     }
-    // Whole card is the link (matches the dashboard) when there's no
-    // inner button to compete for the click.
-    return `
-        <a href="${href}"
-           class="video-card promo-card${editable}" data-child-id="${escapeHtml(child.id)}">
-            <div class="video-thumb">${thumb}</div>
-            <div class="video-info">
-                <h3>${escapeHtml(child.title)}</h3>
-                ${statusStripFor(child)}
-                ${meta}
-            </div>
-        </a>
-    `;
+    // Archive/Unarchive sits OUTSIDE the card anchor (a button inside an <a>
+    // routes the click to the anchor on WebKit). Archiving is reversible and
+    // never deletes the clip or its YouTube video.
+    const archived = !!child.archived;
+    const archiveBtn = archived
+        ? `<button class="btn btn-sm btn-secondary" data-unarchive-id="${escapeHtml(child.id)}">Unarchive</button>`
+        : `<button class="btn btn-sm btn-secondary" data-archive-id="${escapeHtml(child.id)}">Archive</button>`;
+    const wrapStyle = archived ? ' style="opacity:0.55"' : '';
+    return `<div class="promo-card-wrap"${wrapStyle}>${cardHtml}`
+        + `<div class="promo-card-controls" style="margin-top:0.25rem; text-align:right;">${archiveBtn}</div></div>`;
 }
 
 function renderUploadJobCard(job) {
@@ -272,14 +285,34 @@ function renderUploadJobCard(job) {
     `;
 }
 
+let showArchived = false;
+
 async function loadPromos() {
-    const resp = await fetch(`/api/projects/${projectSlug}/videos/${parentId}/promos`);
+    const resp = await fetch(
+        `/api/projects/${projectSlug}/videos/${parentId}/promos?include_archived=${showArchived ? 1 : 0}`);
     if (!resp.ok) {
         document.getElementById('upload-error-banner').style.display = '';
         document.getElementById('upload-error-banner').textContent = 'Failed to load promo videos.';
         return;
     }
     const data = await resp.json();
+    // Archived-clips toggle: only surfaced when some exist. Bound once.
+    const archiveToggle = document.getElementById('toggle-archived-btn');
+    const archivedCount = data.archived_count || 0;
+    if (archivedCount > 0) {
+        archiveToggle.style.display = '';
+        archiveToggle.textContent = showArchived ? 'Hide archived' : `Show ${archivedCount} archived`;
+    } else {
+        archiveToggle.style.display = 'none';
+        showArchived = false;
+    }
+    if (!archiveToggle.dataset.bound) {
+        archiveToggle.dataset.bound = '1';
+        archiveToggle.addEventListener('click', () => {
+            showArchived = !showArchived;
+            loadPromos();
+        });
+    }
     // Seed/refresh in-flight promo-chain jobs from the server so live
     // placeholder cards appear on ANY load of this page (the Insert redirect,
     // a reload, another tab) — not only the tab that started them.
@@ -349,6 +382,30 @@ function bindRetryButtons() {
             loadPromos();
         });
     }
+    const archiveAction = (attr, verb, busy) => {
+        for (const btn of document.querySelectorAll(`[${attr}]`)) {
+            btn.addEventListener('click', async (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const id = btn.getAttribute(attr);
+                btn.disabled = true;
+                btn.textContent = busy;
+                const resp = await fetch(
+                    `/api/projects/${projectSlug}/videos/${parentId}/promos/${id}/${verb}`,
+                    {method: 'POST'});
+                if (!resp.ok) {
+                    btn.disabled = false;
+                    document.getElementById('upload-error-banner').style.display = '';
+                    document.getElementById('upload-error-banner').textContent =
+                        `Failed to ${verb} clip.`;
+                    return;
+                }
+                loadPromos();
+            });
+        }
+    };
+    archiveAction('data-archive-id', 'archive', 'Archiving…');
+    archiveAction('data-unarchive-id', 'unarchive', 'Restoring…');
 }
 
 async function pollUploadJobs() {
