@@ -23,7 +23,9 @@ Server-side post-validation drops any proposal that:
 - falls outside the kind's length band,
 - starts before 0 or ends past the parent's duration,
 - overlaps an existing same-kind cut range on this parent by more than
-  ``_MAX_OVERLAP_FRACTION``,
+  ``_MAX_OVERLAP_FRACTION`` of the shorter of the two clips,
+- has a title near-identical to an existing same-kind clip on this parent
+  (imported clips carry no cut range, so the range check can't see them),
 - is the 9th+ entry returned by Claude for that kind.
 
 A parent with fewer than ``kind_max + _PARENT_HEADROOM_SECONDS`` seconds
@@ -34,6 +36,7 @@ this and never asks for a kind it can't satisfy.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import logging
 import math
 import re
@@ -88,10 +91,20 @@ _EXISTING_OVERREQUEST_BONUS: int = 3
 _OUTPUT_CAP_PER_KIND: int = DEFAULT_MAX_PROPOSALS_PER_KIND
 
 # Overlap with an existing same-kind range that exceeds this fraction of
-# the proposed clip's length → drop the proposal. The threshold is loose
-# on purpose: small head/tail overlaps that produce a meaningfully
-# different clip are fine; near-duplicates are not.
+# the SHORTER of the two clips → drop the proposal. Measuring against the
+# shorter clip (not just the proposal) keeps a long proposal from fully
+# swallowing a short existing clip and still passing because the overlap
+# was a small fraction of its own length. The threshold is loose on
+# purpose: small head/tail overlaps that produce a meaningfully different
+# clip are fine; near-duplicates are not.
 _MAX_OVERLAP_FRACTION: float = 0.5
+
+# Threshold for treating a proposed title as a duplicate of an existing
+# same-kind clip's title. High on purpose: it should catch near-identical
+# titles ("Claude Nuked My Database" vs "Claude Nuked My Production
+# Database") without suppressing genuinely different clips that happen to
+# share a few words.
+_TITLE_SIMILARITY_THRESHOLD: float = 0.8
 
 
 @dataclass(frozen=True)
@@ -139,6 +152,37 @@ def _overlap_seconds(
 
 
 _PUNCT_STRIP_RE = re.compile(r"[^\w\s]")
+
+
+def _normalize_title_for_match(title: str) -> str:
+    """Lower-case, strip punctuation, collapse whitespace — so casing and
+    punctuation differences never defeat the duplicate-title check."""
+    cleaned = _PUNCT_STRIP_RE.sub(" ", title.lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _titles_similar(a: str, b: str) -> bool:
+    """True when two clip titles are close enough to call duplicates.
+
+    Compares normalized titles two ways and accepts either: character-level
+    ``SequenceMatcher`` ratio (catches insertions — "Claude Nuked My
+    [Production] Database") and word-set Jaccard (catches reorderings).
+    This guard exists because imported clips carry no cut range, so the
+    range-overlap check can't see them; their title is the only signal.
+    """
+    norm_a = _normalize_title_for_match(a)
+    norm_b = _normalize_title_for_match(b)
+    if not norm_a or not norm_b:
+        return False
+    if norm_a == norm_b:
+        return True
+    char_ratio = difflib.SequenceMatcher(None, norm_a, norm_b).ratio()
+    if char_ratio >= _TITLE_SIMILARITY_THRESHOLD:
+        return True
+    words_a = set(norm_a.split())
+    words_b = set(norm_b.split())
+    jaccard = len(words_a & words_b) / len(words_a | words_b)
+    return jaccard >= _TITLE_SIMILARITY_THRESHOLD
 
 
 def _normalize_anchor_text(text: str) -> str:
@@ -431,9 +475,14 @@ def _validate_indexed_proposals(
     raw_proposals: list[dict], *, kind: ClipKind, units: list[ClipUnit],
     existing_ranges: list[tuple[float, float]], max_proposals: int,
     parent_duration_seconds: float,
+    existing_titles: list[str] | None = None,
 ) -> list[ProposedClip]:
     """Resolve index ranges to clips: drop bad/duplicate indices and any clip
-    outside the kind's duration window; compute the gap-ramp edges."""
+    outside the kind's duration window; compute the gap-ramp edges.
+
+    ``existing_titles``: titles of same-kind clips already on this parent.
+    Proposals whose title near-matches one are dropped — the only duplicate
+    signal available for imported clips, which carry no cut range."""
     min_s, max_s = _PER_KIND_BOUNDS[kind]
     # Segments have no fixed upper bound — cap at 90% of the parent so a
     # "segment" can run long but can't just be (nearly) the whole video.
@@ -451,6 +500,20 @@ def _validate_indexed_proposals(
             logger.info("Dropping clip proposal: missing/invalid indices %r", entry)
             continue
         title = str(entry.get("title") or "").strip() or f"Untitled {kind}"
+        # Title guard — imported clips have no cut range (unknowable for a
+        # YouTube import), so the range-overlap check below can't see them.
+        # A near-identical title to an existing same-kind clip means the
+        # model re-found the same moment; drop it before any edge math.
+        duplicate_of = next(
+            (t for t in (existing_titles or []) if _titles_similar(title, t)),
+            None,
+        )
+        if duplicate_of is not None:
+            logger.info(
+                "Dropping clip proposal %r: title duplicates existing %s %r.",
+                title, kind, duplicate_of,
+            )
+            continue
         resolved = clip_edges.resolve_unit_range(units, first_index, last_index)
         if resolved is None:
             logger.info(
@@ -481,12 +544,21 @@ def _validate_indexed_proposals(
         edges = clip_edges.compute_edges(units, first_index, last_index)
         # Overlap guard — against already-cut clips and earlier proposals in
         # this same batch (the model is told not to overlap; enforce it).
+        # Symmetric: measured against the SHORTER of the two clips, so a long
+        # proposal that fully contains a short existing clip is also dropped
+        # (against its own length alone, that containment would pass).
         prior = existing_ranges + accepted
-        if any(
-            _overlap_seconds(edges.final_start, edges.final_end, s, e)
-            > _MAX_OVERLAP_FRACTION * (edges.final_end - edges.final_start)
-            for s, e in prior
-        ):
+        proposal_length = edges.final_end - edges.final_start
+        overlaps_prior = False
+        for s, e in prior:
+            shorter_length = min(proposal_length, e - s)
+            if shorter_length <= 0:
+                continue
+            overlap = _overlap_seconds(edges.final_start, edges.final_end, s, e)
+            if overlap > _MAX_OVERLAP_FRACTION * shorter_length:
+                overlaps_prior = True
+                break
+        if overlaps_prior:
             logger.info("Dropping clip proposal %r: overlaps an existing range.", title)
             continue
         rating = entry.get("rating")
@@ -511,6 +583,7 @@ async def propose_clips_for_kind_indexed(
     parent_title: str,
     parent_duration_seconds: float,
     existing_ranges: list[tuple[float, float]],
+    existing_titles: list[str] | None = None,
     max_proposals: int | None = None,
 ) -> list[ProposedClip]:
     """Word-stream proposal: one per-kind Claude call over the numbered units."""
@@ -564,6 +637,7 @@ async def propose_clips_for_kind_indexed(
         raw_proposals, kind=kind, units=units,
         existing_ranges=existing_ranges, max_proposals=base_max,
         parent_duration_seconds=parent_duration_seconds,
+        existing_titles=existing_titles,
     )
     logger.info("Clip-proposal (index) for %s: %d raw -> %d accepted (asked up to %d)",
                 kind, len(raw_proposals), len(proposals), ask_max)
@@ -1218,6 +1292,7 @@ async def propose_all_clips(
     existing_ranges_per_kind: dict[ClipKind, list[tuple[float, float]]],
     project_id: int,
     max_per_kind: dict[ClipKind, int] | None = None,
+    existing_titles_per_kind: dict[ClipKind, list[str]] | None = None,
 ) -> dict[ClipKind, list[ProposedClip]]:
     """Fan out one Claude call per requested kind, in parallel.
 
@@ -1243,6 +1318,7 @@ async def propose_all_clips(
             parent_title=parent_title,
             parent_duration_seconds=parent_duration_seconds,
             existing_ranges=existing_ranges_per_kind.get(k, []),
+            existing_titles=(existing_titles_per_kind or {}).get(k, []),
             max_proposals=caps.get(k),
         )
         return k, proposals
@@ -1463,6 +1539,7 @@ async def start_generate_job(
     crop_vertical_for_kind: dict[ClipKind, bool],
     existing_ranges_per_kind: dict[ClipKind, list[tuple[float, float]]],
     max_per_kind: dict[ClipKind, int] | None = None,
+    existing_titles_per_kind: dict[ClipKind, list[str]] | None = None,
 ) -> str:
     """Queue a preview job. Returns the job_id the client polls.
 
@@ -1501,6 +1578,9 @@ async def start_generate_job(
         "max_per_kind": normalised_max,
         "existing_ranges_per_kind": {
             k: list(v) for k, v in existing_ranges_per_kind.items()
+        },
+        "existing_titles_per_kind": {
+            k: list(v) for k, v in (existing_titles_per_kind or {}).items()
         },
         "state": "pending",
         "last_error": None,
@@ -1592,6 +1672,7 @@ async def _run_generate_job(job_id: str) -> None:
             existing_ranges_per_kind=job["existing_ranges_per_kind"],
             project_id=int(job["project_id"]),
             max_per_kind=job.get("max_per_kind"),
+            existing_titles_per_kind=job["existing_titles_per_kind"],
         )
 
         # Refinement — for kinds the user toggled for vertical crop,

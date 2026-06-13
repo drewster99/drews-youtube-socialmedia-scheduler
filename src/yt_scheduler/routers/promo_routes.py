@@ -62,24 +62,37 @@ _VALID_FORCED_ITEM_TYPES = {"segment", "short", "hook"}
 _GENERATE_MAX_PARENT_SECONDS: float = 4 * 60 * 60  # 4 hours
 
 
-async def _existing_cut_ranges(
+async def _existing_promo_dedup_info(
     parent_id: str, project_id: int,
-) -> dict[str, list[tuple[float, float]]]:
-    """Per-kind ranges already cut from this parent, for the overlap filter."""
+) -> tuple[dict[str, list[tuple[float, float]]], dict[str, list[str]]]:
+    """Per-kind cut ranges AND titles of clips already on this parent.
+
+    Ranges feed Generate's overlap filter. Titles feed its duplicate-title
+    filter, which exists because imported clips (e.g. re-imported from
+    YouTube) have NULL cut ranges — their boundaries within the parent are
+    unknowable — making them invisible to the range check. Without the title
+    signal, Generate happily re-proposes the exact moment an imported clip
+    already covers."""
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT item_type, cut_start_seconds, cut_end_seconds "
-        "FROM videos WHERE parent_item_id = ? AND project_id = ? "
-        "AND cut_start_seconds IS NOT NULL AND cut_end_seconds IS NOT NULL",
+        "SELECT item_type, cut_start_seconds, cut_end_seconds, title "
+        "FROM videos WHERE parent_item_id = ? AND project_id = ?",
         (parent_id, project_id),
     )
-    out: dict[str, list[tuple[float, float]]] = {"hook": [], "short": [], "segment": []}
+    ranges: dict[str, list[tuple[float, float]]] = {"hook": [], "short": [], "segment": []}
+    titles: dict[str, list[str]] = {"hook": [], "short": [], "segment": []}
     for r in rows:
         kind = r["item_type"]
-        if kind not in out:
+        if kind not in ranges:
             continue
-        out[kind].append((float(r["cut_start_seconds"]), float(r["cut_end_seconds"])))
-    return out
+        if r["cut_start_seconds"] is not None and r["cut_end_seconds"] is not None:
+            ranges[kind].append(
+                (float(r["cut_start_seconds"]), float(r["cut_end_seconds"]))
+            )
+        title = (r["title"] or "").strip()
+        if title:
+            titles[kind].append(title)
+    return ranges, titles
 
 
 async def _ensure_primary(slug: str, parent_id: str) -> tuple[dict, dict]:
@@ -481,7 +494,9 @@ async def generate_preview(
             "re-transcribe, then try again.",
         )
 
-    existing_ranges = await _existing_cut_ranges(parent_id, int(project["id"]))
+    existing_ranges, existing_titles = await _existing_promo_dedup_info(
+        parent_id, int(project["id"]),
+    )
 
     eligible_max_per_kind = {k: max_per_kind[k] for k in eligible_kinds}
     job_id = await clipper.start_generate_job(
@@ -494,6 +509,7 @@ async def generate_preview(
         crop_vertical_for_kind=crop_vertical,
         existing_ranges_per_kind=existing_ranges,
         max_per_kind=eligible_max_per_kind,
+        existing_titles_per_kind=existing_titles,
     )
 
     # Source-quality warnings on the parent are useful to surface here
