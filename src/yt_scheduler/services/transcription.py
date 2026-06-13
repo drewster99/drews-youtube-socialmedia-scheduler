@@ -190,6 +190,16 @@ def _extract_audio(video_path: Path) -> Path:
 
 # --- Backend: MLX Whisper ---
 
+# Serializes MLX-Whisper inference across threads. Whisper's word-timestamp
+# alignment is JIT-compiled by numba, whose default "workqueue" threading
+# layer is NOT threadsafe: entered from two threads at once, numba abort()s
+# the entire process (SIGABRT). The promo chain transcribes each clip on its
+# own to_thread worker, so a multi-clip "insert all" reliably tripped this
+# and took the whole server down mid-batch (2026-06-12, crash report
+# python3.12-2026-06-12-184741.ips). Whisper inference saturates the GPU
+# anyway, so serializing costs little wall-clock versus crashing.
+_mlx_whisper_inference_lock = threading.Lock()
+
 
 def _try_mlx_whisper(audio_path: Path, model: str, language: str | None) -> TranscriptionResult | None:
     """Transcribe using mlx-whisper (Apple Silicon only)."""
@@ -210,7 +220,8 @@ def _try_mlx_whisper(audio_path: Path, model: str, language: str | None) -> Tran
     if language:
         kwargs["language"] = language
 
-    result = mlx_whisper.transcribe(str(audio_path), **kwargs)
+    with _mlx_whisper_inference_lock:
+        result = mlx_whisper.transcribe(str(audio_path), **kwargs)
 
     segments = []
     has_words = False
