@@ -213,6 +213,11 @@ async def list_promos(
     ``readiness.state`` is one of empty | ready | working | attention.
     """
     project, _parent = await _ensure_primary(slug, parent_id)
+    # Lazy import, mirroring _tier_readiness's local import of the same
+    # symbol below — scheduler is pulled in on demand rather than at router
+    # load. is_ready_for_schedule is pure, so call-time import is cheap.
+    from yt_scheduler.services.scheduler import is_ready_for_schedule
+
     db = await get_db()
     rows = await db.execute_fetchall(
         "SELECT * FROM videos WHERE parent_item_id = ? AND project_id = ? "
@@ -231,6 +236,15 @@ async def list_promos(
             if not include_archived:
                 continue
         item = _video_public(dict(row))
+        # Per-card schedule-readiness, computed from the RAW row (which still
+        # carries thumbnail_path — _video_public pops it). This is the SAME
+        # is_ready_for_schedule the per-tier summary uses, so a card's "Ready"
+        # bar can never disagree with the parent dashboard's "all ready". An
+        # imported clip's auto_action_state is NULL, so the card cannot infer
+        # readiness from the chain state alone.
+        item_ready, item_missing = is_ready_for_schedule(raw)
+        item["ready"] = item_ready
+        item["missing"] = item_missing
         bucket = item.get("item_type") or item.get("tier") or "short"
         buckets.setdefault(bucket, []).append(item)
         # Summary + readiness reflect ACTIVE clips only, even when archived

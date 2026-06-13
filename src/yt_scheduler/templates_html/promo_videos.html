@@ -187,7 +187,18 @@ function statusStripFor(child) {
     if (child.publish_at) {
         return `<div class="promo-progress promo-progress-scheduled">⏰ Scheduled: <strong>${escapeHtml(fmtScheduledWhen(child.publish_at))}</strong></div>`;
     }
-    return progressStripFor(state, child.auto_action_last_error || null);
+    // Terminal: the chain finished ('ready') or never ran. Imported clips
+    // carry a NULL auto_action_state, so the chain state can't tell us if
+    // they're schedulable — `child.ready` (the server's is_ready_for_schedule,
+    // the same source the parent dashboard's per-tier summary uses) does. A
+    // naive "null means ready" shortcut would mislabel an incomplete import.
+    if (child.ready) {
+        return '<div class="promo-progress promo-progress-ready">Ready</div>';
+    }
+    const needs = (child.missing && child.missing.length)
+        ? child.missing.join(', ')
+        : 'metadata';
+    return `<div class="promo-progress promo-progress-attention">Needs: ${escapeHtml(needs)}</div>`;
 }
 
 function renderChildCard(child) {
@@ -914,6 +925,7 @@ scheduleAllForm.addEventListener('submit', async (e) => {
 .promo-progress-ready { background: rgba(60,180,75,0.12); color: var(--success, #3cb44b); }
 .promo-progress-published { background: rgba(60,180,75,0.18); color: var(--success, #3cb44b); font-weight: 600; }
 .promo-progress-scheduled { background: rgba(139,92,246,0.15); color: #b39bff; }
+.promo-progress-attention { background: rgba(230,170,40,0.14); color: #e6aa28; }
 .promo-progress-failed { background: rgba(220,80,80,0.12); color: var(--error, #d44); }
 .promo-error-msg { margin: 0.3rem 0; font-size: 0.85em; opacity: 0.85; }
 .promo-retry-btn { margin-top: 0.3rem; }
