@@ -104,6 +104,47 @@ def test_title_duplicate_of_existing_clip_dropped_without_any_range():
     assert out == []
 
 
+def test_within_batch_title_duplicate_dropped():
+    """Two proposals in ONE batch with near-identical titles but
+    non-overlapping ranges: the range guard can't link them, so the title
+    guard must — it now compares against titles accepted earlier in the same
+    batch, not only clips already on the parent."""
+    units = make_units(5, dur=10.0, gap=1.0)
+    raw = [
+        {"first_index": 2, "last_index": 2,
+         "title": "Claude Nuked My Database", "reason": "r", "rating": 4},
+        {"first_index": 4, "last_index": 4,
+         "title": "Claude Nuked My Production Database", "reason": "r", "rating": 4},
+    ]
+    out = clipper._validate_indexed_proposals(
+        raw, kind="hook", units=units, existing_ranges=[], max_proposals=8,
+        parent_duration_seconds=PARENT_DURATION)
+    assert len(out) == 1
+    assert out[0].title == "Claude Nuked My Database"
+
+
+def test_prompt_lists_already_covered_titles():
+    """Existing same-kind titles are injected into the proposer prompt so the
+    model avoids re-covering the same moment in different words — the only
+    guard against a semantic repeat the lexical post-filter can't catch."""
+    units = make_units(5, dur=10.0, gap=1.0)
+    text = clipper._build_index_user_text(
+        "hook", units, parent_title="P", max_proposals=8,
+        existing_titles=["One Line Nuked All Your Code", "   "])
+    assert "Already covered" in text
+    assert "One Line Nuked All Your Code" in text
+    # Blank / whitespace-only titles are filtered out of the bullet list.
+    assert "- One Line Nuked All Your Code" in text
+    assert "-    \n" not in text
+
+
+def test_prompt_omits_already_covered_when_none():
+    units = make_units(5, dur=10.0, gap=1.0)
+    text = clipper._build_index_user_text(
+        "hook", units, parent_title="P", max_proposals=8)
+    assert "Already covered" not in text
+
+
 def test_dissimilar_title_survives_title_guard():
     units = make_units(5, dur=10.0, gap=1.0)
     raw = [{"first_index": 2, "last_index": 2,

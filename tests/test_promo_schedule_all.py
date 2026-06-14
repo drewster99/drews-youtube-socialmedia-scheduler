@@ -238,6 +238,38 @@ def test_preview_computes_per_tier_chains(client: TestClient) -> None:
     assert datetime.fromisoformat(targets["segchild001"]) == parent_dt + timedelta(days=3)
 
 
+def test_preview_excludes_archived_children(client: TestClient) -> None:
+    """An archived promo must not appear in the schedule-all preview. It's
+    hidden from the Promo grid, so a stale archived dup should neither block
+    the batch with a 'not ready' row nor get re-scheduled by the writer."""
+    from yt_scheduler.config import DB_PATH
+
+    parent_iso = "2026-04-01T17:30:00+00:00"
+    _insert_ready_video("arcparent01", publish_at=parent_iso, status="scheduled")
+    _insert_ready_video(
+        "archookact1", parent_item_id="arcparent01", item_type="hook",
+    )
+    # An archived dup with NO tags: would read "not ready" and block the
+    # whole batch if it leaked into the preview.
+    _insert_ready_video(
+        "archookarc1", parent_item_id="arcparent01", item_type="hook", tags=[],
+    )
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE videos SET archived = 1 WHERE id = ?", ("archookarc1",)
+        )
+        conn.commit()
+
+    resp = client.post(
+        "/api/projects/default/videos/arcparent01/promos/schedule-all/preview",
+        json={},
+    )
+    assert resp.status_code == 200
+    ids = {r["video_id"] for r in resp.json()["rows"]}
+    assert "archookact1" in ids
+    assert "archookarc1" not in ids
+
+
 def test_preview_honours_project_promo_delays(client: TestClient) -> None:
     """A custom per-tier delay saved in project settings changes the
     schedule-all preview's computed target times."""

@@ -1671,8 +1671,14 @@ async def compute_promo_batch_preview(
             "Parent video isn't ready: missing " + ", ".join(parent_missing)
         )
 
+    # Archived promos are hidden from the Promo grid (list_promos filters
+    # them); they must also be excluded here so an archived dup can neither
+    # block the batch with a stale "not ready" row nor — via schedule_promo_batch,
+    # which reuses these rows — get re-scheduled and re-published after the user
+    # explicitly archived it. COALESCE guards pre-migration NULLs.
     children_rows = await db.execute_fetchall(
         "SELECT * FROM videos WHERE parent_item_id = ? "
+        "AND COALESCE(archived, 0) = 0 "
         "ORDER BY created_at ASC",
         (parent_id,),
     )

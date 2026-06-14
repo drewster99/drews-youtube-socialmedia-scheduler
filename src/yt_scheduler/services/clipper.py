@@ -407,9 +407,17 @@ _KIND_INDEX_GUIDANCE: dict[ClipKind, dict[str, str]] = {
 
 def _build_index_user_text(
     kind: ClipKind, units: list[ClipUnit], *, parent_title: str,
-    max_proposals: int,
+    max_proposals: int, existing_titles: list[str] | None = None,
 ) -> str:
-    """Assemble the instruction block + numbered units the model selects from."""
+    """Assemble the instruction block + numbered units the model selects from.
+
+    ``existing_titles`` are the titles of same-kind clips already on this
+    parent. They're injected as an "already covered" list so the model
+    avoids re-proposing the same moment up front — the post-hoc dedup is
+    lexical (title/range), so it can't catch a clip that re-covers the same
+    point in different words at a different timestamp. Prevention here is
+    the only thing that catches that semantic repeat.
+    """
     spec = _KIND_INDEX_GUIDANCE[kind]
     min_s, max_s = _PER_KIND_BOUNDS[kind]
     durs = sorted(u.duration for u in units) or [1.0]
@@ -421,6 +429,16 @@ def _build_index_user_text(
         "chart, code on screen, a demo, 'look at this', 'right here'). If the "
         "words only make sense with a picture, skip it.\n"
     )
+    already_covered = ""
+    titles = [t.strip() for t in (existing_titles or []) if t and t.strip()]
+    if titles:
+        bullets = "\n".join(f"- {t}" for t in titles)
+        already_covered = (
+            "## Already covered — do NOT repeat\n"
+            f"These {kind} clips already exist for this video. Do not propose "
+            "the same moment or point again, even phrased differently or from a "
+            f"slightly different timestamp:\n{bullets}\n\n"
+        )
     return (
         f"You select {kind} clips from a podcast transcript of "
         f"\"{parent_title}\" for posting as standalone vertical videos.\n\n"
@@ -450,6 +468,7 @@ def _build_index_user_text(
         f"## Rating\nRate each clip 1-4 (4 = best), content and title together.\n\n"
         f"Propose UP TO {max_proposals} clips. Return FEWER (even zero) if there "
         "aren't that many strong ones — do not pad, do not overlap.\n\n"
+        f"{already_covered}"
         "## Transcript\n"
         f"{clip_edges.numbered_units_block(units)}"
     )
@@ -490,6 +509,7 @@ def _validate_indexed_proposals(
         max_s = _SEGMENT_MAX_PARENT_FRACTION * parent_duration_seconds
     out: list[ProposedClip] = []
     accepted: list[tuple[float, float]] = []
+    accepted_titles: list[str] = []
     for entry in raw_proposals:
         if len(out) >= max_proposals:
             break
@@ -499,13 +519,21 @@ def _validate_indexed_proposals(
         except (KeyError, TypeError, ValueError):
             logger.info("Dropping clip proposal: missing/invalid indices %r", entry)
             continue
-        title = str(entry.get("title") or "").strip() or f"Untitled {kind}"
+        raw_title = str(entry.get("title") or "").strip()
+        title = raw_title or f"Untitled {kind}"
         # Title guard — imported clips have no cut range (unknowable for a
         # YouTube import), so the range-overlap check below can't see them.
         # A near-identical title to an existing same-kind clip means the
         # model re-found the same moment; drop it before any edge math.
+        # We check both clips ALREADY on the parent and clips accepted
+        # earlier in THIS batch — the model can re-propose the same moment
+        # twice in one call with non-overlapping ranges, which the range
+        # guard alone would miss. Only REAL titles dedup: the synthetic
+        # "Untitled <kind>" fallback must not collide two distinct untitled
+        # clips (title is schema-required, so this is defensive).
+        prior_titles = list(existing_titles or []) + accepted_titles
         duplicate_of = next(
-            (t for t in (existing_titles or []) if _titles_similar(title, t)),
+            (t for t in prior_titles if raw_title and _titles_similar(raw_title, t)),
             None,
         )
         if duplicate_of is not None:
@@ -573,6 +601,8 @@ def _validate_indexed_proposals(
             audio_fade_out=edges.fade_out,
         ))
         accepted.append((edges.final_start, edges.final_end))
+        if raw_title:
+            accepted_titles.append(raw_title)
     return out
 
 
@@ -605,6 +635,7 @@ async def propose_clips_for_kind_indexed(
 
     user_text = _build_index_user_text(
         kind, units, parent_title=parent_title, max_proposals=ask_max,
+        existing_titles=existing_titles,
     )
 
     model = await ai._resolve_model()
