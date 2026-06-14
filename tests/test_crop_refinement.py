@@ -144,12 +144,14 @@ def test_public_dict_with_off_center_above_threshold():
 # --- assess_crop_for_proposal: failure modes return neutral ------------
 
 @pytest.mark.asyncio
-async def test_run_generate_job_transcribes_on_device_and_skips_vision(
+async def test_run_generate_job_transcribes_on_device_and_runs_vision_for_crop_on_kinds(
     monkeypatch: pytest.MonkeyPatch, tmp_path,
 ):
     """_run_generate_job transcribes the parent on-device with Apple Speech
-    (never large-v3), and — because vertical crop is deferred to a separate
-    later step — never fires a vision call. Vision spend is real money.
+    (never large-v3), and fires the keyframe vision pass only for kinds the
+    user toggled for 9:16 crop (hook here) — never for crop-off kinds
+    (segment). Guards the per-kind crop gate against silently regressing to
+    all-False, which would land landscape hooks/shorts again.
     """
     from yt_scheduler.services import clip_edges, clipper, transcription
 
@@ -193,15 +195,19 @@ async def test_run_generate_job_transcribes_on_device_and_skips_vision(
 
     monkeypatch.setattr(clipper, "assess_crop_for_proposal", fake_assess)
 
-    # Avoid real ffmpeg: stand in for the per-proposal preview cut.
+    # Avoid real ffmpeg: stand in for the per-proposal preview cut, and
+    # record the crop flag each cut was actually asked for.
+    cut_crops: dict[str, bool] = {}
+
     async def fake_cut(*, job_id, parent_video_path, proposal, idx, **kw):
+        cut_crops[proposal.kind] = kw.get("vertical_crop")
         out = tmp_path / f"prev_{proposal.kind}_{idx}.mp4"
         out.write_bytes(b"\x00")
         return out
 
     monkeypatch.setattr(clipper, "cut_preview_for_proposal", fake_cut)
 
-    # Crop requested on hook, but it must be deferred (no vision fires).
+    # Crop on for hook → vision fires for it; off for segment → it doesn't.
     job_id = await clipper.start_generate_job(
         parent_id="PARENT00001",
         project_id=1,
@@ -225,7 +231,10 @@ async def test_run_generate_job_transcribes_on_device_and_skips_vision(
     assert job["state"] == "done", job.get("last_error")
     assert transcribe_kwargs.get("backend") == "macos-speech"
     assert transcribe_kwargs.get("model") is None  # never large-v3
-    assert vision_calls == []  # crop deferred → no vision spend
+    # Vision fires for the crop-on hook and never for the crop-off segment.
+    assert vision_calls == ["hook"]
+    # And the crop actually reaches the cut: hook 9:16, segment full-frame.
+    assert cut_crops == {"hook": True, "segment": False}
 
     clipper._GENERATE_JOBS.pop(job_id, None)
 

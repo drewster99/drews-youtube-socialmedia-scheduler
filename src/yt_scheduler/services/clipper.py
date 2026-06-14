@@ -1709,12 +1709,12 @@ async def _run_generate_job(job_id: str) -> None:
         # across all (kind, proposal) pairs that need it; per-call
         # failure falls back to a neutral assessment (centered, no
         # shift) so we never block a proposal on a flaky vision call.
-        # Vertical 9:16 crop is deferred to a separate later post-processing
-        # step, so Generate cuts the clips uncropped (like the prototype). With
-        # every kind forced non-crop here, the keyframe vision pass below never
-        # runs and the cuts apply no crop; the crop infrastructure stays in the
-        # tree for that later step.
-        crop_for_kind = {k: False for k in proposals}
+        # Honour the per-kind 9:16 toggles the user set in the review modal
+        # (hooks/shorts default on, segments off); they ride on the job from
+        # the preview endpoint. Crop-on kinds get the keyframe vision pass
+        # below to frame the crop column, and the preview cut applies the
+        # 9:16 crop — that single cropped cut is reused as the final clip.
+        crop_for_kind = job.get("crop_vertical") or {k: False for k in proposals}
         refinement_tasks: list[tuple[str, int, asyncio.Task]] = []
         for k, props in proposals.items():
             if not crop_for_kind.get(k, False):
