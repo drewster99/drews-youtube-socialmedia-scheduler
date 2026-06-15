@@ -6,7 +6,7 @@
     <h1 class="page-breadcrumb">
         <a href="/projects/{{ current_project.slug }}" class="crumb crumb-project">{{ current_project.name }}</a>
         <span class="crumb-sep">/</span>
-        <a href="/projects/{{ current_project.slug }}/videos/{{ parent_id }}" class="crumb">{{ current_video.title or parent_id }}</a>
+        <a href="/projects/{{ current_project.slug }}/videos/{{ parent_id }}" class="crumb">{% if current_video.episode_number not in (none, '') %}<span class="badge badge-episode episode-chip-title">Ep {{ current_video.episode_number }}</span>{% endif %}{{ current_video.title or parent_id }}</a>
         <span class="crumb-sep">/</span>
         <span class="crumb crumb-page">Promo videos</span>
     </h1>

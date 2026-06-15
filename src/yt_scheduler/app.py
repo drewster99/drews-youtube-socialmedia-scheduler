@@ -440,7 +440,7 @@ async def project_promo_videos_page(request: Request, slug: str, parent_id: str)
     from yt_scheduler.database import get_db
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT id, title FROM videos WHERE id = ? AND project_id = ?",
+        "SELECT id, title, episode_number FROM videos WHERE id = ? AND project_id = ?",
         (parent_id, int(project["id"])),
     )
     if not rows:
