@@ -31,6 +31,8 @@ final class VideoProcessor {
     private(set) var cropThreshold: Double = 3.0
     /// Sampling step in seconds (for the 0.5s activity window); read live.
     private(set) var sampleStep: Double = 0.05
+    /// Which mouth signal picks the active face among several. Read live.
+    private(set) var activenessMetric: ActivenessMetric = .movement
     /// Running derivation state, shared so a mode toggle during processing can
     /// re-derive the frames-so-far and let `process` continue consistently.
     private var classifyState = ClassifyState()
@@ -55,7 +57,7 @@ final class VideoProcessor {
 
     /// Sample the video every `interval` seconds (e.g. 0.25 → 4 fps), running
     /// Vision on each frame and bucketing faces with `mode`.
-    func process(url: URL, interval: Double, mode: ClassificationMode, cropThreshold: Double) async {
+    func process(url: URL, interval: Double, mode: ClassificationMode, cropThreshold: Double, metric: ActivenessMetric) async {
         isProcessing = true
         frames = []
         rawFrames = []
@@ -64,6 +66,7 @@ final class VideoProcessor {
         unclassifiedCount = 0
         classificationMode = mode
         self.cropThreshold = cropThreshold
+        self.activenessMetric = metric
         classifyState = ClassifyState()
         progress = 0
         statusMessage = "Loading…"
@@ -131,7 +134,7 @@ final class VideoProcessor {
 
                     let raw = RawFrame(time: t, imageSize: imgSize, analysisMs: analysisMs, faces: rawFaces)
                     rawFrames.append(raw)
-                    frames.append(Self.classifyFrame(raw, mode: classificationMode, cropThreshold: self.cropThreshold, step: self.sampleStep, state: &classifyState))
+                    frames.append(Self.classifyFrame(raw, mode: classificationMode, cropThreshold: self.cropThreshold, step: self.sampleStep, metric: self.activenessMetric, state: &classifyState))
                     unclassifiedCount = classifyState.unclassified
                 }
 
@@ -154,12 +157,13 @@ final class VideoProcessor {
     /// Re-bucket the cached detections under a new mode — instant, no Vision.
     /// Safe to call mid-processing: it re-derives the frames so far and hands
     /// the running state back so `process` continues under the new mode.
-    func rederive(mode: ClassificationMode, cropThreshold: Double) {
+    func rederive(mode: ClassificationMode, cropThreshold: Double, metric: ActivenessMetric) {
         classificationMode = mode
         self.cropThreshold = cropThreshold
+        self.activenessMetric = metric
         guard !rawFrames.isEmpty else { classifyState = ClassifyState(); return }
         var state = ClassifyState()
-        frames = rawFrames.map { Self.classifyFrame($0, mode: mode, cropThreshold: cropThreshold, step: sampleStep, state: &state) }
+        frames = rawFrames.map { Self.classifyFrame($0, mode: mode, cropThreshold: cropThreshold, step: sampleStep, metric: metric, state: &state) }
         unclassifiedCount = state.unclassified
         classifyState = state
     }
@@ -184,7 +188,7 @@ final class VideoProcessor {
         var lastFrameTime: Double = 0
     }
 
-    private static func classifyFrame(_ rf: RawFrame, mode: ClassificationMode, cropThreshold: Double, step: Double, state: inout ClassifyState) -> FrameAnalysis {
+    private static func classifyFrame(_ rf: RawFrame, mode: ClassificationMode, cropThreshold: Double, step: Double, metric: ActivenessMetric, state: inout ClassifyState) -> FrameAnalysis {
         var faces: [DetectedFace] = []
         var curOuter: [FacePosition: [CGPoint]] = [:]
         var curInner: [FacePosition: [CGPoint]] = [:]
@@ -258,11 +262,21 @@ final class VideoProcessor {
         state.priorOuter = curOuter
         state.priorInner = curInner
 
-        // Active face: 1 face → it; 2+ → highest inner/outer lip-height ratio.
+        // Active face: 1 face → it; 2+ → the face scoring highest on the chosen
+        // metric. Movement = this position's latest open-% activity (total
+        // variation over ~0.5s, just pushed above); Openness = instantaneous
+        // mouth-open %.
+        let activityByPosition = state.activityHist
+        func activeness(_ face: DetectedFace) -> CGFloat {
+            switch metric {
+            case .movement: return activityByPosition[face.position]?.last ?? 0
+            case .openness: return face.lipPercent
+            }
+        }
         let activeFaceIndex: Int?
         if faces.isEmpty { activeFaceIndex = nil }
         else if faces.count == 1 { activeFaceIndex = 0 }
-        else { activeFaceIndex = faces.indices.max(by: { faces[$0].lipPercent < faces[$1].lipPercent }) }
+        else { activeFaceIndex = faces.indices.max(by: { activeness(faces[$0]) < activeness(faces[$1]) }) }
 
         let frameCenter = rf.imageSize.width / 2
 

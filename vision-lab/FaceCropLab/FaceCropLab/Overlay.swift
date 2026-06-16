@@ -47,7 +47,7 @@ enum OverlayRenderer {
         var mask = Path()
         mask.addRect(videoRect)
         mask.addRect(actualCropView)
-        ctx.fill(mask, with: .color(.black.opacity(0.6)), style: FillStyle(eoFill: true))
+        ctx.fill(mask, with: .color(.black.opacity(0.8)), style: FillStyle(eoFill: true))
 
         for face in frame.faces {
             let box = CGRect(

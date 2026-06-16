@@ -9,6 +9,7 @@ struct ContentView: View {
     @State private var videoURL: URL?
     @State private var sampleInterval: Double = 0.05
     @State private var classificationMode: ClassificationMode = .center
+    @State private var activenessMetric: ActivenessMetric = .movement
     @State private var cropAnxiety: Double = (15.0 - 3.0) / 14.5   // → 3.0s threshold
     @State private var currentTime: Double = 0
 
@@ -55,14 +56,24 @@ struct ContentView: View {
                 // Re-derive instantly from the cached detections — no Vision
                 // re-run. Safe during processing: the processor re-buckets the
                 // frames so far and the live run continues under the new mode.
-                processor.rederive(mode: classificationMode, cropThreshold: cropThreshold)
+                processor.rederive(mode: classificationMode, cropThreshold: cropThreshold, metric: activenessMetric)
+            }
+
+            Text("Active by")
+            Picker("", selection: $activenessMetric) {
+                ForEach(ActivenessMetric.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 150)
+            .onChange(of: activenessMetric) {
+                processor.rederive(mode: classificationMode, cropThreshold: cropThreshold, metric: activenessMetric)
             }
 
             Text("Anxiety")
             Slider(value: $cropAnxiety, in: 0...1)
                 .frame(width: 90)
                 .onChange(of: cropAnxiety) {
-                    processor.rederive(mode: classificationMode, cropThreshold: cropThreshold)
+                    processor.rederive(mode: classificationMode, cropThreshold: cropThreshold, metric: activenessMetric)
                 }
             Text(String(format: "%.1fs", cropThreshold)).font(.caption.monospaced())
 
@@ -222,6 +233,6 @@ struct ContentView: View {
     private func reprocess() {
         guard let url = videoURL else { return }
         processingTask?.cancel()
-        processingTask = Task { await processor.process(url: url, interval: sampleInterval, mode: classificationMode, cropThreshold: cropThreshold) }
+        processingTask = Task { await processor.process(url: url, interval: sampleInterval, mode: classificationMode, cropThreshold: cropThreshold, metric: activenessMetric) }
     }
 }

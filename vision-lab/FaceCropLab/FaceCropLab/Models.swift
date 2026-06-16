@@ -20,6 +20,17 @@ enum ClassificationMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+/// Which mouth signal decides the active (speaking) face when several are
+/// visible.
+enum ActivenessMetric: String, CaseIterable, Identifiable {
+    /// Total variation of mouth-open % over the last ~0.5s — a talking mouth
+    /// moves, a merely-open mouth does not. The default.
+    case movement = "Movement"
+    /// Instantaneous mouth-open % (inner-lip height / outer-lip height).
+    case openness = "Open %"
+    var id: String { rawValue }
+}
+
 /// One face detected in one processed frame. Coordinates are in image
 /// pixels with an upper-left origin (so they map straight onto the
 /// displayed video without a Y-flip).
