@@ -229,6 +229,11 @@ final class VideoProcessor {
         var cropCenterX: CGFloat = 0
         var cropCenterStarted = false
         var lastFrameTime: Double = 0
+        /// Which sides held a face in the previous frame. A left↔right switch
+        /// toward a side that was empty last frame is a just-appeared subject
+        /// (a cut / new arrangement), not a hand-off between two present
+        /// speakers, so it bypasses the anxiety threshold.
+        var sidesLastFrame: Set<FacePosition> = []
     }
 
     private static func classifyFrame(_ rf: RawFrame, mode: ClassificationMode, cropThreshold: Double, step: Double, metric: ActivenessMetric, state: inout ClassifyState) -> FrameAnalysis {
@@ -340,8 +345,15 @@ final class VideoProcessor {
             candidate = .center
         }
 
+        let sidesThisFrame = Set(faces.map { $0.position })
+
         // Commit the crop SIDE with anxiety hysteresis: center↔side switches
-        // immediately; left↔right only after cropThreshold seconds.
+        // immediately; left↔right only after cropThreshold seconds — UNLESS the
+        // destination side had no face last frame, meaning its subject just
+        // appeared (a cut / new arrangement). The threshold debounces hand-offs
+        // between two continuously-present speakers; it must not hold the crop
+        // on a stale side after a cut, which made it crawl toward the wrong
+        // (now-different) person on the committed side.
         var switched = false
         if !state.cropStarted {
             state.cropPosition = candidate
@@ -350,12 +362,14 @@ final class VideoProcessor {
             switched = true
         } else if candidate != state.cropPosition {
             let viaCenter = candidate == .center || state.cropPosition == .center
-            if viaCenter || rf.time - state.lastCropChange >= cropThreshold {
+            let destinationJustAppeared = !state.sidesLastFrame.contains(candidate)
+            if viaCenter || destinationJustAppeared || rf.time - state.lastCropChange >= cropThreshold {
                 state.cropPosition = candidate
                 state.lastCropChange = rf.time
                 switched = true
             }
         }
+        state.sidesLastFrame = sidesThisFrame
 
         // Crop target = horizontal center of the face on the COMMITTED side.
         // We deliberately never chase a face on a DIFFERENT side here: moving to
