@@ -21,6 +21,10 @@ struct ContentView: View {
     /// Monotonic time of the last frame-step; the observer defers to `step`
     /// for a short window so late seek callbacks can't bounce the playhead.
     @State private var lastStepNanos: UInt64 = 0
+    /// While a frame-step seek is in flight, the time it's seeking toward. The
+    /// overlay's `currentTime` only advances when the seek lands, so the overlay
+    /// can't get ahead of the (slow, 4K) video; rapid steps chain off this.
+    @State private var seekTargetTime: Double?
 
     var body: some View {
         VStack(spacing: 8) {
@@ -181,6 +185,10 @@ struct ContentView: View {
                 // Snap to the analyzed-frame boundary so the overlay only
                 // redraws when the displayed frame changes — otherwise fast
                 // scrubbing floods the main queue and the overlay lags behind.
+                // The observer only runs when we're tracking the player live
+                // (playback / native scrub), not mid-step; clear any stale step
+                // target so the next step chains off the real position.
+                seekTargetTime = nil
                 let frames = processor.frames
                 let target = frames.isEmpty
                     ? time.seconds
@@ -208,11 +216,27 @@ struct ContentView: View {
         player.pause()
         isPlaying = false
         lastStepNanos = DispatchTime.now().uptimeNanoseconds
-        let idx = max(0, min(frames.count - 1, currentFrameIndex() + delta))
+        // Chain off the in-flight target (if any) so rapid steps advance even
+        // before a slow seek lands.
+        let baseTime = seekTargetTime ?? currentTime
+        let idx = max(0, min(frames.count - 1, Self.frameIndex(for: baseTime, in: frames) + delta))
         let t = frames[idx].time
-        currentTime = t
+        seekTargetTime = t
+        // Advance the overlay only when the (possibly slow, 4K) exact seek has
+        // actually landed, so the analysis overlay always matches the displayed
+        // video frame. Setting currentTime up-front let the overlay jump ahead of
+        // the still-seeking video — drawing a face where the shown frame had none.
         player.seek(to: CMTime(seconds: t, preferredTimescale: 600),
-                    toleranceBefore: .zero, toleranceAfter: .zero)
+                    toleranceBefore: .zero, toleranceAfter: .zero) { finished in
+            guard finished else { return }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    currentTime = t
+                    if seekTargetTime == t { seekTargetTime = nil }
+                    lastStepNanos = DispatchTime.now().uptimeNanoseconds
+                }
+            }
+        }
     }
 
     private func openVideo() {
