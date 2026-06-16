@@ -1,0 +1,227 @@
+import SwiftUI
+import AVKit
+import AppKit
+import UniformTypeIdentifiers
+
+struct ContentView: View {
+    @State private var processor = VideoProcessor()
+    @State private var player = AVPlayer()
+    @State private var videoURL: URL?
+    @State private var sampleInterval: Double = 0.05
+    @State private var classificationMode: ClassificationMode = .center
+    @State private var cropAnxiety: Double = (15.0 - 3.0) / 14.5   // → 3.0s threshold
+    @State private var currentTime: Double = 0
+
+    /// Seconds before a left↔right crop switch is allowed: anxiety 0 → 15s, 1 → 0.5s.
+    private var cropThreshold: Double { 15.0 - cropAnxiety * 14.5 }
+    @State private var isPlaying = false
+    @State private var timeObserver: Any?
+    @State private var processingTask: Task<Void, Never>?
+    /// Monotonic time of the last frame-step; the observer defers to `step`
+    /// for a short window so late seek callbacks can't bounce the playhead.
+    @State private var lastStepNanos: UInt64 = 0
+
+    var body: some View {
+        VStack(spacing: 8) {
+            controlBar
+            playerArea
+        }
+        .padding(8)
+        .frame(minWidth: 940, minHeight: 680)
+        .onAppear(perform: installTimeObserver)
+        .onDisappear(perform: removeTimeObserver)
+    }
+
+    private var controlBar: some View {
+        HStack(spacing: 10) {
+            Button("Open Video…", action: openVideo)
+
+            Divider().frame(height: 18)
+
+            Text("Interval")
+            TextField("", value: $sampleInterval, format: .number.precision(.fractionLength(2)))
+                .frame(width: 52)
+                .textFieldStyle(.roundedBorder)
+            Text("s")
+            Button("Reprocess", action: reprocess)
+                .disabled(videoURL == nil || processor.isProcessing)
+
+            Picker("", selection: $classificationMode) {
+                ForEach(ClassificationMode.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 190)
+            .onChange(of: classificationMode) {
+                // Re-derive instantly from the cached detections — no Vision
+                // re-run. Safe during processing: the processor re-buckets the
+                // frames so far and the live run continues under the new mode.
+                processor.rederive(mode: classificationMode, cropThreshold: cropThreshold)
+            }
+
+            Text("Anxiety")
+            Slider(value: $cropAnxiety, in: 0...1)
+                .frame(width: 90)
+                .onChange(of: cropAnxiety) {
+                    processor.rederive(mode: classificationMode, cropThreshold: cropThreshold)
+                }
+            Text(String(format: "%.1fs", cropThreshold)).font(.caption.monospaced())
+
+            Divider().frame(height: 18)
+
+            Button(isPlaying ? "Pause" : "Play", action: togglePlay)
+                .keyboardShortcut(.space, modifiers: [])
+                .disabled(videoURL == nil)
+            Button("◀ Frame", action: { step(-1) })
+                .keyboardShortcut(.leftArrow, modifiers: [])
+                .disabled(processor.frames.isEmpty)
+            Button("Frame ▶", action: { step(1) })
+                .keyboardShortcut(.rightArrow, modifiers: [])
+                .disabled(processor.frames.isEmpty)
+
+            if processor.isProcessing {
+                ProgressView(value: processor.progress).frame(width: 120)
+            }
+            Spacer()
+            Text(statusLine).font(.caption.monospaced()).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var playerArea: some View {
+        if videoURL != nil {
+            VideoPlayer(player: player)
+                .overlay {
+                    GeometryReader { _ in
+                        Canvas { ctx, size in
+                            guard processor.imageSize.width > 0 else { return }
+                            OverlayRenderer.draw(ctx, size: size,
+                                                 frame: currentAnalysis(),
+                                                 imageSize: processor.imageSize,
+                                                 summary: processor.timingSummary)
+                        }
+                        .allowsHitTesting(false)
+                    }
+                }
+        } else {
+            ContentUnavailableView("Open a video to begin",
+                                   systemImage: "video.badge.waveform",
+                                   description: Text("Pick a file; it's sampled at the chosen interval and analyzed with Vision."))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private static func mmss(_ seconds: Double) -> String {
+        let s = Int(seconds.rounded())
+        return String(format: "%d:%02d", s / 60, s % 60)
+    }
+
+    private var statusLine: String {
+        let count = processor.frames.count
+        let src = processor.sourceSize
+        let proc = processor.imageSize
+        var parts: [String] = []
+        if src.width > 0 {
+            let srcStr = "\(Int(src.width))×\(Int(src.height))"
+            parts.append(proc.width > 0 && (Int(proc.width) != Int(src.width) || Int(proc.height) != Int(src.height))
+                ? "\(srcStr)→\(Int(proc.width))×\(Int(proc.height))"
+                : srcStr)
+        }
+        if processor.videoDuration > 0 { parts.append("len \(Self.mmss(processor.videoDuration))") }
+        parts.append(String(format: "t=%.2fs", currentTime))
+        parts.append(count > 0 ? "frame \(currentFrameIndex() + 1)/\(count)" : "—")
+        parts.append(processor.statusMessage)
+        return parts.joined(separator: " · ")
+    }
+
+    /// Index of the last frame whose time ≤ `t` (binary search; frames are
+    /// in ascending time order).
+    private static func frameIndex(for t: Double, in frames: [FrameAnalysis]) -> Int {
+        guard !frames.isEmpty else { return 0 }
+        var lo = 0, hi = frames.count - 1, ans = 0
+        while lo <= hi {
+            let mid = (lo + hi) / 2
+            if frames[mid].time <= t + 1e-6 { ans = mid; lo = mid + 1 } else { hi = mid - 1 }
+        }
+        return ans
+    }
+
+    private func currentAnalysis() -> FrameAnalysis? {
+        let frames = processor.frames
+        guard !frames.isEmpty else { return nil }
+        return frames[Self.frameIndex(for: currentTime, in: frames)]
+    }
+
+    private func currentFrameIndex() -> Int {
+        Self.frameIndex(for: currentTime, in: processor.frames)
+    }
+
+    private func installTimeObserver() {
+        guard timeObserver == nil else { return }
+        let interval = CMTime(seconds: 0.05, preferredTimescale: 600)
+        timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { time in
+            MainActor.assumeIsolated {
+                let playing = player.rate != 0
+                if isPlaying != playing { isPlaying = playing }
+                // While frame-stepping (paused), `step` owns the playhead;
+                // ignore seek-driven callbacks for a short window so late
+                // callbacks from earlier seeks can't bounce the playhead back
+                // to a higher frame (the "holding ← wraps around" bug).
+                if DispatchTime.now().uptimeNanoseconds &- lastStepNanos < 250_000_000 { return }
+                // Snap to the analyzed-frame boundary so the overlay only
+                // redraws when the displayed frame changes — otherwise fast
+                // scrubbing floods the main queue and the overlay lags behind.
+                let frames = processor.frames
+                let target = frames.isEmpty
+                    ? time.seconds
+                    : frames[Self.frameIndex(for: time.seconds, in: frames)].time
+                if abs(currentTime - target) > 1e-6 { currentTime = target }
+            }
+        }
+    }
+
+    private func removeTimeObserver() {
+        if let token = timeObserver {
+            player.removeTimeObserver(token)
+            timeObserver = nil
+        }
+    }
+
+    private func togglePlay() {
+        if player.rate == 0 { player.play() } else { player.pause() }
+        isPlaying = player.rate != 0
+    }
+
+    private func step(_ delta: Int) {
+        let frames = processor.frames
+        guard !frames.isEmpty else { return }
+        player.pause()
+        isPlaying = false
+        lastStepNanos = DispatchTime.now().uptimeNanoseconds
+        let idx = max(0, min(frames.count - 1, currentFrameIndex() + delta))
+        let t = frames[idx].time
+        currentTime = t
+        player.seek(to: CMTime(seconds: t, preferredTimescale: 600),
+                    toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    private func openVideo() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.movie, .video, .mpeg4Movie, .quickTimeMovie]
+        panel.directoryURL = URL(
+            fileURLWithPath: "/Users/andrew/Library/Application Support/com.nuclearcyborg.drews-socialmedia-scheduler/uploads",
+            isDirectory: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        videoURL = url
+        currentTime = 0
+        player.replaceCurrentItem(with: AVPlayerItem(url: url))
+        reprocess()
+    }
+
+    private func reprocess() {
+        guard let url = videoURL else { return }
+        processingTask?.cancel()
+        processingTask = Task { await processor.process(url: url, interval: sampleInterval, mode: classificationMode, cropThreshold: cropThreshold) }
+    }
+}
