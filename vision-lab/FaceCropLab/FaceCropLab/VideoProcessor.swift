@@ -47,6 +47,14 @@ final class VideoProcessor {
     /// Horizontal classification boundaries as fractions of image width.
     nonisolated static let leftLine: CGFloat = 0.45
     nonisolated static let rightLine: CGFloat = 0.55
+    /// A frame-to-frame jump of the crop target larger than this fraction of the
+    /// frame width is a discontinuity (cut / different subject), so the crop
+    /// snaps instead of easing — this is what prevents the slow slide.
+    nonisolated static let cropSnapJumpFraction: CGFloat = 0.05
+    /// After the face count changes (a likely cut), left↔right switches skip the
+    /// anxiety threshold for this long, so the crop commits to the new scene's
+    /// active speaker instead of being held on a now-stale side.
+    nonisolated static let cutSettleSeconds: Double = 0.6
 
     /// Min / max / average per-frame Vision time across all processed frames.
     var timingSummary: (min: Double, max: Double, avg: Double)? {
@@ -234,6 +242,13 @@ final class VideoProcessor {
         /// (a cut / new arrangement), not a hand-off between two present
         /// speakers, so it bypasses the anxiety threshold.
         var sidesLastFrame: Set<FacePosition> = []
+        /// Previous frame's crop target, to detect a discontinuous target jump.
+        var lastTargetCenterX: CGFloat = 0
+        /// Face count last frame; a change marks a likely scene cut.
+        var lastFaceCount = -1
+        /// Until this time, left↔right switches skip the anxiety threshold
+        /// (opened by a face-count change — a likely cut).
+        var cutSettleUntil: Double = -1
     }
 
     private static func classifyFrame(_ rf: RawFrame, mode: ClassificationMode, cropThreshold: Double, step: Double, metric: ActivenessMetric, state: inout ClassifyState) -> FrameAnalysis {
@@ -346,13 +361,22 @@ final class VideoProcessor {
 
         let sidesThisFrame = Set(faces.map { $0.position })
 
+        // A change in face count is a likely scene cut; open a short settle
+        // window during which left↔right switches skip the anxiety threshold,
+        // so the crop commits to the new scene's actual speaker (which may take
+        // a few frames of movement to emerge) instead of being held on a stale
+        // side by the threshold and crawling toward the wrong subject.
+        if faces.count != state.lastFaceCount {
+            state.cutSettleUntil = rf.time + Self.cutSettleSeconds
+        }
+        let inCutSettle = rf.time < state.cutSettleUntil
+
         // Commit the crop SIDE with anxiety hysteresis: center↔side switches
         // immediately; left↔right only after cropThreshold seconds — UNLESS the
-        // destination side had no face last frame, meaning its subject just
-        // appeared (a cut / new arrangement). The threshold debounces hand-offs
-        // between two continuously-present speakers; it must not hold the crop
-        // on a stale side after a cut, which made it crawl toward the wrong
-        // (now-different) person on the committed side.
+        // destination side had no face last frame (its subject just appeared) or
+        // we're in a post-cut settle window. The threshold debounces hand-offs
+        // between two continuously-present speakers; it must not hold the crop on
+        // a stale side across a cut.
         var switched = false
         if !state.cropStarted {
             state.cropPosition = candidate
@@ -362,13 +386,14 @@ final class VideoProcessor {
         } else if candidate != state.cropPosition {
             let viaCenter = candidate == .center || state.cropPosition == .center
             let destinationJustAppeared = !state.sidesLastFrame.contains(candidate)
-            if viaCenter || destinationJustAppeared || rf.time - state.lastCropChange >= cropThreshold {
+            if viaCenter || destinationJustAppeared || inCutSettle || rf.time - state.lastCropChange >= cropThreshold {
                 state.cropPosition = candidate
                 state.lastCropChange = rf.time
                 switched = true
             }
         }
         state.sidesLastFrame = sidesThisFrame
+        state.lastFaceCount = faces.count
 
         // Crop target = horizontal center of the face on the COMMITTED side.
         // We deliberately never chase a face on a DIFFERENT side here: moving to
@@ -387,9 +412,13 @@ final class VideoProcessor {
             targetCenterX = state.cropCenterStarted ? state.cropCenterX : frameCenter
         }
 
-        // Snap on a committed switch / first frame; otherwise ease toward the
-        // committed-side face over ~8 real seconds to gently follow small moves.
-        let snapped = switched || !state.cropCenterStarted
+        // Snap on a committed switch / first frame, or when the target jumps
+        // discontinuously (a cut / different subject — never slide across that);
+        // otherwise ease toward the committed-side face over ~8 real seconds to
+        // gently follow small movements.
+        let targetJumped = state.cropCenterStarted
+            && abs(targetCenterX - state.lastTargetCenterX) > rf.imageSize.width * Self.cropSnapJumpFraction
+        let snapped = switched || !state.cropCenterStarted || targetJumped
         if snapped {
             state.cropCenterX = targetCenterX
             state.cropCenterStarted = true
@@ -398,6 +427,7 @@ final class VideoProcessor {
             let alpha = min(1.0, dt / 8.0)
             state.cropCenterX += (targetCenterX - state.cropCenterX) * alpha
         }
+        state.lastTargetCenterX = targetCenterX
         state.lastFrameTime = rf.time
 
         return FrameAnalysis(
