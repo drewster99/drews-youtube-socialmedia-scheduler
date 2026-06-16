@@ -38,6 +38,10 @@ struct DetectedFace: Identifiable {
     let id = UUID()
     var boundingBox: CGRect
     var position: FacePosition
+    /// Vision's detection confidence (0–1). Low values are usually false
+    /// positives (a face found in background texture); used to keep phantoms
+    /// out of the active-face selection.
+    var confidence: Float
     var outerLips: [CGPoint]
     var innerLips: [CGPoint]
     /// Vision's `pointsClassification` for the region ("closedPath" /
@@ -80,6 +84,7 @@ struct DetectedFace: Identifiable {
 /// switching classification mode only re-buckets — it never re-runs Vision.
 struct RawFace {
     var boundingBox: CGRect
+    var confidence: Float
     var outerLips: [CGPoint]
     var innerLips: [CGPoint]
     var outerClassification: String

@@ -55,6 +55,10 @@ final class VideoProcessor {
     /// anxiety threshold for this long, so the crop commits to the new scene's
     /// active speaker instead of being held on a now-stale side.
     nonisolated static let cutSettleSeconds: Double = 0.6
+    /// Faces Vision reports below this confidence are kept for display but
+    /// excluded from the active-face selection — they're usually false
+    /// positives on background texture, not real speakers.
+    nonisolated static let minFaceConfidence: Float = 0.5
 
     /// Min / max / average per-frame Vision time across all processed frames.
     var timingSummary: (min: Double, max: Double, avg: Double)? {
@@ -149,6 +153,7 @@ final class VideoProcessor {
                         let inner = lm.innerLips
                         rawFaces.append(RawFace(
                             boundingBox: obs.boundingBox.toImageCoordinates(imgSize, origin: .upperLeft),
+                            confidence: obs.confidence,
                             outerLips: outer.pointsInImageCoordinates(imgSize, origin: .upperLeft),
                             innerLips: inner.pointsInImageCoordinates(imgSize, origin: .upperLeft),
                             outerClassification: String(describing: outer.pointsClassification),
@@ -280,6 +285,7 @@ final class VideoProcessor {
             faces.append(DetectedFace(
                 boundingBox: face.boundingBox,
                 position: pos,
+                confidence: face.confidence,
                 outerLips: face.outerLips,
                 innerLips: face.innerLips,
                 outerClassification: face.outerClassification,
@@ -337,10 +343,13 @@ final class VideoProcessor {
             case .openness: return face.lipPercent
             }
         }
-        let activeFaceIndex: Int?
-        if faces.isEmpty { activeFaceIndex = nil }
-        else if faces.count == 1 { activeFaceIndex = 0 }
-        else { activeFaceIndex = faces.indices.max(by: { activeness(faces[$0]) < activeness(faces[$1]) }) }
+        // Only confident detections may become the active face — a low-confidence
+        // face is usually a Vision false positive on background texture and must
+        // not capture the crop. If every face is low-confidence (e.g. a hard
+        // frame), fall back to all of them so tracking isn't lost entirely.
+        let confident = faces.indices.filter { faces[$0].confidence >= Self.minFaceConfidence }
+        let candidates = confident.isEmpty ? Array(faces.indices) : confident
+        let activeFaceIndex = candidates.max(by: { activeness(faces[$0]) < activeness(faces[$1]) })
 
         // Record each face's selection score for on-screen telemetry.
         for i in faces.indices { faces[i].activeness = activeness(faces[i]) }

@@ -60,10 +60,12 @@ enum OverlayRenderer {
             if face.position == .unclassified {
                 ctx.fill(Path(box), with: .color(.red.opacity(0.25)))
             }
-            // The active (selected) face gets a brighter, thicker box.
-            ctx.stroke(Path(box),
-                       with: .color(face.position == .unclassified ? .red : (isActive ? .green : .green.opacity(0.5))),
-                       lineWidth: isActive ? 4 : 2)
+            // Low-confidence faces (likely false positives) are orange and can't
+            // be selected; the active face gets a brighter, thicker box.
+            let lowConf = face.confidence < VideoProcessor.minFaceConfidence
+            let boxColor: Color = face.position == .unclassified ? .red
+                : (lowConf ? .orange : (isActive ? .green : .green.opacity(0.5)))
+            ctx.stroke(Path(box), with: .color(boxColor), lineWidth: isActive ? 4 : 2)
 
             drawLipContour(ctx, points: face.outerLips.map(map), color: .red, isClosed: face.outerIsClosed)
             drawLipContour(ctx, points: face.innerLips.map(map), color: .blue, isClosed: face.innerIsClosed)
@@ -230,7 +232,7 @@ enum OverlayRenderer {
         func dist(_ v: CGFloat) -> String { String(format: "%.1f", v) }
         func pct(_ v: CGFloat) -> String { String(format: "%.0f%%", v * 100) }
         let lines = [
-            face.position.rawValue.uppercased() + (isActive ? "  ◀ ACTIVE" : ""),
+            face.position.rawValue.uppercased() + "  conf \(String(format: "%.2f", face.confidence))" + (isActive ? "  ◀ ACTIVE" : ""),
             "outer: \(face.outerClassification)  p=\(prec(face.outerPrecisionMean))  Δ=\(dist(face.outerMotion))",
             "inner: \(face.innerClassification)  p=\(prec(face.innerPrecisionMean))  Δ=\(dist(face.innerMotion))",
             "open: \(pct(face.lipPercent))  (\(dist(face.innerHeight))/\(dist(face.outerHeight)))",
