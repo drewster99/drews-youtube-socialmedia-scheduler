@@ -49,7 +49,8 @@ enum OverlayRenderer {
         mask.addRect(actualCropView)
         ctx.fill(mask, with: .color(.black.opacity(0.8)), style: FillStyle(eoFill: true))
 
-        for face in frame.faces {
+        for (i, face) in frame.faces.enumerated() {
+            let isActive = (i == frame.activeFaceIndex)
             let box = CGRect(
                 x: videoRect.minX + face.boundingBox.minX * sx,
                 y: videoRect.minY + face.boundingBox.minY * sy,
@@ -59,17 +60,19 @@ enum OverlayRenderer {
             if face.position == .unclassified {
                 ctx.fill(Path(box), with: .color(.red.opacity(0.25)))
             }
+            // The active (selected) face gets a brighter, thicker box.
             ctx.stroke(Path(box),
-                       with: .color(face.position == .unclassified ? .red : .green),
-                       lineWidth: 2)
+                       with: .color(face.position == .unclassified ? .red : (isActive ? .green : .green.opacity(0.5))),
+                       lineWidth: isActive ? 4 : 2)
 
             drawLipContour(ctx, points: face.outerLips.map(map), color: .red, isClosed: face.outerIsClosed)
             drawLipContour(ctx, points: face.innerLips.map(map), color: .blue, isClosed: face.innerIsClosed)
 
             // Classification + distilled precision below the box.
-            drawInfo(ctx, face: face, below: box)
+            drawInfo(ctx, face: face, isActive: isActive, below: box)
         }
 
+        drawCropState(ctx, frame: frame, videoRect: videoRect, imageSize: imageSize)
         drawBottomCharts(ctx, frame: frame, videoRect: videoRect)
 
         // Top-center: open-% activity (Δ of open% over ~0.5s) for L/C/R.
@@ -195,15 +198,43 @@ enum OverlayRenderer {
         ctx.draw(resolved, at: origin, anchor: .topLeading)
     }
 
-    static func drawInfo(_ ctx: GraphicsContext, face: DetectedFace, below box: CGRect) {
+    /// Upper-left telemetry for the crop state machine: committed side, this
+    /// frame's candidate, snap-vs-ease, and the target/actual crop centers (as
+    /// fractions of width) plus their gap — so a slow drift can be traced to its
+    /// cause (a moving target, a wrong committed side, or a long ease).
+    static func drawCropState(_ ctx: GraphicsContext, frame: FrameAnalysis, videoRect: CGRect, imageSize: CGSize) {
+        guard imageSize.width > 0 else { return }
+        let targetFrac = frame.targetCenterX / imageSize.width
+        let actualFrac = frame.actualCenterX / imageSize.width
+        let gap = actualFrac - targetFrac
+        let lines = [
+            "CROP  pos=\(frame.cropPosition.rawValue)  cand=\(frame.candidate.rawValue)  \(frame.cropSnapped ? "SNAP" : "ease")",
+            String(format: "target %.3f   actual %.3f", targetFrac, actualFrac),
+            String(format: "gap %+.3f  (>0 ⇒ eases left)", gap),
+            String(format: "since switch %.1fs", frame.secondsSinceCropChange),
+        ].joined(separator: "\n")
+
+        let text = Text(lines)
+            .font(.system(size: 11, weight: .medium).monospaced())
+            .foregroundColor(.white)
+        let resolved = ctx.resolve(text)
+        let s = resolved.measure(in: CGSize(width: 1000, height: 1000))
+        let origin = CGPoint(x: videoRect.minX + 8, y: videoRect.minY + 6)
+        let panel = CGRect(origin: origin, size: s).insetBy(dx: -5, dy: -3)
+        ctx.fill(Path(roundedRect: panel, cornerRadius: 4), with: .color(.black.opacity(0.62)))
+        ctx.draw(resolved, at: origin, anchor: .topLeading)
+    }
+
+    static func drawInfo(_ ctx: GraphicsContext, face: DetectedFace, isActive: Bool, below box: CGRect) {
         func prec(_ v: Float?) -> String { v.map { String(format: "%.2f", $0) } ?? "n/a" }
         func dist(_ v: CGFloat) -> String { String(format: "%.1f", v) }
         func pct(_ v: CGFloat) -> String { String(format: "%.0f%%", v * 100) }
         let lines = [
-            face.position.rawValue.uppercased(),
+            face.position.rawValue.uppercased() + (isActive ? "  ◀ ACTIVE" : ""),
             "outer: \(face.outerClassification)  p=\(prec(face.outerPrecisionMean))  Δ=\(dist(face.outerMotion))",
             "inner: \(face.innerClassification)  p=\(prec(face.innerPrecisionMean))  Δ=\(dist(face.innerMotion))",
             "open: \(pct(face.lipPercent))  (\(dist(face.innerHeight))/\(dist(face.outerHeight)))",
+            "score: \(String(format: "%.3f", face.activeness))",
         ].joined(separator: "\n")
 
         let text = Text(lines)

@@ -62,6 +62,9 @@ struct DetectedFace: Identifiable {
     /// innerHeight / outerHeight — mouth-openness ratio used to pick the active
     /// face. 0 when outerHeight is degenerate.
     var lipPercent: CGFloat
+    /// The score this face was given when picking the active face, under the
+    /// current metric (movement EMA or open %). Telemetry only.
+    var activeness: CGFloat = 0
 
     /// Per-point precision estimates distilled to one number (mean of the
     /// 0–1 confidences). `nil` when Vision supplied no estimates.
@@ -111,10 +114,21 @@ struct FrameAnalysis: Identifiable {
     var candidateCenterX: CGFloat
     /// Image-px x-center of the committed, eased crop (drawn as the purple fill).
     var actualCenterX: CGFloat
+    /// Image-px x-center the eased crop is moving toward this frame.
+    var targetCenterX: CGFloat
+    /// The committed crop side (left/center/right) after this frame's hysteresis.
+    var cropPosition: FacePosition
+    /// The side this frame proposed (active face's bucket) before hysteresis.
+    var candidate: FacePosition
+    /// True when the crop snapped to the target this frame (committed switch /
+    /// first frame); false when it eased toward it.
+    var cropSnapped: Bool
+    /// Seconds since the committed crop side last changed.
+    var secondsSinceCropChange: Double
     /// Per-position rolling histories (last ≤20), for the fixed on-screen charts.
     var motionOuter: [FacePosition: [CGFloat]]
     var motionInner: [FacePosition: [CGFloat]]
     var percent: [FacePosition: [CGFloat]]
-    /// Per-position open-% "activity": total variation of open% over the last ~0.5s.
+    /// Per-position open-% "activity": EMA of |Δopen%| (recency-weighted, ~0.5s memory).
     var activity: [FacePosition: [CGFloat]]
 }

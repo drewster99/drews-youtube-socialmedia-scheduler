@@ -99,16 +99,36 @@ final class VideoProcessor {
             generator.maximumSize = CGSize(width: Self.maxAnalysisDimension, height: Self.maxAnalysisDimension)
             let request = DetectFaceLandmarksRequest()
 
-            let totalSamples = Int(duration / step) + 1
-            var sampleIndex = 0
+            // Build all sample times up front, then extract them in ONE batched,
+            // sequentially-decoded pass (images(for:)) instead of thousands of
+            // independent frame-exact image(at:) seeks that re-decode each GOP
+            // repeatedly. Extraction time was never counted in analysisMs, so
+            // this is the hidden cost behind a slow overall run.
+            var times: [CMTime] = []
             var t = 0.0
+            while t <= duration {
+                times.append(CMTime(seconds: t, preferredTimescale: 600))
+                t += step
+            }
+            let totalSamples = times.count
+            var sampleIndex = 0
             var cancelled = false
 
-            while t <= duration {
-                if Task.isCancelled { cancelled = true; break }
-                let cmTime = CMTime(seconds: t, preferredTimescale: 600)
+            // classifyFrame is stateful (motion/activity/crop carry across frames
+            // in time order), so we never assume images(for:) delivers in order:
+            // buffer each Vision result by its sample index and drain the
+            // contiguous run. A failed extraction still yields a result, so the
+            // run can't stall on a gap.
+            enum Slot { case frame(RawFrame); case failed }
+            var pending: [Int: Slot] = [:]
+            var nextIndex = 0
 
-                if let image = try? await generator.image(at: cmTime).image {
+            for await result in generator.images(for: times) {
+                if Task.isCancelled { cancelled = true; break }
+                let frameTime = result.requestedTime.seconds
+                let idx = Int((frameTime / step).rounded())
+
+                if let image = try? result.image {
                     let imgSize = CGSize(width: image.width, height: image.height)
                     imageSize = imgSize
                     let analysisStart = DispatchTime.now()
@@ -131,17 +151,38 @@ final class VideoProcessor {
                             innerPrecision: inner.precisionEstimatesPerPoint ?? []))
                     }
                     let analysisMs = Double(DispatchTime.now().uptimeNanoseconds - analysisStart.uptimeNanoseconds) / 1_000_000
+                    pending[idx] = .frame(RawFrame(time: frameTime, imageSize: imgSize, analysisMs: analysisMs, faces: rawFaces))
+                } else {
+                    pending[idx] = .failed
+                }
 
-                    let raw = RawFrame(time: t, imageSize: imgSize, analysisMs: analysisMs, faces: rawFaces)
-                    rawFrames.append(raw)
-                    frames.append(Self.classifyFrame(raw, mode: classificationMode, cropThreshold: self.cropThreshold, step: self.sampleStep, metric: self.activenessMetric, state: &classifyState))
-                    unclassifiedCount = classifyState.unclassified
+                // Classify every contiguous frame that's now ready, in time order.
+                while let slot = pending.removeValue(forKey: nextIndex) {
+                    if case .frame(let raw) = slot {
+                        rawFrames.append(raw)
+                        frames.append(Self.classifyFrame(raw, mode: classificationMode, cropThreshold: self.cropThreshold, step: self.sampleStep, metric: self.activenessMetric, state: &classifyState))
+                        unclassifiedCount = classifyState.unclassified
+                    }
+                    nextIndex += 1
                 }
 
                 sampleIndex += 1
                 progress = min(1.0, Double(sampleIndex) / Double(max(totalSamples, 1)))
                 statusMessage = "Processing \(sampleIndex)/\(totalSamples)…"
-                t += step
+            }
+            if cancelled {
+                generator.cancelAllCGImageGeneration()
+            } else {
+                // Defensive: if a requested time yielded no result the in-loop
+                // drain would stall at that index; flush whatever remains in
+                // ascending time order so no trailing frames are stranded.
+                for idx in pending.keys.sorted() {
+                    if case .frame(let raw)? = pending[idx] {
+                        rawFrames.append(raw)
+                        frames.append(Self.classifyFrame(raw, mode: classificationMode, cropThreshold: self.cropThreshold, step: self.sampleStep, metric: self.activenessMetric, state: &classifyState))
+                    }
+                }
+                unclassifiedCount = classifyState.unclassified
             }
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds &- startNanos.uptimeNanoseconds) / 1_000_000_000
             statusMessage = cancelled
@@ -178,6 +219,8 @@ final class VideoProcessor {
         var innerHist: [FacePosition: [CGFloat]] = [:]
         var percentHist: [FacePosition: [CGFloat]] = [:]
         var activityHist: [FacePosition: [CGFloat]] = [:]
+        /// Running EMA of |Δopen%| per position (the movement signal).
+        var activityEMA: [FacePosition: CGFloat] = [:]
         var unclassified = 0
         // Crop-trajectory state, carried across frames.
         var cropPosition: FacePosition = .center
@@ -233,9 +276,12 @@ final class VideoProcessor {
         }
 
         // Append one value per position EVERY frame (0 when absent) so all
-        // charts stay synchronized; also derive an "activity" = total variation
-        // of open% over the last ~0.5s.
+        // charts stay synchronized; also derive a movement "activity" = an EMA
+        // of |Δopen%|. The smoothing factor targets the same ~0.5s memory the
+        // old fixed window used (alpha = 2/(N+1) for an N-sample span), so it
+        // scales with the sampling interval.
         let activityWindow = max(2, Int((0.5 / step).rounded()))
+        let emaAlpha = CGFloat(2.0 / (Double(activityWindow) + 1.0))
         for pos in [FacePosition.left, .center, .right] {
             func push(_ dict: inout [FacePosition: [CGFloat]], _ value: CGFloat) {
                 var arr = dict[pos] ?? []
@@ -243,18 +289,17 @@ final class VideoProcessor {
                 if arr.count > Self.historyLength { arr.removeFirst(arr.count - Self.historyLength) }
                 dict[pos] = arr
             }
+            let current = pct[pos] ?? 0
+            let prevPercent = state.percentHist[pos]?.last ?? current   // previous frame's open% (before this push)
             push(&state.outerHist, oMot[pos] ?? 0)
             push(&state.innerHist, iMot[pos] ?? 0)
-            push(&state.percentHist, pct[pos] ?? 0)
+            push(&state.percentHist, current)
 
-            let recent = state.percentHist[pos]?.suffix(activityWindow) ?? []
-            var activity: CGFloat = 0
-            var prev: CGFloat?
-            for v in recent {
-                if let p = prev { activity += abs(v - p) }
-                prev = v
-            }
-            push(&state.activityHist, activity)
+            let delta = abs(current - prevPercent)
+            let priorEMA = state.activityEMA[pos] ?? delta
+            let ema = emaAlpha * delta + (1 - emaAlpha) * priorEMA
+            state.activityEMA[pos] = ema
+            push(&state.activityHist, ema)
         }
 
         // Next frame's "prior" is exactly this frame — positions with no face
@@ -277,6 +322,9 @@ final class VideoProcessor {
         if faces.isEmpty { activeFaceIndex = nil }
         else if faces.count == 1 { activeFaceIndex = 0 }
         else { activeFaceIndex = faces.indices.max(by: { activeness(faces[$0]) < activeness(faces[$1]) }) }
+
+        // Record each face's selection score for on-screen telemetry.
+        for i in faces.indices { faces[i].activeness = activeness(faces[i]) }
 
         let frameCenter = rf.imageSize.width / 2
 
@@ -328,7 +376,8 @@ final class VideoProcessor {
 
         // Snap on a committed switch / first frame; otherwise ease toward the
         // committed-side face over ~8 real seconds to gently follow small moves.
-        if switched || !state.cropCenterStarted {
+        let snapped = switched || !state.cropCenterStarted
+        if snapped {
             state.cropCenterX = targetCenterX
             state.cropCenterStarted = true
         } else {
@@ -341,6 +390,8 @@ final class VideoProcessor {
         return FrameAnalysis(
             time: rf.time, imageSize: rf.imageSize, faces: faces, analysisMs: rf.analysisMs,
             activeFaceIndex: activeFaceIndex, candidateCenterX: activeCenterX, actualCenterX: state.cropCenterX,
+            targetCenterX: targetCenterX, cropPosition: state.cropPosition, candidate: candidate,
+            cropSnapped: snapped, secondsSinceCropChange: rf.time - state.lastCropChange,
             motionOuter: state.outerHist, motionInner: state.innerHist, percent: state.percentHist,
             activity: state.activityHist)
     }
