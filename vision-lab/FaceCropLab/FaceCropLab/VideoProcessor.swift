@@ -313,9 +313,8 @@ final class VideoProcessor {
         state.priorInner = curInner
 
         // Active face: 1 face → it; 2+ → the face scoring highest on the chosen
-        // metric. Movement = this position's latest open-% activity (total
-        // variation over ~0.5s, just pushed above); Openness = instantaneous
-        // mouth-open %.
+        // metric. Movement = this position's latest open-% activity (the EMA of
+        // |Δopen%| just pushed above); Openness = instantaneous mouth-open %.
         let activityByPosition = state.activityHist
         func activeness(_ face: DetectedFace) -> CGFloat {
             switch metric {
