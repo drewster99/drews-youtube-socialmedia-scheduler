@@ -130,10 +130,13 @@ struct FrameAnalysis: Identifiable {
     var cropSnapped: Bool
     /// Seconds since the committed crop side last changed.
     var secondsSinceCropChange: Double
-    /// Per-position rolling histories (last ≤20), for the fixed on-screen charts.
-    var motionOuter: [FacePosition: [CGFloat]]
-    var motionInner: [FacePosition: [CGFloat]]
-    var percent: [FacePosition: [CGFloat]]
+    /// This frame's per-position chart values (0 when that side has no face).
+    /// The overlay reconstructs each chart's rolling window from these scalars
+    /// across the trailing frames — they are NOT a per-frame history snapshot
+    /// (storing a 200-sample window per frame was the ~1.9GB memory blowup).
+    var motionOuter: [FacePosition: CGFloat]
+    var motionInner: [FacePosition: CGFloat]
+    var percent: [FacePosition: CGFloat]
     /// Per-position open-% "activity": EMA of |Δopen%| (recency-weighted, ~0.5s memory).
-    var activity: [FacePosition: [CGFloat]]
+    var activity: [FacePosition: CGFloat]
 }

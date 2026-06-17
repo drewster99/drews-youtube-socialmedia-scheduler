@@ -13,11 +13,12 @@ import Darwin
 //   swiftc -O -target arm64-apple-macos26.0 \
 //     FaceCropLab/FaceCropLab/Models.swift \
 //     FaceCropLab/FaceCropLab/VideoProcessor.swift \
+//     FaceCropLab/FaceCropLab/CropExporter.swift \
 //     cli/main.swift -o /tmp/facecrop-cli
 // Run:
 //   /tmp/facecrop-cli [videoPath] [--interval 0.05] [--mode center|edges]
 //                     [--metric movement|openness] [--anxiety 3.0]
-//                     [--max-seconds N] [--batch 1000]
+//                     [--max-seconds N] [--batch 1000] [--sim-ui] [--export OUT.mov]
 
 func rssMB() -> Double {
     var info = mach_task_basic_info()
@@ -90,6 +91,9 @@ frames.reserveCapacity(times.count)
 enum Slot { case frame(RawFrame); case failed }
 var pending: [Int: Slot] = [:]
 var nextIndex = 0
+// Exact result→sample-index lookup keyed on the echoed-back CMTime value.
+var indexByTimeValue: [Int64: Int] = [:]
+for (i, ct) in times.enumerated() { indexByTimeValue[ct.value] = i }
 
 let runStart = DispatchTime.now()
 var batchStart = runStart
@@ -107,7 +111,7 @@ func simTimingSummary() {
 print("\nframes        wall    vision/f  classify/f  ui/f      rss")
 for await result in generator.images(for: times) {
     let frameTime = result.requestedTime.seconds
-    let idx = Int((frameTime / step).rounded())
+    let idx = indexByTimeValue[result.requestedTime.value] ?? Int((frameTime / step).rounded())
     if let image = try? result.image {
         let imgSize = CGSize(width: image.width, height: image.height)
         let vStart = DispatchTime.now()
@@ -161,6 +165,14 @@ for await result in generator.images(for: times) {
     }
 }
 
+// Defensive: flush any results stranded after a gap, in ascending time order
+// (mirrors VideoProcessor.process so a dropped result can't lose trailing frames).
+for k in pending.keys.sorted() {
+    if case .frame(let raw)? = pending[k] {
+        frames.append(VideoProcessor.classifyFrame(raw, mode: mode, cropThreshold: anxiety, step: step, metric: metric, state: &state))
+    }
+}
+
 let total = ms(runStart, DispatchTime.now()) / 1000
 print(String(format: "\nDONE  %d frames in %.1fs  (%.1f fps)  finalRSS %.0fMB",
              frames.count, total, Double(frames.count) / total, rssMB()))
@@ -174,7 +186,7 @@ if let outPath = exportPath {
                                   centers: centers) { p in
         if p - lastPct.get() >= 0.1 || p >= 1.0 {
             lastPct.set(p)
-            FileHandle.standardError.write(String(format: "  export %.0f%%\n", p * 100).data(using: .utf8)!)
+            FileHandle.standardError.write(Data(String(format: "  export %.0f%%\n", p * 100).utf8))
         }
     }
     print("export complete: \(outPath)")

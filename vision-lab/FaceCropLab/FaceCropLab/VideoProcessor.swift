@@ -141,6 +141,11 @@ final class VideoProcessor {
                 t += step
             }
             let totalSamples = times.count
+            // Exact result→sample-index lookup keyed on the (echoed-back) CMTime
+            // value, so the mapping can't collide or drift regardless of `step`
+            // (the old `round(time/step)` was fragile for very fine intervals).
+            var indexByTimeValue: [Int64: Int] = [:]
+            for (i, ct) in times.enumerated() { indexByTimeValue[ct.value] = i }
             var sampleIndex = 0
             var cancelled = false
 
@@ -156,7 +161,7 @@ final class VideoProcessor {
             for await result in generator.images(for: times) {
                 if Task.isCancelled { cancelled = true; break }
                 let frameTime = result.requestedTime.seconds
-                let idx = Int((frameTime / step).rounded())
+                let idx = indexByTimeValue[result.requestedTime.value] ?? Int((frameTime / step).rounded())
 
                 if let image = try? result.image {
                     let imgSize = CGSize(width: image.width, height: image.height)
@@ -249,11 +254,12 @@ final class VideoProcessor {
     struct ClassifyState {
         var priorOuter: [FacePosition: [CGPoint]] = [:]
         var priorInner: [FacePosition: [CGPoint]] = [:]
-        var outerHist: [FacePosition: [CGFloat]] = [:]
-        var innerHist: [FacePosition: [CGFloat]] = [:]
-        var percentHist: [FacePosition: [CGFloat]] = [:]
-        var activityHist: [FacePosition: [CGFloat]] = [:]
-        /// Running EMA of |Δopen%| per position (the movement signal).
+        /// Previous frame's open-% per position, for the |Δopen%| EMA.
+        var lastPercent: [FacePosition: CGFloat] = [:]
+        /// Running EMA of |Δopen%| per position — the movement signal AND the
+        /// value charted as "activity". (Charts reconstruct their rolling window
+        /// from the per-frame scalars in `frames`, so no history is kept here —
+        /// keeping a 200-sample window per frame was the ~1.9GB memory blowup.)
         var activityEMA: [FacePosition: CGFloat] = [:]
         var unclassified = 0
         // Crop-trajectory state, carried across frames.
@@ -322,31 +328,30 @@ final class VideoProcessor {
                 lipPercent: lipPercent))
         }
 
-        // Append one value per position EVERY frame (0 when absent) so all
-        // charts stay synchronized; also derive a movement "activity" = an EMA
-        // of |Δopen%|. The smoothing factor targets the same ~0.5s memory the
-        // old fixed window used (alpha = 2/(N+1) for an N-sample span), so it
-        // scales with the sampling interval.
+        // This frame's per-position chart values (0 when no face that side). The
+        // overlay reconstructs each chart's rolling window from these scalars
+        // across the last `historyLength` frames — nothing is stored per-frame
+        // beyond a few floats. "activity" is an EMA of |Δopen%| (movement); the
+        // smoothing factor targets ~0.5s memory (alpha = 2/(N+1)), scaling with
+        // the sampling interval.
         let activityWindow = max(2, Int((0.5 / step).rounded()))
         let emaAlpha = CGFloat(2.0 / (Double(activityWindow) + 1.0))
+        var motionOuterNow: [FacePosition: CGFloat] = [:]
+        var motionInnerNow: [FacePosition: CGFloat] = [:]
+        var percentNow: [FacePosition: CGFloat] = [:]
+        var activityNow: [FacePosition: CGFloat] = [:]
         for pos in [FacePosition.left, .center, .right] {
-            func push(_ dict: inout [FacePosition: [CGFloat]], _ value: CGFloat) {
-                var arr = dict[pos] ?? []
-                arr.append(value)
-                if arr.count > Self.historyLength { arr.removeFirst(arr.count - Self.historyLength) }
-                dict[pos] = arr
-            }
             let current = pct[pos] ?? 0
-            let prevPercent = state.percentHist[pos]?.last ?? current   // previous frame's open% (before this push)
-            push(&state.outerHist, oMot[pos] ?? 0)
-            push(&state.innerHist, iMot[pos] ?? 0)
-            push(&state.percentHist, current)
-
+            let prevPercent = state.lastPercent[pos] ?? current
             let delta = abs(current - prevPercent)
             let priorEMA = state.activityEMA[pos] ?? delta
             let ema = emaAlpha * delta + (1 - emaAlpha) * priorEMA
             state.activityEMA[pos] = ema
-            push(&state.activityHist, ema)
+            state.lastPercent[pos] = current
+            motionOuterNow[pos] = oMot[pos] ?? 0
+            motionInnerNow[pos] = iMot[pos] ?? 0
+            percentNow[pos] = current
+            activityNow[pos] = ema
         }
 
         // Next frame's "prior" is exactly this frame — positions with no face
@@ -357,10 +362,9 @@ final class VideoProcessor {
         // Active face: 1 face → it; 2+ → the face scoring highest on the chosen
         // metric. Movement = this position's latest open-% activity (the EMA of
         // |Δopen%| just pushed above); Openness = instantaneous mouth-open %.
-        let activityByPosition = state.activityHist
         func activeness(_ face: DetectedFace) -> CGFloat {
             switch metric {
-            case .movement: return activityByPosition[face.position]?.last ?? 0
+            case .movement: return activityNow[face.position] ?? 0
             case .openness: return face.lipPercent
             }
         }
@@ -391,12 +395,15 @@ final class VideoProcessor {
 
         let sidesThisFrame = Set(faces.map { $0.position })
 
-        // A change in face count is a likely scene cut; open a short settle
-        // window during which left↔right switches skip the anxiety threshold,
-        // so the crop commits to the new scene's actual speaker (which may take
-        // a few frames of movement to emerge) instead of being held on a stale
-        // side by the threshold and crawling toward the wrong subject.
-        if faces.count != state.lastFaceCount {
+        // A change in the CONFIDENT face count is a likely scene cut; open a short
+        // settle window during which left↔right switches skip the anxiety
+        // threshold, so the crop commits to the new scene's actual speaker (which
+        // may take a few frames of movement to emerge) instead of being held on a
+        // stale side. Using the confident count (not all faces) keeps a flickering
+        // low-confidence phantom from continuously re-arming the window and
+        // silently defeating the anxiety hysteresis.
+        let confidentCount = confident.count
+        if confidentCount != state.lastFaceCount {
             state.cutSettleUntil = rf.time + Self.cutSettleSeconds
         }
         let inCutSettle = rf.time < state.cutSettleUntil
@@ -423,7 +430,7 @@ final class VideoProcessor {
             }
         }
         state.sidesLastFrame = sidesThisFrame
-        state.lastFaceCount = faces.count
+        state.lastFaceCount = confidentCount
 
         // Crop target = horizontal center of the face on the COMMITTED side.
         // We deliberately never chase a face on a DIFFERENT side here: moving to
@@ -465,8 +472,8 @@ final class VideoProcessor {
             activeFaceIndex: activeFaceIndex, candidateCenterX: activeCenterX, actualCenterX: state.cropCenterX,
             targetCenterX: targetCenterX, cropPosition: state.cropPosition, candidate: candidate,
             cropSnapped: snapped, secondsSinceCropChange: rf.time - state.lastCropChange,
-            motionOuter: state.outerHist, motionInner: state.innerHist, percent: state.percentHist,
-            activity: state.activityHist)
+            motionOuter: motionOuterNow, motionInner: motionInnerNow, percent: percentNow,
+            activity: activityNow)
     }
 
     static func classify(boundingBox: CGRect, imageWidth: CGFloat, mode: ClassificationMode) -> FacePosition {

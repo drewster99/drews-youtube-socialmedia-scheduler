@@ -14,11 +14,15 @@ enum OverlayRenderer {
         return CGRect(x: (bounds.width - w) / 2, y: (bounds.height - h) / 2, width: w, height: h)
     }
 
-    static func draw(_ ctx: GraphicsContext, size: CGSize, frame: FrameAnalysis?, imageSize: CGSize,
+    /// `history` is the trailing window of analyzed frames (≤ historyLength)
+    /// ending at the displayed frame; the displayed frame is `history.last`. The
+    /// charts reconstruct their rolling series from this window since each frame
+    /// now stores only per-position scalars.
+    static func draw(_ ctx: GraphicsContext, size: CGSize, history: ArraySlice<FrameAnalysis>, imageSize: CGSize,
                      summary: (min: Double, max: Double, avg: Double)?) {
         let videoRect = aspectFit(content: imageSize, into: size)
         guard videoRect.width > 0 else { return }
-        drawTimingPanel(ctx, videoRect: videoRect, frameMs: frame?.analysisMs, summary: summary)
+        drawTimingPanel(ctx, videoRect: videoRect, frameMs: history.last?.analysisMs, summary: summary)
         let sx = videoRect.width / imageSize.width
         let sy = videoRect.height / imageSize.height
         func map(_ p: CGPoint) -> CGPoint {
@@ -34,7 +38,7 @@ enum OverlayRenderer {
             ctx.stroke(line, with: .color(.yellow.opacity(0.45)), style: StrokeStyle(lineWidth: 1, dash: [5, 5]))
         }
 
-        guard let frame else { return }
+        guard let frame = history.last else { return }
 
         func toView(_ r: CGRect) -> CGRect {
             CGRect(x: videoRect.minX + r.minX * sx, y: videoRect.minY + r.minY * sy,
@@ -75,20 +79,23 @@ enum OverlayRenderer {
         }
 
         drawCropState(ctx, frame: frame, videoRect: videoRect, imageSize: imageSize)
-        drawBottomCharts(ctx, frame: frame, videoRect: videoRect)
+        drawBottomCharts(ctx, history: history, videoRect: videoRect)
 
-        // Top-center: open-% activity (Δ of open% over ~0.5s) for L/C/R.
+        // Top-center: open-% activity (EMA of |Δopen%|) for L/C/R, reconstructed
+        // from the trailing window of per-frame scalars.
         let actW = min(440, videoRect.width * 0.42)
         let actRect = CGRect(x: videoRect.midX - actW / 2, y: videoRect.minY + 22, width: actW, height: 64)
         drawTriChart(ctx, rect: actRect, keyLabel: "Δopen%",
-                     left: frame.activity[.left] ?? [], center: frame.activity[.center] ?? [], right: frame.activity[.right] ?? [])
+                     left: history.map { $0.activity[.left] ?? 0 },
+                     center: history.map { $0.activity[.center] ?? 0 },
+                     right: history.map { $0.activity[.right] ?? 0 })
     }
 
     /// Fixed bottom-of-screen charts: a wide open-% chart (left/center/right on
     /// one graph, with a color key) centered at the very bottom, and three
     /// motion charts (red=outer / blue=inner) centered on the left/center/right
     /// thirds just above it.
-    static func drawBottomCharts(_ ctx: GraphicsContext, frame: FrameAnalysis, videoRect: CGRect) {
+    static func drawBottomCharts(_ ctx: GraphicsContext, history: ArraySlice<FrameAnalysis>, videoRect: CGRect) {
         let w = videoRect.width
 
         // Open-% chart: centered, at the very bottom.
@@ -97,7 +104,9 @@ enum OverlayRenderer {
         let pctRect = CGRect(x: videoRect.midX - pctW / 2, y: videoRect.maxY - pctH - 8,
                              width: pctW, height: pctH)
         drawTriChart(ctx, rect: pctRect, keyLabel: "open%",
-                     left: frame.percent[.left] ?? [], center: frame.percent[.center] ?? [], right: frame.percent[.right] ?? [])
+                     left: history.map { $0.percent[.left] ?? 0 },
+                     center: history.map { $0.percent[.center] ?? 0 },
+                     right: history.map { $0.percent[.right] ?? 0 })
 
         // Three motion charts above, centered on the left / center / right thirds.
         let motW = min(190, w * 0.26)
@@ -107,8 +116,8 @@ enum OverlayRenderer {
         for (cx, pos) in zip(centers, [FacePosition.left, .center, .right]) {
             let r = CGRect(x: cx - motW / 2, y: motY, width: motW, height: motH)
             let motSeries: [(values: [CGFloat], color: Color)] = [
-                (frame.motionOuter[pos] ?? [], .red),
-                (frame.motionInner[pos] ?? [], .blue),
+                (history.map { $0.motionOuter[pos] ?? 0 }, .red),
+                (history.map { $0.motionInner[pos] ?? 0 }, .blue),
             ]
             drawSeriesChart(ctx, rect: r, series: motSeries)
             ctx.draw(Text(pos.rawValue.prefix(1).uppercased()).font(.system(size: 10, weight: .semibold)).foregroundColor(.white.opacity(0.85)),

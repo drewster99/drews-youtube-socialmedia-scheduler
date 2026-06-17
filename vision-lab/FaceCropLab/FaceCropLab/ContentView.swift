@@ -30,6 +30,8 @@ struct ContentView: View {
     @State private var exportError: String?
     /// The one-shot pick→analyze→crop→save flow is running.
     @State private var isAutoCropping = false
+    /// The in-flight "export the loaded analysis" task, so it can be cancelled.
+    @State private var exportTask: Task<Void, Never>?
 
     var body: some View {
         VStack(spacing: 8) {
@@ -39,7 +41,11 @@ struct ContentView: View {
         .padding(8)
         .frame(minWidth: 940, minHeight: 680)
         .onAppear(perform: installTimeObserver)
-        .onDisappear(perform: removeTimeObserver)
+        .onDisappear {
+            removeTimeObserver()
+            processingTask?.cancel()
+            exportTask?.cancel()
+        }
         .alert("Export failed", isPresented: Binding(get: { exportError != nil }, set: { if !$0 { exportError = nil } })) {
             Button("OK", role: .cancel) { exportError = nil }
         } message: {
@@ -134,7 +140,7 @@ struct ContentView: View {
                         Canvas { ctx, size in
                             guard processor.imageSize.width > 0 else { return }
                             OverlayRenderer.draw(ctx, size: size,
-                                                 frame: currentAnalysis(),
+                                                 history: currentHistoryWindow(),
                                                  imageSize: processor.imageSize,
                                                  summary: processor.timingSummary)
                         }
@@ -184,10 +190,15 @@ struct ContentView: View {
         return ans
     }
 
-    private func currentAnalysis() -> FrameAnalysis? {
+    /// The trailing window of frames (≤ historyLength) ending at the displayed
+    /// frame — the overlay draws the last one and reconstructs its charts from
+    /// the rest. Empty slice when there are no frames yet.
+    private func currentHistoryWindow() -> ArraySlice<FrameAnalysis> {
         let frames = processor.frames
-        guard !frames.isEmpty else { return nil }
-        return frames[Self.frameIndex(for: currentTime, in: frames)]
+        guard !frames.isEmpty else { return frames[...] }
+        let idx = Self.frameIndex(for: currentTime, in: frames)
+        let lo = max(0, idx - (VideoProcessor.historyLength - 1))
+        return frames[lo...idx]
     }
 
     private func currentFrameIndex() -> Int {
@@ -296,20 +307,17 @@ struct ContentView: View {
         let centers = CropExporter.centers(from: processor.frames)
         isExporting = true
         exportProgress = 0
-        Task {
+        exportTask = Task { @MainActor in
+            defer { isExporting = false }
             do {
                 try await CropExporter.export(source: src, to: outURL, centers: centers, progress: { p in
                     DispatchQueue.main.async { MainActor.assumeIsolated { exportProgress = p } }
                 })
-                await MainActor.run {
-                    isExporting = false
-                    NSWorkspace.shared.activateFileViewerSelecting([outURL])
-                }
+                NSWorkspace.shared.activateFileViewerSelecting([outURL])
+            } catch is CancellationError {
+                // user navigated away / cancelled — nothing to surface
             } catch {
-                await MainActor.run {
-                    isExporting = false
-                    exportError = error.localizedDescription
-                }
+                exportError = error.localizedDescription
             }
         }
     }
@@ -349,16 +357,16 @@ struct ContentView: View {
             }
             isExporting = true
             exportProgress = 0
+            defer { isExporting = false; isAutoCropping = false }
             do {
                 try await CropExporter.export(source: inURL, to: outURL, centers: centers, progress: { p in
                     DispatchQueue.main.async { MainActor.assumeIsolated { exportProgress = p } }
                 })
-                isExporting = false
-                isAutoCropping = false
+                if Task.isCancelled { return }
                 NSWorkspace.shared.activateFileViewerSelecting([outURL])
+            } catch is CancellationError {
+                // cancelled (e.g. user opened another file) — nothing to surface
             } catch {
-                isExporting = false
-                isAutoCropping = false
                 exportError = error.localizedDescription
             }
         }

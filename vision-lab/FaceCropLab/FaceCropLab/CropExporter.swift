@@ -66,13 +66,15 @@ enum CropExporter {
         let srcW = abs(displayed.width)
         let srcH = abs(displayed.height)
         guard srcW > 0, srcH > 0 else { throw ExportError(message: "Could not read source dimensions.") }
+        guard !centers.isEmpty else { throw ExportError(message: "No crop trajectory — analyze the video first.") }
 
-        // 9:16 crop column, full source height. Both output dimensions rounded to
-        // even — H.264 requires it (an odd-height source would otherwise fail).
-        let cropW = (srcH * 9.0 / 16.0 / 2.0).rounded() * 2
-        let evenH = (srcH / 2).rounded(.down) * 2
-        // Native crop resolution by default → no downscale, input-quality output.
-        let outSize = renderSize ?? CGSize(width: cropW, height: evenH)
+        // Even output dimensions (H.264 requires BOTH even). The 9:16 column is
+        // derived from the even height so the crop rect, the canvas, and the 9:16
+        // ratio are all internally consistent (no 1px aspect drift / clipping).
+        // Native crop height by default → no downscale, input-quality output.
+        let cropH = (srcH / 2).rounded(.down) * 2
+        let cropW = (cropH * 9.0 / 16.0 / 2.0).rounded() * 2
+        let outSize = renderSize ?? CGSize(width: cropW, height: cropH)
         let renderW = outSize.width
 
         let comp = AVMutableVideoComposition(asset: asset) { request in
@@ -80,9 +82,9 @@ enum CropExporter {
             let frac = fraction(at: request.compositionTime.seconds, in: centers)
             let cropX = max(0, min(srcW - cropW, frac * srcW - cropW / 2)).rounded()
             let cropped = srcImage
-                .cropped(to: CGRect(x: cropX, y: 0, width: cropW, height: srcH))
+                .cropped(to: CGRect(x: cropX, y: 0, width: cropW, height: cropH))
                 .transformed(by: CGAffineTransform(translationX: -cropX, y: 0))
-            // Uniform scale: cropW:srcH == renderW:renderH == 9:16.
+            // Uniform scale (cropW:cropH == renderW:renderH); 1.0 at native size.
             let scale = renderW / cropW
             let out = cropped.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             request.finish(with: out, context: nil)
@@ -120,13 +122,19 @@ enum CropExporter {
         }
         defer { poller.cancel() }
 
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            session.exportAsynchronously { cont.resume() }
+        // Cancellable: if the awaiting Task is cancelled, cancel the export
+        // session (box captured so the @Sendable onCancel can reach it).
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                session.exportAsynchronously { cont.resume() }
+            }
+        } onCancel: {
+            box.session.cancelExport()
         }
 
         switch session.status {
         case .completed: progress(1.0)
-        case .cancelled: throw ExportError(message: "Export cancelled.")
+        case .cancelled: throw CancellationError()
         default: throw session.error ?? ExportError(message: "Export failed (\(session.status.rawValue)).")
         }
     }
