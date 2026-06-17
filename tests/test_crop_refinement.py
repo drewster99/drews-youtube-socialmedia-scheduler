@@ -166,7 +166,8 @@ async def test_run_generate_job_transcribes_on_device_and_runs_vision_for_crop_o
         all_words = ["w"]
         backend = "macos-speech"
 
-    def fake_transcribe(*, video_path, backend=None, language=None, model=None):
+    def fake_transcribe(*, video_path, backend=None, language=None, model=None,
+                        progress_callback=None):
         transcribe_kwargs.update(backend=backend, model=model)
         return _FakeResult()
 
