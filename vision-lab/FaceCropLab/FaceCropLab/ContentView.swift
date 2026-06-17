@@ -25,6 +25,9 @@ struct ContentView: View {
     /// overlay's `currentTime` only advances when the seek lands, so the overlay
     /// can't get ahead of the (slow, 4K) video; rapid steps chain off this.
     @State private var seekTargetTime: Double?
+    @State private var isExporting = false
+    @State private var exportProgress: Double = 0
+    @State private var exportError: String?
 
     var body: some View {
         VStack(spacing: 8) {
@@ -35,6 +38,11 @@ struct ContentView: View {
         .frame(minWidth: 940, minHeight: 680)
         .onAppear(perform: installTimeObserver)
         .onDisappear(perform: removeTimeObserver)
+        .alert("Export failed", isPresented: Binding(get: { exportError != nil }, set: { if !$0 { exportError = nil } })) {
+            Button("OK", role: .cancel) { exportError = nil }
+        } message: {
+            Text(exportError ?? "")
+        }
     }
 
     private var controlBar: some View {
@@ -96,6 +104,16 @@ struct ContentView: View {
             if processor.isProcessing {
                 ProgressView(value: processor.progress).frame(width: 120)
             }
+
+            Divider().frame(height: 18)
+
+            Button("Crop 9:16 & Export…", action: exportCrop)
+                .disabled(videoURL == nil || processor.frames.isEmpty || processor.isProcessing || isExporting)
+            if isExporting {
+                ProgressView(value: exportProgress).frame(width: 100)
+                Text("\(Int(exportProgress * 100))%").font(.caption.monospaced())
+            }
+
             Spacer()
             Text(statusLine).font(.caption.monospaced()).foregroundStyle(.secondary)
         }
@@ -258,5 +276,35 @@ struct ContentView: View {
         guard let url = videoURL else { return }
         processingTask?.cancel()
         processingTask = Task { await processor.process(url: url, interval: sampleInterval, mode: classificationMode, cropThreshold: cropThreshold, metric: activenessMetric) }
+    }
+
+    /// Render the moving 9:16 crop (the current analysis trajectory) of the
+    /// loaded video to a new file the user picks.
+    private func exportCrop() {
+        guard let src = videoURL, !processor.frames.isEmpty else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.quickTimeMovie]
+        panel.nameFieldStringValue = src.deletingPathExtension().lastPathComponent + "_9x16.mov"
+        guard panel.runModal() == .OK, let outURL = panel.url else { return }
+
+        let centers = CropExporter.centers(from: processor.frames)
+        isExporting = true
+        exportProgress = 0
+        Task {
+            do {
+                try await CropExporter.export(source: src, to: outURL, centers: centers, progress: { p in
+                    DispatchQueue.main.async { MainActor.assumeIsolated { exportProgress = p } }
+                })
+                await MainActor.run {
+                    isExporting = false
+                    NSWorkspace.shared.activateFileViewerSelecting([outURL])
+                }
+            } catch {
+                await MainActor.run {
+                    isExporting = false
+                    exportError = error.localizedDescription
+                }
+            }
+        }
     }
 }

@@ -45,6 +45,7 @@ var anxiety = 3.0
 var maxSeconds = Double.greatestFiniteMagnitude
 var batch = 1000
 var simUI = false   // recompute timingSummary per frame like the overlay does
+var exportPath: String?
 
 var i = 0
 while i < args.count {
@@ -58,6 +59,7 @@ while i < args.count {
     case "--max-seconds": if let v = next().flatMap(Double.init) { maxSeconds = v }; i += 1
     case "--batch": if let v = next().flatMap(Int.init) { batch = v }; i += 1
     case "--sim-ui": simUI = true
+    case "--export": exportPath = next(); i += 1
     default: if !a.hasPrefix("--") { path = a }
     }
     i += 1
@@ -162,3 +164,25 @@ for await result in generator.images(for: times) {
 let total = ms(runStart, DispatchTime.now()) / 1000
 print(String(format: "\nDONE  %d frames in %.1fs  (%.1f fps)  finalRSS %.0fMB",
              frames.count, total, Double(frames.count) / total, rssMB()))
+
+if let outPath = exportPath {
+    let centers = CropExporter.centers(from: frames)
+    print("\nexporting 9:16 crop -> \(outPath)  (\(centers.count) trajectory points)")
+    let lastPct = LockedDouble()
+    try await CropExporter.export(source: URL(fileURLWithPath: path),
+                                  to: URL(fileURLWithPath: outPath),
+                                  centers: centers) { p in
+        if p - lastPct.get() >= 0.1 || p >= 1.0 {
+            lastPct.set(p)
+            FileHandle.standardError.write(String(format: "  export %.0f%%\n", p * 100).data(using: .utf8)!)
+        }
+    }
+    print("export complete: \(outPath)")
+}
+
+// Tiny thread-safe holder so the @Sendable progress closure can throttle prints.
+final class LockedDouble: @unchecked Sendable {
+    private let lock = NSLock(); private var value = 0.0
+    func get() -> Double { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ v: Double) { lock.lock(); value = v; lock.unlock() }
+}
