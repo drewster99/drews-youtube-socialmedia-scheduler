@@ -49,10 +49,12 @@ enum CropExporter {
         return a.fraction + (b.fraction - a.fraction) * f
     }
 
-    /// Render `source` to `output` as a 9:16 video of `renderSize`, moving the
-    /// crop column per `centers`. Reports 0…1 progress. Overwrites `output`.
+    /// Render `source` to `output` as a 9:16 video, moving the crop column per
+    /// `centers`. `renderSize` nil = native crop resolution (full source height,
+    /// no downscale — input-quality output). Reports 0…1 progress. Overwrites
+    /// `output`.
     static func export(source: URL, to output: URL, centers: [Center],
-                       renderSize: CGSize = CGSize(width: 1080, height: 1920),
+                       renderSize: CGSize? = nil,
                        progress: @escaping @Sendable (Double) -> Void) async throws {
         let asset = AVURLAsset(url: source)
         guard let track = try await asset.loadTracks(withMediaType: .video).first else {
@@ -65,9 +67,11 @@ enum CropExporter {
         let srcH = abs(displayed.height)
         guard srcW > 0, srcH > 0 else { throw ExportError(message: "Could not read source dimensions.") }
 
-        // 9:16 crop column, full source height.
-        let cropW = (srcH * 9.0 / 16.0).rounded()
-        let renderW = renderSize.width
+        // 9:16 crop column, full source height. Width rounded to even (H.264).
+        let cropW = (srcH * 9.0 / 16.0 / 2.0).rounded() * 2
+        // Native crop resolution by default → no downscale, input-quality output.
+        let outSize = renderSize ?? CGSize(width: cropW, height: srcH)
+        let renderW = outSize.width
 
         let comp = AVMutableVideoComposition(asset: asset) { request in
             let srcImage = request.sourceImage           // already display-oriented; origin bottom-left
@@ -81,7 +85,7 @@ enum CropExporter {
             let out = cropped.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             request.finish(with: out, context: nil)
         }
-        comp.renderSize = renderSize
+        comp.renderSize = outSize
 
         guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
             throw ExportError(message: "Could not create export session.")

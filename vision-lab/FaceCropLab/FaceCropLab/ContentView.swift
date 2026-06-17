@@ -28,6 +28,8 @@ struct ContentView: View {
     @State private var isExporting = false
     @State private var exportProgress: Double = 0
     @State private var exportError: String?
+    /// The one-shot pick→analyze→crop→save flow is running.
+    @State private var isAutoCropping = false
 
     var body: some View {
         VStack(spacing: 8) {
@@ -48,6 +50,10 @@ struct ContentView: View {
     private var controlBar: some View {
         HStack(spacing: 10) {
             Button("Open Video…", action: openVideo)
+
+            Button("Auto-Crop to 9:16…", action: autoCropFile)
+                .disabled(isAutoCropping || processor.isProcessing || isExporting)
+                .help("Pick a video → analyze → render a 9:16 active-speaker crop at full source resolution → save.")
 
             Divider().frame(height: 18)
 
@@ -304,6 +310,56 @@ struct ContentView: View {
                     isExporting = false
                     exportError = error.localizedDescription
                 }
+            }
+        }
+    }
+
+    /// The whole thing in one button: pick a video, analyze it, render the 9:16
+    /// active-speaker crop at full source resolution, and save it where chosen.
+    private func autoCropFile() {
+        let openPanel = NSOpenPanel()
+        openPanel.allowsMultipleSelection = false
+        openPanel.canChooseDirectories = false
+        openPanel.allowedContentTypes = [.movie, .video, .mpeg4Movie, .quickTimeMovie]
+        openPanel.directoryURL = URL(
+            fileURLWithPath: "/Users/andrew/Library/Application Support/com.nuclearcyborg.drews-socialmedia-scheduler/uploads",
+            isDirectory: true)
+        guard openPanel.runModal() == .OK, let inURL = openPanel.url else { return }
+
+        let savePanel = NSSavePanel()
+        savePanel.allowedContentTypes = [.quickTimeMovie]
+        savePanel.nameFieldStringValue = inURL.deletingPathExtension().lastPathComponent + "_9x16.mov"
+        guard savePanel.runModal() == .OK, let outURL = savePanel.url else { return }
+
+        videoURL = inURL
+        currentTime = 0
+        player.replaceCurrentItem(with: AVPlayerItem(url: inURL))
+
+        isAutoCropping = true
+        processingTask?.cancel()
+        processingTask = Task { @MainActor in
+            await processor.process(url: inURL, interval: sampleInterval, mode: classificationMode,
+                                    cropThreshold: cropThreshold, metric: activenessMetric)
+            if Task.isCancelled { isAutoCropping = false; return }
+            let centers = CropExporter.centers(from: processor.frames)
+            guard !centers.isEmpty else {
+                isAutoCropping = false
+                exportError = "Analysis produced no frames to crop."
+                return
+            }
+            isExporting = true
+            exportProgress = 0
+            do {
+                try await CropExporter.export(source: inURL, to: outURL, centers: centers, progress: { p in
+                    DispatchQueue.main.async { MainActor.assumeIsolated { exportProgress = p } }
+                })
+                isExporting = false
+                isAutoCropping = false
+                NSWorkspace.shared.activateFileViewerSelecting([outURL])
+            } catch {
+                isExporting = false
+                isAutoCropping = false
+                exportError = error.localizedDescription
             }
         }
     }
