@@ -150,6 +150,20 @@ _write_lock = asyncio.Lock()
 _in_write_txn: ContextVar[bool] = ContextVar("_in_write_txn", default=False)
 
 
+def reset_write_txn_flag() -> None:
+    """Clear the in-transaction marker for the current task.
+
+    ``asyncio.create_task`` COPIES the parent's context into the child, so a task
+    detached from inside an open ``write_transaction`` would inherit
+    ``_in_write_txn = True`` and — fatally — have its own ``write_transaction``
+    *join* the parent's already-closed transaction (no BEGIN, no lock, writes
+    neither isolated nor reliably committed). Detached-task launchers
+    (``spawn_background``) call this at the child's entry so it always starts a
+    fresh, independent transaction.
+    """
+    _in_write_txn.set(False)
+
+
 @asynccontextmanager
 async def write_transaction():
     """Run a read-modify-write critical section as one serialized, isolated unit.

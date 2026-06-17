@@ -130,9 +130,18 @@ async def publish_video_job(video_id: str) -> dict:
         results: dict = {"video_id": video_id, "published": False, "social_results": {}}
 
         cursor = await db.execute(
-            "SELECT project_id, item_type, url FROM videos WHERE id = ?", (video_id,)
+            "SELECT project_id, item_type, url, archived FROM videos WHERE id = ?", (video_id,)
         )
         video_row = await cursor.fetchone()
+
+        # Re-check archived under the lock: archiving a clip cancels its publish
+        # (see archive_promo), but defend against a race / a stale job so an
+        # archived clip can never be flipped public or have its posts sent.
+        if video_row is not None and bool(video_row["archived"]):
+            logger.info("publish_video_job: skipping archived video %s", video_id)
+            results["skipped_archived"] = True
+            return results
+
         project_id = int(video_row["project_id"]) if video_row else 1
         item_type = (video_row["item_type"] if video_row else "episode") or "episode"
         item_url = (video_row["url"] if video_row else "") or ""
@@ -1049,7 +1058,9 @@ async def restore_scheduled_jobs() -> None:
     plus any individually-scheduled social posts."""
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT id, publish_at FROM videos WHERE status = 'scheduled' AND publish_at IS NOT NULL"
+        "SELECT id, publish_at FROM videos "
+        "WHERE status = 'scheduled' AND publish_at IS NOT NULL "
+        "AND COALESCE(archived, 0) = 0"
     )
 
     now = datetime.now(timezone.utc)

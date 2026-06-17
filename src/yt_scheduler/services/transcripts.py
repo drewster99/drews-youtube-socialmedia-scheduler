@@ -248,6 +248,10 @@ async def set_active_transcript(
     if transcript["video_id"] != video_id:
         raise ValueError("Transcript does not belong to this video")
 
+    # The videos mirror AND the user_edited transcript row are written in ONE
+    # transaction so they can't desync on a crash (the desync this function's
+    # mirror exists to prevent). ensure_user_edited_row / add_transcript use
+    # write_transaction, which joins this one (reentrant).
     async with write_transaction() as db:
         await db.execute(
             """
@@ -270,14 +274,13 @@ async def set_active_transcript(
                 video_id,
             ),
         )
-    # When the active transcript text was edited away from any source, also
-    # persist that edit as a user_edited transcript row so it survives a
-    # subsequent re-selection of a different source. The source row may not
-    # itself be a user_edited row, so look up (or create) the per-video
-    # user_edited row separately rather than trying to UPDATE by transcript_id.
-    if is_edited:
-        await ensure_user_edited_row(video_id, text)
-        async with write_transaction() as db:
+        # When the active transcript text was edited away from any source, also
+        # persist that edit as a user_edited transcript row so it survives a
+        # subsequent re-selection of a different source. The source row may not
+        # itself be a user_edited row, so look up (or create) the per-video
+        # user_edited row separately rather than trying to UPDATE by transcript_id.
+        if is_edited:
+            await ensure_user_edited_row(video_id, text)
             await db.execute(
                 "UPDATE transcripts SET text = ?, created_at = datetime('now') "
                 "WHERE video_id = ? AND source = 'user_edited'",

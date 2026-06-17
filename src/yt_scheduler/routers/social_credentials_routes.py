@@ -89,8 +89,13 @@ async def refresh_credential_username(uuid: str):
     from yt_scheduler.database import write_transaction
 
     async with write_transaction() as db:
-        await db.execute(
-            "UPDATE social_accounts SET username = ? WHERE uuid = ?",
+        # Re-scope to a live row: the credential could have been soft-deleted
+        # during the resolve_username network call above; don't resurrect-write
+        # a username onto a deleted row.
+        cursor = await db.execute(
+            "UPDATE social_accounts SET username = ? WHERE uuid = ? AND deleted_at IS NULL",
             (new_username, uuid),
         )
+        if cursor.rowcount == 0:
+            raise HTTPException(404, "Credential not found")
     return {"changed": True, "username": new_username}

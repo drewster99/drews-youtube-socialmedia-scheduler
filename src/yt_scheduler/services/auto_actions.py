@@ -735,9 +735,14 @@ async def _persist_pending_promo_job(job: dict) -> None:
 async def _mark_pending_promo_job(
     job_id: str, *, status: str | None = None,
     youtube_video_id: str | None = None, last_error: str | None = None,
+    critical: bool = False,
 ) -> None:
-    """Update a persisted promo job's progress/terminal fields. Best-effort —
-    these are bookkeeping writes; never let one break the chain."""
+    """Update a persisted promo job's progress/terminal fields. Normally
+    best-effort (these are bookkeeping writes; never break the chain). When
+    ``critical`` is set — used for the post-upload ``youtube_video_id`` stamp,
+    which is the load-bearing "don't re-upload on restart" marker — the write is
+    retried before giving up, so a transient DB hiccup can't silently drop it and
+    cause a duplicate YouTube upload on the next resume."""
     assignments = ["updated_at = datetime('now')"]
     params: list[object] = []
     if status is not None:
@@ -750,14 +755,22 @@ async def _mark_pending_promo_job(
         assignments.append("last_error = ?")
         params.append(last_error[:500])
     params.append(job_id)
-    try:
-        async with write_transaction() as db:
-            await db.execute(
-                f"UPDATE pending_promo_jobs SET {', '.join(assignments)} WHERE job_id = ?",
-                params,
-            )
-    except Exception as exc:
-        logger.warning("Could not update pending promo job %s: %s", job_id, exc)
+    attempts = 4 if critical else 1
+    for attempt in range(attempts):
+        try:
+            async with write_transaction() as db:
+                await db.execute(
+                    f"UPDATE pending_promo_jobs SET {', '.join(assignments)} WHERE job_id = ?",
+                    params,
+                )
+            return
+        except Exception as exc:
+            if attempt + 1 < attempts:
+                await asyncio.sleep(0.25 * (attempt + 1))
+                continue
+            log = logger.error if critical else logger.warning
+            log("Could not update pending promo job %s%s: %s",
+                job_id, " (CRITICAL youtube_video_id stamp)" if critical else "", exc)
 
 
 async def start_promo_upload(
@@ -1147,7 +1160,9 @@ async def _run_promo_chain_inner(job_id: str) -> None:
     # Stamp the YouTube id BEFORE the row INSERT so a restart in this narrow
     # window recognises the clip already uploaded and does NOT re-upload it
     # (which would create a duplicate — the exact thing we're trying to avoid).
-    await _mark_pending_promo_job(job_id, youtube_video_id=video_id)
+    # critical=True: retry rather than silently swallow — this stamp is the dedup
+    # guarantee, not bookkeeping.
+    await _mark_pending_promo_job(job_id, youtube_video_id=video_id, critical=True)
 
     duration = tiers.probe_local_duration(local_path)
     derived_tier = tiers.tier_for_duration(duration)

@@ -176,13 +176,20 @@ def _titles_similar(a: str, b: str) -> bool:
         return False
     if norm_a == norm_b:
         return True
-    char_ratio = difflib.SequenceMatcher(None, norm_a, norm_b).ratio()
-    if char_ratio >= _TITLE_SIMILARITY_THRESHOLD:
-        return True
     words_a = set(norm_a.split())
     words_b = set(norm_b.split())
     jaccard = len(words_a & words_b) / len(words_a | words_b)
-    return jaccard >= _TITLE_SIMILARITY_THRESHOLD
+    if jaccard >= _TITLE_SIMILARITY_THRESHOLD:
+        return True  # high word overlap / reordering
+    # High character similarity counts as a duplicate ONLY when one title's words
+    # are a subset of the other's — i.e. a genuine insertion ("Claude Nuked My
+    # [Production] Database"). Without this gate, two short titles that differ by
+    # a single CONTENT word ("…Should Quit" vs "…Should Stay", "Top 5" vs
+    # "Top 10") score a high char-ratio and a legit, distinct clip gets dropped.
+    if words_a.issubset(words_b) or words_b.issubset(words_a):
+        char_ratio = difflib.SequenceMatcher(None, norm_a, norm_b).ratio()
+        return char_ratio >= _TITLE_SIMILARITY_THRESHOLD
+    return False
 
 
 def _normalize_anchor_text(text: str) -> str:

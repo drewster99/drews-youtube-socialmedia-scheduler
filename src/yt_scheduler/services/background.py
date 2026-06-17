@@ -29,8 +29,19 @@ def spawn_background(coro: Coroutine[Any, Any, Any], *, name: str) -> asyncio.Ta
     Holds a strong reference until the task completes and, on done,
     retrieves ``task.exception()`` so the unhandled-task warning
     never fires. Logs failures with a full traceback under ``name``.
+
+    The child inherits a COPY of the spawner's context; reset the
+    in-transaction marker at its entry so a task detached from inside a
+    ``write_transaction`` starts its own fresh transaction instead of silently
+    joining the parent's already-closed one.
     """
-    task = asyncio.create_task(coro, name=name)
+    from yt_scheduler.database import reset_write_txn_flag
+
+    async def _detached() -> Any:
+        reset_write_txn_flag()
+        return await coro
+
+    task = asyncio.create_task(_detached(), name=name)
     _background_tasks.add(task)
 
     def _done(t: asyncio.Task) -> None:

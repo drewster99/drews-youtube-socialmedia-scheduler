@@ -726,6 +726,9 @@ async def save_template(
         raise ValueError("applies_to must include at least one tier")
 
     is_builtin_flag = 1 if name in BUILTIN_TEMPLATE_NAMES else 0
+    # The template row, its read-back id, and all built-in slots are ONE atomic
+    # transaction so a crash can't leave a template row with stale/no slots. Each
+    # _set_builtin_slot's own write_transaction joins this one (reentrant).
     try:
         async with write_transaction() as db:
             await db.execute(
@@ -738,31 +741,27 @@ async def save_template(
                 "  updated_at  = datetime('now')",
                 (project_id, name, description, json.dumps(tiers), is_builtin_flag),
             )
+            cursor = await db.execute(
+                "SELECT id FROM templates WHERE project_id = ? AND name = ?",
+                (project_id, name),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise RuntimeError("Failed to read back saved template row")
+            template_id = int(row["id"])
+
+            for platform_name, config in (platforms or {}).items():
+                if platform_name not in ALL_PLATFORMS:
+                    continue
+                await _set_builtin_slot(
+                    template_id,
+                    platform_name,
+                    body=str(config.get("template", "")),
+                    media=str(config.get("media", "thumbnail")),
+                    max_chars=int(config.get("max_chars", 500)),
+                )
     except aiosqlite.IntegrityError as exc:
         raise ValueError(str(exc)) from exc
-
-    cursor = await db.execute(
-        "SELECT id FROM templates WHERE project_id = ? AND name = ?",
-        (project_id, name),
-    )
-    row = await cursor.fetchone()
-    if row is None:
-        raise RuntimeError("Failed to read back saved template row")
-    template_id = int(row["id"])
-
-    # One atomic transaction for all built-in slots; each _set_builtin_slot's
-    # own write_transaction joins this one (reentrant).
-    async with write_transaction() as db:
-        for platform_name, config in (platforms or {}).items():
-            if platform_name not in ALL_PLATFORMS:
-                continue
-            await _set_builtin_slot(
-                template_id,
-                platform_name,
-                body=str(config.get("template", "")),
-                media=str(config.get("media", "thumbnail")),
-                max_chars=int(config.get("max_chars", 500)),
-            )
 
     saved = await get_template(name, project_id=project_id)
     if saved is None:

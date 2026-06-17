@@ -282,6 +282,11 @@ async def archive_promo(slug: str, parent_id: str, video_id: str) -> dict:
     )
     if not rows:
         raise HTTPException(404, "Promo clip not found under this parent")
+    # Archiving must not leave a pending publish behind: a scheduled-then-archived
+    # clip would otherwise be flipped public on YouTube (and its posts sent) at
+    # its publish time. Cancel any schedule first (no-op if it wasn't scheduled).
+    from yt_scheduler.services.scheduler import cancel_scheduled_publish
+    await cancel_scheduled_publish(video_id)
     async with write_transaction() as db:
         await db.execute(
             "UPDATE videos SET archived = 1, archived_at = datetime('now'), "
