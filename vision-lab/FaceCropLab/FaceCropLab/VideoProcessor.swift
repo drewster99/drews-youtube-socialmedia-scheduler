@@ -60,11 +60,25 @@ final class VideoProcessor {
     /// positives on background texture, not real speakers.
     nonisolated static let minFaceConfidence: Float = 0.5
 
-    /// Min / max / average per-frame Vision time across all processed frames.
+    /// Running per-frame Vision-time stats, maintained incrementally. Recomputing
+    /// these from all of `rawFrames` on every overlay redraw was O(n) per redraw
+    /// and the cause of the "slower and slower" slowdown as frames accumulated.
+    private var analysisMsMin = Double.greatestFiniteMagnitude
+    private var analysisMsMax = -Double.greatestFiniteMagnitude
+    private var analysisMsSum = 0.0
+    private var analysisMsCount = 0
+
+    /// Min / max / average per-frame Vision time across all processed frames. O(1).
     var timingSummary: (min: Double, max: Double, avg: Double)? {
-        let times = rawFrames.map(\.analysisMs)
-        guard let mn = times.min(), let mx = times.max() else { return nil }
-        return (mn, mx, times.reduce(0, +) / Double(times.count))
+        guard analysisMsCount > 0 else { return nil }
+        return (analysisMsMin, analysisMsMax, analysisMsSum / Double(analysisMsCount))
+    }
+
+    private func recordAnalysisMs(_ value: Double) {
+        analysisMsMin = min(analysisMsMin, value)
+        analysisMsMax = max(analysisMsMax, value)
+        analysisMsSum += value
+        analysisMsCount += 1
     }
 
     /// Sample the video every `interval` seconds (e.g. 0.25 → 4 fps), running
@@ -73,6 +87,10 @@ final class VideoProcessor {
         isProcessing = true
         frames = []
         rawFrames = []
+        analysisMsMin = .greatestFiniteMagnitude
+        analysisMsMax = -.greatestFiniteMagnitude
+        analysisMsSum = 0
+        analysisMsCount = 0
         sourceSize = .zero
         videoDuration = 0
         unclassifiedCount = 0
@@ -173,6 +191,7 @@ final class VideoProcessor {
                 while let slot = pending.removeValue(forKey: nextIndex) {
                     if case .frame(let raw) = slot {
                         rawFrames.append(raw)
+                        recordAnalysisMs(raw.analysisMs)
                         frames.append(Self.classifyFrame(raw, mode: classificationMode, cropThreshold: self.cropThreshold, step: self.sampleStep, metric: self.activenessMetric, state: &classifyState))
                         unclassifiedCount = classifyState.unclassified
                     }
@@ -192,6 +211,7 @@ final class VideoProcessor {
                 for idx in pending.keys.sorted() {
                     if case .frame(let raw)? = pending[idx] {
                         rawFrames.append(raw)
+                        recordAnalysisMs(raw.analysisMs)
                         frames.append(Self.classifyFrame(raw, mode: classificationMode, cropThreshold: self.cropThreshold, step: self.sampleStep, metric: self.activenessMetric, state: &classifyState))
                     }
                 }
@@ -225,7 +245,8 @@ final class VideoProcessor {
     // MARK: - Derivation
 
     /// Running per-position state carried across frames while deriving motion.
-    private struct ClassifyState {
+    /// Internal (not private) so the headless CLI can drive the same pipeline.
+    struct ClassifyState {
         var priorOuter: [FacePosition: [CGPoint]] = [:]
         var priorInner: [FacePosition: [CGPoint]] = [:]
         var outerHist: [FacePosition: [CGFloat]] = [:]
@@ -256,7 +277,7 @@ final class VideoProcessor {
         var cutSettleUntil: Double = -1
     }
 
-    private static func classifyFrame(_ rf: RawFrame, mode: ClassificationMode, cropThreshold: Double, step: Double, metric: ActivenessMetric, state: inout ClassifyState) -> FrameAnalysis {
+    static func classifyFrame(_ rf: RawFrame, mode: ClassificationMode, cropThreshold: Double, step: Double, metric: ActivenessMetric, state: inout ClassifyState) -> FrameAnalysis {
         var faces: [DetectedFace] = []
         var curOuter: [FacePosition: [CGPoint]] = [:]
         var curInner: [FacePosition: [CGPoint]] = [:]
