@@ -67,10 +67,12 @@ enum CropExporter {
         let srcH = abs(displayed.height)
         guard srcW > 0, srcH > 0 else { throw ExportError(message: "Could not read source dimensions.") }
 
-        // 9:16 crop column, full source height. Width rounded to even (H.264).
+        // 9:16 crop column, full source height. Both output dimensions rounded to
+        // even — H.264 requires it (an odd-height source would otherwise fail).
         let cropW = (srcH * 9.0 / 16.0 / 2.0).rounded() * 2
+        let evenH = (srcH / 2).rounded(.down) * 2
         // Native crop resolution by default → no downscale, input-quality output.
-        let outSize = renderSize ?? CGSize(width: cropW, height: srcH)
+        let outSize = renderSize ?? CGSize(width: cropW, height: evenH)
         let renderW = outSize.width
 
         let comp = AVMutableVideoComposition(asset: asset) { request in

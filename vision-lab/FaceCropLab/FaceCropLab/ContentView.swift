@@ -63,7 +63,7 @@ struct ContentView: View {
                 .textFieldStyle(.roundedBorder)
             Text("s")
             Button("Reprocess", action: reprocess)
-                .disabled(videoURL == nil || processor.isProcessing)
+                .disabled(videoURL == nil || processor.isProcessing || isExporting || isAutoCropping)
 
             Picker("", selection: $classificationMode) {
                 ForEach(ClassificationMode.allCases) { Text($0.rawValue).tag($0) }
