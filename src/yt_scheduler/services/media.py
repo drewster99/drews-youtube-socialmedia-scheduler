@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-import math
+import os
 import secrets
 import subprocess
 from dataclasses import dataclass
@@ -355,55 +355,6 @@ def _videotoolbox_bitrate_for_output(width: int | None, height: int | None) -> s
     return "2M"       # sub-720p (640x360, 640x480, etc.)
 
 
-def _vertical_crop_filter(x_shift_normalized: float) -> str:
-    """ffmpeg ``-vf`` filter chain that crops to 9:16 centered + scales.
-
-    ``x_shift_normalized`` ∈ [-1.0, 1.0] moves the crop column away from
-    center toward the right (positive) or left (negative) as a fraction
-    of the available room (``iw - crop_width``). 0 is dead-center, which
-    is what 3c uses by default. 3d's vision pass produces non-zero
-    values from face position estimates.
-
-    The expression handles both landscape and vertical sources without
-    branching: ``min(iw, ih*9/16)`` picks the largest 9:16-wide column
-    that fits, so a 1080×1920 phone clip leaves the column at full
-    frame and a 1920×1080 horizontal clip pulls a 608-wide strip out of
-    the middle.
-
-    Output is always scaled to 1080×1920 — downscale from 4K is sharp;
-    upscale from 720p is soft (we warn about that in the source-quality
-    UI).
-    """
-    # Clamp the shift so the crop never walks off the source frame. A NaN/Inf
-    # (e.g. from a malformed model proposal) survives min()/max() unchanged and
-    # would be formatted into the crop expression as the literal "nan", making
-    # ffmpeg fail to parse the filter — coerce it to a centered crop instead.
-    raw_shift = float(x_shift_normalized)
-    if not math.isfinite(raw_shift):
-        raw_shift = 0.0
-    shift = max(-1.0, min(1.0, raw_shift))
-    # Force the crop width to an even integer ≤ the ideal 9:16 width.
-    # ffmpeg's crop filter rejects non-integer dims, and libx264 (the
-    # YUV 4:2:0 default) needs both width and height even.
-    # floor(.../2)*2 rounds down to the nearest even integer.
-    #
-    # The literal comma inside ``min(iw,ih*9/16)`` MUST be escaped as
-    # ``\,`` — ffmpeg's ``-vf`` parser treats unescaped commas as
-    # filter-chain separators, so the unescaped form makes ffmpeg
-    # parse the expression as four bogus filters and exit with
-    # "No such filter: 'ih*9/16)/2)*2:...'". Comma between
-    # ``crop=...:0`` and ``scale=...`` is intentional (chains them).
-    cw = "floor(min(iw\\,ih*9/16)/2)*2"
-    if shift == 0.0:
-        x_expr = f"floor((iw-{cw})/2)"
-    else:
-        x_expr = f"floor((iw-{cw})/2+({shift:.4f})*(iw-{cw})/2)"
-    return (
-        f"crop={cw}:ih:{x_expr}:0,"
-        f"scale={_VERTICAL_OUTPUT_WIDTH}:{_VERTICAL_OUTPUT_HEIGHT}"
-    )
-
-
 def _ffmpeg_timestamp_to_seconds(ts: str) -> float:
     """Parse an ffmpeg timestamp (``"SS.mmm"``, ``"MM:SS"``, ``"HH:MM:SS.mmm"``)
     into seconds. Used to position the audio fade-out from the clip duration."""
@@ -421,8 +372,6 @@ def extract_clip(
     output_name: str | None = None,
     *,
     precise: bool = True,
-    vertical_crop: bool = False,
-    x_shift_normalized: float = 0.0,
     encoder: Literal["auto", "hardware", "software"] = "auto",
     preset: str | None = None,
     audio_fade_in: float = 0.0,
@@ -456,10 +405,10 @@ def extract_clip(
     ffmpeg falls back to software decode for codecs the hardware
     doesn't support.
 
-    ``vertical_crop=True`` crops the output to 9:16 (1080×1920) using
-    :func:`_vertical_crop_filter`. ``x_shift_normalized`` shifts the
-    crop column away from dead-center; values come from the 3d vision
-    pass when available, default 0 for 3c's center-only behaviour.
+    This produces a **landscape** clip (no crop). Vertical 9:16 clips are
+    produced by :func:`extract_clip_stacked` (the Swift clipcrop engine), not
+    here — the old single-column ``_vertical_crop_filter`` was retired in favour
+    of YOLO head-tracking stacked/single recrop.
 
     ``encoder`` selects the H.264 encoder:
 
@@ -537,14 +486,12 @@ def extract_clip(
     # though the frame data is fine. ``setpts=PTS-STARTPTS`` zeroes it. The
     # matching audio ``asetpts`` is applied with the fades below.
     video_filters = ["setpts=PTS-STARTPTS"]
-    if vertical_crop:
-        video_filters.append(_vertical_crop_filter(x_shift_normalized))
     cmd.extend(["-vf", ",".join(video_filters)])
 
     # Probe the source once when we need it for either bitrate selection
-    # (hardware encoder, non-cropped) or audio-stream detection (fades).
-    # Doing this before the fade block lets both uses share the same probe.
-    needs_probe = (use_hardware and not vertical_crop) or (audio_fade_in > 0 or audio_fade_out > 0)
+    # (hardware encoder) or audio-stream detection (fades). Doing this
+    # before the fade block lets both uses share the same probe.
+    needs_probe = use_hardware or (audio_fade_in > 0 or audio_fade_out > 0)
     probe: VideoProbe | None = probe_video_file(video_path) if needs_probe else None
 
     # Audio edge ramps. Cubic IN (sharp attack pops up at the first word) and a
@@ -588,19 +535,13 @@ def extract_clip(
         cmd.extend(["-af", ",".join(audio_filters)])
 
     if use_hardware:
-        # Pick the bitrate by what the OUTPUT will actually be: 9:16
-        # crop locks output to 1080×1920 (use 1080 as the larger dim),
-        # otherwise mirror the source's max dim. Probe lazily; on
-        # failure we conservatively assume 1080p.
-        if vertical_crop:
-            bitrate = _videotoolbox_bitrate_for_output(1080, 1920)
-        else:
-            # probe was already obtained above when needs_probe is True
-            # (hardware + not vertical_crop satisfies that condition).
-            bitrate = _videotoolbox_bitrate_for_output(
-                probe.width if probe else None,
-                probe.height if probe else None,
-            )
+        # Bitrate matched to the OUTPUT (== source, no crop) resolution so a 4K
+        # parent isn't crushed at the 1080p target. The probe is present whenever
+        # use_hardware is set (needs_probe), but guard defensively.
+        bitrate = _videotoolbox_bitrate_for_output(
+            probe.width if probe else None,
+            probe.height if probe else None,
+        )
         cmd.extend([
             "-c:v", "h264_videotoolbox",
             "-b:v", bitrate,
@@ -657,6 +598,98 @@ def extract_clip(
         Path(tmp_output).unlink(missing_ok=True)
         raise
     return output
+
+
+def _resolve_clipcrop() -> tuple[Path, Path]:
+    """Locate the bundled ``clipcrop`` Swift binary + pre-compiled CoreML model.
+
+    Mirrors :func:`migrations._resolve_migrations_dir`: prefer the bundled
+    ``<package>/_bin/`` (build.sh copies them there so the .app is self-contained);
+    a dev checkout points at its own build via ``DYS_CLIPCROP_BIN`` /
+    ``DYS_CLIPCROP_MODEL`` (non-secret path config). The model is the
+    *compiled* ``.mlmodelc`` so clipcrop loads it directly (no per-clip compile).
+    """
+    bin_dir = Path(__file__).resolve().parent.parent / "_bin"
+    env_bin = os.environ.get("DYS_CLIPCROP_BIN")
+    env_model = os.environ.get("DYS_CLIPCROP_MODEL")
+    binary = Path(env_bin) if env_bin else bin_dir / "clipcrop"
+    model = Path(env_model) if env_model else bin_dir / "yolov8n-pose-384.mlmodelc"
+    return binary, model
+
+
+def extract_clip_stacked(
+    video_path: str | Path,
+    start_seconds: float,
+    end_seconds: float,
+    output_name: str | None = None,
+    *,
+    fade_in: float = 0.0,
+    fade_out: float = 0.0,
+    min_height: int = _VERTICAL_OUTPUT_HEIGHT,
+) -> tuple[Path, bool]:
+    """Cut ``[start_seconds, end_seconds]`` and recrop to a native-resolution 9:16
+    ``.mp4`` via the bundled Swift ``clipcrop`` (YOLO head-tracking stacked/single
+    render). Edges + fades are applied EXACTLY as given (computed upstream by
+    ``clip_edges`` — clipcrop never recomputes them), in a single hardware encode.
+
+    Returns ``(output_path, uncertain)``; ``uncertain`` is True when clipcrop's
+    YOLO-derived croppability guard flagged the clip as low (b-roll / screen
+    content → neutral center crop) so the review UI can badge it. Raises
+    ``RuntimeError`` on any failure — no silent fallback to a center crop (rule C).
+    """
+    video_path = Path(video_path)
+    if output_name is None:
+        output_name = f"{video_path.stem}_stacked_{start_seconds:.3f}-{end_seconds:.3f}.mp4"
+    output = UPLOAD_DIR / output_name
+    # Same atomic-temp discipline as extract_clip: write to a ``.cutpart_*`` name
+    # the preview-cleanup globs don't match, then os.replace into place.
+    tmp_output = UPLOAD_DIR / f".cutpart_{secrets.token_hex(8)}.mp4"
+
+    binary, model = _resolve_clipcrop()
+    if not Path(binary).exists():
+        raise RuntimeError(f"clipcrop binary not found: {binary}")
+    if not Path(model).exists():
+        raise RuntimeError(f"clipcrop model not found: {model}")
+
+    cmd = [
+        str(binary), str(video_path),
+        "--clipcrop", str(tmp_output),
+        "--start", f"{float(start_seconds):.4f}",
+        "--end", f"{float(end_seconds):.4f}",
+        "--fade-in", f"{float(fade_in):.4f}",
+        "--fade-out", f"{float(fade_out):.4f}",
+        "--min-height", str(int(min_height)),
+        "--model", str(model),
+    ]
+    try:
+        result = subprocess.run(
+            cmd, check=True, capture_output=True, timeout=_FFMPEG_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        Path(tmp_output).unlink(missing_ok=True)
+        raise
+    except FileNotFoundError as exc:
+        Path(tmp_output).unlink(missing_ok=True)
+        raise RuntimeError(f"clipcrop not runnable: {binary} ({exc})") from exc
+    except subprocess.CalledProcessError as exc:
+        # Surface clipcrop's real stderr tail, identical to extract_clip's ffmpeg
+        # handling — the UI's preview_error shows the actual reason.
+        Path(tmp_output).unlink(missing_ok=True)
+        stderr_text = (exc.stderr or b"").decode("utf-8", errors="replace")
+        tail = "\n".join(
+            line for line in stderr_text.strip().splitlines()[-6:] if line.strip()
+        )
+        raise RuntimeError(
+            f"clipcrop exit {exc.returncode}: {tail or 'no stderr captured'}"
+        ) from exc
+
+    uncertain = b"CROPPABILITY=low" in (result.stderr or b"")
+    try:
+        tmp_output.replace(output)
+    except OSError:
+        Path(tmp_output).unlink(missing_ok=True)
+        raise
+    return output, uncertain
 
 
 def extract_gif(

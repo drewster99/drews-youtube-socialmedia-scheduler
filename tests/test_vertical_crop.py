@@ -1,75 +1,26 @@
-"""3c — vertical crop + hardware encoder routing.
+"""Clip cutting + encoder routing.
 
-Pure-unit coverage of the filter graph, encoder detection plumbing, and
-extract_clip's command construction. The actual ffmpeg invocation is
-mocked out — we only verify that the right command lines get built.
+Pure-unit coverage of encoder detection, ``extract_clip``'s (landscape, no-crop)
+command construction, the all-Swift ``extract_clip_stacked`` (clipcrop) wrapper,
+and the cut-lane selection in ``clipper``. The actual ffmpeg / clipcrop
+invocations are mocked — we only verify the command lines + error handling.
+(The single-column ``_vertical_crop_filter`` was retired; 9:16 recrop is owned by
+clipcrop, exercised via ``extract_clip_stacked``.)
 """
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 import pytest
 
 
-# --- _vertical_crop_filter ----------------------------------------------
-
-def test_vertical_crop_filter_center():
-    from yt_scheduler.services.media import _vertical_crop_filter
-
-    out = _vertical_crop_filter(0.0)
-    # crop width forced to an even integer via floor(.../2)*2 so a
-    # source whose ih*9/16 is fractional (e.g. 360 -> 202.5) still
-    # produces a valid ffmpeg crop expression rather than ffmpeg
-    # exit 8. x offset wrapped in floor() for the same reason.
-    #
-    # The comma inside min(iw,ih*9/16) MUST be backslash-escaped
-    # because ffmpeg's -vf parser treats unescaped commas as filter
-    # chain separators — without the escape ffmpeg parses the whole
-    # crop expression as four bogus filters and dies with "No such
-    # filter: 'ih*9/16)/2)*2...'".
-    assert out.startswith(
-        r"crop=floor(min(iw\,ih*9/16)/2)*2:ih:floor((iw-floor(min(iw\,ih*9/16)/2)*2)/2):0"
-    )
-    assert out.endswith("scale=1080:1920")
-
-
-def test_vertical_crop_filter_shift_right():
-    from yt_scheduler.services.media import _vertical_crop_filter
-
-    out = _vertical_crop_filter(0.5)
-    # Same floor() wrapping; the +0.5*(iw-cw)/2 shift sits inside floor().
-    assert r"+(0.5000)*(iw-floor(min(iw\,ih*9/16)/2)*2)/2)" in out
-
-
-def test_vertical_crop_filter_shift_left():
-    from yt_scheduler.services.media import _vertical_crop_filter
-
-    out = _vertical_crop_filter(-0.4)
-    assert "(-0.4000)" in out
-
-
-def test_vertical_crop_filter_escapes_min_comma():
-    """The comma inside ``min(iw,ih*9/16)`` MUST be escaped as ``\\,``;
-    unescaped commas inside an expression are interpreted by
-    ffmpeg's ``-vf`` parser as filter-chain separators and the cut
-    fails with "No such filter: ..." (real-world reproduction:
-    640×360 source preview cuts).
-
-    The chain comma between ``crop=...`` and ``scale=...`` is a real
-    chain separator and stays unescaped."""
-    from yt_scheduler.services.media import _vertical_crop_filter
-
-    out = _vertical_crop_filter(0.0)
-    # Inside-expression commas escaped.
-    assert r"min(iw\,ih*9/16)" in out
-    assert "min(iw,ih*9/16)" not in out  # no UNescaped form anywhere
-    # The chain separator before scale is unescaped (just one).
-    assert ":0,scale=" in out
-
+# --- videotoolbox bitrate buckets ---------------------------------------
 
 def test_videotoolbox_bitrate_buckets_match_resolution():
-    """4K-class inputs get a higher bitrate so they don't get crushed
-    at the 1080p target. ≤720p sources stay modest so a 640×360 cut
-    doesn't waste bits on noise."""
+    """4K-class inputs get a higher bitrate so they don't get crushed at the
+    1080p target. ≤720p sources stay modest."""
     from yt_scheduler.services.media import _videotoolbox_bitrate_for_output
 
     assert _videotoolbox_bitrate_for_output(3840, 2160) == "18M"   # 4K
@@ -81,39 +32,6 @@ def test_videotoolbox_bitrate_buckets_match_resolution():
     # Unknown dims → conservative 1080p default so we don't underbit.
     assert _videotoolbox_bitrate_for_output(None, None) == "6M"
     assert _videotoolbox_bitrate_for_output(None, 1080) == "6M"
-
-
-def test_vertical_crop_filter_handles_fractional_9_16_sources():
-    """640x360 source: ih*9/16 = 202.5. Without floor() the crop filter
-    expression contains a fractional value and ffmpeg exits 8. With
-    floor(.../2)*2 the expression evaluates to an even integer (202),
-    which is what libx264 + YUV 4:2:0 require."""
-    from yt_scheduler.services.media import _vertical_crop_filter
-
-    out = _vertical_crop_filter(0.0)
-    # No bare `ih*9/16` term should appear without a floor() wrap;
-    # otherwise ffmpeg sees the fractional value directly.
-    assert "crop=floor(" in out
-    assert "floor((iw-" in out  # x expression also floored
-    # Sanity: the expression evaluates to 202 (even) for 640x360.
-    # eval() here mirrors ffmpeg's expression evaluator closely
-    # enough to verify the math.
-    import math
-    iw, ih = 640, 360
-    cw = math.floor(min(iw, ih * 9 / 16) / 2) * 2
-    assert cw == 202
-    x = math.floor((iw - cw) / 2)
-    assert x == 219
-
-
-def test_vertical_crop_filter_clamps_out_of_range():
-    """Values outside [-1, 1] are clamped so the crop never leaves the frame."""
-    from yt_scheduler.services.media import _vertical_crop_filter
-
-    out_pos = _vertical_crop_filter(5.0)
-    assert "(1.0000)" in out_pos
-    out_neg = _vertical_crop_filter(-5.0)
-    assert "(-1.0000)" in out_neg
 
 
 # --- hardware encoder detection -----------------------------------------
@@ -159,7 +77,7 @@ def test_hardware_encoder_available_helper(monkeypatch: pytest.MonkeyPatch):
     assert media.hardware_encoder_available("hevc") is False
 
 
-# --- extract_clip command construction ---------------------------------
+# --- extract_clip command construction (landscape, no crop) -------------
 
 def _capture_cmd(monkeypatch, media_module):
     """Replace subprocess.run with a recorder; return the list it writes to."""
@@ -191,53 +109,23 @@ def test_extract_clip_software_no_crop(
     cmd = captured[0]
     assert "libx264" in cmd
     assert "h264_videotoolbox" not in cmd
-    # -vf is always present now: setpts rebases the first frame to t=0 (fixes
-    # the black-first-frame edit-list offset). No crop filter when not cropping.
+    # -vf is always present: setpts rebases the first frame to t=0 (fixes the
+    # black-first-frame edit-list offset). No crop filter — extract_clip is
+    # landscape-only now.
     assert "-vf" in cmd
     assert cmd[cmd.index("-vf") + 1] == "setpts=PTS-STARTPTS"
 
 
-def test_extract_clip_hardware_for_vertical_crop_when_auto(
+def test_extract_clip_auto_uses_hardware(
     monkeypatch: pytest.MonkeyPatch, tmp_path,
 ):
-    """``auto`` picks hardware only when ``vertical_crop=True`` — that's the
-    case where output is always scaled to 1080×1920 and the fixed-bitrate
-    hardware path is appropriate. For non-vertical, libx264 + CRF keeps
-    quality consistent across source resolutions."""
+    """``auto`` picks videotoolbox whenever ffmpeg has it built in. The
+    bitrate-by-output-resolution helper keeps a 4K source from being crushed at
+    a 1080p bitrate."""
     from yt_scheduler.services import media
 
     monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(media, "_HARDWARE_ENCODERS", frozenset({"h264_videotoolbox"}))
-    captured = _capture_cmd(monkeypatch, media)
-
-    src = tmp_path / "src.mp4"
-    src.write_bytes(b"\x00")
-    media.extract_clip(
-        src, "0:00", "0:10", output_name="out.mp4",
-        encoder="auto", vertical_crop=True,
-    )
-
-    cmd = captured[0]
-    assert "h264_videotoolbox" in cmd
-    # Hardware needs an explicit bitrate, not CRF.
-    assert "-b:v" in cmd
-    assert "libx264" not in cmd
-
-
-def test_extract_clip_auto_uses_hardware_without_vertical_crop(
-    monkeypatch: pytest.MonkeyPatch, tmp_path,
-):
-    """``auto`` now picks videotoolbox whenever ffmpeg has it built
-    in, regardless of ``vertical_crop``. The bitrate-by-output-
-    resolution helper avoids the original concern (a 4K source
-    crushed at a 1080p bitrate) by scaling the target up for large
-    inputs. Confirm hardware is selected and that the per-resolution
-    bitrate appears."""
-    from yt_scheduler.services import media
-
-    monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
-    monkeypatch.setattr(media, "_HARDWARE_ENCODERS", frozenset({"h264_videotoolbox"}))
-    # Stub probe so the bitrate picker has dimensions to chew on.
     monkeypatch.setattr(
         media, "probe_video_file",
         lambda _p: media.VideoProbe(
@@ -249,10 +137,7 @@ def test_extract_clip_auto_uses_hardware_without_vertical_crop(
 
     src = tmp_path / "src.mp4"
     src.write_bytes(b"\x00")
-    media.extract_clip(
-        src, "0:00", "0:10", output_name="out.mp4",
-        encoder="auto", vertical_crop=False,
-    )
+    media.extract_clip(src, "0:00", "0:10", output_name="out.mp4", encoder="auto")
 
     cmd = captured[0]
     assert "h264_videotoolbox" in cmd
@@ -264,21 +149,9 @@ def test_extract_clip_auto_uses_hardware_without_vertical_crop(
 def test_extract_clip_uses_hardware_decode_and_fast_seek(
     monkeypatch: pytest.MonkeyPatch, tmp_path,
 ):
-    """Two changes that turn minute-long 4K cuts into second-long ones:
-
-    1. ``-hwaccel auto`` before ``-i`` — on Apple Silicon this resolves
-       to videotoolbox and decodes 4K H.264/HEVC ~10× faster than CPU.
-    2. ``-ss`` BEFORE ``-i`` (input-side seek) instead of after — the
-       demuxer fast-seeks to the nearest preceding keyframe rather
-       than software-decoding the whole prefix from frame 0.
-
-    With ``precise=True`` (the default), ``-accurate_seek`` stays
-    enabled (ffmpeg's default for transcoding), so the cut still
-    lands sample-accurate — the demuxer hops to the keyframe, then
-    decode-and-discards the last few seconds until the requested
-    start. With ``precise=False`` we add ``-noaccurate_seek`` so the
-    cut snaps to the keyframe with zero prefix decode.
-    """
+    """``-hwaccel auto`` + input-side ``-ss`` (before ``-i``) turn minute-long 4K
+    cuts into second-long ones. ``precise=True`` keeps ``-accurate_seek`` (the
+    default) for a sample-accurate cut; ``precise=False`` adds ``-noaccurate_seek``."""
     from yt_scheduler.services import media
 
     monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
@@ -292,14 +165,8 @@ def test_extract_clip_uses_hardware_decode_and_fast_seek(
         encoder="software", precise=True,
     )
     cmd = captured[-1]
-    # Hardware decode requested for every cut.
-    hwaccel_idx = cmd.index("-hwaccel")
-    assert cmd[hwaccel_idx + 1] == "auto"
-    # -ss is before -i (fast input-side seek).
-    ss_idx = cmd.index("-ss")
-    i_idx = cmd.index("-i")
-    assert ss_idx < i_idx, f"-ss must precede -i for fast seek; got {cmd!r}"
-    # precise=True keeps the accurate_seek default — do NOT pass -noaccurate_seek.
+    assert cmd[cmd.index("-hwaccel") + 1] == "auto"
+    assert cmd.index("-ss") < cmd.index("-i"), f"-ss must precede -i; got {cmd!r}"
     assert "-noaccurate_seek" not in cmd
 
     media.extract_clip(
@@ -307,11 +174,8 @@ def test_extract_clip_uses_hardware_decode_and_fast_seek(
         encoder="software", precise=False,
     )
     cmd = captured[-1]
-    # precise=False explicitly disables accurate_seek for max speed.
     assert "-noaccurate_seek" in cmd
-    ss_idx = cmd.index("-ss")
-    i_idx = cmd.index("-i")
-    assert ss_idx < i_idx
+    assert cmd.index("-ss") < cmd.index("-i")
 
 
 def test_extract_clip_software_when_auto_and_unavailable(
@@ -325,41 +189,11 @@ def test_extract_clip_software_when_auto_and_unavailable(
 
     src = tmp_path / "src.mp4"
     src.write_bytes(b"\x00")
-    media.extract_clip(
-        src, "0:00", "0:10", output_name="out.mp4",
-        encoder="auto", vertical_crop=True,
-    )
+    media.extract_clip(src, "0:00", "0:10", output_name="out.mp4", encoder="auto")
 
     cmd = captured[0]
     assert "libx264" in cmd
     assert "h264_videotoolbox" not in cmd
-
-
-def test_extract_clip_vertical_crop_filter_included(
-    monkeypatch: pytest.MonkeyPatch, tmp_path,
-):
-    from yt_scheduler.services import media
-
-    monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
-    captured = _capture_cmd(monkeypatch, media)
-
-    src = tmp_path / "src.mp4"
-    src.write_bytes(b"\x00")
-    media.extract_clip(
-        src, "0:00", "0:10",
-        output_name="out.mp4",
-        vertical_crop=True,
-        x_shift_normalized=0.0,
-        encoder="software",
-    )
-    cmd = captured[0]
-    assert "-vf" in cmd
-    vf_idx = cmd.index("-vf")
-    vf_value = cmd[vf_idx + 1]
-    # The setpts PTS-rebase is prepended; the crop filter follows it.
-    assert vf_value.startswith("setpts=PTS-STARTPTS,")
-    assert r"crop=floor(min(iw\,ih*9/16)/2)*2:ih:" in vf_value
-    assert vf_value.endswith("scale=1080:1920")
 
 
 def test_extract_clip_hardware_force_when_unavailable_raises(
@@ -372,14 +206,124 @@ def test_extract_clip_hardware_force_when_unavailable_raises(
     src = tmp_path / "src.mp4"
     src.write_bytes(b"\x00")
     with pytest.raises(RuntimeError, match="not available"):
-        media.extract_clip(
-            src, "0:00", "0:10",
-            output_name="out.mp4",
-            encoder="hardware",
+        media.extract_clip(src, "0:00", "0:10", output_name="out.mp4", encoder="hardware")
+
+
+# --- extract_clip_stacked (the clipcrop wrapper) ------------------------
+
+def _fake_clipcrop(monkeypatch, tmp_path):
+    """Point _resolve_clipcrop at a fake binary + model that exist, and return a
+    dict that records the clipcrop argv (the recorder writes the --out file so
+    the atomic rename succeeds)."""
+    from yt_scheduler.services import media
+
+    binary = tmp_path / "clipcrop"
+    binary.write_bytes(b"\x00")
+    model = tmp_path / "yolo.mlmodelc"
+    model.mkdir()
+    monkeypatch.setenv("DYS_CLIPCROP_BIN", str(binary))
+    monkeypatch.setenv("DYS_CLIPCROP_MODEL", str(model))
+    monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
+    return binary, model
+
+
+def test_extract_clip_stacked_builds_clipcrop_argv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+):
+    from yt_scheduler.services import media
+
+    binary, model = _fake_clipcrop(monkeypatch, tmp_path)
+    captured: dict[str, list[str]] = {}
+
+    class _R:
+        returncode = 0
+        stderr = b""
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        Path(cmd[cmd.index("--clipcrop") + 1]).write_bytes(b"\x00")  # the .cutpart temp
+        return _R()
+
+    monkeypatch.setattr(media.subprocess, "run", fake_run)
+
+    src = tmp_path / "src.mp4"
+    src.write_bytes(b"\x00")
+    out, uncertain = media.extract_clip_stacked(
+        src, 10.0, 25.0, output_name="o.mp4", fade_in=0.12, fade_out=0.3,
+    )
+
+    cmd = captured["cmd"]
+    assert cmd[0] == str(binary)
+    assert cmd[cmd.index("--start") + 1] == "10.0000"
+    assert cmd[cmd.index("--end") + 1] == "25.0000"
+    assert cmd[cmd.index("--fade-in") + 1] == "0.1200"
+    assert cmd[cmd.index("--fade-out") + 1] == "0.3000"
+    assert cmd[cmd.index("--model") + 1] == str(model)
+    assert "--min-height" in cmd
+    assert uncertain is False
+    assert (tmp_path / "o.mp4").exists()
+
+
+def test_extract_clip_stacked_flags_uncertain_from_stderr(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+):
+    from yt_scheduler.services import media
+
+    _fake_clipcrop(monkeypatch, tmp_path)
+
+    class _R:
+        returncode = 0
+        stderr = b"CROPPABILITY=low present=0.10\n"
+
+    def fake_run(cmd, **kw):
+        Path(cmd[cmd.index("--clipcrop") + 1]).write_bytes(b"\x00")
+        return _R()
+
+    monkeypatch.setattr(media.subprocess, "run", fake_run)
+
+    src = tmp_path / "src.mp4"
+    src.write_bytes(b"\x00")
+    _out, uncertain = media.extract_clip_stacked(src, 10.0, 25.0, output_name="o.mp4")
+    assert uncertain is True
+
+
+def test_extract_clip_stacked_reraises_clipcrop_error_with_stderr_tail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+):
+    from yt_scheduler.services import media
+
+    _fake_clipcrop(monkeypatch, tmp_path)
+
+    def fake_run(cmd, **kw):
+        raise subprocess.CalledProcessError(
+            1, cmd, output=b"", stderr=b"some spam\nERROR: bad range [25,10]\n",
         )
 
+    monkeypatch.setattr(media.subprocess, "run", fake_run)
 
-# --- clipper.cut_clip_from_parent uses the right semaphore -------------
+    src = tmp_path / "src.mp4"
+    src.write_bytes(b"\x00")
+    with pytest.raises(RuntimeError, match=r"clipcrop exit 1:.*bad range"):
+        media.extract_clip_stacked(src, 10.0, 25.0, output_name="o.mp4")
+    # No partial/temp left behind.
+    assert not list(tmp_path.glob(".cutpart_*"))
+
+
+def test_extract_clip_stacked_raises_when_binary_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+):
+    from yt_scheduler.services import media
+
+    monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setenv("DYS_CLIPCROP_BIN", str(tmp_path / "nope"))
+    monkeypatch.setenv("DYS_CLIPCROP_MODEL", str(tmp_path / "nope.mlmodelc"))
+    src = tmp_path / "src.mp4"
+    src.write_bytes(b"\x00")
+    with pytest.raises(RuntimeError, match="clipcrop binary not found"):
+        media.extract_clip_stacked(src, 10.0, 25.0, output_name="o.mp4")
+
+
+# --- cut-lane selection in clipper --------------------------------------
 
 class _TracingSemaphore:
     """Stand-in for ``asyncio.Semaphore`` that records each acquire."""
@@ -397,17 +341,12 @@ class _TracingSemaphore:
 
 
 @pytest.mark.asyncio
-async def test_cut_clip_picks_hardware_lane_when_available(
+async def test_cut_lanes_crop_on_hardware_crop_off_follows_encoder(
     monkeypatch: pytest.MonkeyPatch, tmp_path,
 ):
-    """The semaphore lane held during the cut must match the encoder
-    extract_clip will actually use, otherwise hardware sessions and
-    software cores skew under load.
-
-    Hardware available → hardware lane for BOTH vertical and non-
-    vertical cuts (the bitrate-by-output-resolution helper now keeps
-    large sources from being undersized). Software lane only when
-    hardware is unavailable (covered by the next test)."""
+    """Crop-on (vertical) cuts go through clipcrop, which owns its own hardware
+    encode, so they ALWAYS take the hardware lane. Crop-off (landscape) cuts
+    follow ffmpeg's encoder: hardware when videotoolbox is available."""
     from yt_scheduler.services import clipper, media
 
     monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
@@ -418,72 +357,28 @@ async def test_cut_clip_picks_hardware_lane_when_available(
     monkeypatch.setattr(clipper, "_HARDWARE_CUT_SEMAPHORE", _TracingSemaphore(lanes, "hw"))
     monkeypatch.setattr(clipper, "_SOFTWARE_CUT_SEMAPHORE", _TracingSemaphore(lanes, "sw"))
     monkeypatch.setattr(media, "extract_clip", lambda *a, **k: tmp_path / "fake.mp4")
+    monkeypatch.setattr(
+        media, "extract_clip_stacked", lambda *a, **k: (tmp_path / "fake.mp4", False),
+    )
 
     proposal = clipper.ProposedClip(
         kind="hook", start_seconds=0, end_seconds=10, title="x", reason="x",
     )
-
     await clipper.cut_clip_from_parent(
-        parent_video_path=tmp_path / "src.mp4",
-        proposal=proposal, vertical_crop=True,
+        parent_video_path=tmp_path / "src.mp4", proposal=proposal, vertical_crop=True,
     )
     await clipper.cut_clip_from_parent(
-        parent_video_path=tmp_path / "src.mp4",
-        proposal=proposal, vertical_crop=False,
+        parent_video_path=tmp_path / "src.mp4", proposal=proposal, vertical_crop=False,
     )
     assert lanes == ["hw", "hw"]
 
 
 @pytest.mark.asyncio
-async def test_cut_clip_cleans_up_partial_output_on_failure(
+async def test_cut_lanes_crop_off_software_when_hardware_unavailable(
     monkeypatch: pytest.MonkeyPatch, tmp_path,
 ):
-    """When ffmpeg raises mid-cut, cut_clip_from_parent must unlink
-    the half-written output so it doesn't accumulate in UPLOAD_DIR
-    with no row pointing at it."""
-    from yt_scheduler.services import clipper, media
-
-    monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
-    monkeypatch.setattr(clipper, "UPLOAD_DIR", tmp_path)
-    # Bypass the semaphores so we don't accidentally hold one.
-    monkeypatch.setattr(clipper, "_HARDWARE_CUT_SEMAPHORE", _TracingSemaphore([], "hw"))
-    monkeypatch.setattr(clipper, "_SOFTWARE_CUT_SEMAPHORE", _TracingSemaphore([], "sw"))
-
-    leaked_paths: list = []
-
-    def fake_extract_clip(*args, **kwargs):
-        # Simulate ffmpeg writing a partial output, then failing.
-        out_name = kwargs["output_name"]
-        partial = tmp_path / out_name
-        partial.write_bytes(b"partial mp4 header...")
-        leaked_paths.append(partial)
-        raise RuntimeError("ffmpeg returned non-zero")
-
-    monkeypatch.setattr(media, "extract_clip", fake_extract_clip)
-
-    proposal = clipper.ProposedClip(
-        kind="hook", start_seconds=0, end_seconds=10, title="x", reason="x",
-    )
-    with pytest.raises(RuntimeError):
-        await clipper.cut_clip_from_parent(
-            parent_video_path=tmp_path / "src.mp4",
-            proposal=proposal,
-        )
-
-    # The partial file written before the raise must have been cleaned up.
-    assert leaked_paths, "fake_extract_clip must have been called"
-    assert not leaked_paths[0].exists(), (
-        f"Partial cut output {leaked_paths[0]} survived the failure"
-    )
-
-
-@pytest.mark.asyncio
-async def test_cut_clip_uses_software_lane_when_hardware_unavailable(
-    monkeypatch: pytest.MonkeyPatch, tmp_path,
-):
-    """Even with vertical_crop=True, if videotoolbox isn't available the
-    cut acquires the software lane and extract_clip falls back to libx264.
-    """
+    """No videotoolbox: crop-on still takes the hardware lane (clipcrop), crop-off
+    falls to the software lane (libx264)."""
     from yt_scheduler.services import clipper, media
 
     monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
@@ -494,12 +389,56 @@ async def test_cut_clip_uses_software_lane_when_hardware_unavailable(
     monkeypatch.setattr(clipper, "_HARDWARE_CUT_SEMAPHORE", _TracingSemaphore(lanes, "hw"))
     monkeypatch.setattr(clipper, "_SOFTWARE_CUT_SEMAPHORE", _TracingSemaphore(lanes, "sw"))
     monkeypatch.setattr(media, "extract_clip", lambda *a, **k: tmp_path / "fake.mp4")
+    monkeypatch.setattr(
+        media, "extract_clip_stacked", lambda *a, **k: (tmp_path / "fake.mp4", False),
+    )
 
     proposal = clipper.ProposedClip(
         kind="hook", start_seconds=0, end_seconds=10, title="x", reason="x",
     )
     await clipper.cut_clip_from_parent(
-        parent_video_path=tmp_path / "src.mp4",
-        proposal=proposal, vertical_crop=True,
+        parent_video_path=tmp_path / "src.mp4", proposal=proposal, vertical_crop=True,
     )
-    assert lanes == ["sw"]
+    await clipper.cut_clip_from_parent(
+        parent_video_path=tmp_path / "src.mp4", proposal=proposal, vertical_crop=False,
+    )
+    assert lanes == ["hw", "sw"]
+
+
+@pytest.mark.asyncio
+async def test_cut_clip_cleans_up_partial_output_on_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+):
+    """When the cut raises mid-way, cut_clip_from_parent must unlink the
+    half-written output so it doesn't accumulate in UPLOAD_DIR."""
+    from yt_scheduler.services import clipper, media
+
+    monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(clipper, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(media, "_HARDWARE_ENCODERS", frozenset())
+    monkeypatch.setattr(clipper, "_HARDWARE_CUT_SEMAPHORE", _TracingSemaphore([], "hw"))
+    monkeypatch.setattr(clipper, "_SOFTWARE_CUT_SEMAPHORE", _TracingSemaphore([], "sw"))
+
+    leaked_paths: list = []
+
+    def fake_extract_clip(*args, **kwargs):
+        out_name = kwargs["output_name"]
+        partial = tmp_path / out_name
+        partial.write_bytes(b"partial mp4 header...")
+        leaked_paths.append(partial)
+        raise RuntimeError("ffmpeg returned non-zero")
+
+    monkeypatch.setattr(media, "extract_clip", fake_extract_clip)
+
+    proposal = clipper.ProposedClip(
+        kind="segment", start_seconds=0, end_seconds=10, title="x", reason="x",
+    )
+    with pytest.raises(RuntimeError):
+        await clipper.cut_clip_from_parent(
+            parent_video_path=tmp_path / "src.mp4", proposal=proposal,
+        )
+
+    assert leaked_paths, "fake_extract_clip must have been called"
+    assert not leaked_paths[0].exists(), (
+        f"Partial cut output {leaked_paths[0]} survived the failure"
+    )

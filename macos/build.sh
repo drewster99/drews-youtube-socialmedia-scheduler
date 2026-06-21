@@ -386,6 +386,28 @@ BUILDINFO
 mkdir -p "$SITE_PACKAGES/_migrations"
 cp "$PROJECT_DIR/migrations/"*.sql "$SITE_PACKAGES/_migrations/"
 
+# --- Bundle the Swift clipcrop tool + its pre-compiled CoreML model ----------
+# Generate-from-source recrops hooks/shorts to 9:16 via the all-Swift clipcrop
+# (YOLO head-tracking stacked/single). services/media.extract_clip_stacked()
+# resolves both at "$SITE_PACKAGES/_bin/". Universal (arm64+x86_64) to match the
+# app; macOS 15 deployment target — the vision-lab CLI uses the new Vision API.
+echo "Building clipcrop (vision-lab Swift CLI)…"
+mkdir -p "$SITE_PACKAGES/_bin"
+CLIPCROP_SRCS=(
+    "$PROJECT_DIR/vision-lab/cli/"*.swift
+    "$PROJECT_DIR/vision-lab/FaceCropLab/FaceCropLab/VideoProcessor.swift"
+    "$PROJECT_DIR/vision-lab/FaceCropLab/FaceCropLab/Models.swift"
+    "$PROJECT_DIR/vision-lab/FaceCropLab/FaceCropLab/CropExporter.swift"
+)
+swiftc -O -target arm64-apple-macos15.0 "${CLIPCROP_SRCS[@]}" -o "$BUILD_DIR/clipcrop-arm64"
+swiftc -O -target x86_64-apple-macos15.0 "${CLIPCROP_SRCS[@]}" -o "$BUILD_DIR/clipcrop-x86_64"
+lipo -create "$BUILD_DIR/clipcrop-arm64" "$BUILD_DIR/clipcrop-x86_64" -o "$SITE_PACKAGES/_bin/clipcrop"
+rm -f "$BUILD_DIR/clipcrop-arm64" "$BUILD_DIR/clipcrop-x86_64"
+# Compile the YOLO model once (.mlpackage -> .mlmodelc) so clipcrop loads it
+# directly at runtime with zero per-clip compile.
+xcrun coremlcompiler compile \
+    "$PROJECT_DIR/vision-lab/models/yolov8n-pose-384.mlpackage" "$SITE_PACKAGES/_bin/"
+
 # ============================================================================
 # Step 5: Strip cruft (release only — leave debug builds heavier so we can
 # attach a debugger / inspect bytecode without re-bundling)
@@ -451,6 +473,16 @@ if [ "$SIGN" = true ]; then
     # Sign the Swift binary explicitly (no --deep on the .app below).
     codesign --force --sign "$DEVELOPER_ID" --options runtime --timestamp \
         "$APP_BUNDLE/Contents/MacOS/$SWIFT_TARGET"
+
+    # Sign the bundled clipcrop tool — a nested Mach-O inside the embedded
+    # Python package that the *.so/*.dylib sweep above does NOT catch; without
+    # this the outer .app seal/notarization breaks. (The .mlmodelc is plain data
+    # covered by the outer seal, no separate signature.)
+    if [ -f "$SITE_PACKAGES/_bin/clipcrop" ]; then
+        codesign --force --sign "$DEVELOPER_ID" --options runtime --timestamp \
+            --identifier "$BUNDLE_ID.clipcrop" \
+            "$SITE_PACKAGES/_bin/clipcrop"
+    fi
 
     # Outer .app sign — NO --deep. ``--deep`` would recursively re-sign every
     # nested executable with the .app's identifier (overwriting the

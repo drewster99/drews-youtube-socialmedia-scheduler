@@ -812,327 +812,65 @@ def _format_ffmpeg_timestamp(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
-# --- 3d: vision-based crop refinement -----------------------------------
-#
-# After the per-kind proposal calls land, any kind toggled for vertical
-# crop in the modal gets a second pass: we sample ~3 keyframes per
-# proposal and ask Claude vision whether the subject is centered enough
-# for a plain center crop, or whether the crop window should shift, or
-# whether the range should be flagged as "uncertain". The vision call's
-# output is a structured assessment via the assess_crop tool.
+async def _run_cut(
+    *, parent_video_path: Path, proposal: ProposedClip, out_name: str, vertical_crop: bool,
+) -> tuple[Path, bool]:
+    """Cut a proposal to ``out_name`` in UPLOAD_DIR. Shared by the preview cut and
+    the re-cut fallback so both route identically.
 
-# Cautious threshold for actually applying a shift. Below this, the
-# vision pass might say "off_center, shift +0.05" — a near-zero offset
-# almost certainly inside the model's noise floor. Default to center.
-_MIN_SHIFT_TO_APPLY: float = 0.15
+    * **Crop-on** kinds → the all-Swift ``clipcrop`` (YOLO head-tracking stacked/
+      single 9:16, native-resolution, audio fades). It owns its own hardware
+      encode, so it always takes the hardware lane. Returns ``uncertain=True`` when
+      clipcrop's croppability guard flagged the clip (b-roll / screen content).
+    * **Crop-off** (segments) → the ffmpeg landscape cut (no crop).
 
-# Cap on concurrent vision-pass Claude calls. A Generate with crops on
-# for hooks + shorts can produce up to 16 proposals; firing all of
-# them simultaneously trips Anthropic's per-minute rate limits in
-# practice. 4 in flight matches what the propose_clips fan-out does
-# implicitly (one call per kind, 3 kinds max) and keeps the dominant
-# input prompt cached across consecutive calls.
-_VISION_CONCURRENCY: int = 4
-_VISION_SEMAPHORE: asyncio.Semaphore | None = None
-
-
-def _get_vision_semaphore() -> asyncio.Semaphore:
-    global _VISION_SEMAPHORE
-    if _VISION_SEMAPHORE is None:
-        _VISION_SEMAPHORE = asyncio.Semaphore(_VISION_CONCURRENCY)
-    return _VISION_SEMAPHORE
-
-
-class _NullAsyncContext:
-    """async-with-style no-op context manager. Used to keep
-    ``assess_crop_for_proposal``'s ``async with lane`` shape uniform
-    when no semaphore was supplied."""
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-
-def _null_async_context() -> _NullAsyncContext:
-    return _NullAsyncContext()
-
-_CROP_ASSESSMENT_TOOL = {
-    "name": "assess_crop",
-    "description": (
-        "Submit your assessment of whether this clip range crops well to "
-        "9:16 vertical, and how far to shift the crop column off center."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "classification": {
-                "type": "string",
-                "enum": [
-                    "centered", "off_center", "drift", "multi_face", "no_face",
-                ],
-                "description": (
-                    "centered: subject in center third throughout. "
-                    "off_center: subject consistently in a side third. "
-                    "drift: subject moves between thirds. "
-                    "multi_face: multiple separated subjects. "
-                    "no_face: no clear subject (b-roll / graphics)."
-                ),
-            },
-            "x_shift_normalized": {
-                "type": "number",
-                "description": (
-                    "Where to shift the 9:16 column from center, in "
-                    "[-1.0, 1.0]. Negative = left, positive = right. "
-                    "Set 0 for any classification other than off_center."
-                ),
-            },
-            "confidence": {
-                "type": "number",
-                "description": "0–1 confidence in the classification.",
-            },
-        },
-        "required": ["classification", "x_shift_normalized", "confidence"],
-    },
-}
-
-
-@dataclass(frozen=True)
-class CropAssessment:
-    """Result of the vision pass on a single proposal range."""
-
-    classification: Literal[
-        "centered", "off_center", "drift", "multi_face", "no_face",
-    ]
-    x_shift_normalized: float
-    confidence: float
-
-    @property
-    def uncertain(self) -> bool:
-        """Show the 'uncertain crop' badge in the preview UI when set."""
-        return self.classification in ("drift", "multi_face")
-
-
-_NEUTRAL_ASSESSMENT = CropAssessment(
-    classification="no_face", x_shift_normalized=0.0, confidence=0.0,
-)
-
-
-def _apply_assessment_shift(assessment: CropAssessment) -> float:
-    """Map a vision assessment to the x_shift_normalized we actually
-    feed ffmpeg.
-
-    Only ``off_center`` proposals with a shift magnitude above
-    :data:`_MIN_SHIFT_TO_APPLY` produce a non-zero result — everything
-    else (centered / drift / multi_face / no_face) falls back to a
-    plain center crop. This is the "cautious" behaviour the user asked
-    for: better to give the user a center crop they can manually shift
-    later than to reframe a shot they wanted as-is.
+    Raises on any failure — NO silent fallback to a center crop (rule C). The
+    caller owns the filename and how the error/uncertain flag surface.
     """
-    if assessment.classification != "off_center":
-        return 0.0
-    shift = assessment.x_shift_normalized
-    # Defense-in-depth: a non-finite shift survives min()/max() unchanged and
-    # would reach the ffmpeg crop expression as "nan". assess_crop already
-    # rejects these, but a CropAssessment built elsewhere shouldn't be trusted.
-    if not math.isfinite(shift) or abs(shift) < _MIN_SHIFT_TO_APPLY:
-        return 0.0
-    return max(-1.0, min(1.0, shift))
-
-
-async def assess_crop_for_proposal(
-    *,
-    proposal: ProposedClip,
-    parent_video_path: Path,
-    project_id: int,
-    frame_count: int = 3,
-    semaphore: asyncio.Semaphore | None = None,
-) -> CropAssessment:
-    """Run the vision pass for a single proposal.
-
-    Returns ``_NEUTRAL_ASSESSMENT`` (== center crop) on any failure:
-    missing frames, Claude unreachable, malformed tool response. The
-    point of this pass is to *improve* the crop when it can; "no
-    information" should never block a proposal.
-
-    ``semaphore`` is honoured around the actual Claude call so the
-    caller can rate-limit a fan-out (the refinement step in
-    :func:`_run_generate_job` uses :data:`_VISION_SEMAPHORE`). When not
-    supplied, the call runs ungated — appropriate for one-off use.
-    """
-    import base64
-    from yt_scheduler.services import prompts as prompt_service
-
-    frames = await asyncio.to_thread(
-        media_service.extract_keyframes_in_range,
-        parent_video_path,
-        start_seconds=proposal.start_seconds,
-        end_seconds=proposal.end_seconds,
-        count=frame_count,
-    )
-    if not frames:
-        return _NEUTRAL_ASSESSMENT
-    lane = semaphore if semaphore is not None else _null_async_context()
-
-    prompt = await prompt_service.get_prompt_with_fallback(
-        "promo_clip_crop_refinement", project_id=project_id,
-    )
-
-    content: list[dict] = []
-    for jpeg in frames:
-        content.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/jpeg",
-                "data": base64.b64encode(jpeg).decode("ascii"),
-            },
-        })
-    content.append({"type": "text", "text": prompt["body"]})
-
-    model = await ai._resolve_model()
-    kwargs: dict[str, object] = {
-        "model": model,
-        "max_tokens": 512,
-        "messages": [{"role": "user", "content": content}],
-        "tools": [_CROP_ASSESSMENT_TOOL],
-        "tool_choice": {"type": "tool", "name": "assess_crop"},
-    }
-    if prompt["system"]:
-        kwargs["system"] = prompt["system"]
-
-    _log_crop_request(proposal, model, kwargs, content)
-
-    try:
-        async with lane:
-            client = ai.get_client()
-            message = await asyncio.to_thread(client.messages.create, **kwargs)
-    except Exception as exc:
-        logger.warning(
-            "Crop-assessment vision call failed for %.1f-%.1f: %s",
-            proposal.start_seconds, proposal.end_seconds, exc,
-        )
-        return _NEUTRAL_ASSESSMENT
-
-    _log_crop_response(proposal, message)
-
-    for block in getattr(message, "content", []) or []:
-        if getattr(block, "type", None) == "tool_use" and getattr(block, "name", "") == "assess_crop":
-            tool_input = getattr(block, "input", None) or {}
-            classification = tool_input.get("classification")
-            if classification not in (
-                "centered", "off_center", "drift", "multi_face", "no_face",
-            ):
-                logger.info(
-                    "Crop assessment returned unknown classification %r; "
-                    "falling back to neutral.", classification,
+    out_path = UPLOAD_DIR / out_name
+    if vertical_crop:
+        async with _get_hardware_cut_semaphore():
+            ok = False
+            try:
+                _, uncertain = await asyncio.to_thread(
+                    media_service.extract_clip_stacked,
+                    parent_video_path,
+                    proposal.start_seconds,
+                    proposal.end_seconds,
+                    output_name=out_name,
+                    fade_in=proposal.audio_fade_in,
+                    fade_out=proposal.audio_fade_out,
                 )
-                return _NEUTRAL_ASSESSMENT
-            # Reject non-finite numbers (json accepts bare NaN/Infinity, and a
-            # NaN here survives the downstream clamp and lands as "nan" in the
-            # ffmpeg crop expression) — treat a malformed proposal as neutral.
-            shift = _maybe_float(tool_input.get("x_shift_normalized"))
-            confidence = _maybe_float(tool_input.get("confidence"))
-            if shift is None or confidence is None:
-                return _NEUTRAL_ASSESSMENT
-            return CropAssessment(
-                classification=classification,
-                x_shift_normalized=shift,
-                confidence=confidence,
+                ok = True
+            finally:
+                if not ok:
+                    out_path.unlink(missing_ok=True)
+        return out_path, uncertain
+
+    will_use_hardware = media_service.hardware_encoder_available("h264")
+    semaphore = (
+        _get_hardware_cut_semaphore() if will_use_hardware
+        else _get_software_cut_semaphore()
+    )
+    async with semaphore:
+        ok = False
+        try:
+            await asyncio.to_thread(
+                media_service.extract_clip,
+                parent_video_path,
+                _format_ffmpeg_timestamp(proposal.start_seconds),
+                _format_ffmpeg_timestamp(proposal.end_seconds),
+                output_name=out_name,
+                precise=True,
+                encoder="auto",
+                audio_fade_in=proposal.audio_fade_in,
+                audio_fade_out=proposal.audio_fade_out,
             )
-    return _NEUTRAL_ASSESSMENT
-
-
-def _log_crop_request(
-    proposal: ProposedClip, model: str, kwargs: dict, content: list[dict],
-) -> None:
-    """Dump the full Anthropic request for a crop-assessment call at INFO.
-
-    Image blocks log the media type + byte length instead of the
-    base64 payload (each frame is ~50-200 KB; logging the bytes would
-    blow up the file with noise).
-    """
-    import json as _json
-    try:
-        sanitized: list[dict] = []
-        for block in content:
-            btype = block.get("type")
-            if btype == "image":
-                src = block.get("source") or {}
-                data = src.get("data") or ""
-                sanitized.append({
-                    "type": "image",
-                    "source": {
-                        "type": src.get("type"),
-                        "media_type": src.get("media_type"),
-                        "data_length_bytes": len(data),
-                    },
-                })
-            else:
-                sanitized.append(block)
-        system_str = kwargs.get("system") or ""
-        uc_str = _json.dumps(sanitized, ensure_ascii=False, indent=2)
-        tool_str = _json.dumps(kwargs.get("tools") or [], ensure_ascii=False)
-        logger.info(
-            "===== Claude crop-assessment REQUEST [%.1f-%.1f] =====\n"
-            "model=%s tool_choice=%s max_tokens=%s\n"
-            "----- system -----\n%s\n"
-            "----- user content (%d blocks) -----\n%s\n"
-            "----- tools -----\n%s\n"
-            "===== end Claude crop-assessment REQUEST [%.1f-%.1f] =====",
-            proposal.start_seconds, proposal.end_seconds,
-            model,
-            kwargs.get("tool_choice"),
-            kwargs.get("max_tokens"),
-            system_str,
-            len(content),
-            uc_str,
-            tool_str,
-            proposal.start_seconds, proposal.end_seconds,
-        )
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "Failed to log Claude crop-assessment request for %.1f-%.1f",
-            proposal.start_seconds, proposal.end_seconds, exc_info=True,
-        )
-
-
-def _log_crop_response(proposal: ProposedClip, message) -> None:
-    """Dump the full Anthropic response for a crop-assessment call at INFO."""
-    import json as _json
-    try:
-        usage = getattr(message, "usage", None)
-        usage_dict = {
-            "input_tokens": getattr(usage, "input_tokens", None),
-            "output_tokens": getattr(usage, "output_tokens", None),
-        } if usage is not None else {}
-        # Extract every tool_use block's input so the full structured
-        # assessment is visible (not just the one we end up using).
-        tool_uses: list[dict] = []
-        for block in getattr(message, "content", []) or []:
-            if getattr(block, "type", None) == "tool_use":
-                tool_uses.append({
-                    "name": getattr(block, "name", None),
-                    "input": getattr(block, "input", None),
-                })
-        logger.info(
-            "===== Claude crop-assessment RESPONSE [%.1f-%.1f] =====\n"
-            "stop_reason=%s usage=%s\n"
-            "----- tool_use blocks (n=%d) -----\n%s\n"
-            "===== end Claude crop-assessment RESPONSE [%.1f-%.1f] =====",
-            proposal.start_seconds, proposal.end_seconds,
-            getattr(message, "stop_reason", None),
-            _json.dumps(usage_dict),
-            len(tool_uses),
-            _json.dumps(tool_uses, ensure_ascii=False, indent=2),
-            proposal.start_seconds, proposal.end_seconds,
-        )
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "Failed to log Claude crop-assessment response for %.1f-%.1f",
-            proposal.start_seconds, proposal.end_seconds, exc_info=True,
-        )
+            ok = True
+        finally:
+            if not ok:
+                out_path.unlink(missing_ok=True)
+    return out_path, False
 
 
 async def cut_clip_from_parent(
@@ -1140,7 +878,7 @@ async def cut_clip_from_parent(
     parent_video_path: Path,
     proposal: ProposedClip,
     vertical_crop: bool = False,
-    x_shift_normalized: float = 0.0,
+    x_shift_normalized: float = 0.0,  # deprecated/unused — YOLO owns crop geometry
 ) -> Path:
     """Cut ``proposal`` out of ``parent_video_path`` to a new MP4 in
     UPLOAD_DIR. Returns the absolute path of the new file.
@@ -1161,45 +899,12 @@ async def cut_clip_from_parent(
     always ``.mp4`` regardless of the parent's container — the
     YouTube-upload step that runs next prefers MP4 anyway.
     """
-    # Mirror extract_clip's encoder choice (auto + vertical_crop +
-    # hardware-available → videotoolbox; otherwise libx264) so the lock
-    # we hold matches the actual encoder lane we're about to use. If we
-    # mis-routed (e.g. acquired the hardware lane for a software cut),
-    # the system would still be correct but lane utilisation would skew.
-    # Mirror extract_clip's "auto" choice: hardware whenever ffmpeg
-    # has h264_videotoolbox, regardless of vertical_crop. The output-
-    # resolution-aware bitrate picker inside extract_clip handles the
-    # 4K case so we don't crush large sources at the 1080p bitrate.
-    will_use_hardware = media_service.hardware_encoder_available("h264")
-    semaphore = (
-        _get_hardware_cut_semaphore() if will_use_hardware
-        else _get_software_cut_semaphore()
+    out_name = f"clip_{proposal.kind}_{secrets.token_hex(6)}.mp4"
+    path, _ = await _run_cut(
+        parent_video_path=parent_video_path, proposal=proposal,
+        out_name=out_name, vertical_crop=vertical_crop,
     )
-    async with semaphore:
-        out_name = f"clip_{proposal.kind}_{secrets.token_hex(6)}.mp4"
-        out_path = UPLOAD_DIR / out_name
-        try:
-            await asyncio.to_thread(
-                media_service.extract_clip,
-                parent_video_path,
-                _format_ffmpeg_timestamp(proposal.start_seconds),
-                _format_ffmpeg_timestamp(proposal.end_seconds),
-                output_name=out_name,
-                precise=True,
-                vertical_crop=vertical_crop,
-                x_shift_normalized=x_shift_normalized,
-                encoder="auto",
-                audio_fade_in=proposal.audio_fade_in,
-                audio_fade_out=proposal.audio_fade_out,
-            )
-        except Exception:
-            # ffmpeg can leave a partial mp4 behind on non-zero exit /
-            # timeout. Without this cleanup the file leaks into
-            # UPLOAD_DIR forever — visible to nothing (no row points
-            # at it) and slowly fills disk on a flaky parent.
-            out_path.unlink(missing_ok=True)
-            raise
-        return out_path
+    return path
 
 
 # Deterministic prefix so review-page cleanups (eviction, Cancel,
@@ -1219,8 +924,8 @@ async def cut_preview_for_proposal(
     proposal: ProposedClip,
     idx: int,
     vertical_crop: bool = False,
-    x_shift_normalized: float = 0.0,
-) -> Path:
+    x_shift_normalized: float = 0.0,  # deprecated/unused — YOLO owns crop geometry
+) -> tuple[Path, bool]:
     """Cut a proposal to a .mp4 so the review page can play the actual
     clip the user will import.
 
@@ -1241,43 +946,11 @@ async def cut_preview_for_proposal(
     cleanup sweep can glob the unadopted (rejected / failed)
     remainder without bookkeeping per proposal on the job dict.
     """
-    # Mirror extract_clip's "auto" choice: hardware whenever ffmpeg
-    # has h264_videotoolbox, regardless of vertical_crop. The output-
-    # resolution-aware bitrate picker inside extract_clip handles the
-    # 4K case so we don't crush large sources at the 1080p bitrate.
-    will_use_hardware = media_service.hardware_encoder_available("h264")
-    semaphore = (
-        _get_hardware_cut_semaphore() if will_use_hardware
-        else _get_software_cut_semaphore()
-    )
     out_name = _preview_filename(job_id, proposal.kind, idx)
-    out_path = UPLOAD_DIR / out_name
-    async with semaphore:
-        # try/finally with a success flag so a CancelledError (which
-        # inherits from BaseException, not Exception, in 3.11+) also
-        # triggers the partial-file unlink. The plain `except Exception`
-        # we'd otherwise want would skip past it and leak the half-
-        # written mp4.
-        ok = False
-        try:
-            await asyncio.to_thread(
-                media_service.extract_clip,
-                parent_video_path,
-                _format_ffmpeg_timestamp(proposal.start_seconds),
-                _format_ffmpeg_timestamp(proposal.end_seconds),
-                output_name=out_name,
-                precise=True,
-                vertical_crop=vertical_crop,
-                x_shift_normalized=x_shift_normalized,
-                encoder="auto",
-                audio_fade_in=proposal.audio_fade_in,
-                audio_fade_out=proposal.audio_fade_out,
-            )
-            ok = True
-        finally:
-            if not ok:
-                out_path.unlink(missing_ok=True)
-    return out_path
+    return await _run_cut(
+        parent_video_path=parent_video_path, proposal=proposal,
+        out_name=out_name, vertical_crop=vertical_crop,
+    )
 
 
 def cleanup_generate_previews(job_id: str) -> None:
@@ -1512,29 +1185,15 @@ def proposal_to_public_dict(
     p: ProposedClip,
     *,
     crop_vertical: bool = False,
-    assessment: CropAssessment | None = None,
-    vision_crashed: bool = False,
 ) -> dict:
     """JSON-safe representation of a proposal for the preview response.
 
-    When the kind was toggled for vertical crop and the vision pass ran,
-    the resulting :class:`CropAssessment` is attached so the UI can:
-
-    * Show the actual ``x_shift_normalized`` that will be applied at
-      cut time (after the cautious-shift threshold).
-    * Render the "uncertain crop" badge for drift / multi-face cases.
-
-    ``vision_crashed=True`` marks proposals whose vision call raised an
-    unhandled exception — the UI badges them as "uncertain" with a
-    distinct ``crop_classification = 'vision_error'`` so the user sees
-    the same warning as drift / multi-face rather than silently
-    assuming a clean center crop.
-
-    For kinds without crop, or when vision wasn't run, ``assessment`` is
-    ``None`` and the only crop-related field on the dict is the inert
-    ``vertical_crop`` mirror of the kind setting.
+    ``crop_vertical`` mirrors the per-kind 9:16 toggle. Crop geometry and the
+    review-UI "uncertain" badge now come from the Swift clipcrop recrop at cut
+    time (the caller sets ``crop_uncertain`` on this dict from clipcrop's
+    croppability flag) — there is no Claude-vision assessment attached here.
     """
-    out: dict[str, object] = {
+    return {
         "kind": p.kind,
         "start_seconds": p.start_seconds,
         "end_seconds": p.end_seconds,
@@ -1547,20 +1206,10 @@ def proposal_to_public_dict(
         "audio_fade_in": p.audio_fade_in,
         "audio_fade_out": p.audio_fade_out,
         "vertical_crop": crop_vertical,
+        # Deprecated/inert — kept so the rejection-store columns (migration 028)
+        # still receive a value; geometry is owned by clipcrop now.
+        "x_shift_normalized": 0.0,
     }
-    if vision_crashed:
-        out["x_shift_normalized"] = 0.0
-        out["crop_classification"] = "vision_error"
-        out["crop_confidence"] = 0.0
-        out["crop_uncertain"] = True
-    elif assessment is not None:
-        out["x_shift_normalized"] = _apply_assessment_shift(assessment)
-        out["crop_classification"] = assessment.classification
-        out["crop_confidence"] = assessment.confidence
-        out["crop_uncertain"] = assessment.uncertain
-    else:
-        out["x_shift_normalized"] = 0.0
-    return out
 
 
 async def start_generate_job(
@@ -1710,70 +1359,18 @@ async def _run_generate_job(job_id: str) -> None:
             existing_titles_per_kind=job["existing_titles_per_kind"],
         )
 
-        # Refinement — for kinds the user toggled for vertical crop,
-        # sample keyframes and ask Claude vision whether the subject is
-        # centered enough for a plain center crop. Run in parallel
-        # across all (kind, proposal) pairs that need it; per-call
-        # failure falls back to a neutral assessment (centered, no
-        # shift) so we never block a proposal on a flaky vision call.
-        # Honour the per-kind 9:16 toggles the user set in the review modal
-        # (hooks/shorts default on, segments off); they ride on the job from
-        # the preview endpoint. Crop-on kinds get the keyframe vision pass
-        # below to frame the crop column, and the preview cut applies the
-        # 9:16 crop — that single cropped cut is reused as the final clip.
+        # Per-kind 9:16 toggles the user set in the review modal (hooks/shorts
+        # default on, segments off); they ride on the job from the preview
+        # endpoint. Crop-on kinds get the all-Swift clipcrop recrop at cut time
+        # (YOLO head-tracking stacked/single 9:16) — there is NO Claude vision
+        # pass anymore: YOLO owns the crop geometry, and clipcrop emits the
+        # croppability flag that becomes the review-UI "uncertain" badge.
         crop_for_kind = job.get("crop_vertical") or {k: False for k in proposals}
-        refinement_tasks: list[tuple[str, int, asyncio.Task]] = []
-        for k, props in proposals.items():
-            if not crop_for_kind.get(k, False):
-                continue
-            for idx, prop in enumerate(props):
-                task = asyncio.create_task(
-                    assess_crop_for_proposal(
-                        proposal=prop,
-                        parent_video_path=Path(job["parent_video_path"]),
-                        project_id=int(job["project_id"]),
-                        semaphore=_get_vision_semaphore(),
-                    )
-                )
-                refinement_tasks.append((k, idx, task))
 
-        assessments: dict[tuple[str, int], CropAssessment | None] = {}
-        # Crashes are distinct from neutral assessments — the UI flags
-        # the former with the same "uncertain crop" badge it uses for
-        # drift / multi-face, so the user can see "vision had no
-        # opinion" rather than silently assuming a clean center crop.
-        crashed: set[tuple[str, int]] = set()
-        if refinement_tasks:
-            job["state"] = "refining_crops"
-            job["progress_message"] = (
-                f"Checking framing on {len(refinement_tasks)} "
-                f"crop{'s' if len(refinement_tasks) != 1 else ''}…"
-            )
-            results = await asyncio.gather(
-                *(t for _, _, t in refinement_tasks),
-                return_exceptions=True,
-            )
-            for (k, idx, _), res in zip(refinement_tasks, results):
-                if isinstance(res, Exception):
-                    logger.warning(
-                        "Vision pass crashed for %s[%d]: %s", k, idx, res,
-                    )
-                    assessments[(k, idx)] = None
-                    crashed.add((k, idx))
-                else:
-                    assessments[(k, idx)] = res
-
-        # Build public dicts first so we have the same crop +
-        # x_shift_normalized values the preview cuts must use.
         public_per_kind: dict[str, list[dict]] = {
             k: [
-                proposal_to_public_dict(
-                    p,
-                    crop_vertical=crop_for_kind.get(k, False),
-                    assessment=assessments.get((k, idx)),
-                    vision_crashed=(k, idx) in crashed,
-                )
-                for idx, p in enumerate(v)
+                proposal_to_public_dict(p, crop_vertical=crop_for_kind.get(k, False))
+                for p in v
             ]
             for k, v in proposals.items()
         }
@@ -1795,7 +1392,7 @@ async def _run_generate_job(job_id: str) -> None:
 
         async def _cut_and_count(
             k: str, p_idx: int, p: ProposedClip, kind_crop: bool, x_shift: float,
-        ) -> Path:
+        ) -> tuple[Path, bool]:
             try:
                 return await cut_preview_for_proposal(
                     job_id=job_id,
@@ -1852,8 +1449,13 @@ async def _run_generate_job(job_id: str) -> None:
                     )
                     public_per_kind[k][idx]["preview_error"] = full_msg[:2000]
                     continue
+                cut_path, crop_uncertain = res
                 from yt_scheduler.config import media_url
-                public_per_kind[k][idx]["preview_url"] = media_url(str(res))
+                public_per_kind[k][idx]["preview_url"] = media_url(str(cut_path))
+                # YOLO-derived croppability flag (b-roll / screen content → neutral
+                # center crop). Reuses the existing review-UI badge field.
+                if crop_uncertain:
+                    public_per_kind[k][idx]["crop_uncertain"] = True
 
         job["proposals"] = public_per_kind
         job["state"] = "done"

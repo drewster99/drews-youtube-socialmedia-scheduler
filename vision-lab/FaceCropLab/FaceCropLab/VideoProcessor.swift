@@ -43,7 +43,7 @@ final class VideoProcessor {
     nonisolated static let historyLength = 200
     /// Frames are downscaled so their largest dimension is at most this many
     /// pixels before Vision runs — 4K is needless work for face landmarks.
-    static let maxAnalysisDimension: CGFloat = 800
+    nonisolated static let maxAnalysisDimension: CGFloat = 800
     /// Horizontal classification boundaries as fractions of image width.
     nonisolated static let leftLine: CGFloat = 0.45
     nonisolated static let rightLine: CGFloat = 0.55
@@ -197,7 +197,7 @@ final class VideoProcessor {
                     if case .frame(let raw) = slot {
                         rawFrames.append(raw)
                         recordAnalysisMs(raw.analysisMs)
-                        frames.append(Self.classifyFrame(raw, mode: classificationMode, cropThreshold: self.cropThreshold, step: self.sampleStep, metric: self.activenessMetric, state: &classifyState))
+                        frames.append(Self.classifyFrame(raw, mode: classificationMode, cropThreshold: self.cropThreshold, step: self.sampleStep, metric: self.activenessMetric, tuning: ClassifyTuning(), state: &classifyState))
                         unclassifiedCount = classifyState.unclassified
                     }
                     nextIndex += 1
@@ -217,7 +217,7 @@ final class VideoProcessor {
                     if case .frame(let raw)? = pending[idx] {
                         rawFrames.append(raw)
                         recordAnalysisMs(raw.analysisMs)
-                        frames.append(Self.classifyFrame(raw, mode: classificationMode, cropThreshold: self.cropThreshold, step: self.sampleStep, metric: self.activenessMetric, state: &classifyState))
+                        frames.append(Self.classifyFrame(raw, mode: classificationMode, cropThreshold: self.cropThreshold, step: self.sampleStep, metric: self.activenessMetric, tuning: ClassifyTuning(), state: &classifyState))
                     }
                 }
                 unclassifiedCount = classifyState.unclassified
@@ -242,7 +242,7 @@ final class VideoProcessor {
         self.activenessMetric = metric
         guard !rawFrames.isEmpty else { classifyState = ClassifyState(); return }
         var state = ClassifyState()
-        frames = rawFrames.map { Self.classifyFrame($0, mode: mode, cropThreshold: cropThreshold, step: sampleStep, metric: metric, state: &state) }
+        frames = rawFrames.map { Self.classifyFrame($0, mode: mode, cropThreshold: cropThreshold, step: sampleStep, metric: metric, tuning: ClassifyTuning(), state: &state) }
         unclassifiedCount = state.unclassified
         classifyState = state
     }
@@ -283,7 +283,21 @@ final class VideoProcessor {
         var cutSettleUntil: Double = -1
     }
 
-    static func classifyFrame(_ rf: RawFrame, mode: ClassificationMode, cropThreshold: Double, step: Double, metric: ActivenessMetric, state: inout ClassifyState) -> FrameAnalysis {
+    /// Tunable knobs for active-face selection + the movement signal. Defaults
+    /// reproduce the current production behavior.
+    struct ClassifyTuning {
+        var minConfidence: Float = minFaceConfidence
+        /// Absolute activeness gap a challenger must exceed to steal the crop.
+        var absoluteMargin: CGFloat = 0
+        /// Relative bar: a challenger must exceed the incumbent's activeness by
+        /// this FACTOR (0.5 = 50% more). Combined with absoluteMargin as an AND,
+        /// so absoluteMargin acts as the floor for the both-near-zero case.
+        var relativeMargin: CGFloat = 0
+        /// Movement-EMA memory in seconds (the |Δ open%| smoothing window).
+        var activityWindowSeconds: Double = 0.5
+    }
+
+    nonisolated static func classifyFrame(_ rf: RawFrame, mode: ClassificationMode, cropThreshold: Double, step: Double, metric: ActivenessMetric, tuning: ClassifyTuning, state: inout ClassifyState) -> FrameAnalysis {
         var faces: [DetectedFace] = []
         var curOuter: [FacePosition: [CGPoint]] = [:]
         var curInner: [FacePosition: [CGPoint]] = [:]
@@ -334,7 +348,7 @@ final class VideoProcessor {
         // beyond a few floats. "activity" is an EMA of |Δopen%| (movement); the
         // smoothing factor targets ~0.5s memory (alpha = 2/(N+1)), scaling with
         // the sampling interval.
-        let activityWindow = max(2, Int((0.5 / step).rounded()))
+        let activityWindow = max(2, Int((tuning.activityWindowSeconds / step).rounded()))
         let emaAlpha = CGFloat(2.0 / (Double(activityWindow) + 1.0))
         var motionOuterNow: [FacePosition: CGFloat] = [:]
         var motionInnerNow: [FacePosition: CGFloat] = [:]
@@ -372,9 +386,23 @@ final class VideoProcessor {
         // face is usually a Vision false positive on background texture and must
         // not capture the crop. If every face is low-confidence (e.g. a hard
         // frame), fall back to all of them so tracking isn't lost entirely.
-        let confident = faces.indices.filter { faces[$0].confidence >= Self.minFaceConfidence }
+        let confident = faces.indices.filter { faces[$0].confidence >= tuning.minConfidence }
         let candidates = confident.isEmpty ? Array(faces.indices) : confident
-        let activeFaceIndex = candidates.max(by: { activeness(faces[$0]) < activeness(faces[$1]) })
+        let challenger = candidates.max(by: { activeness(faces[$0]) < activeness(faces[$1]) })
+        // Sticky incumbent: the face on the currently committed crop side keeps
+        // the active role unless a challenger clears BOTH the absolute and the
+        // relative bar. With both margins 0 this reduces to the plain argmax.
+        let incumbent = candidates.first(where: { faces[$0].position == state.cropPosition })
+        let activeFaceIndex: Int?
+        if let inc = incumbent, let ch = challenger, ch != inc {
+            let challengerScore = activeness(faces[ch])
+            let incumbentScore = activeness(faces[inc])
+            let beatsAbsolute = challengerScore - incumbentScore > tuning.absoluteMargin
+            let beatsRelative = challengerScore > incumbentScore * (1 + tuning.relativeMargin)
+            activeFaceIndex = (beatsAbsolute && beatsRelative) ? ch : inc
+        } else {
+            activeFaceIndex = challenger
+        }
 
         // Record each face's selection score for on-screen telemetry.
         for i in faces.indices { faces[i].activeness = activeness(faces[i]) }
@@ -476,7 +504,7 @@ final class VideoProcessor {
             activity: activityNow)
     }
 
-    static func classify(boundingBox: CGRect, imageWidth: CGFloat, mode: ClassificationMode) -> FacePosition {
+    nonisolated static func classify(boundingBox: CGRect, imageWidth: CGFloat, mode: ClassificationMode) -> FacePosition {
         guard imageWidth > 0 else { return .unclassified }
         let left = boundingBox.minX / imageWidth
         let right = boundingBox.maxX / imageWidth
@@ -496,7 +524,7 @@ final class VideoProcessor {
 
     /// Inner-lip opening height: split the inner-lip Y values at the median,
     /// average the lower half and the upper half, return |upper − lower|.
-    static func innerLipHeight(_ points: [CGPoint]) -> CGFloat {
+    nonisolated static func innerLipHeight(_ points: [CGPoint]) -> CGFloat {
         guard points.count >= 2 else { return 0 }
         let ys = points.map(\.y).sorted()
         let half = ys.count / 2
@@ -510,7 +538,7 @@ final class VideoProcessor {
 
     /// Σ of per-point pixel distance. Current points beyond the prior array's
     /// length are measured from (0,0), per spec.
-    static func motion(prior: [CGPoint], current: [CGPoint]) -> CGFloat {
+    nonisolated static func motion(prior: [CGPoint], current: [CGPoint]) -> CGFloat {
         guard !current.isEmpty else { return 0 }
         var sum: CGFloat = 0
         for (i, p) in current.enumerated() {

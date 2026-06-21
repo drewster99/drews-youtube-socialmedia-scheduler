@@ -6,3 +6,8 @@ DerivedData/
 build/
 Build/
 *.app
+
+# Upstream PyTorch model weights — reproducible from ultralytics and only used
+# to (re)export the CoreML .mlpackage that the build actually bundles. Keeping
+# the multi-MB binaries out of git; the compiled model under models/ is checked in.
+*.pt
