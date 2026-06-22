@@ -11,7 +11,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 OUT="${1:-/tmp/facecrop-cli2}"
 
-swiftc -O \
+# Pin the deployment target to match the production app build (macos/build.sh).
+# At macOS 15.0 the AVFoundation composition/export APIs we use are current; their
+# replacements (AVVideoComposition.Configuration et al., deprecated-in-26.0) don't
+# exist before 26.0, so a 15.0-targeting binary is warning-clean and still runs on
+# newer hosts. Without an explicit target swiftc builds for the host OS and emits
+# 26.0 deprecation noise the production build never sees.
+swiftc -O -target arm64-apple-macos15.0 \
   cli/*.swift \
   FaceCropLab/FaceCropLab/VideoProcessor.swift \
   FaceCropLab/FaceCropLab/Models.swift \

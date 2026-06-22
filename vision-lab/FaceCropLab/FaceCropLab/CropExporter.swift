@@ -77,7 +77,7 @@ enum CropExporter {
         let outSize = renderSize ?? CGSize(width: cropW, height: cropH)
         let renderW = outSize.width
 
-        let comp = AVMutableVideoComposition(asset: asset) { request in
+        let base = try await AVVideoComposition.videoComposition(with: asset) { request in
             let srcImage = request.sourceImage           // already display-oriented; origin bottom-left
             let frac = fraction(at: request.compositionTime.seconds, in: centers)
             let cropX = max(0, min(srcW - cropW, frac * srcW - cropW / 2)).rounded()
@@ -89,14 +89,15 @@ enum CropExporter {
             let out = cropped.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             request.finish(with: out, context: nil)
         }
+        guard let comp = base.mutableCopy() as? AVMutableVideoComposition else {
+            throw ExportError(message: "Could not build video composition.")
+        }
         comp.renderSize = outSize
 
         guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
             throw ExportError(message: "Could not create export session.")
         }
         session.videoComposition = comp
-        session.outputURL = output
-        session.outputFileType = .mov
         // Render only the span we have a trajectory for (covers the whole video
         // for a full analysis; bounds a partial one).
         if let last = centers.last {
@@ -107,35 +108,15 @@ enum CropExporter {
             try FileManager.default.removeItem(at: output)
         }
 
-        // AVAssetExportSession isn't Sendable; box it so the progress poller can
-        // read `.progress` from a child task without a data-race diagnostic
-        // (the read is safe).
-        struct SessionBox: @unchecked Sendable { let session: AVAssetExportSession }
-        let box = SessionBox(session: session)
-        let poller = Task {
-            while !Task.isCancelled {
-                let p = Double(box.session.progress)
-                progress(p)
-                if p >= 1.0 { break }
-                try? await Task.sleep(nanoseconds: 250_000_000)
-            }
+        // Drive the export via async-let; monitor progress via states() (it ends
+        // when the export finishes). export(to:as:) is cancellation-aware — it
+        // throws CancellationError if the awaiting Task is cancelled — and throws
+        // the underlying error on failure, both surfaced by `try await exported`.
+        async let exported: Void = session.export(to: output, as: .mov)
+        for await state in session.states(updateInterval: 0.25) {
+            if case .exporting(let p) = state { progress(p.fractionCompleted) }
         }
-        defer { poller.cancel() }
-
-        // Cancellable: if the awaiting Task is cancelled, cancel the export
-        // session (box captured so the @Sendable onCancel can reach it).
-        await withTaskCancellationHandler {
-            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                session.exportAsynchronously { cont.resume() }
-            }
-        } onCancel: {
-            box.session.cancelExport()
-        }
-
-        switch session.status {
-        case .completed: progress(1.0)
-        case .cancelled: throw CancellationError()
-        default: throw session.error ?? ExportError(message: "Export failed (\(session.status.rawValue)).")
-        }
+        try await exported
+        progress(1.0)
     }
 }

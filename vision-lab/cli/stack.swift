@@ -148,8 +148,6 @@ func analyzeStackSegments(path: String, sampleInterval: Double, maxSeconds: Doub
     return segmentsFromSamples(samples, sampleInterval: sampleInterval, debounce: debounce)
 }
 
-private struct StackSessionBox: @unchecked Sendable { let session: AVAssetExportSession }
-
 struct StackExportError: LocalizedError { let message: String; var errorDescription: String? { message } }
 
 /// Build the 9:16 single/stacked CoreImage video composition. Shared by the
@@ -160,16 +158,18 @@ struct StackExportError: LocalizedError { let message: String; var errorDescript
 /// composes correctly.
 func makeStackComposition(asset: AVAsset, segments: [StackSegment], canvas: CGRect,
                           srcW: CGFloat, srcH: CGFloat, fps: Float,
-                          bandZoom: CGFloat, sizeByHeight: Bool, headBias: CGFloat) -> AVMutableVideoComposition {
+                          bandZoom: CGFloat, sizeByHeight: Bool, headBias: CGFloat) async throws -> AVMutableVideoComposition {
     let starts = segments.map { $0.start }
     let segs = segments
-    func segLayout(_ t: Double) -> StackLayout {
-        guard !segs.isEmpty else { return .single(centerX: 0.5) }
-        var lo = 0, hi = starts.count - 1, ans = 0
-        while lo <= hi { let m = (lo + hi) / 2; if starts[m] <= t { ans = m; lo = m + 1 } else { hi = m - 1 } }
-        return segs[ans].layout
-    }
-    let comp = AVMutableVideoComposition(asset: asset) { request in
+    // The CIFilter applier closure is @Sendable, so segLayout lives inside it
+    // (capturing only the Sendable `segs`/`starts` arrays).
+    let base = try await AVVideoComposition.videoComposition(with: asset) { request in
+        func segLayout(_ t: Double) -> StackLayout {
+            guard !segs.isEmpty else { return .single(centerX: 0.5) }
+            var lo = 0, hi = starts.count - 1, ans = 0
+            while lo <= hi { let m = (lo + hi) / 2; if starts[m] <= t { ans = m; lo = m + 1 } else { hi = m - 1 } }
+            return segs[ans].layout
+        }
         let src = request.sourceImage   // display-oriented, bottom-left origin
         var output = CIImage(color: .black).cropped(to: canvas)
         func place(cropTL: CGRect, destBL: CGRect) {
@@ -221,6 +221,9 @@ func makeStackComposition(asset: AVAsset, segments: [StackSegment], canvas: CGRe
         }
         request.finish(with: output, context: nil)
     }
+    guard let comp = base.mutableCopy() as? AVMutableVideoComposition else {
+        throw StackExportError(message: "Could not build video composition.")
+    }
     comp.renderSize = canvas.size
     comp.frameDuration = CMTimeMakeWithSeconds(1.0 / Double(fps), preferredTimescale: 600)
     return comp
@@ -247,36 +250,25 @@ func renderStacked(path: String, segments: [StackSegment], outURL: URL, renderHe
     let outW = even(outH * 9.0 / 16.0)
     let canvas = CGRect(x: 0, y: 0, width: outW, height: outH)
 
-    let comp = makeStackComposition(asset: asset, segments: segments, canvas: canvas,
-                                    srcW: srcW, srcH: srcH, fps: fps, bandZoom: bandZoom,
-                                    sizeByHeight: sizeByHeight, headBias: headBias)
+    let comp = try await makeStackComposition(asset: asset, segments: segments, canvas: canvas,
+                                              srcW: srcW, srcH: srcH, fps: fps, bandZoom: bandZoom,
+                                              sizeByHeight: sizeByHeight, headBias: headBias)
 
     guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
         throw StackExportError(message: "Could not create export session.")
     }
     session.videoComposition = comp
-    session.outputURL = outURL
-    session.outputFileType = .mov
     session.timeRange = CMTimeRange(start: .zero, duration: CMTime(seconds: duration, preferredTimescale: 600))
     if FileManager.default.fileExists(atPath: outURL.path) { try FileManager.default.removeItem(at: outURL) }
 
-    let box = StackSessionBox(session: session)
-    let poller = Task {
-        while !Task.isCancelled {
-            let p = Double(box.session.progress)
-            progress(p)
-            if p >= 1.0 { break }
-            try? await Task.sleep(nanoseconds: 500_000_000)
-        }
+    // Drive the export via async-let; monitor progress via states() (it ends when
+    // the export finishes). `try await exported` surfaces any export error.
+    async let exported: Void = session.export(to: outURL, as: .mov)
+    for await state in session.states(updateInterval: 0.5) {
+        if case .exporting(let p) = state { progress(p.fractionCompleted) }
     }
-    defer { poller.cancel() }
-    await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-        session.exportAsynchronously { cont.resume() }
-    }
-    switch session.status {
-    case .completed: progress(1.0)
-    default: throw session.error ?? StackExportError(message: "Export failed (\(session.status.rawValue)).")
-    }
+    try await exported
+    progress(1.0)
 }
 
 /// Driver: the full native Swift pipeline — batched CoreML head detection →
@@ -460,9 +452,9 @@ func renderClipCrop(parent: String, segments: [StackSegment], start: Double, end
     let outW = even(outH * 9.0 / 16.0)
     let canvas = CGRect(x: 0, y: 0, width: outW, height: outH)
 
-    let comp = makeStackComposition(asset: asset, segments: segments, canvas: canvas,
-                                    srcW: srcW, srcH: srcH, fps: fps, bandZoom: bandZoom,
-                                    sizeByHeight: true, headBias: 0.0)
+    let comp = try await makeStackComposition(asset: asset, segments: segments, canvas: canvas,
+                                              srcW: srcW, srcH: srcH, fps: fps, bandZoom: bandZoom,
+                                              sizeByHeight: true, headBias: 0.0)
 
     // Audio fades in the SAME export, in parent time — identical to the Python
     // afade over [0, fadeIn] / [dur-fadeOut, dur] of the cut.
@@ -494,23 +486,20 @@ func renderClipCrop(parent: String, segments: [StackSegment], start: Double, end
     }
     session.videoComposition = comp
     session.audioMix = audioMix
-    session.outputFileType = .mp4
     session.timeRange = CMTimeRange(start: CMTime(seconds: start, preferredTimescale: ts),
                                     duration: CMTime(seconds: clampedEnd - start, preferredTimescale: ts))
 
     // Write to a temp sibling and atomically move on success — never leave a
-    // partial at the final path.
+    // partial at the final path. export(to:as:) throws on any failure.
     let tmpURL = URL(fileURLWithPath: outURL.path + ".tmp.mp4")
     for u in [tmpURL, outURL] where FileManager.default.fileExists(atPath: u.path) {
         try FileManager.default.removeItem(at: u)
     }
-    session.outputURL = tmpURL
-    await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-        session.exportAsynchronously { cont.resume() }
-    }
-    guard session.status == .completed else {
+    do {
+        try await session.export(to: tmpURL, as: .mp4)
+    } catch {
         try? FileManager.default.removeItem(at: tmpURL)
-        throw session.error ?? StackExportError(message: "Export failed (status \(session.status.rawValue)).")
+        throw error
     }
     try FileManager.default.moveItem(at: tmpURL, to: outURL)
 }
