@@ -687,12 +687,19 @@ async def propose_clips_for_kind_indexed(
 #
 #   * Software (libx264) — CPU-bound, scales with cores. 8 in flight is
 #     comfortable on Apple Silicon (M-series wide cores) without thrash.
-#   * Hardware (videotoolbox) — uses the Media Engine block, which
-#     serialises internally past 4 concurrent sessions. Quality does not
-#     degrade beyond 4; they just queue. 4 keeps the queue shallow.
+#   * Hardware (videotoolbox) — uses the Media Engine block, whose
+#     aggregate throughput on a single 4K source is effectively fixed
+#     (measured ~2.6x realtime total): N concurrent cuts each run at
+#     ~2.6/N x, so concurrency does NOT speed the batch up — it only
+#     divides a fixed pie and lengthens each cut's wall time. A long
+#     (multi-minute) segment at high concurrency can therefore approach
+#     the per-cut ffmpeg timeout for no aggregate gain. 2 keeps each
+#     cut's latency low (and well clear of the timeout) at the same
+#     total throughput. This lane is shared by the ffmpeg landscape cut
+#     and the Swift clipcrop recrop — both drive videotoolbox.
 #
 # Each cut acquires whichever lane it's actually going to use, so a
-# generate confirm with vertical crops gets up to 4 hardware encodes in
+# generate confirm with vertical crops gets up to 2 hardware encodes in
 # flight while non-crop cuts keep filling the 8 software slots
 # independently.
 #
@@ -714,7 +721,7 @@ def _get_software_cut_semaphore() -> asyncio.Semaphore:
 def _get_hardware_cut_semaphore() -> asyncio.Semaphore:
     global _HARDWARE_CUT_SEMAPHORE
     if _HARDWARE_CUT_SEMAPHORE is None:
-        _HARDWARE_CUT_SEMAPHORE = asyncio.Semaphore(4)
+        _HARDWARE_CUT_SEMAPHORE = asyncio.Semaphore(2)
     return _HARDWARE_CUT_SEMAPHORE
 
 
