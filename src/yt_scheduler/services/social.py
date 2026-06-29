@@ -267,6 +267,35 @@ class MediaUploadError(RuntimeError):
     """
 
 
+def _http_error_detail(resp: httpx.Response) -> str:
+    """Build a human-readable failure string from a non-2xx httpx response,
+    preferring the provider's own error body.
+
+    ``response.raise_for_status()`` throws away the response body and yields
+    only a generic ``'400 Bad Request' for url ...`` line, which hides the
+    real reason the provider rejected the call. Meta (Threads / Facebook
+    Graph) returns ``{"error": {"message", "code", "error_subcode",
+    "fbtrace_id"}}``; surface those fields so the actual cause reaches the UI.
+    """
+    try:
+        data = resp.json()
+    except (ValueError, json.JSONDecodeError):
+        text = (resp.text or "").strip()
+        return f"HTTP {resp.status_code}: {text}" if text else f"HTTP {resp.status_code}"
+    err = data.get("error") if isinstance(data, dict) else None
+    if isinstance(err, dict):
+        parts = [
+            f"{key}={err[key]}"
+            for key in ("message", "code", "error_subcode", "type", "fbtrace_id")
+            if err.get(key) not in (None, "")
+        ]
+        if parts:
+            return f"HTTP {resp.status_code}: " + ", ".join(parts)
+    if isinstance(err, str) and err:
+        return f"HTTP {resp.status_code}: {err}"
+    return f"HTTP {resp.status_code}: {json.dumps(data)[:500]}"
+
+
 class SocialPoster:
     """Base class for social media platform posters.
 
@@ -1241,6 +1270,7 @@ class LinkedInPoster(SocialPoster):
                     for path_obj, alt in uploadable:
                         asset_urn = await self._linkedin_upload_asset(
                             client, token, owner_urn, path_obj, is_video,
+                            creds.get("uuid"),
                         )
                         block: dict = {
                             "status": "READY",
@@ -1290,7 +1320,10 @@ class LinkedInPoster(SocialPoster):
                         creds.get("uuid"),
                         "LinkedIn rejected the access token — re-OAuth.",
                     )
-                resp.raise_for_status()
+                if resp.status_code >= 400:
+                    raise RuntimeError(
+                        f"LinkedIn post failed: {_http_error_detail(resp)}"
+                    )
                 post_id = resp.headers.get("x-restli-id", "")
                 return {
                     "url": f"https://www.linkedin.com/feed/update/{post_id}",
@@ -1308,6 +1341,7 @@ class LinkedInPoster(SocialPoster):
         owner_urn: str,
         path: Path,
         is_video: bool,
+        cred_uuid: str | None,
     ) -> str:
         """Run the three-step LinkedIn asset upload. Returns the asset URN
         (e.g. ``urn:li:digitalmediaAsset:abc123...``) on success."""
@@ -1340,8 +1374,13 @@ class LinkedInPoster(SocialPoster):
             json=register_payload,
         )
         if resp.status_code == 401:
-            raise CredentialAuthError(None, "LinkedIn registerUpload 401")
-        resp.raise_for_status()
+            raise CredentialAuthError(
+                cred_uuid, "LinkedIn rejected the access token — re-OAuth.",
+            )
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"LinkedIn registerUpload failed: {_http_error_detail(resp)}"
+            )
         data = resp.json()
         value = data.get("value") or {}
         upload_mech = (
@@ -1367,6 +1406,13 @@ class LinkedInPoster(SocialPoster):
         put_resp = await client.put(
             upload_url, headers=put_headers, content=asset_bytes
         )
+        if put_resp.status_code == 401:
+            # The upload URL carries the same bearer as registerUpload; a 401
+            # here is an auth failure, so flag the credential for re-auth rather
+            # than burying it as a generic media-upload error.
+            raise CredentialAuthError(
+                cred_uuid, "LinkedIn rejected the access token — re-OAuth.",
+            )
         if put_resp.status_code not in (200, 201):
             raise RuntimeError(
                 f"LinkedIn asset PUT failed: HTTP {put_resp.status_code} {put_resp.text}"
@@ -1416,8 +1462,19 @@ class ThreadsPoster(SocialPoster):
                         creds.get("uuid"),
                         "Threads rejected the access token — re-OAuth.",
                     )
-                create_resp.raise_for_status()
+                if create_resp.status_code >= 400:
+                    raise RuntimeError(
+                        f"Threads container create failed: {_http_error_detail(create_resp)}"
+                    )
                 container_id = create_resp.json()["id"]
+
+                # Threads' publish is a separate call from create, and the
+                # container is not necessarily ready the instant it's created.
+                # Publishing too early races the server and returns a 400, so
+                # poll the container's status until it reports FINISHED.
+                await self._await_container_finished(
+                    client, container_id, access_token, creds.get("uuid"),
+                )
 
                 publish_resp = await client.post(
                     f"https://graph.threads.net/v1.0/{user_id}/threads_publish",
@@ -1428,7 +1485,10 @@ class ThreadsPoster(SocialPoster):
                         creds.get("uuid"),
                         "Threads rejected the access token — re-OAuth.",
                     )
-                publish_resp.raise_for_status()
+                if publish_resp.status_code >= 400:
+                    raise RuntimeError(
+                        f"Threads publish failed: {_http_error_detail(publish_resp)}"
+                    )
                 post_id = publish_resp.json()["id"]
 
                 username = creds.get("username", "")
@@ -1437,6 +1497,63 @@ class ThreadsPoster(SocialPoster):
             raise
         except Exception as e:
             raise RuntimeError(f"Threads post failed: {e}") from e
+
+    _CONTAINER_POLL_ATTEMPTS = 10
+    _CONTAINER_POLL_DELAY_SECONDS = 1.0
+
+    async def _await_container_finished(
+        self,
+        client: httpx.AsyncClient,
+        container_id: str,
+        access_token: str,
+        cred_uuid: str | None,
+    ) -> None:
+        """Poll a Threads media container until its status is ``FINISHED``.
+
+        Raises if the container reports ``ERROR``/``EXPIRED``, if the status
+        check itself fails, or if it never reaches ``FINISHED`` within the
+        bounded attempt budget. Text containers are usually ready on the first
+        poll; the loop exists to absorb the brief server-side processing gap
+        that otherwise makes ``threads_publish`` return a 400.
+        """
+        last_status = "UNKNOWN"
+        for attempt in range(self._CONTAINER_POLL_ATTEMPTS):
+            status_resp = await client.get(
+                f"https://graph.threads.net/v1.0/{container_id}",
+                params={"fields": "status,error_message", "access_token": access_token},
+            )
+            if status_resp.status_code == 401:
+                raise CredentialAuthError(
+                    cred_uuid, "Threads rejected the access token — re-OAuth.",
+                )
+            if status_resp.status_code >= 400:
+                raise RuntimeError(
+                    f"Threads container status check failed: "
+                    f"{_http_error_detail(status_resp)}"
+                )
+            data = status_resp.json()
+            # Graph can answer 200 with an error object (and no status) rather
+            # than a 4xx; surface that immediately instead of polling to timeout
+            # and hiding the real cause.
+            if isinstance(data, dict) and data.get("error"):
+                raise RuntimeError(
+                    f"Threads container status check failed: "
+                    f"{_http_error_detail(status_resp)}"
+                )
+            last_status = data.get("status", "UNKNOWN")
+            if last_status == "FINISHED":
+                return
+            if last_status in ("ERROR", "EXPIRED"):
+                raise RuntimeError(
+                    f"Threads container {last_status}: "
+                    f"{data.get('error_message') or 'no detail from Threads'}"
+                )
+            if attempt < self._CONTAINER_POLL_ATTEMPTS - 1:
+                await asyncio.sleep(self._CONTAINER_POLL_DELAY_SECONDS)
+        raise RuntimeError(
+            f"Threads container not ready to publish (last status={last_status}) "
+            f"after {self._CONTAINER_POLL_ATTEMPTS} checks."
+        )
 
 
 # --- Registry ---

@@ -150,15 +150,29 @@ async def get_first_active_credential(platform: str) -> dict | None:
 
 
 async def load_bundle(platform: str, uuid: str) -> dict | None:
-    """Load and JSON-parse the Keychain bundle for a credential."""
+    """Load and JSON-parse the Keychain bundle for a credential.
+
+    The bundle's ``uuid`` key is always set from the ``uuid`` argument here,
+    not trusted from the stored JSON. Posters surface a credential's UUID on
+    auth failure (so the send-path can flag it ``needs_reauth``) by reading
+    ``creds["uuid"]``; a bundle written before ``save_bundle`` started
+    stamping the UUID — or by any path that didn't — would otherwise lack it,
+    silently breaking the reconnect flow. ``load_bundle`` already knows the
+    UUID, so it is the single place that can guarantee it.
+    """
     raw = await load_secret_async(platform, f"{CREDENTIAL_KEY_PREFIX}{uuid}")
     if not raw:
         return None
     try:
-        return json.loads(raw)
+        bundle = json.loads(raw)
     except json.JSONDecodeError:
         logger.warning("Bundle at %s:cred.%s is not valid JSON", platform, uuid[:8])
         return None
+    if not isinstance(bundle, dict):
+        logger.warning("Bundle at %s:cred.%s is not a JSON object", platform, uuid[:8])
+        return None
+    bundle["uuid"] = uuid
+    return bundle
 
 
 async def save_bundle(platform: str, uuid: str, bundle: dict) -> None:

@@ -1066,8 +1066,13 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
         )
         return {"status": "ok", "url": result.get("url", ""), "warning": result.get("warning")}
     except social.CredentialAuthError as e:
-        if e.uuid:
-            await mark_needs_reauth(e.uuid)
+        # Flag the credential so Settings shows a Reconnect button. Prefer the
+        # UUID the error carried, but fall back to the credential we already
+        # resolved above: telling the user to reconnect while leaving
+        # needs_reauth unset would surface the prompt with no button to act on.
+        uuid_to_flag = e.uuid or (cred.get("uuid") if cred else None)
+        if uuid_to_flag:
+            await mark_needs_reauth(uuid_to_flag)
         async with write_transaction() as db:
             await db.execute(
                 "UPDATE social_posts SET status = 'failed', error = ?, "
@@ -1237,8 +1242,14 @@ async def send_all_posts(
                 },
             )
         except social.CredentialAuthError as e:
-            if e.uuid:
-                await mark_needs_reauth(e.uuid)
+            # See send_post: flag the resolved credential when the error
+            # didn't carry a UUID, so the Reconnect button actually appears.
+            uuid_to_flag = e.uuid
+            if not uuid_to_flag:
+                cred = await _credential_for_post(post)
+                uuid_to_flag = cred.get("uuid") if cred else None
+            if uuid_to_flag:
+                await mark_needs_reauth(uuid_to_flag)
             async with write_transaction() as db:
                 await db.execute(
                     "UPDATE social_posts SET status = 'failed', error = ?, "
