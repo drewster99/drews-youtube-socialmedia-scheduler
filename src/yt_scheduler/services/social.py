@@ -296,6 +296,49 @@ def _http_error_detail(resp: httpx.Response) -> str:
     return f"HTTP {resp.status_code}: {json.dumps(data)[:500]}"
 
 
+def _exception_host(exc: BaseException) -> str | None:
+    """Host the failing request targeted, or None.
+
+    ``httpx.HTTPError.request`` *raises* RuntimeError when the exception was
+    constructed without one, so it can never be read bare inside an error path.
+    """
+    try:
+        return exc.request.url.host  # type: ignore[attr-defined]
+    except (AttributeError, RuntimeError):
+        return None
+
+
+def _exception_detail(exc: BaseException) -> str:
+    """Describe ``exc`` for a user who has to decide what to do next.
+
+    ``f"...failed: {exc}"`` is not enough: several exceptions the posting paths
+    actually raise stringify to the empty string — ``httpx.ConnectError``,
+    ``httpx.ReadTimeout`` and ``httpx.HTTPStatusError`` among them — which
+    produced stored errors like ``"Threads post failed: "`` with no detail at
+    all. Always return something the user can act on.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return _http_error_detail(exc.response)
+
+    # TimeoutException is a subclass of TransportError, so it must be tested first.
+    if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        target = _exception_host(exc) or "the provider"
+        verb = "timed out contacting" if isinstance(exc, httpx.TimeoutException) else "could not reach"
+        text = str(exc).strip()
+        return (
+            f"{type(exc).__name__}: {verb} {target}"
+            + (f" ({text})" if text else "")
+            + ". Check your network connection, then use Send to retry."
+        )
+
+    text = str(exc).strip()
+    if text:
+        return f"{type(exc).__name__}: {text}"
+    # No message at all — the type name is the only signal left. Better a bare
+    # class name than a bare colon.
+    return f"{type(exc).__name__} (no further detail; see the server log)"
+
+
 class SocialPoster:
     """Base class for social media platform posters.
 
@@ -645,7 +688,7 @@ class TwitterPoster(SocialPoster):
         except (CredentialAuthError, MediaUploadError):
             raise
         except Exception as e:
-            raise RuntimeError(f"Twitter post failed: {e}") from e
+            raise RuntimeError(f"Twitter post failed: {_exception_detail(e)}") from e
 
 
 # Trailing chars we always peel off the end of a URL — common sentence
@@ -1253,7 +1296,7 @@ class MastodonPoster(SocialPoster):
         except CredentialAuthError:
             raise
         except Exception as e:
-            raise RuntimeError(f"Mastodon post failed: {e}") from e
+            raise RuntimeError(f"Mastodon post failed: {_exception_detail(e)}") from e
 
 
 class LinkedInPoster(SocialPoster):
@@ -1379,7 +1422,7 @@ class LinkedInPoster(SocialPoster):
         except (CredentialAuthError, MediaUploadError):
             raise
         except Exception as e:
-            raise RuntimeError(f"LinkedIn post failed: {e}") from e
+            raise RuntimeError(f"LinkedIn post failed: {_exception_detail(e)}") from e
 
     @staticmethod
     async def _linkedin_upload_asset(
@@ -1543,7 +1586,7 @@ class ThreadsPoster(SocialPoster):
         except (CredentialAuthError, MediaUploadError):
             raise
         except Exception as e:
-            raise RuntimeError(f"Threads post failed: {e}") from e
+            raise RuntimeError(f"Threads post failed: {_exception_detail(e)}") from e
 
     _CONTAINER_POLL_ATTEMPTS = 10
     _CONTAINER_POLL_DELAY_SECONDS = 1.0
