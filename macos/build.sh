@@ -359,6 +359,21 @@ echo "=== Step 4: Installing dependencies + package ==="
 "$EMBED_PYTHON" -m pip install --quiet --no-warn-script-location \
     -r "$PROJECT_DIR/requirements-app.txt"
 
+# setuptools builds in-tree and REUSES $PROJECT_DIR/build/lib between runs (pip's
+# isolation covers build *dependencies*, not the build directory). A module
+# deleted from src/ therefore keeps getting reinstalled from that stale tree —
+# services/ngrok.py shipped for two months after it was removed. The .app is
+# rebuilt from scratch, so make the package build be too.
+#
+# Note this is NOT $BUILD_DIR (macos/build, the .app output); it's the
+# setuptools scratch tree at the repo root. Assert that before removing it.
+STALE_PACKAGE_BUILD="$PROJECT_DIR/build"
+if [ "$STALE_PACKAGE_BUILD" = "$BUILD_DIR" ] || [ "$STALE_PACKAGE_BUILD" = "$PROJECT_DIR" ]; then
+    echo "ERROR: refusing to remove '$STALE_PACKAGE_BUILD' — that is not the setuptools tree"
+    exit 1
+fi
+rm -rf "$STALE_PACKAGE_BUILD"
+
 # Install the package itself (no deps — we already pinned them above).
 "$EMBED_PYTHON" -m pip install --quiet --no-deps --no-warn-script-location \
     "$PROJECT_DIR"
