@@ -11,12 +11,12 @@ duplicate the YouTube video, the exact failure we were fixing.
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 
 import aiosqlite
 import pytest
 
-import yt_scheduler.database as database
 from yt_scheduler.migrations import apply_migrations
 
 
@@ -59,8 +59,16 @@ async def _insert_pending(conn: aiosqlite.Connection, **overrides) -> None:
 @pytest.fixture
 def wired(monkeypatch, tmp_path):
     """auto_actions wired to a fresh migrated DB and a spawn-recorder that does
-    NOT run the chain (we only assert the resumer's branching)."""
-    from yt_scheduler.services import auto_actions as aa
+    NOT run the chain (we only assert the resumer's branching).
+
+    Both modules are resolved here rather than imported at module scope: other
+    test files purge ``yt_scheduler.*`` from sys.modules, so a reference captured
+    at import time can point at a dead module object while ``auto_actions``
+    talks to a freshly imported one — patching the dead one's ``_db`` then has
+    no effect and the resumer silently reads the wrong database.
+    """
+    aa = importlib.import_module("yt_scheduler.services.auto_actions")
+    database = importlib.import_module("yt_scheduler.database")
 
     aa._UPLOAD_JOBS.clear()
     spawned: list[str] = []
@@ -70,7 +78,7 @@ def wired(monkeypatch, tmp_path):
         spawned.append(name)
 
     monkeypatch.setattr(aa, "spawn_background", _stub_spawn)
-    return aa, spawned
+    return aa, spawned, database
 
 
 async def _status(conn: aiosqlite.Connection, job_id: str) -> str:
@@ -81,7 +89,7 @@ async def _status(conn: aiosqlite.Connection, job_id: str) -> str:
 
 
 async def test_uploaded_but_uninserted_is_not_re_uploaded(wired, tmp_path, monkeypatch):
-    aa, spawned = wired
+    aa, spawned, database = wired
     conn = await _make_conn(tmp_path)
 
     # Make the migrated temp connection the module singleton so BOTH the
@@ -100,7 +108,7 @@ async def test_uploaded_but_uninserted_is_not_re_uploaded(wired, tmp_path, monke
 
 
 async def test_clean_pending_job_is_respawned(wired, tmp_path, monkeypatch):
-    aa, spawned = wired
+    aa, spawned, database = wired
     conn = await _make_conn(tmp_path)
 
     # Make the migrated temp connection the module singleton so BOTH the
@@ -124,7 +132,7 @@ async def test_clean_pending_job_is_respawned(wired, tmp_path, monkeypatch):
 
 
 async def test_missing_cut_file_and_no_recut_params_is_failed(wired, tmp_path, monkeypatch):
-    aa, spawned = wired
+    aa, spawned, database = wired
     conn = await _make_conn(tmp_path)
 
     # Make the migrated temp connection the module singleton so BOTH the
