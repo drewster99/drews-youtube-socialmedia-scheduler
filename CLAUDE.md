@@ -6,6 +6,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 These are hard rules from repeated, explicit user feedback. Follow them every session.
 
+> ### ⚠️ NOTHING YOU EDIT TAKES EFFECT UNTIL THE MAC APP IS REBUILT AND RELAUNCHED
+>
+> Editing `src/` changes **nothing** that is running. The server executes a *copy* of the
+> package installed inside the app bundle:
+>
+> ```
+> …/macos/build/Drew's Video + Socials Scheduler.app/Contents/Resources/python/
+>     bin/python3.12                                  ← the interpreter that runs
+>     lib/python3.12/site-packages/yt_scheduler/      ← the code that runs
+> ```
+>
+> **NOT** `src/yt_scheduler/`. There is no auto-reload, no editable install, no symlink.
+> Templates, JS, routers, services, migrations — all of it is the bundled copy.
+>
+> To make a change real: `macos/build.sh --debug`, then quit and relaunch the app.
+> Until then `/api/build` reports the old `build_number`, the browser serves the old
+> HTML/JS, and any behaviour you "verify" against `:8008` is the *previous* build.
+>
+> Corollary: never conclude a fix works by poking the running server after only editing
+> source. Either rebuild first, or verify with `pytest` — which *does* import `src/`.
+
 **A. NEVER run the app or server. DO run the tests.** Never run `yt-scheduler` or the server — unsigned code hits the real macOS Keychain and fires password prompts that disrupt the user mid-work. The user runs the app; you do not.
 
 `pytest` is yours to run (the user does not run it). The full suite is safe to run, including while the menubar app is up: `tests/conftest.py` installs a session-wide guard that wraps `aiosqlite.connect` and `sqlite3.connect` and raises `ProductionDatabaseAccess` on any path inside the real data dir. `config.DATA_DIR`/`DB_PATH` still freeze at import time, so a test that reaches `yt_scheduler.database` without first pointing `DYS_DATA_DIR` at a tmp dir *would* target the real `publisher.db` — the guard is what stops it, not each test's own care. Use the `isolated_db` / `isolated_data_dir` fixtures for new tests. Never delete or write the user's DB.
@@ -17,7 +38,7 @@ Two footguns the guard does not cover:
 
 (Historical note: this rule used to claim five named tests "hang because they open the production DB and block on the SQLite write lock." That was a misdiagnosis — they isolate correctly and pass; they hung on the leaked-connection thread above.)
 
-Static checks are still the cheap first pass, not a substitute: `ruff check`, `python -m py_compile`, `node --check`, Jinja2 `get_template` parse, grep. (`ffmpeg`/`sqlite3` against scratch data is fine.) Note: a running server on `:8008` is the bundled macOS app's Python and won't reflect source edits until the user rebuilds.
+Static checks are still the cheap first pass, not a substitute: `ruff check`, `python -m py_compile`, `node --check`, Jinja2 `get_template` parse, grep. (`ffmpeg`/`sqlite3` against scratch data is fine.) `pytest` imports `src/` directly, so it is the only way to exercise an edit without rebuilding — see the callout above.
 
 **B. No fallbacks, no silent defaults.** If a value the current code always populates is missing, raise and name it — never `x.get(k, default)` / `|| default` / a default model/codec/etc. "for convenience". A wrong default is worse than a loud error. Legitimate back-compat fallbacks (e.g. a column that is NULL only on pre-migration rows) are fine — say so in a comment.
 
