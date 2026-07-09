@@ -261,8 +261,12 @@ function renderMatrix() {
         </tr>
     `).join('');
 
-    const backendOpts = ['', 'mlx-whisper', 'whisper.cpp', 'macos-speech'];
-    const backendLabel = b => b === '' ? 'Default' : b;
+    // '' means "let the server auto-detect", which resolves to Apple Speech.
+    // Name it, so the resolved backend is never a hidden default. mlx-whisper is
+    // reachable only by picking it here (or on the video detail page) — it is
+    // never auto-selected, because it retains multi-GB of GPU memory.
+    const backendOpts = ['', 'macos-speech', 'whisper.cpp', 'mlx-whisper'];
+    const backendLabel = b => b === '' ? 'Default (Apple Speech)' : b;
     const renderBackend = col => `
         <select data-col="${col}" data-key="auto_transcribe_backend">
             ${backendOpts.map(b => `<option value="${b}" ${(autoActions[col].auto_transcribe_backend || '') === b ? 'selected' : ''}>${backendLabel(b)}</option>`).join('')}

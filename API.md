@@ -728,7 +728,11 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 { "model": "large-v3", "language": "en", "backend": "mlx-whisper" }
 ```
 
-`model` defaults to `large-v3` only when a bare API call omits it (the UI always sends an explicit model from its dropdown). `language` is auto-detected when omitted. `backend` forces a specific backend (`mlx-whisper`, `whisper.cpp`, `macos-speech`); otherwise the service picks the best available. The response echoes the resolved `model` so the choice is never invisible.
+`model` has **no default**. `language` is auto-detected when omitted.
+
+`backend` forces a specific backend (`mlx-whisper`, `whisper.cpp`, `macos-speech`). Omit it and the service auto-detects in the order `macos-speech` → `whisper.cpp`. **`mlx-whisper` is never auto-selected** — it loads multi-gigabyte weights and a Metal allocator into the long-lived server process, so it runs only when named explicitly here or chosen in the UI.
+
+Returns **400** when `backend` is unknown, or when a Whisper backend (`mlx-whisper`, `whisper.cpp`) is named without a `model`. A bare call with neither field resolves to `macos-speech`, which takes no model. The response echoes the resolved `model` (`null` for `macos-speech`) so the choice is never invisible.
 
 **Response 200**:
 

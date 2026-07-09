@@ -950,11 +950,11 @@ async def transcribe_video(
         # and stalling concurrent requests; that was the source of the
         # "Network error: Load failed" the client saw on a long
         # first-run download.
-        # Surface the resolved model in the response (and below) so the choice —
-        # including the heavyweight default when a caller omits it — is never
-        # invisible. The frontend always sends an explicit model from its
-        # dropdown; this default only applies to a bare API call.
-        resolved_model = opts.get("model") or "large-v3"
+        # No model default here. A bare API call that omits both `model` and
+        # `backend` auto-resolves to Apple SpeechAnalyzer, which takes no model;
+        # naming a Whisper backend without a model is a 400 from transcribe().
+        # The frontend always sends both from its dropdowns.
+        resolved_model = opts.get("model")
         result = await asyncio.to_thread(
             transcription.transcribe,
             video_path=video_file,
@@ -962,7 +962,10 @@ async def transcribe_video(
             language=opts.get("language"),
             backend=opts.get("backend"),
         )
-    except RuntimeError as e:
+    except (RuntimeError, ValueError) as e:
+        # ValueError = bad request shape (unknown backend, Whisper without a
+        # model); RuntimeError = the backend itself failed. Both are the caller's
+        # to see verbatim rather than a bare 500.
         raise HTTPException(400, str(e))
 
     # Save transcript, SRT, and JSON with word-level timestamps
@@ -1013,10 +1016,19 @@ async def transcribe_video(
             {"transcript": {"old": old_transcript, "new": canonical_transcript}},
         )
 
+    # The UI's model dropdown always posts a value, even when the chosen backend
+    # is macos-speech (which uses Apple's own model and ignores it). Echo the
+    # model the resolved backend actually ran, never the caller's unused pick.
+    used_model = (
+        resolved_model
+        if result.backend in transcription.WHISPER_MODEL_BACKENDS
+        else None
+    )
+
     return {
         "status": "ok",
         "backend": result.backend,
-        "model": resolved_model,
+        "model": used_model,
         "language": result.language,
         "segments": len(result.segments),
         "word_count": len(result.all_words),

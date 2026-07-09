@@ -282,10 +282,13 @@ async def _maybe_transcribe(
         return
     try:
         from yt_scheduler.services import transcription
+        # Both may be None: that means "no backend configured for this column",
+        # which transcribe() resolves to Apple SpeechAnalyzer. Substituting a
+        # model here would silently re-enable the 3 GB large-v3 MLX path.
         result = await asyncio.to_thread(
             transcription.transcribe,
             video_path=video_file_path,
-            model=model or "large-v3",
+            model=model,
             backend=backend,
         )
     except Exception as exc:

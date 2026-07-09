@@ -6,7 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 These are hard rules from repeated, explicit user feedback. Follow them every session.
 
-**A. NEVER run the app, server, tests, or any project Python.** Do not run `yt-scheduler`, the server, `pytest` (whole suite or a single file), `.venv/bin/python -m yt_scheduler...`, or any one-off script that imports `yt_scheduler`. Running unsigned code hits the real macOS Keychain and fires password prompts that disrupt the user mid-work. The user runs the app and tests; you do not — not "to verify", not "just one file", not ever. Verify instead at the static level: read the code and trace the logic, `ruff check`, `python -m py_compile`, `node --check`, Jinja2 `get_template` parse, and grep the source. (`ffmpeg`/`sqlite3` against scratch data is fine ONLY if it does not import `yt_scheduler`.) When verification truly requires execution, hand it to the user. Note: a running server on `:8008` is the bundled macOS app's Python and won't reflect source edits until the user rebuilds.
+**A. NEVER run the app or server. DO run the tests.** Never run `yt-scheduler` or the server — unsigned code hits the real macOS Keychain and fires password prompts that disrupt the user mid-work. The user runs the app; you do not.
+
+`pytest` is yours to run (the user does not run it), but **only on the specific test files your change touches** — never a bulk sweep. `config.DATA_DIR`/`DB_PATH` freeze at import time to the real `publisher.db`, so any test that reaches `yt_scheduler.database` (directly, transitively, or via `TestClient`) opens the **production database** read/write. With the menubar app running (`pgrep -f yt_scheduler.main`) those tests block on the SQLite write lock and hang. Grepping for `TestClient` does NOT identify them — `test_fk_pragma_persists`, `test_imported_video_url`, `test_parent_variables`, `test_projects_service`, and `test_video_file_download_state` hang without it. Never run the full suite while the app is running; ask first. Never delete or write the user's DB.
+
+Static checks are still the cheap first pass, not a substitute: `ruff check`, `python -m py_compile`, `node --check`, Jinja2 `get_template` parse, grep. (`ffmpeg`/`sqlite3` against scratch data is fine.) Note: a running server on `:8008` is the bundled macOS app's Python and won't reflect source edits until the user rebuilds.
 
 **B. No fallbacks, no silent defaults.** If a value the current code always populates is missing, raise and name it — never `x.get(k, default)` / `|| default` / a default model/codec/etc. "for convenience". A wrong default is worse than a loud error. Legitimate back-compat fallbacks (e.g. a column that is NULL only on pre-migration rows) are fine — say so in a comment.
 
@@ -131,7 +135,7 @@ Business logic layer, each service wraps one concern:
 - **`auth.py`** — YouTube OAuth flow + credential storage (Keychain on macOS, encrypted JSON fallback)
 - **`scheduler.py`** — APScheduler background jobs (scheduled publish, caption polling, comment moderation)
 - **`moderation.py`** — Comment filtering against blocklist (supports plain text and regex)
-- **`transcription.py`** — On-device transcription with multiple backends (MLX Whisper, whisper.cpp, macOS SFSpeechRecognizer)
+- **`transcription.py`** — On-device transcription. Auto-detect order is Apple SpeechAnalyzer (`macos-speech`) → `whisper.cpp`. **MLX Whisper is opt-in only** — never auto-selected, because MLX never returns freed Metal buffers to the OS (a 12-clip batch once left 30 GB resident on an idle server). When it is chosen, the buffer cache is capped, trimmed after every run, and the cached model weights are dropped after an idle timeout. There is no default `model`: naming a Whisper backend without one is an error, not a silent `large-v3`.
 - **`media.py`** — FFmpeg clip/GIF extraction; ffprobe-based video probing; hardware-encoder (videotoolbox) detection; browser-codec allowlist + source-quality warnings; 9:16 vertical crop filter
 - **`clipper.py`** — Generate-from-source: per-kind Claude tool_use calls proposing clip ranges from a parent's SRT transcript, optional Claude-vision pass refining crop position, ffmpeg cut execution gated by separate hardware (4) and software (8) semaphores
 - **`keychain.py`** — macOS Keychain wrapper via `security` CLI

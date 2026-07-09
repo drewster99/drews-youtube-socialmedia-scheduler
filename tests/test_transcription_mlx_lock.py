@@ -49,6 +49,12 @@ def test_mlx_whisper_inference_is_serialized(monkeypatch, tmp_path: Path) -> Non
     # probes so the lock path is exercised on any machine (incl. CI).
     monkeypatch.setattr(transcription.platform, "machine", lambda: "arm64")
     monkeypatch.setattr(transcription.platform, "system", lambda: "Darwin")
+    # Stub the MLX memory hooks: with mlx installed they would spin up a real
+    # Metal allocator, and the idle timer would outlive this test. Their own
+    # behaviour is covered in test_transcription_backend_selection.py.
+    monkeypatch.setattr(transcription, "_mlx_cap_buffer_cache", lambda: None)
+    monkeypatch.setattr(transcription, "_mlx_trim_buffer_cache", lambda: None)
+    monkeypatch.setattr(transcription, "_arm_mlx_idle_release", lambda: None)
 
     audio_path = tmp_path / "audio.wav"  # never opened — the fake ignores it
     results: list[object] = []

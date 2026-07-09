@@ -1,15 +1,21 @@
 """On-device video transcription.
 
-Attempts backends in order of preference:
-1. MLX Whisper — fastest on Apple Silicon Macs
+Auto-detect attempts backends in order of preference:
+1. Apple SpeechAnalyzer — on-device, word-level timing, nothing to download
 2. whisper.cpp (CLI) — if installed as a system binary
-3. macOS SFSpeechRecognizer — built-in, no downloads needed
+
+MLX Whisper is never auto-selected. It pulls multi-gigabyte weights and a Metal
+allocator into this long-lived server process and does not give that memory back
+(see ``_release_mlx_memory``), so it runs only when a user asks for it by name —
+the Transcribe control on the video detail page, or a project's auto-action
+transcribe-backend setting.
 
 Produces both plain text transcripts and SRT subtitle files.
 """
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import math
@@ -200,6 +206,100 @@ def _extract_audio(video_path: Path) -> Path:
 # anyway, so serializing costs little wall-clock versus crashing.
 _mlx_whisper_inference_lock = threading.Lock()
 
+# MLX never returns freed GPU buffers to the OS. Released arrays go into an
+# internal buffer cache whose default ceiling is derived from the device's
+# recommended max working-set size — tens of gigabytes on a big Mac — and the
+# buffers are nonvolatile, so the kernel cannot reclaim them under pressure
+# either. On top of that, ``mlx_whisper.transcribe`` parks the loaded model in a
+# class attribute (``ModelHolder.model``) that lives for the life of the process.
+#
+# In a batch script nobody notices; the process exits. In this server it meant a
+# 12-clip promo batch on 2026-06-29 left 30.3 GB of Metal buffers resident, still
+# held ten days later with the process otherwise idle. So: cap the cache, hand it
+# back after every run, and drop the model weights once the batch goes quiet.
+_MLX_CACHE_LIMIT_BYTES = 1 << 30
+
+# Long enough that the per-clip transcriptions of one promo batch keep the model
+# hot (reloading ~3 GB of weights between clips would dominate the run), short
+# enough that an idle server doesn't hold them overnight.
+_MLX_IDLE_RELEASE_SECONDS = 120.0
+
+_mlx_cache_limit_applied = False
+_mlx_release_timer: threading.Timer | None = None
+_mlx_release_timer_lock = threading.Lock()
+
+
+def _mlx_cap_buffer_cache() -> None:
+    """Bound MLX's freed-buffer cache so it can't grow to the device ceiling."""
+    global _mlx_cache_limit_applied
+    if _mlx_cache_limit_applied:
+        return
+    # Set the flag first: a failure here is worth one warning, not one per run.
+    _mlx_cache_limit_applied = True
+    try:
+        import mlx.core as mx
+
+        mx.set_cache_limit(_MLX_CACHE_LIMIT_BYTES)
+    except Exception as exc:
+        logger.warning("Could not cap the MLX buffer cache: %s", exc)
+
+
+def _mlx_trim_buffer_cache() -> None:
+    """Return MLX's freed-buffer cache to the OS. Never raises."""
+    try:
+        import mlx.core as mx
+
+        freed = mx.get_cache_memory()
+        mx.clear_cache()
+        logger.info(
+            "MLX buffer cache trimmed: %.0f MB returned, %.0f MB still live",
+            freed / 1e6, mx.get_active_memory() / 1e6,
+        )
+    except Exception as exc:
+        logger.warning("Could not trim the MLX buffer cache: %s", exc)
+
+
+def _release_mlx_memory() -> None:
+    """Drop mlx-whisper's cached model weights and free MLX's buffer cache.
+
+    Fired by an idle timer that each run re-arms. If inference is running we skip
+    rather than block — that run's own ``finally`` re-arms the timer, so the
+    release just happens later instead of tearing weights out from under it.
+    """
+    if not _mlx_whisper_inference_lock.acquire(blocking=False):
+        return
+    try:
+        import mlx.core as mx
+        import mlx_whisper.transcribe as mlx_transcribe
+
+        holder = mlx_transcribe.ModelHolder
+        dropped = holder.model is not None
+        holder.model = None
+        holder.model_path = None
+        gc.collect()  # the model's array graph has cycles; refcounts alone won't do it
+        mx.clear_cache()
+        logger.info(
+            "MLX idle release (weights dropped: %s): %.0f MB live, %.0f MB cached",
+            dropped, mx.get_active_memory() / 1e6, mx.get_cache_memory() / 1e6,
+        )
+    except Exception as exc:
+        logger.warning("MLX idle release failed: %s", exc)
+    finally:
+        _mlx_whisper_inference_lock.release()
+
+
+def _arm_mlx_idle_release() -> None:
+    """(Re)start the idle countdown that frees MLX's model and buffer cache."""
+    global _mlx_release_timer
+    with _mlx_release_timer_lock:
+        if _mlx_release_timer is not None:
+            _mlx_release_timer.cancel()
+        timer = threading.Timer(_MLX_IDLE_RELEASE_SECONDS, _release_mlx_memory)
+        timer.name = "mlx-idle-release"
+        timer.daemon = True  # must never hold up server shutdown
+        timer.start()
+        _mlx_release_timer = timer
+
 
 def _try_mlx_whisper(audio_path: Path, model: str, language: str | None) -> TranscriptionResult | None:
     """Transcribe using mlx-whisper (Apple Silicon only)."""
@@ -220,8 +320,16 @@ def _try_mlx_whisper(audio_path: Path, model: str, language: str | None) -> Tran
     if language:
         kwargs["language"] = language
 
-    with _mlx_whisper_inference_lock:
-        result = mlx_whisper.transcribe(str(audio_path), **kwargs)
+    try:
+        with _mlx_whisper_inference_lock:
+            _mlx_cap_buffer_cache()
+            try:
+                result = mlx_whisper.transcribe(str(audio_path), **kwargs)
+            finally:
+                _mlx_trim_buffer_cache()
+    finally:
+        # Armed even when inference raised — a failed run leaves buffers behind too.
+        _arm_mlx_idle_release()
 
     segments = []
     has_words = False
@@ -725,14 +833,21 @@ def _try_macos_speech(
 
 # --- Public API ---
 
-# Whisper model sizes: tiny, base, small, medium, large-v3
-# Recommended: "large-v3" for best quality, "medium" for speed/quality balance
-DEFAULT_MODEL = "large-v3"
+# Backends that need an explicit Whisper model size. ``macos-speech`` uses
+# Apple's own model and takes no size.
+WHISPER_MODEL_BACKENDS = ("mlx-whisper", "whisper.cpp")
+
+# Auto-detect order. ``mlx-whisper`` is deliberately absent: it is opt-in only
+# (see the module docstring). Apple's SpeechAnalyzer is on-device, gives
+# word-level timing, runs ~70x faster than realtime and downloads nothing.
+_AUTO_BACKEND_ORDER = ("macos-speech", "whisper.cpp")
+
+_ALL_BACKENDS = ("mlx-whisper", "whisper.cpp", "macos-speech")
 
 
 def transcribe(
     video_path: str | Path,
-    model: str = DEFAULT_MODEL,
+    model: str | None = None,
     language: str | None = None,
     backend: str | None = None,
     progress_callback: Callable[[float, float], None] | None = None,
@@ -741,17 +856,34 @@ def transcribe(
 
     Args:
         video_path: Path to the video file
-        model: Whisper model size (tiny, base, small, medium, large-v3)
+        model: Whisper model size (tiny, base, small, medium, large-v3). Required
+                 by the Whisper backends; ignored by ``macos-speech``. There is no
+                 default — an unspecified model must never silently mean the 3 GB
+                 ``large-v3``.
         language: Language code (e.g., "en"). None for auto-detect.
         backend: Force a specific backend. None for auto-detect order:
-                 mlx-whisper → whisper.cpp → macos-speech
+                 macos-speech → whisper.cpp. ``mlx-whisper`` runs only when named
+                 here explicitly.
         progress_callback: Optional ``(finalized_seconds, total_seconds)`` hook
                  for live progress. Only the ``macos-speech`` backend reports it;
                  the Whisper backends ignore it.
 
     Returns:
         TranscriptionResult with segments, timestamps, and text.
+
+    Raises:
+        ValueError: unknown ``backend``, or a Whisper backend named without a ``model``.
+        RuntimeError: the chosen backend failed, or auto-detect found none usable.
     """
+    if backend and backend not in _ALL_BACKENDS:
+        raise ValueError(
+            f"Unknown backend: {backend}. Available: {', '.join(_ALL_BACKENDS)}"
+        )
+    if backend in WHISPER_MODEL_BACKENDS and not model:
+        raise ValueError(
+            f"Backend {backend} requires an explicit model "
+            "(tiny, base, small, medium, large-v3)."
+        )
     video_path = Path(video_path)
     if not video_path.exists():
         raise FileNotFoundError(f"Video not found: {video_path}")
@@ -763,57 +895,54 @@ def transcribe(
     audio_path = _extract_audio(video_path)
 
     try:
-        # Try backends in order.
-        #
-        # ``macos-speech`` now uses the macOS 26 ``SpeechAnalyzer`` API, which
-        # (unlike the old ``SFSpeechURLRecognitionRequest``) transcribes
-        # long-form audio in one pass with per-word timing and runs ~70× faster
-        # than realtime. It sits last in the auto-fallback order so the more
-        # accurate Whisper backends are preferred when present, but it can also
-        # be selected explicitly via ``backend="macos-speech"``.
-        backends = [
-            ("mlx-whisper", lambda: _try_mlx_whisper(audio_path, model, language)),
-            ("whisper.cpp", lambda: _try_whisper_cpp(audio_path, model, language)),
-            ("macos-speech", lambda: _try_macos_speech(audio_path, language, progress_callback)),
-        ]
+        # ``macos-speech`` uses the macOS 26 ``SpeechAnalyzer`` API, which (unlike
+        # the old ``SFSpeechURLRecognitionRequest``) transcribes long-form audio in
+        # one pass with per-word timing. It leads the auto order: quality is on par
+        # with large-v3 on this content, it is far faster, and it leaves no
+        # multi-gigabyte residue in the server process.
+        runners = {
+            "mlx-whisper": lambda: _try_mlx_whisper(audio_path, model, language),
+            "whisper.cpp": lambda: _try_whisper_cpp(audio_path, model, language),
+            "macos-speech": lambda: _try_macos_speech(audio_path, language, progress_callback),
+        }
 
         if backend:
             # User explicitly picked a backend — surface its specific failure
             # rather than auto-falling-back (which would hide the real cause).
-            backends = [(n, fn) for n, fn in backends if n == backend]
-            if not backends:
-                raise ValueError(
-                    f"Unknown backend: {backend}. "
-                    "Available: mlx-whisper, whisper.cpp, macos-speech"
-                )
-            name, try_fn = backends[0]
             try:
-                result = try_fn()
+                result = runners[backend]()
             except Exception as e:
                 hint = ""
-                if name == "macos-speech":
+                if backend == "macos-speech":
                     hint = (
                         " — macOS likely killed the helper for privacy. Open "
                         "System Settings → Privacy & Security → Speech "
                         "Recognition and enable access for Drew's Video + "
                         "Socials Scheduler."
                     )
-                raise RuntimeError(f"Backend {name} failed: {e}{hint}") from e
+                raise RuntimeError(f"Backend {backend} failed: {e}{hint}") from e
             if not (result and result.segments):
                 raise RuntimeError(
-                    f"Backend {name} returned no segments — the audio may "
+                    f"Backend {backend} returned no segments — the audio may "
                     "have been empty or unintelligible."
                 )
             logger.info(
                 "Transcription complete (%s): %d segments, %d characters",
-                name, len(result.segments), len(result.text),
+                backend, len(result.segments), len(result.text),
             )
             return result
 
-        # Auto-pick: first backend that succeeds wins; failures are logged.
-        for name, try_fn in backends:
+        # Auto-pick: first backend that succeeds wins; failures are logged. A
+        # Whisper backend without a model is skipped loudly rather than handed a
+        # default — picking one for the user is how large-v3 got in here.
+        skipped: list[str] = []
+        for name in _AUTO_BACKEND_ORDER:
+            if name in WHISPER_MODEL_BACKENDS and not model:
+                skipped.append(name)
+                logger.info("Auto-detect skipping %s: no model specified", name)
+                continue
             try:
-                result = try_fn()
+                result = runners[name]()
                 if result and result.segments:
                     logger.info(
                         f"Transcription complete ({name}): "
@@ -825,11 +954,14 @@ def transcribe(
                 logger.warning(f"Backend {name} failed: {e}")
                 continue
 
+        detail = (
+            f" ({', '.join(skipped)} skipped: no model specified)" if skipped else ""
+        )
         raise RuntimeError(
-            "No transcription backend available. Install one of:\n"
-            "  pip install mlx-whisper      # Apple Silicon Mac (recommended)\n"
-            "  brew install whisper-cpp      # macOS via Homebrew\n"
-            "Or use macOS built-in speech recognition (limited quality)."
+            f"No transcription backend available{detail}. On macOS 26+, Apple "
+            "SpeechAnalyzer needs Speech Recognition permission. Otherwise "
+            "install whisper.cpp (brew install whisper-cpp) and pass a model, or "
+            "choose the MLX Whisper backend explicitly."
         )
     finally:
         audio_path.unlink(missing_ok=True)
