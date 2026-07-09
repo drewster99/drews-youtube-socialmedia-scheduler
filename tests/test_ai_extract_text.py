@@ -18,7 +18,10 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from yt_scheduler.services.ai import ClaudeEmptyResponseError, _extract_text
+from yt_scheduler.services.ai import (  # noqa: E402 — must follow the sys.path bootstrap above
+    ClaudeEmptyResponseError,
+    _extract_text,
+)
 
 
 # ---------------------------------------------------------------------------

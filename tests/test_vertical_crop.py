@@ -88,6 +88,10 @@ def _capture_cmd(monkeypatch, media_module):
 
     def fake_run(cmd, **kw):
         captured.append(cmd)
+        # extract_clip has ffmpeg write a `.cutpart_*` temp (always the last
+        # argv entry) and then os.replace()s it into place, so the recorder has
+        # to leave a file behind or the atomic publish raises FileNotFoundError.
+        Path(cmd[-1]).write_bytes(b"encoded")
         return _R()
 
     monkeypatch.setattr(media_module.subprocess, "run", fake_run)
@@ -303,7 +307,8 @@ def test_extract_clip_stacked_reraises_clipcrop_error_with_stderr_tail(
 
     src = tmp_path / "src.mp4"
     src.write_bytes(b"\x00")
-    with pytest.raises(RuntimeError, match=r"clipcrop exit 1:.*bad range"):
+    # (?s) so `.` spans the newline between the two stderr-tail lines.
+    with pytest.raises(RuntimeError, match=r"(?s)clipcrop exit 1:.*bad range"):
         media.extract_clip_stacked(src, 10.0, 25.0, output_name="o.mp4")
     # No partial/temp left behind.
     assert not list(tmp_path.glob(".cutpart_*"))
