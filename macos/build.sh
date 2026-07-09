@@ -442,12 +442,31 @@ if [ "$SIGN" = true ]; then
 
     # Sign innermost Mach-O files first. ``--identifier`` gives each library
     # a sub-identifier of the bundle so SMAppService's LWCR check is satisfied.
-    find "$APP_BUNDLE" \( -name "*.so" -o -name "*.dylib" \) -print0 | while IFS= read -r -d '' lib; do
-        rel="${lib#$APP_BUNDLE/Contents/}"
-        sub_id="$BUNDLE_ID.$(basename "$lib" | tr -d ' ')"
+    #
+    # Match by CONTENT, not by filename. A `*.so`/`*.dylib` glob misses plain
+    # Mach-O executables that pip drops into `site-packages/<pkg>/bin/` —
+    # torch/bin/{protoc,protoc-3.13.0.0,torch_shm_manager} (via mlx-whisper) and
+    # nodejs_wheel/bin/node (via pytubefix). Unsigned, they fail notarization
+    # with "not signed with a valid Developer ID" + "no secure timestamp" +
+    # "hardened runtime not enabled" (submission a7ca7cdf, 2026-07-09). Any
+    # future dependency shipping a helper binary is now covered automatically
+    # instead of needing another special case like clipcrop's below.
+    #
+    # The explicitly-signed binaries below (python3, python3.12, the launcher,
+    # the Swift target, clipcrop) are re-signed afterwards with --force, so the
+    # identifiers and entitlements they require still win.
+    find "$APP_BUNDLE" -type f \
+        \( -name "*.so" -o -name "*.dylib" -o -perm -u+x \) -print0 |
+    while IFS= read -r -d '' macho; do
+        case "$(file -b "$macho")" in
+            *Mach-O*) ;;
+            *) continue ;;   # shell/python scripts with +x, data files, etc.
+        esac
+        rel="${macho#$APP_BUNDLE/Contents/}"
+        sub_id="$BUNDLE_ID.$(basename "$macho" | tr -d ' ')"
         codesign --force --sign "$DEVELOPER_ID" --options runtime --timestamp \
             --identifier "$sub_id" \
-            "$lib" 2>/dev/null || echo "  warn: could not sign $rel"
+            "$macho" 2>/dev/null || echo "  warn: could not sign $rel"
     done
 
     # The embedded Python interpreter is the SMAppService helper executable.
@@ -483,6 +502,21 @@ if [ "$SIGN" = true ]; then
             --identifier "$BUNDLE_ID.clipcrop" \
             "$SITE_PACKAGES/_bin/clipcrop"
     fi
+
+    # Re-sign the bundled `node` with allow-jit. The sweep above already signed
+    # it, but a plain hardened-runtime signature makes V8 abort at startup
+    # ("Failed to reserve virtual memory for CodeRange"). pytubefix runs node for
+    # botGuard / n-sig on every YouTube download, so this must not silently fail.
+    # pytubefix is a hard dependency — a missing node means a broken bundle.
+    NODE_BIN="$(dirname "$SITE_PACKAGES")/nodejs_wheel/bin/node"
+    if [ ! -f "$NODE_BIN" ]; then
+        echo "ERROR: bundled node not found at $NODE_BIN (pytubefix needs it)"
+        exit 1
+    fi
+    codesign --force --sign "$DEVELOPER_ID" --options runtime --timestamp \
+        --identifier "$BUNDLE_ID.node" \
+        --entitlements "$SCRIPT_DIR/EntitlementsNode.plist" \
+        "$NODE_BIN"
 
     # Outer .app sign — NO --deep. ``--deep`` would recursively re-sign every
     # nested executable with the .app's identifier (overwriting the

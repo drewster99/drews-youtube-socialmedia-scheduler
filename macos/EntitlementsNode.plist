@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Entitlements for the bundled `node` (nodejs-wheel-binaries, pulled in by
+         pytubefix). Notarization requires the hardened runtime, but V8 cannot
+         reserve its CodeRange under it and aborts at startup with
+         "Fatal process out of memory: Failed to reserve virtual memory for
+         CodeRange" (SIGTRAP) before running a single line of JS.
+
+         pytubefix shells out to node for botGuard and the n-signature solver,
+         i.e. every YouTube download — so a node that cannot JIT is a silently
+         broken app, not a cosmetic problem.
+
+         allow-jit alone is sufficient (verified against this exact binary);
+         deliberately NOT granting allow-unsigned-executable-memory, which is
+         strictly weaker protection and turns out to be unnecessary here. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+</dict>
+</plist>
