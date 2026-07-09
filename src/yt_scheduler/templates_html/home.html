@@ -284,8 +284,8 @@ async function loadUpcoming() {
         container.innerHTML = items.map(i => `
             <div class="event-row">
                 <span class="event-when">${fmtWhen(i.publish_at)}</span>
-                <a href="/projects/${i.project_slug}/videos/${i.video_id}">${i.title}</a>
-                <span class="event-project">${i.project_name}</span>
+                <a href="/projects/${i.project_slug}/videos/${i.video_id}">${escapeHtml(i.title)}</a>
+                <span class="event-project">${escapeHtml(i.project_name)}</span>
             </div>
         `).join('');
     } catch (e) {

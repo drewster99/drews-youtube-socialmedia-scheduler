@@ -122,13 +122,13 @@ async def linkedin_start(data: dict):
         "ts": time.time(),
     }
 
-    auth_url = (
-        "https://www.linkedin.com/oauth/v2/authorization"
-        f"?response_type=code&client_id={client_id}"
-        f"&redirect_uri={redirect_uri}"
-        f"&scope={LINKEDIN_SCOPES.replace(' ', '%20')}"
-        f"&state={state}"
-    )
+    auth_url = "https://www.linkedin.com/oauth/v2/authorization?" + urlencode({
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "scope": LINKEDIN_SCOPES,
+        "state": state,
+    })
     return {"auth_url": auth_url, "redirect_uri": redirect_uri}
 
 
@@ -141,7 +141,7 @@ async def linkedin_callback(code: str | None = None, state: str | None = None, e
         return _result_page(False, "Missing code or state in callback URL.")
 
     pending = _pending.pop(state, None)
-    if pending is None:
+    if pending is None or pending.get("platform") != "linkedin":
         return _result_page(False, "Unknown or expired OAuth state. Click Connect with LinkedIn again.")
 
     # Exchange code for access token
@@ -264,14 +264,13 @@ async def threads_start(data: dict):
         "ts": time.time(),
     }
 
-    auth_url = (
-        "https://threads.net/oauth/authorize"
-        f"?client_id={client_id}"
-        f"&redirect_uri={redirect_uri}"
-        f"&scope={THREADS_SCOPES}"
-        "&response_type=code"
-        f"&state={state}"
-    )
+    auth_url = "https://threads.net/oauth/authorize?" + urlencode({
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "scope": THREADS_SCOPES,
+        "response_type": "code",
+        "state": state,
+    })
     return {"auth_url": auth_url, "redirect_uri": redirect_uri}
 
 
@@ -338,7 +337,22 @@ async def threads_callback(code: str | None = None, state: str | None = None, er
         )
         return _result_page(False, f"Long-lived token exchange failed (status {long_resp.status_code}). See server log for details.", platform="threads")
 
-    access_token = long_resp.json().get("access_token") or short_token
+    # No silent fallback to short_token: storing the ~1h token as though it were
+    # the ~60-day one makes the credential expire unexpectedly. The sibling
+    # /threads/token endpoint already treats this exact case as an error.
+    long_data = long_resp.json()
+    access_token = long_data.get("access_token")
+    if not access_token:
+        logger.warning(
+            "Threads long-token exchange returned 200 but no access_token; keys=%s",
+            sorted(long_data.keys()),
+        )
+        return _result_page(
+            False,
+            "Threads long-lived token exchange succeeded but the response had no "
+            "access_token. See server log for details.",
+            platform="threads",
+        )
 
     # Fetch username (we already have user_id from the initial response)
     username = ""
@@ -569,11 +583,16 @@ async def twitter_start(data: dict):
     client_secret = (data.get("client_secret") or "").strip()
     origin = resolve_oauth_origin(data.get("origin") or "")
     project_slug = (data.get("project_slug") or "").strip() or None
+    stored_id, stored_secret = await oauth_clients.get_oauth_client_async("twitter")
     if not client_id:
-        stored_id, stored_secret = await oauth_clients.get_oauth_client_async("twitter")
         client_id = stored_id
-        if not client_secret:
-            client_secret = stored_secret
+    # Pull the saved secret when none was supplied — but only when it belongs to
+    # the app id we're actually using. store_oauth_client writes id+secret as a
+    # matched pair, so pairing a caller-supplied NEW client_id with the OLD app's
+    # secret would fail the exchange in a confusing way. X also supports genuine
+    # public (PKCE-only) apps, so a missing secret is not an error.
+    if not client_secret and client_id and client_id == stored_id:
+        client_secret = stored_secret
     if not client_id:
         raise HTTPException(
             400,
@@ -951,6 +970,11 @@ async def youtube_start(data: dict):
     # collapse that to None and 400; check for key PRESENCE instead.
     pre_create_present = "pre_create" in data and data.get("pre_create") is not None
     pre_create_blob = data.get("pre_create") if pre_create_present else None
+    if pre_create_present and not isinstance(pre_create_blob, dict):
+        # Otherwise the .get() below raises AttributeError as a bare 500.
+        raise HTTPException(
+            400, 'pre_create must be an object (e.g. {} or {"name": "..."}).'
+        )
     if mode_re_auth and pre_create_present:
         raise HTTPException(400, "Provide project_slug OR pre_create, not both")
     if not mode_re_auth and not pre_create_present:

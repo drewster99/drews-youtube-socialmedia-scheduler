@@ -137,14 +137,25 @@ async def publish_video_job(video_id: str) -> dict:
         # Re-check archived under the lock: archiving a clip cancels its publish
         # (see archive_promo), but defend against a race / a stale job so an
         # archived clip can never be flipped public or have its posts sent.
-        if video_row is not None and bool(video_row["archived"]):
+        if video_row is None:
+            # Deleted between scheduling and firing. Fabricating project_id=1 /
+            # item_type='episode' here would hit YouTube for a nonexistent id and
+            # could emit a misleading credential_invalid event.
+            logger.warning(
+                "publish_video_job: video %s no longer exists — aborting job",
+                video_id,
+            )
+            results["skipped_missing_video"] = True
+            return results
+
+        if bool(video_row["archived"]):
             logger.info("publish_video_job: skipping archived video %s", video_id)
             results["skipped_archived"] = True
             return results
 
-        project_id = int(video_row["project_id"]) if video_row else 1
-        item_type = (video_row["item_type"] if video_row else "episode") or "episode"
-        item_url = (video_row["url"] if video_row else "") or ""
+        project_id = int(video_row["project_id"])
+        item_type = video_row["item_type"] or "episode"
+        item_url = video_row["url"] or ""
 
         # Bind the active project so YouTube wrappers below pick the
         # right OAuth credential — without this, a scheduled publish in
@@ -259,13 +270,16 @@ async def publish_video_job(video_id: str) -> dict:
             # an identical content was sent to the same platform+account
             # in the last 30 days we refuse to post it twice. The user
             # can override by manually re-sending with confirm_dup=true.
-            from yt_scheduler.services.social import find_recent_duplicate_post
+            from yt_scheduler.services.social import (
+                decode_media_paths,
+                find_recent_duplicate_post,
+            )
 
             dup = await find_recent_duplicate_post(
                 platform=post["platform"],
                 social_account_id=post.get("social_account_id"),
                 content=post.get("content") or "",
-                media_path=post.get("media_path"),
+                media_paths=decode_media_paths(post),
                 exclude_post_id=post_id,
             )
             if dup is not None:
@@ -350,7 +364,8 @@ async def publish_video_job(video_id: str) -> dict:
                 # 'sending' row can't survive a mid-batch crash.
                 async with write_transaction() as db:
                     await db.execute(
-                        "UPDATE social_posts SET status = 'failed', error = ? WHERE id = ?",
+                        "UPDATE social_posts SET status = 'failed', error = ?, "
+                        "scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
                         (str(e), post_id),
                     )
                 results["social_results"][platform].append(
@@ -418,7 +433,7 @@ async def _send_scheduled_post(post_id: int) -> None:
             async with write_transaction() as db:
                 await db.execute(
                     "UPDATE social_posts SET status = 'failed', error = ?, "
-                    "scheduler_job_id = NULL WHERE id = ?",
+                    "scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
                     (err, post_id),
                 )
             await events.record_event(
@@ -446,19 +461,38 @@ async def _send_scheduled_post(post_id: int) -> None:
     # scheduler must never post identical content twice. Releasing the
     # claim leaves the post in 'approved' so the user can override
     # manually via the route's confirm_dup=true.
-    from yt_scheduler.services.social import find_recent_duplicate_post
+    from yt_scheduler.services.social import (
+        decode_media_paths,
+        find_recent_duplicate_post,
+    )
 
     dup = await find_recent_duplicate_post(
         platform=post["platform"],
         social_account_id=post.get("social_account_id"),
         content=post.get("content") or "",
-        media_path=post.get("media_path"),
+        media_paths=decode_media_paths(post),
         exclude_post_id=post_id,
     )
     if dup is not None:
-        await _release_post_to_approved(post_id)
+        # Terminal, not retried. The duplicate window is anchored to the ORIGINAL
+        # post's posted_at, so an hourly re-schedule would keep matching for up to
+        # 30 days (~720 fires, each writing an event and a warning) and could
+        # never self-heal. The user re-approves and sends with confirm_dup=true if
+        # they genuinely want a repost.
+        posted_when = dup.get("posted_at") or "recently"
+        err = (
+            f"Auto-send skipped: an identical post was already sent to "
+            f"{post['platform']} on {posted_when}. Use Send to override, "
+            "or edit the content."
+        )
+        async with write_transaction() as db:
+            await db.execute(
+                "UPDATE social_posts SET status = 'failed', error = ?, "
+                "scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
+                (err, post_id),
+            )
         logger.warning(
-            "_send_scheduled_post: skipped post %s — duplicate of #%s",
+            "_send_scheduled_post: post %s terminal-skipped — duplicate of #%s",
             post_id, dup.get("id"),
         )
         await events.record_event(
@@ -471,36 +505,6 @@ async def _send_scheduled_post(post_id: int) -> None:
                 "previous_post_url": dup.get("post_url"),
             },
         )
-        # The DateTrigger that fired is now gone. Re-register a fresh job
-        # one hour from now so the duplicate window can expire and the post
-        # can self-heal without requiring a server restart. Without this the
-        # post would sit 'approved' with a stale scheduler_job_id and no
-        # live trigger until the next restart (or the user manually retimes it).
-        retry_at = datetime.now(timezone.utc) + timedelta(hours=1)
-        try:
-            await schedule_social_post(post_id, retry_at)
-            logger.info(
-                "_send_scheduled_post: re-scheduled duplicate post %s for %s",
-                post_id, retry_at.isoformat(),
-            )
-        except Exception as reschedule_exc:
-            # Non-fatal: restore_scheduled_posts will re-create the job on
-            # the next restart. Null the stale id so the state is at least
-            # self-consistent for restore to pick up.
-            logger.error(
-                "_send_scheduled_post: could not re-schedule post %s after "
-                "duplicate guard — clearing stale job id: %s",
-                post_id, reschedule_exc,
-            )
-            # Set scheduled_at to the FUTURE retry time so restore re-creates a
-            # future-dated job (the `when > now` branch) instead of treating it
-            # as a missed window and firing it immediately on next startup.
-            async with write_transaction() as db:
-                await db.execute(
-                    "UPDATE social_posts SET scheduler_job_id = NULL, scheduled_at = ? "
-                    "WHERE id = ?",
-                    (retry_at.isoformat(), post_id),
-                )
         return
 
     try:
@@ -534,19 +538,23 @@ async def _send_scheduled_post(post_id: int) -> None:
             else:
                 poster = get_poster(post["platform"])
     except ValueError as exc:
+        # Recoverable, matching publish_video_job: the user can reconnect the
+        # account and re-send. The spent DateTrigger is cleared so a restart
+        # doesn't re-register a dead job for it.
         async with write_transaction() as db:
             await db.execute(
-                "UPDATE social_posts SET status = 'failed', error = ?, "
-                "scheduler_job_id = NULL WHERE id = ?",
+                "UPDATE social_posts SET status = 'approved', error = ?, "
+                "scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
                 (f"credential resolution failed: {exc}", post_id),
             )
         return
 
     if not await poster.is_configured():
+        # Also recoverable — configuring the platform is a user action away.
         async with write_transaction() as db:
             await db.execute(
-                "UPDATE social_posts SET status = 'failed', error = ?, "
-                "scheduler_job_id = NULL WHERE id = ?",
+                "UPDATE social_posts SET status = 'approved', error = ?, "
+                "scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
                 (f"{post['platform']} not configured", post_id),
             )
         return
@@ -605,7 +613,7 @@ async def _send_scheduled_post(post_id: int) -> None:
         async with write_transaction() as db:
             await db.execute(
                 "UPDATE social_posts SET status = 'failed', error = ?, "
-                "scheduler_job_id = NULL WHERE id = ?",
+                "scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
                 (str(exc), post_id),
             )
 
@@ -1263,6 +1271,7 @@ async def check_captions_job() -> None:
                                 transcript_created_at = COALESCE(transcript_created_at, datetime('now')),
                                 transcript_updated_at = datetime('now'),
                                 status = 'captioned',
+                                youtube_transcript_state = 'fetched',
                                 updated_at = datetime('now')
                             WHERE id = ?""",
                             (caption_text, transcript_id, video_id),

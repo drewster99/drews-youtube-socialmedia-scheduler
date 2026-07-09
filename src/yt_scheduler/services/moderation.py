@@ -11,6 +11,12 @@ from yt_scheduler.services import youtube
 
 logger = logging.getLogger(__name__)
 
+# A 'pending' moderation_log row older than this can only come from a run that
+# died between claiming a comment and recording the outcome — no live YouTube
+# call takes anywhere near this long. Comfortably shorter than the 30-minute
+# default sweep interval, so a stranded comment is retried on the next tick.
+_STALE_CLAIM_MINUTES = 10
+
 # Comments are short by nature; capping the input before regex matching bounds
 # the backtracking surface for catastrophic patterns without losing real data.
 _MATCH_INPUT_MAX_CHARS = 10_000
@@ -153,17 +159,40 @@ async def _process_one(
     matched = await matches_blocklist(text, blocklist)
     if not matched:
         return []
-    # Skip if we've already logged anything for this comment in this project.
-    # YouTube's commentThreads.list still returns already-rejected comments,
-    # and re-running moderation would otherwise insert a duplicate row every
-    # tick (every 30 min by default) — both for new errors and for
-    # already-deleted successes.
-    cursor = await db.execute(
-        "SELECT 1 FROM moderation_log WHERE project_id = ? AND comment_id = ? LIMIT 1",
-        (project_id, comment_id),
-    )
-    if await cursor.fetchone() is not None:
-        return []
+    # Claim the comment atomically before touching YouTube. A plain SELECT-then-
+    # INSERT let a manual "run now" overlapping the periodic sweep pass the check
+    # in both coroutines (they share one event loop and the await below yields),
+    # double-moderating and double-logging. The unique index on
+    # (project_id, comment_id) from migration 032 makes the DB the arbiter:
+    # whoever wins the INSERT owns this comment, the loser sees rowcount 0.
+    #
+    # YouTube's commentThreads.list keeps returning already-rejected comments, so
+    # this claim is also what stops a duplicate row on every 30-minute tick.
+    async with write_transaction() as wdb:
+        cursor = await wdb.execute(
+            """INSERT OR IGNORE INTO moderation_log
+            (project_id, video_id, comment_id, author, comment_text, matched_keyword, action)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending')""",
+            (project_id, video_id, comment_id, author, text[:500], matched),
+        )
+        claimed = cursor.rowcount > 0
+    if not claimed:
+        # A row already exists. If it is still 'pending' and old enough that no
+        # live run could own it, a previous run died between claiming and
+        # recording the outcome — retry rather than leave the comment unmoderated
+        # forever. A *fresh* 'pending' row belongs to a concurrent run; leave it.
+        cursor = await db.execute(
+            "SELECT action FROM moderation_log "
+            "WHERE project_id = ? AND comment_id = ? "
+            f"AND action = 'pending' AND created_at <= datetime('now', '-{_STALE_CLAIM_MINUTES} minutes')",
+            (project_id, comment_id),
+        )
+        if await cursor.fetchone() is None:
+            return []
+        logger.warning(
+            "Retrying comment %s (project %s): a previous run left it pending.",
+            comment_id, project_id,
+        )
 
     try:
         await asyncio.to_thread(youtube.moderate_comment, comment_id, "rejected")
@@ -176,15 +205,13 @@ async def _process_one(
         )
         action = "error"
         error = f"{type(exc).__name__}: {exc}"
-    # Log the attempt either way so the user can see why moderation 'didn't
-    # work' — silently swallowing the failure was the historical bug. The
-    # YouTube moderate call (above) is already done, OUTSIDE this transaction.
+    # Record the outcome either way so the user can see why moderation 'didn't
+    # work' — silently swallowing the failure was the historical bug.
     async with write_transaction() as wdb:
         await wdb.execute(
-            """INSERT INTO moderation_log
-            (project_id, video_id, comment_id, author, comment_text, matched_keyword, action)
-            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (project_id, video_id, comment_id, author, text[:500], matched, action),
+            "UPDATE moderation_log SET action = ? "
+            "WHERE project_id = ? AND comment_id = ?",
+            (action, project_id, comment_id),
         )
     return [{
         "comment_id": comment_id,
@@ -231,10 +258,14 @@ async def check_all_videos(project_id: int) -> dict:
 
 
 async def get_moderation_log(limit: int = 50, *, project_id: int) -> list[dict]:
-    """Get recent moderation actions for a project."""
+    """Get recent moderation actions for a project.
+
+    'pending' rows are in-flight claims, not outcomes — showing them would
+    report an action that hasn't happened yet.
+    """
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT * FROM moderation_log WHERE project_id = ? "
+        "SELECT * FROM moderation_log WHERE project_id = ? AND action != 'pending' "
         "ORDER BY created_at DESC LIMIT ?",
         (project_id, limit),
     )

@@ -1007,7 +1007,7 @@ async function loadVideo() {
     // the latter even when we just confirmed the former.
     if (video.transcript) {
         document.getElementById('transcript-area').innerHTML = `
-            <textarea id="transcript-text" rows="12" class="transcript-editor">${video.transcript}</textarea>
+            <textarea id="transcript-text" rows="12" class="transcript-editor">${escapeHtml(video.transcript)}</textarea>
         `;
     }
     renderTranscriptStatePill(video);
@@ -1263,7 +1263,7 @@ function renderEvent(ev) {
             // Jump the user to the matching post card and flash it —
             // "Send below to retry" is no help when the social posts
             // section is scrolled off-screen on a long detail page.
-            return `${ts} <span style="color: var(--danger);">Social post failed — YouTube video is ${escapeHtml(priv)}, not public [${escapeHtml(platform)}] <a href="#" onclick="focusFailedPost(${JSON.stringify(platform)}); return false;" style="margin-left: 0.4rem;">Find the post →</a></span>`;
+            return `${ts} <span style="color: var(--danger);">Social post failed — YouTube video is ${escapeHtml(priv)}, not public [${escapeHtml(platform)}] <a href="#" class="event-failed-post-link" data-platform="${escapeHtml(platform)}" style="margin-left: 0.4rem;">Find the post →</a></span>`;
         }
         case 'credential_invalid': {
             const scope = ev.payload?.scope || 'account';
@@ -1513,6 +1513,12 @@ document.addEventListener('click', (event) => {
         if (ev) showScheduledPostModal(ev);
         return;
     }
+    const failedPostLink = event.target.closest?.('.event-failed-post-link');
+    if (failedPostLink) {
+        event.preventDefault();
+        focusFailedPost(failedPostLink.dataset.platform);
+        return;
+    }
     const diffModeBtn = event.target.closest?.('.diff-mode-btn');
     if (diffModeBtn) {
         setFieldDiffMode(diffModeBtn.dataset.mode);
@@ -1671,13 +1677,16 @@ async function loadComments() {
             area.innerHTML = '<p class="empty-state">No comments yet.</p>';
             return;
         }
+        // Comment author and body come from arbitrary YouTube viewers. textDisplay
+        // is HTML-formatted by YouTube, so escaping renders its <br>/<a> literally —
+        // accepted, because anything else executes a stranger's markup in this page.
         area.innerHTML = threads.map(t => {
             const c = t.snippet.topLevelComment.snippet;
             return `
                 <div class="comment">
-                    <strong>${c.authorDisplayName}</strong>
+                    <strong>${escapeHtml(c.authorDisplayName)}</strong>
                     <span class="comment-date">${new Date(c.publishedAt).toLocaleDateString()}</span>
-                    <p>${c.textDisplay}</p>
+                    <p>${escapeHtml(c.textDisplay)}</p>
                 </div>
             `;
         }).join('');

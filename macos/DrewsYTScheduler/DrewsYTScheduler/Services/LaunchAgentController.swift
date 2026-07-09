@@ -26,6 +26,41 @@ final class LaunchAgentController {
         SMAppService.mainApp
     }
 
+    /// Exit status plus the combined stdout+stderr of a short-lived process.
+    private struct ProcessOutput: Sendable {
+        let status: Int32
+        let text: String
+    }
+
+    /// Run a short-lived executable to completion off the main thread.
+    ///
+    /// Drains the output pipe BEFORE waiting: `launchctl print` for a live job
+    /// can exceed the ~64KB pipe buffer, and a child blocked on `write()` means
+    /// `waitUntilExit()` never returns — which, on this `@MainActor` type, would
+    /// hang the whole app. stdout and stderr share one pipe with one reader, so
+    /// there is also no two-pipe drain race. Never throws; a launch failure is
+    /// reported as status -1 with the error text.
+    private static func run(_ executable: String, _ arguments: [String]) async -> ProcessOutput {
+        await Task.detached(priority: .userInitiated) {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: executable)
+            proc.arguments = arguments
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = pipe
+            do {
+                try proc.run()
+            } catch {
+                return ProcessOutput(status: -1, text: error.localizedDescription)
+            }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            return ProcessOutput(
+                status: proc.terminationStatus,
+                text: String(data: data, encoding: .utf8) ?? "")
+        }.value
+    }
+
     // --- background server agent --------------------------------------------
 
     var agentStatus: SMAppService.Status {
@@ -180,7 +215,7 @@ final class LaunchAgentController {
         // the PID launchd thinks is running the job, plus its loaded/
         // pending state, so we can see whether bootout actually changed
         // anything.
-        let preState = launchctlPrintSummary(target: target)
+        let preState = await launchctlPrintSummary(target: target)
         ActivityLog.shared.log(.info, .agent,
             "restart: launchd pre-bootout for \(target): \(preState)")
 
@@ -190,70 +225,48 @@ final class LaunchAgentController {
             return
         }
 
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        proc.arguments = ["bootout", target]
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        proc.standardOutput = outPipe
-        proc.standardError = errPipe
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-            let stderr = String(
-                data: errPipe.fileHandleForReading.readDataToEndOfFile(),
-                encoding: .utf8) ?? ""
-            ActivityLog.shared.log(
-                proc.terminationStatus == 0 ? .info : .warn,
-                .agent,
-                "restart: launchctl bootout \(target) exited \(proc.terminationStatus)" +
-                    (stderr.isEmpty ? "" : "; stderr=\(stderr.trimmingCharacters(in: .whitespacesAndNewlines))"))
-        } catch {
+        let out = await run("/bin/launchctl", ["bootout", target])
+        guard out.status >= 0 else {
             ActivityLog.shared.log(.warn, .agent,
-                "restart: launchctl bootout threw: \(error.localizedDescription)")
+                "restart: launchctl bootout threw: \(out.text)")
             return
         }
+        let output = out.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        ActivityLog.shared.log(
+            out.status == 0 ? .info : .warn,
+            .agent,
+            "restart: launchctl bootout \(target) exited \(out.status)" +
+                (output.isEmpty ? "" : "; output=\(output)"))
 
         // Wait up to ~3s for launchd to fully release the job.
         for _ in 0..<6 {
             try? await Task.sleep(nanoseconds: 500_000_000)
-            if launchctlPrintSummary(target: target) == "not loaded" {
+            if await launchctlPrintSummary(target: target) == "not loaded" {
                 ActivityLog.shared.log(.info, .agent,
                     "restart: launchd released \(target)")
                 return
             }
         }
+        let postState = await launchctlPrintSummary(target: target)
         ActivityLog.shared.log(.warn, .agent,
             "restart: launchd still reports \(target) loaded after bootout " +
-            "— register() may fail. Post-state: \(launchctlPrintSummary(target: target))")
+            "— register() may fail. Post-state: \(postState)")
     }
 
     /// Run ``launchctl print <target>`` and reduce to a one-word summary:
     /// "not loaded" when the target doesn't exist, "loaded pid=N" when it
     /// does, or "loaded" when it's loaded but no PID was reported.
-    private static func launchctlPrintSummary(target: String) -> String {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        proc.arguments = ["print", target]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = Pipe()
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-        } catch {
+    private static func launchctlPrintSummary(target: String) async -> String {
+        let out = await run("/bin/launchctl", ["print", target])
+        if out.status < 0 {
             return "unknown"
         }
-        if proc.terminationStatus != 0 {
+        if out.status != 0 {
             // Non-zero typically means "Could not find service" — i.e.
             // the job isn't loaded. Treat that as the success state.
             return "not loaded"
         }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let text = String(data: data, encoding: .utf8) else {
-            return "loaded"
-        }
-        for line in text.split(whereSeparator: \.isNewline) {
+        for line in out.text.split(whereSeparator: \.isNewline) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("pid = ") {
                 return "loaded \(trimmed)"
@@ -266,7 +279,7 @@ final class LaunchAgentController {
     /// TCP listener on ``port``. Logs every PID it finds and the result
     /// of each kill. No-op when nothing is listening.
     static func killProcessOnPort(_ port: Int) async {
-        let pids = listeningPIDs(onPort: port)
+        let pids = await listeningPIDs(onPort: port)
         guard !pids.isEmpty else {
             ActivityLog.shared.log(.info, .agent,
                 "restart: nothing listening on port \(port) — nothing to kill")
@@ -279,13 +292,13 @@ final class LaunchAgentController {
         // First pass — polite SIGTERM. Most well-behaved processes (the
         // Python server included) flush state and exit on this.
         for pid in pids {
-            sendSignal(pid: pid, signal: "TERM")
+            await sendSignal(pid: pid, signal: "TERM")
         }
 
         // Wait up to ~5s for the port to free.
         for _ in 0..<10 {
             try? await Task.sleep(nanoseconds: 500_000_000)
-            if listeningPIDs(onPort: port).isEmpty {
+            if await listeningPIDs(onPort: port).isEmpty {
                 ActivityLog.shared.log(.info, .agent,
                     "restart: port \(port) freed after SIGTERM")
                 return
@@ -293,14 +306,15 @@ final class LaunchAgentController {
         }
 
         // Still holding the port — escalate to SIGKILL.
-        let stragglers = listeningPIDs(onPort: port)
+        let stragglers = await listeningPIDs(onPort: port)
         ActivityLog.shared.log(.warn, .agent,
             "restart: \(stragglers.count) PID(s) still holding port \(port) after SIGTERM — sending SIGKILL")
         for pid in stragglers {
-            sendSignal(pid: pid, signal: "KILL")
+            await sendSignal(pid: pid, signal: "KILL")
         }
         try? await Task.sleep(nanoseconds: 500_000_000)
-        if !listeningPIDs(onPort: port).isEmpty {
+        let remaining = await listeningPIDs(onPort: port)
+        if !remaining.isEmpty {
             ActivityLog.shared.log(.error, .agent,
                 "restart: port \(port) STILL not free after SIGKILL — register() will likely fail to bind")
         }
@@ -308,43 +322,23 @@ final class LaunchAgentController {
 
     /// Return PIDs listening on ``port`` (parsed from ``lsof -ti``).
     /// Returns ``[]`` on tool error or no listener; never throws.
-    private static func listeningPIDs(onPort port: Int) -> [pid_t] {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-        proc.arguments = ["-ti", "tcp:\(port)", "-sTCP:LISTEN"]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = Pipe()
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-        } catch {
-            return []
-        }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let text = String(data: data, encoding: .utf8) else { return [] }
-        return text
+    private static func listeningPIDs(onPort port: Int) async -> [pid_t] {
+        let out = await run("/usr/sbin/lsof", ["-ti", "tcp:\(port)", "-sTCP:LISTEN"])
+        guard out.status >= 0 else { return [] }
+        return out.text
             .split(whereSeparator: \.isNewline)
             .compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
     }
 
     /// Run ``/bin/kill -<signal> <pid>``. Logs failure but doesn't throw.
-    private static func sendSignal(pid: pid_t, signal: String) {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/kill")
-        proc.arguments = ["-\(signal)", String(pid)]
-        proc.standardOutput = Pipe()
-        proc.standardError = Pipe()
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-            if proc.terminationStatus != 0 {
-                ActivityLog.shared.log(.warn, .agent,
-                    "kill -\(signal) \(pid) exited \(proc.terminationStatus)")
-            }
-        } catch {
+    private static func sendSignal(pid: pid_t, signal: String) async {
+        let out = await run("/bin/kill", ["-\(signal)", String(pid)])
+        if out.status < 0 {
             ActivityLog.shared.log(.warn, .agent,
-                "kill -\(signal) \(pid) threw: \(error.localizedDescription)")
+                "kill -\(signal) \(pid) threw: \(out.text)")
+        } else if out.status != 0 {
+            ActivityLog.shared.log(.warn, .agent,
+                "kill -\(signal) \(pid) exited \(out.status)")
         }
     }
 

@@ -535,7 +535,9 @@ function renderCredentialRow(cred) {
         : '';
     const reconnectBtn = cred.needs_reauth
         ? `<button class="btn btn-sm btn-warning" title="Re-authenticate this account"
-                   onclick="reconnectCredential('${escapeHtml(cred.platform)}', '${escapeHtml(cred.username || '')}')">Reconnect</button>`
+                   data-cred-action="reconnect"
+                   data-platform="${escapeHtml(cred.platform)}"
+                   data-username="${escapeHtml(cred.username || '')}">Reconnect</button>`
         : '';
     const xPremium = cred.platform === 'twitter' && cred.verified_type && cred.verified_type !== 'none';
     const premiumBadge = xPremium
@@ -561,10 +563,11 @@ function renderCredentialRow(cred) {
             <div style="display:flex; gap:0.25rem; align-items:center;">
                 ${reconnectBtn}
                 <button class="btn-icon" title="Refresh username from provider"
-                        onclick="refreshCredentialUsername('${escapeHtml(cred.uuid)}')">↻</button>
+                        data-cred-action="refresh-username">↻</button>
                 <button class="btn-icon" title="Remove"
                         style="color: var(--danger);"
-                        onclick="confirmDeleteCredential('${escapeHtml(cred.uuid)}', '${escapeHtml(cred.label)}')">×</button>
+                        data-cred-action="delete-credential"
+                        data-label="${escapeHtml(cred.label)}">×</button>
             </div>
         </div>`;
 }
@@ -666,6 +669,28 @@ async function doDeleteCredential(uuid) {
         loadSocialPlatforms();
     }
 }
+
+// Delegated off the persistent #social-platforms container rather than bound per
+// row, so re-rendering the list never needs rebinding. Values ride on data-*
+// attributes instead of interpolated onclick strings: an attribute value is
+// entity-decoded before the JS parser sees it, so a label containing a quote
+// would break out of the handler and execute.
+document.getElementById('social-platforms').addEventListener('click', (e) => {
+    const btn = e.target.closest?.('[data-cred-action]');
+    if (!btn) return;
+    const uuid = btn.closest('.credential-row')?.dataset.uuid;
+    switch (btn.dataset.credAction) {
+        case 'reconnect':
+            reconnectCredential(btn.dataset.platform, btn.dataset.username || '');
+            break;
+        case 'refresh-username':
+            if (uuid) refreshCredentialUsername(uuid);
+            break;
+        case 'delete-credential':
+            if (uuid) confirmDeleteCredential(uuid, btn.dataset.label || '');
+            break;
+    }
+});
 
 window.addEventListener('message', (ev) => {
     if (!ev.data || ev.data.source !== 'oauth') return;

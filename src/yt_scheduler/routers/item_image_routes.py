@@ -8,8 +8,8 @@ item plus an optional alt text. Validated app-side.
 
 from __future__ import annotations
 
+import asyncio
 import re
-import shutil
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
@@ -85,8 +85,8 @@ async def upload_item_image(
     # ext or symlink inside UPLOAD_DIR cannot escape the directory.
     if not dest.resolve().is_relative_to(UPLOAD_DIR.resolve()):
         raise HTTPException(400, "Invalid upload path.")
-    with open(dest, "wb") as out:
-        shutil.copyfileobj(file.file, out)
+    data = await file.read()
+    await asyncio.to_thread(dest.write_bytes, data)
 
     db = await get_db()
     try:

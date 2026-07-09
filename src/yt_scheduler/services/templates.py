@@ -314,14 +314,16 @@ def render(
         })
     text = _substitute_variables(template_text, variables)
     if trace is not None:
-        trace.append({"kind": "substituted", "text": text})
-    return _resolve_ai_blocks(
+        trace.append({"kind": "substituted", "text": _restore_braces(text)})
+    # Output boundary: everything below this line is what the user actually sees,
+    # so sentinels become real braces again.
+    return _restore_braces(_resolve_ai_blocks(
         text,
         default_system_prompt=default_system_prompt,
         model=model,
         max_tokens=max_tokens,
         trace=trace,
-    )
+    ))
 
 
 # Backwards-compatible alias kept so older callers don't need a churn pass.
@@ -334,21 +336,33 @@ def render_template(template_text: str, variables: dict[str, object]) -> str:
 # bare-suffix. Default text is non-greedy so it stops at the next '}}'.
 _VAR_PATTERN = re.compile(r"\{\{(\w+)(?:(!)|\?\?(.*?))?\}\}")
 
-# Matches the exact two-char opener that _resolve_ai_blocks looks for.
-# Replacing it with a non-matching form in user-supplied values prevents
-# variable content from being executed as template directives.
-_AI_OPENER = re.compile(r"\{\{(?=ai[\[:])")
+# The AI-block walker finds blocks by the literal doublets ``{{`` / ``}}`` and
+# counts brace depth. Substitution runs BEFORE that walk, so any ``{{`` or ``}}``
+# inside a substituted value would be miscounted as template structure: an
+# unmatched ``{{`` leaves the walk at depth != 0 and emits the whole
+# ``{{ai: ...}}`` directive verbatim into the post, while a stray ``}}`` closes
+# the block early and truncates the prompt sent to Claude.
+#
+# Values carry sentinels through the walk instead of real braces, so user data
+# can never alter block structure. Real braces are restored at the two output
+# boundaries — the Claude prompt, and the final rendered string — which keeps
+# the rendered output byte-exact for values that legitimately contain braces.
+_SENTINEL_OPEN = "\x00AIB_OPEN\x00"
+_SENTINEL_CLOSE = "\x00AIB_CLOSE\x00"
 
 
 def _sanitize_value(value: str) -> str:
-    """Neutralize any ``{{ai`` openers inside a substituted variable value.
+    """Hide ``{{``/``}}`` in a substituted variable value from the AI-block walker."""
+    if "\x00" in value:
+        # A NUL can only reach here from corrupted data, and would let a value
+        # forge a sentinel and therefore forge block structure.
+        raise ValueError(f"Variable value contains a NUL byte: {value[:40]!r}")
+    return value.replace("{{", _SENTINEL_OPEN).replace("}}", _SENTINEL_CLOSE)
 
-    Variable values come from user-supplied data (video titles, descriptions,
-    transcripts) and must never be executed as template directives. A space
-    is inserted between the braces so the opener no longer matches the
-    literal two-char sequence the AI-block walker requires.
-    """
-    return _AI_OPENER.sub("{ {", value)
+
+def _restore_braces(text: str) -> str:
+    """Turn sentinels back into the real braces the user's value contained."""
+    return text.replace(_SENTINEL_OPEN, "{{").replace(_SENTINEL_CLOSE, "}}")
 
 
 def _substitute_variables(text: str, variables: dict[str, object]) -> str:
@@ -483,9 +497,14 @@ def _resolve_ai_blocks(
         effective_system = (
             system_override if system_override is not None else default_system_prompt
         )
+        # Output boundary: Claude must see the user's real braces, not sentinels.
         out.append(call_ai_block(
-            prompt,
-            system=effective_system,
+            _restore_braces(prompt),
+            system=(
+                _restore_braces(effective_system)
+                if effective_system is not None
+                else None
+            ),
             model=model,
             max_tokens=max_tokens,
             trace=trace,

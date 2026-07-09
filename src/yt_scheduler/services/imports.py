@@ -191,12 +191,16 @@ async def import_video(
     thumb_url = thumb.get("url")
     if thumb_url:
         try:
-            UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
             target = UPLOAD_DIR / f"{video_id}_thumb.jpg"
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.get(thumb_url)
                 resp.raise_for_status()
+
+            def _save() -> None:
+                UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(resp.content)
+
+            await asyncio.to_thread(_save)
             thumbnail_path = str(target)
         except Exception as exc:
             logger.warning("Could not download thumbnail for %s: %s", video_id, exc)
@@ -265,38 +269,42 @@ async def import_video(
     # detail page can show "Transcript from YouTube" vs. "No YouTube
     # captions for this video" vs. nothing (haven't checked) — without
     # this column the empty `transcript` field is ambiguous.
+    # Only the external calls may fail benignly ("YouTube has no captions" /
+    # network / auth) — that is the honest 'unavailable' case. Persistence is
+    # deliberately OUTSIDE this try, so a DB failure can never be relabelled as
+    # 'unavailable', which would leave a stored transcript the video denies having.
+    caption_text: str | None = None
     try:
         captions = await asyncio.to_thread(youtube.list_captions, video_id)
         if captions:
-            text = await asyncio.to_thread(
+            caption_text = await asyncio.to_thread(
                 youtube.download_caption, captions[0]["id"], fmt="srt"
             )
-            transcript_id = await transcript_service.upsert_transcript_for_source(
-                video_id, "youtube", text
-            )
-            async with write_transaction() as db:
-                await db.execute(
-                    """UPDATE videos SET
-                        transcript = ?,
-                        transcript_id = ?,
-                        transcript_source = 'youtube',
-                        transcript_created_at = datetime('now'),
-                        transcript_updated_at = datetime('now'),
-                        status = 'captioned',
-                        youtube_transcript_state = 'fetched'
-                    WHERE id = ?""",
-                    (text, transcript_id, video_id),
-                )
-        else:
-            async with write_transaction() as db:
-                await db.execute(
-                    "UPDATE videos SET youtube_transcript_state = 'unavailable' "
-                    "WHERE id = ?",
-                    (video_id,),
-                )
     except Exception as exc:
         logger.info("No YouTube transcript available for %s: %s", video_id, exc)
-        async with write_transaction() as db:
+        caption_text = None
+
+    # One transaction for the transcript row AND the videos mirror, so they can
+    # never diverge. write_transaction is ContextVar-reentrant, so the upsert
+    # joins this block rather than committing separately.
+    async with write_transaction() as db:
+        if caption_text is not None:
+            transcript_id = await transcript_service.upsert_transcript_for_source(
+                video_id, "youtube", caption_text
+            )
+            await db.execute(
+                """UPDATE videos SET
+                    transcript = ?,
+                    transcript_id = ?,
+                    transcript_source = 'youtube',
+                    transcript_created_at = datetime('now'),
+                    transcript_updated_at = datetime('now'),
+                    status = 'captioned',
+                    youtube_transcript_state = 'fetched'
+                WHERE id = ?""",
+                (caption_text, transcript_id, video_id),
+            )
+        else:
             await db.execute(
                 "UPDATE videos SET youtube_transcript_state = 'unavailable' "
                 "WHERE id = ?",

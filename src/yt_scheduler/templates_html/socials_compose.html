@@ -413,6 +413,11 @@ function escapeHtmlBasic(s) {
     return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+// escapeHtmlBasic leaves quotes intact, which breaks out of a quoted attribute.
+function escapeAttr(s) {
+    return escapeHtmlBasic(s).replace(/"/g, '&quot;');
+}
+
 function renderPreviews() {
     const container = document.getElementById('preview-cards');
     if (!posts.length) {
@@ -437,7 +442,7 @@ function renderPreviews() {
         if (prior) {
             const when = new Date(_ensureUtc(prior.posted_at || prior.updated_at || prior.created_at)).toLocaleString();
             const link = prior.post_url
-                ? ` — <a href="${escapeHtmlBasic(prior.post_url)}" target="_blank" rel="noopener">open</a>`
+                ? ` — <a href="${escapeAttr(prior.post_url)}" target="_blank" rel="noopener">open</a>`
                 : '';
             priorNote = `<div class="form-hint" style="margin: 0.25rem 0; color: var(--warning, #d29922);">⚠ Already posted to ${escapeHtmlBasic(p.platform)} for this video on ${escapeHtmlBasic(when)}${link}</div>`;
         }
@@ -448,7 +453,7 @@ function renderPreviews() {
                     <input type="checkbox" name="include" data-id="${p.id}" checked>
                     <span class="platform-badge platform-${p.platform}">${p.platform}</span>${accountLabel}
                 </label>
-                <span class="compose-status">${isFailed ? 'Error: ' + (p.error || 'unknown') : ''}</span>
+                <span class="compose-status">${isFailed ? 'Error: ' + escapeHtmlBasic(p.error || 'unknown') : ''}</span>
             </div>
             <textarea data-id="${p.id}" rows="4">${(p.content || '').replace(/</g,'&lt;')}</textarea>
             ${mediaSummaryHtml(p)}
@@ -535,15 +540,17 @@ async function postNowAll() {
         }
         const resp = await fetch(`/api/social/posts/${videoId}/send-all`, { method: 'POST' });
         if (resp.ok) {
-            const results = await resp.json().catch(() => ({}));
+            const results = await resp.json().catch(() => []);
             let anyFailed = false;
-            for (const [platform, r] of Object.entries(results || {})) {
+            // A per-post list: two accounts on one platform each get their own entry.
+            for (const r of (Array.isArray(results) ? results : [])) {
                 if (!r) continue;
+                const who = r.account_label ? `${r.platform} (${r.account_label})` : r.platform;
                 if (r.status === 'failed' || r.status === 'needs_reauth') {
                     anyFailed = true;
-                    showToast(`${platform}: ${r.error || 'send failed'}`, 'error');
+                    showToast(`${who}: ${r.error || 'send failed'}`, 'error');
                 } else if (r.status === 'skipped') {
-                    showToast(`${platform} skipped — ${r.reason || 'not sent'}`, 'error');
+                    showToast(`${who} skipped — ${r.reason || 'not sent'}`, 'error');
                 } else if (r.warning) {
                     showToast(r.warning, 'error');
                 }

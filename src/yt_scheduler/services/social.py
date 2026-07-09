@@ -617,7 +617,7 @@ class TwitterPoster(SocialPoster):
         try:
             try:
                 media_ids = await _upload_all(bearer)
-                response = _tweet(bearer, media_ids)
+                response = await asyncio.to_thread(_tweet, bearer, media_ids)
             except (tweepy.errors.Unauthorized, _TwitterBearerExpired):
                 # Bearer expired (~2h lifetime). Refresh under the per-credential
                 # lock so a concurrent background refresh can't race us to the
@@ -633,7 +633,7 @@ class TwitterPoster(SocialPoster):
                 # auth session may not be valid.
                 try:
                     media_ids = await _upload_all(new_bearer)
-                    response = _tweet(new_bearer, media_ids)
+                    response = await asyncio.to_thread(_tweet, new_bearer, media_ids)
                 except (tweepy.errors.Unauthorized, _TwitterBearerExpired) as exc2:
                     raise CredentialAuthError(
                         uuid,
@@ -930,12 +930,39 @@ class BlueskyPoster(SocialPoster):
             )
         return parts[-1]
 
-    @staticmethod
-    async def _stash_pds_nonce(creds: dict, resp, save_bundle) -> None:
+    async def _persist_nonce_field(self, creds: dict, field: str, value: str) -> None:
+        """Persist one DPoP nonce without clobbering a concurrent token refresh.
+
+        ``save_bundle`` writes the whole dict, so an unlocked write of this
+        coroutine's stale ``creds`` would overwrite access/refresh tokens that a
+        concurrent locked refresh just rotated. Read-modify-write the freshest
+        stored bundle under the same per-credential lock instead.
+        """
+        from yt_scheduler.services.social_credentials import (
+            get_credential_lock,
+            load_bundle,
+            save_bundle,
+        )
+
+        creds[field] = value  # in-memory: this coroutine's next request uses it
+        uuid = creds.get("uuid")
+        if not uuid:
+            return
+        async with get_credential_lock(uuid):
+            stored = await load_bundle("bluesky", uuid)
+            if stored is None:
+                return
+            creds.update(stored)  # pull in any concurrent token refresh
+            if stored.get(field) == value:
+                return
+            stored[field] = value
+            creds[field] = value
+            await save_bundle("bluesky", uuid, stored)
+
+    async def _stash_pds_nonce(self, creds: dict, resp, save_bundle) -> None:
         new_nonce = resp.headers.get("DPoP-Nonce")
         if new_nonce and new_nonce != creds.get("dpop_nonce_pds"):
-            creds["dpop_nonce_pds"] = new_nonce
-            await save_bundle("bluesky", creds["uuid"], creds)
+            await self._persist_nonce_field(creds, "dpop_nonce_pds", new_nonce)
 
     async def _handle_dpop_or_token_error(
         self,
@@ -958,11 +985,16 @@ class BlueskyPoster(SocialPoster):
         if err == "use_dpop_nonce":
             nonce = resp.headers.get("DPoP-Nonce")
             if nonce:
-                creds["dpop_nonce_pds"] = nonce
-                await save_bundle("bluesky", creds["uuid"], creds)
+                await self._persist_nonce_field(creds, "dpop_nonce_pds", nonce)
                 return True
         if resp.status_code == 401 or err in ("invalid_token", "expired_token"):
-            await self._refresh_access_token(creds, bluesky_oauth, save_bundle)
+            # Serialise against the background sweep and any sibling post via the
+            # per-credential lock, double-checked on token identity: without it
+            # both paths present the same single-use rotating refresh token and
+            # the loser's rejection wrongly flags a healthy credential.
+            await self._refresh_under_lock(
+                creds, window_secs=0, stale_token=creds.get("access_token"),
+            )
             return True
         return False
 
@@ -974,14 +1006,20 @@ class BlueskyPoster(SocialPoster):
     _PRE_REFRESH_WINDOW_SECS = 15 * 60
 
     async def _refresh_under_lock(
-        self, creds: dict, *, window_secs: int,
+        self, creds: dict, *, window_secs: int, stale_token: str | None = None,
     ) -> bool:
         """Refresh the access token, serialised per-credential via
         ``get_credential_lock``. Re-reads the stored bundle inside the lock so
         a concurrent refresh on another path (e.g. the background job vs a
         post) doesn't leave us presenting a now-consumed refresh token.
         Returns True if a refresh was performed, False if it was already
-        fresh / not possible. RuntimeError from the AS propagates."""
+        fresh / not possible. RuntimeError from the AS propagates.
+
+        ``stale_token`` marks the reactive (post-time 401) path. There the
+        freshness gate is token *identity*, not the clock: a 401 proves the
+        token is dead whatever ``expires_at`` claims, so we refresh unless a
+        concurrent waiter already rotated the access token out from under us.
+        """
         from yt_scheduler.services import bluesky_oauth
         from yt_scheduler.services.social_credentials import (
             clear_needs_reauth,
@@ -996,9 +1034,18 @@ class BlueskyPoster(SocialPoster):
                 fresh = await load_bundle("bluesky", uuid)
                 if fresh:
                     creds.update(fresh)
-            expires_at = int(creds.get("expires_at") or 0)
-            if expires_at and expires_at - window_secs > int(time.time()):
-                return False
+            if stale_token is not None:
+                current = creds.get("access_token")
+                if current and current != stale_token:
+                    logger.info(
+                        "Bluesky access token already refreshed by another waiter; "
+                        "reusing it instead of burning the refresh token."
+                    )
+                    return False
+            else:
+                expires_at = int(creds.get("expires_at") or 0)
+                if expires_at and expires_at - window_secs > int(time.time()):
+                    return False
             if not creds.get("refresh_token"):
                 return False
             await self._refresh_access_token(creds, bluesky_oauth, save_bundle)
@@ -1691,6 +1738,7 @@ async def find_recent_duplicate_post(
     social_account_id: int | None,
     content: str,
     media_path: str | None = None,
+    media_paths: list[str] | None = None,
     exclude_post_id: int | None = None,
     lookback_days: int = 30,
 ) -> dict | None:
@@ -1708,10 +1756,11 @@ async def find_recent_duplicate_post(
       (internal newlines and indentation are preserved — only the edges
       are normalised, since AI blocks frequently emit a stray leading
       space or trailing newline),
-    * identical ``media_path`` — same text with different attached media
-      is NOT a duplicate. NULL/empty-string media is treated as a single
-      "no media" bucket; switching from no-media to media (or vice
-      versa) is also not a duplicate.
+    * identical media — same text with different attached media is NOT a
+      duplicate. Pass ``media_paths`` (the full list actually being sent);
+      ``media_path`` remains accepted as the single-attachment shorthand.
+      No media is a single bucket, so switching from no-media to media (or
+      vice versa) is also not a duplicate.
     * status is ``posted`` or ``sending``,
     * occurred within the last ``lookback_days`` days.
 
@@ -1729,23 +1778,29 @@ async def find_recent_duplicate_post(
     if not normalised:
         return None  # empty post can't be a dup of anything meaningful
 
-    # Normalise media to "" for the no-media bucket so NULL and "" both
-    # compare equal. SQLite NULL semantics would otherwise make
-    # ``media_path = ?`` always false when one side is NULL.
-    media_key = (media_path or "").strip()
+    # Compare the FULL attachment list, not just the legacy first path: the send
+    # path posts every entry of ``media_paths``, so two posts differing only in
+    # their 2nd-4th attachments are not duplicates. Both sides run through
+    # decode_media_paths, which normalises the legacy single-string column and the
+    # JSON array to the same shape — a string compare in SQL would be fragile,
+    # since migration 010's json_array() emits ["a","b"] while json.dumps emits
+    # ["a", "b"].
+    if media_paths is not None:
+        expected_media = [str(p).strip() for p in media_paths if p]
+    else:
+        expected_media = decode_media_paths({"media_path": media_path})
 
     db = await get_db()
     sql_parts = [
-        "SELECT id, video_id, platform, content, media_path, social_account_id, "
-        "       posted_at, post_url, status, "
+        "SELECT id, video_id, platform, content, media_path, media_paths, "
+        "       social_account_id, posted_at, post_url, status, "
         "       COALESCE(posted_at, created_at) AS event_at "
         "FROM social_posts "
         "WHERE platform = ? AND TRIM(content) = ? "
-        "AND COALESCE(TRIM(media_path), '') = ? "
         "AND status IN ('posted', 'sending') "
         "AND COALESCE(posted_at, created_at) >= datetime('now', '-' || ? || ' days')"
     ]
-    params: list = [platform, normalised, media_key, lookback_days]
+    params: list = [platform, normalised, lookback_days]
     if social_account_id is not None:
         sql_parts.append(
             "AND (social_account_id = ? OR social_account_id IS NULL)"
@@ -1754,13 +1809,22 @@ async def find_recent_duplicate_post(
     if exclude_post_id is not None:
         sql_parts.append("AND id != ?")
         params.append(int(exclude_post_id))
-    sql_parts.append("ORDER BY event_at DESC LIMIT 1")
+    # Media is compared in Python below, so this can't be LIMIT 1 any more — and
+    # deliberately no LIMIT at all: a cap that hid an older same-media post would
+    # silently let the duplicate through and publish it twice, the exact failure
+    # this guard exists to prevent. The query is already scoped to one platform,
+    # one account, one exact content string and the lookback window, so the
+    # candidate set is tiny.
+    sql_parts.append("ORDER BY event_at DESC")
 
     cursor = await db.execute(" ".join(sql_parts), tuple(params))
-    row = await cursor.fetchone()
-    if row is None:
-        return None
-    return dict(row)
+    rows = await cursor.fetchall()
+    for row in rows:
+        candidate = dict(row)
+        candidate_media = [p.strip() for p in decode_media_paths(candidate)]
+        if candidate_media == expected_media:
+            return candidate
+    return None
 
 
 async def get_poster_for_account(social_account_id: int) -> SocialPoster:

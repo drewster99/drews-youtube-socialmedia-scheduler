@@ -418,6 +418,19 @@ async def _maybe_generate_description(video: dict, project_id: int) -> str | Non
     return description
 
 
+async def _video_has_social_posts(db, video_id: str) -> bool:
+    """Whether any social_posts row already exists for this video.
+
+    The auto chain re-enters on every re-import, restart restore, and manual
+    re-trigger, and a description (its only prior gate) is permanent — so
+    without this the step inserts a fresh duplicate draft set each time.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT 1 FROM social_posts WHERE video_id = ? LIMIT 1", (video_id,)
+    )
+    return bool(rows)
+
+
 async def _maybe_generate_socials(
     video_id: str, project_id: int, platforms: list[str]
 ) -> None:
@@ -446,6 +459,16 @@ async def _maybe_generate_socials(
         return
     video = dict(rows[0])
 
+    # Cheap pre-check before spending any Claude tokens. The authoritative check
+    # runs under the publish lock further down; this one just avoids rendering a
+    # whole slot-set we're about to throw away.
+    if await _video_has_social_posts(db, video_id):
+        logger.info(
+            "auto-social: %s already has social_posts; skipping auto-generate "
+            "(use the Generate button to regenerate).", video_id,
+        )
+        return
+
     posting = await project_settings.get_posting_settings(project_id)
     tier = video.get("tier") or "video"
     template_name = posting.get(f"default_template_{tier}") or "announce_video"
@@ -465,6 +488,11 @@ async def _maybe_generate_socials(
     ))["system"]
 
     video_directive_re = re.compile(r"\{\{\s*video\s*\}\}", re.IGNORECASE)
+
+    # Rendered rows are collected here and committed as one set below, so a crash
+    # mid-loop can't leave a half-generated slot-set that the idempotency gate
+    # would then refuse to complete.
+    pending_inserts: list[tuple] = []
 
     for slot in template.get("slots", []):
         if slot.get("is_disabled"):
@@ -520,21 +548,40 @@ async def _maybe_generate_socials(
         # that produced it so a later partial regenerate can target
         # this one specifically (two same-platform multi-account slots
         # are routed independently).
-        # async_render (AI) for this slot is already done above, outside the
-        # lock; persist each slot's post on its own.
-        async with write_transaction() as db:
-            await db.execute(
-                """INSERT INTO social_posts
-                       (video_id, platform, content, media_path, media_paths,
-                        media_type, status, social_account_id, max_chars, slot_id)
-                VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)""",
-                (
-                    video_id, platform, rendered,
-                    primary_media, media_paths_json,
-                    media_type, sa_id, int(slot_max),
-                    int(slot_id) if slot_id is not None else None,
-                ),
+        # async_render (AI) for this slot is already done above; collect the row
+        # and commit the whole set together once the lock is held.
+        pending_inserts.append((
+            video_id, platform, rendered,
+            primary_media, media_paths_json,
+            media_type, sa_id, int(slot_max),
+            int(slot_id) if slot_id is not None else None,
+        ))
+
+    if not pending_inserts:
+        return
+
+    # Authoritative gate. spawn_background does NOT dedup by name, so two chains
+    # for one video really can run concurrently; without the lock both would read
+    # "no posts" and both insert a full duplicate set. This is the same per-video
+    # lock the manual /generate-posts route takes.
+    from yt_scheduler.services.scheduler import get_publish_lock
+
+    async with get_publish_lock(video_id):
+        if await _video_has_social_posts(db, video_id):
+            logger.info(
+                "auto-social: %s gained social_posts while rendering; "
+                "skipping insert.", video_id,
             )
+            return
+        async with write_transaction() as wdb:
+            for params in pending_inserts:
+                await wdb.execute(
+                    """INSERT INTO social_posts
+                           (video_id, platform, content, media_path, media_paths,
+                            media_type, status, social_account_id, max_chars, slot_id)
+                    VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)""",
+                    params,
+                )
 
 
 # --- Promo Videos auto-action chain --------------------------------------
@@ -1167,7 +1214,7 @@ async def _run_promo_chain_inner(job_id: str) -> None:
     # guarantee, not bookkeeping.
     await _mark_pending_promo_job(job_id, youtube_video_id=video_id, critical=True)
 
-    duration = tiers.probe_local_duration(local_path)
+    duration = await asyncio.to_thread(tiers.probe_local_duration, local_path)
     derived_tier = tiers.tier_for_duration(duration)
     # ``forced_item_type`` is set when the user adds via a per-section
     # button (Segments / Shorts / Hooks). Top-level "Add" leaves it None

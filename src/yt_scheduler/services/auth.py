@@ -174,6 +174,13 @@ def get_credentials(project_slug: str = DEFAULT_PROJECT_SLUG) -> Credentials | N
         logger.warning("Stored credentials for %s are invalid", project_slug)
         return None
 
+    # Check-then-act: two concurrent callers (this runs inside asyncio.to_thread
+    # workers) can both see `expired` and both refresh+save, last write winning.
+    # Accepted deliberately: Google's installed-app refresh tokens do not rotate,
+    # so both writes persist the same refresh_token and no session is lost. A
+    # correct guard would be a per-slug threading.Lock (not asyncio.Lock — wrong
+    # thread context) held across a multi-second network call, trading a benign
+    # race for real contention. Revisit if Google ever rotates these tokens.
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())

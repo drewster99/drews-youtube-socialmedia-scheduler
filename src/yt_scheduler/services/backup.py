@@ -222,7 +222,12 @@ def _build_inner_archive(tar_path: Path) -> dict:
         has_db = _snapshot_db(db_snapshot)
         summary["includes_db"] = has_db
 
-        secrets = keychain.export_all_secrets()
+        try:
+            secrets = keychain.export_all_secrets()
+        except keychain.SecretsIndexError as exc:
+            # Better to refuse than to write a bundle that silently omits every
+            # credential because the index could not be read.
+            raise BackupError(f"Could not enumerate stored secrets: {exc}") from exc
         summary["secret_count"] = sum(len(v) for v in secrets.values())
         secrets_bytes = json.dumps(secrets).encode("utf-8")
 
@@ -400,20 +405,82 @@ def import_bundle(in_path: Path, passphrase: str) -> dict:
             raise BackupError("Backup is missing its data directory")
 
         data_dir = config.DATA_DIR
+        data_dir.parent.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+
+        # Stage the incoming tree as a SIBLING of the live data dir so it lands on
+        # the same filesystem and the swap below is pure renames. The one
+        # unavoidable cross-device copy (the system temp dir may be on another
+        # volume than a DYS_DATA_DIR pointed at external storage) happens here,
+        # into staging, where a failure touches nothing live. shutil.move is a
+        # rename when same-fs and a copy+unlink otherwise.
+        staged_dir = data_dir.with_name(f"{data_dir.name}.import-staging-{ts}")
+        shutil.rmtree(staged_dir, ignore_errors=True)
+        try:
+            shutil.move(str(new_data), str(staged_dir))
+            for stale_name in (*_DB_SIDE_FILES, "server.pid"):
+                stale = staged_dir / stale_name
+                if stale.exists():
+                    stale.unlink()
+        except BaseException:
+            shutil.rmtree(staged_dir, ignore_errors=True)
+            raise
+
+        # Commit. From here the live data dir is only ever moved by renames within
+        # data_dir.parent (same filesystem, atomic), so a half-populated data dir
+        # is structurally impossible and rollback can always undo step (1).
         pre_import_path: Path | None = None
         if data_dir.exists():
-            ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             pre_import_path = data_dir.with_name(f"{data_dir.name}.pre-import-{ts}")
-            os.rename(data_dir, pre_import_path)
-        data_dir.mkdir(parents=True, exist_ok=True)
-        for entry in new_data.iterdir():
-            shutil.move(str(entry), str(data_dir / entry.name))
-        for stale_name in (*_DB_SIDE_FILES, "server.pid"):
-            stale = data_dir / stale_name
-            if stale.exists():
-                stale.unlink()
+            os.rename(data_dir, pre_import_path)  # (1) original aside
+            try:
+                os.rename(staged_dir, data_dir)  # (2) new into place
+            except BaseException as exc:
+                try:
+                    # Undo (1). Same filesystem, and (2) is atomic so data_dir is
+                    # free — but if even this fails, say exactly where the data is.
+                    os.rename(pre_import_path, data_dir)
+                except BaseException as rollback_exc:
+                    raise BackupError(
+                        "Restore failed AND rollback failed. Your original data is "
+                        f"at {pre_import_path} and {data_dir} does not exist. "
+                        f"Rename {pre_import_path} back to {data_dir} to recover. "
+                        f"(swap error: {exc}; rollback error: {rollback_exc})"
+                    ) from exc
+                shutil.rmtree(staged_dir, ignore_errors=True)
+                raise BackupError(
+                    "Restore failed while swapping in the new data; your original "
+                    f"data was left in place. ({exc})"
+                ) from exc
+        else:
+            os.rename(staged_dir, data_dir)
 
-        secret_count = keychain.import_all_secrets(secrets)
+        # Secrets live INSIDE the data dir (keychain.SECRETS_FILE is
+        # DATA_DIR/secrets.json), so they must be imported AFTER the swap —
+        # importing first would write into the tree we are about to discard.
+        # import_all_secrets is idempotent but not all-or-nothing, so on failure
+        # roll the whole data dir back, which restores the old secrets file too.
+        try:
+            secret_count = keychain.import_all_secrets(secrets)
+        except BaseException as exc:
+            if pre_import_path is not None:
+                try:
+                    broken = data_dir.with_name(f"{data_dir.name}.import-broken-{ts}")
+                    os.rename(data_dir, broken)
+                    os.rename(pre_import_path, data_dir)
+                except BaseException as rollback_exc:
+                    raise BackupError(
+                        "Restore failed AND rollback failed. Your original data is "
+                        f"at {pre_import_path}; the partially-restored data is at "
+                        f"{data_dir}. Rename {pre_import_path} back to {data_dir} "
+                        f"to recover. (import error: {exc}; "
+                        f"rollback error: {rollback_exc})"
+                    ) from exc
+                raise BackupError(
+                    "Restoring secrets failed; rolled back to your original data. "
+                    f"The failed attempt was kept at {broken}. ({exc})"
+                ) from exc
+            raise
 
     config.ensure_dirs()
     return {

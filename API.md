@@ -1203,16 +1203,19 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 
 **Query params** — `confirm_dup` (bool, default `false`).
 
-**Response 200** — Object keyed by platform:
+**Response 200** — Array with one entry per post. A template can route two posts to two different accounts on the same platform, so results are keyed by `post_id`, not by platform; `account_label` names the credential each post was sent with (`null` when none resolved).
 
 ```json
-{
-  "twitter":  { "status": "posted",       "url": "..." },
-  "bluesky":  { "status": "skipped",      "reason": "not configured" },
-  "linkedin": { "status": "needs_reauth", "error": "..." },
-  "mastodon": { "status": "failed",       "error": "..." }
-}
+[
+  { "post_id": 11, "platform": "twitter",  "account_label": "@drew @X",       "status": "posted",       "url": "..." },
+  { "post_id": 12, "platform": "mastodon", "account_label": "@drew@hachyderm", "status": "posted",       "url": "..." },
+  { "post_id": 13, "platform": "mastodon", "account_label": "@alt@mas.to",     "status": "failed",       "error": "..." },
+  { "post_id": 14, "platform": "bluesky",  "account_label": null,              "status": "skipped",      "reason": "not configured" },
+  { "post_id": 15, "platform": "linkedin", "account_label": "Drew B",          "status": "needs_reauth", "error": "..." }
+]
 ```
+
+`posted` entries may also carry a `warning` field.
 
 **Errors** — `409` when any approved post is a duplicate (body: `{"detail": {"duplicate": true, "duplicates": [<per-post entries>], "needs_confirm": true}}`). Per-post failures during the send loop are reported in the 200 response, not raised.
 

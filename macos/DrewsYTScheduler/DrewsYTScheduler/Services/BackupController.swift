@@ -82,8 +82,14 @@ final class BackupController: ObservableObject {
 
         busy = true
         Task {
-            ActivityLog.shared.log(.info, .ui, "Backup import: stopping the server")
-            try? await LaunchAgentController.shared.unregisterAgent()
+            // Deliberately do NOT unregisterAgent() here. bootout + kill already
+            // stop the running server and break the KeepAlive respawn loop, and
+            // dropping the SMAppService record would mean a crash or force-quit
+            // mid-import leaves launchd with no job — so the server wouldn't come
+            // back at next login until the user reopened the app. registerAgent()
+            // below unregisters-then-registers, so it re-bootstraps cleanly.
+            ActivityLog.shared.log(.info, .ui,
+                "Backup import: stopping the server (agent stays registered)")
             await LaunchAgentController.launchctlBootout(label: LaunchAgentController.agentLabel)
             await LaunchAgentController.killProcessOnPort(AppPaths.serverPort)
 

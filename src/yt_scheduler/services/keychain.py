@@ -33,6 +33,24 @@ KEYCHAIN_SERVICE_PREFIX = "com.nuclearcyborg.drews-socialmedia-scheduler"
 LEGACY_KEYCHAIN_SERVICE_PREFIX = "com.youtube-publisher"
 SECRETS_FILE = DATA_DIR / "secrets.json"
 
+
+class KeychainWriteError(RuntimeError):
+    """A keychain write could not be completed safely.
+
+    Raised when the Security framework is unusable (missing, or its lock is held
+    by a wedged call) instead of falling back to `security add-generic-password
+    -w <value>`, which would expose the secret on the process argv.
+    """
+
+
+class SecretsIndexError(RuntimeError):
+    """The secrets index exists but could not be read or parsed.
+
+    Raised rather than treated as empty: this index is the sole account
+    enumerator, so silently returning {} would make load_all_secrets /
+    export_all_secrets / delete_all_secrets act as if no credentials exist.
+    """
+
 # Guards the read-modify-write cycle on the on-disk index. We don't
 # hold this across the `security` subprocess call — it wraps just the
 # index file mutations inside the public helpers.
@@ -171,99 +189,78 @@ def _keychain_set(service: str, account: str, value: str) -> bool:
     `security add-generic-password`, which would expose it to all local users
     via the process table (ps/libproc).
 
-    Falls back to the `security` CLI subprocess if the Security framework
-    cannot be loaded (should never happen on macOS, but guards against the
-    unexpected).
+    There is no safe non-argv CLI write (`security` accepts the password only
+    via `-w <value>` or an interactive TTY prompt), so when the framework is
+    unusable this raises ``KeychainWriteError`` rather than leaking the secret.
+    A genuine SecKeychain error code still returns False, leaving the caller's
+    existing encrypted-file fallback intact.
     """
     svc_b = service.encode()
     acct_b = account.encode()
     val_b = value.encode("utf-8")
 
     lib = _get_sec_lib()
-    if lib is not None:
-        if _keychain_framework_lock.acquire(
-            timeout=_KEYCHAIN_FRAMEWORK_LOCK_TIMEOUT_SECS
-        ):
-            try:
-                status = lib.SecKeychainAddGenericPassword(
-                    None,
-                    len(svc_b), svc_b,
-                    len(acct_b), acct_b,
-                    len(val_b), val_b,
-                    None,
-                )
-                if status == _ERR_SEC_DUPLICATE_ITEM:
-                    # Item already exists; find it and overwrite the password data.
-                    pw_len = ctypes.c_uint32(0)
-                    pw_data = ctypes.c_void_p(None)
-                    item_ref = ctypes.c_void_p(None)
-                    find_status = lib.SecKeychainFindGenericPassword(
-                        None,
-                        len(svc_b), svc_b,
-                        len(acct_b), acct_b,
-                        ctypes.byref(pw_len),
-                        ctypes.byref(pw_data),
-                        ctypes.byref(item_ref),
-                    )
-                    if find_status != 0:
-                        logger.warning("SecKeychainFindGenericPassword returned %d for %s/%s", find_status, service, account)
-                        return False
-                    try:
-                        lib.SecKeychainItemFreeContent(None, pw_data)
-                        mod_status = lib.SecKeychainItemModifyAttributesAndData(
-                            item_ref, None, len(val_b), val_b,
-                        )
-                        if mod_status != 0:
-                            logger.warning("SecKeychainItemModifyAttributesAndData returned %d for %s/%s", mod_status, service, account)
-                            return False
-                    finally:
-                        # itemRef is CF_RETURNS_RETAINED — release it so the update
-                        # path doesn't leak a keychain item ref on every refresh.
-                        _cf_release(item_ref)
-                elif status != 0:
-                    logger.warning("SecKeychainAddGenericPassword returned %d for %s/%s", status, service, account)
-                    return False
-                return True
-            except Exception:
-                logger.exception("Security framework call failed for %s/%s", service, account)
-                return False
-            finally:
-                _keychain_framework_lock.release()
-        else:
-            # Another framework call is wedged. Don't pile on (that's how the
-            # original deadlock spread); log and fall through to the CLI path.
-            logger.error(
-                "Keychain framework lock not acquired within %.0fs for set %s/%s; "
-                "another keychain call appears wedged — using CLI fallback",
-                _KEYCHAIN_FRAMEWORK_LOCK_TIMEOUT_SECS, service, account,
-            )
-
-    # Fallback path: Security framework unavailable.
-    # The secret is still on argv here — this path should never be reached on macOS.
-    logger.warning("Security framework unavailable; falling back to security CLI for %s/%s", service, account)
+    if lib is None:
+        raise KeychainWriteError(
+            f"Security framework unavailable; refusing to write {service}/{account} "
+            "via the security CLI (that would expose the secret on the process argv)"
+        )
+    if not _keychain_framework_lock.acquire(
+        timeout=_KEYCHAIN_FRAMEWORK_LOCK_TIMEOUT_SECS
+    ):
+        # Another framework call is wedged. The CLI fallback would put the secret
+        # on argv, which is exactly the leak the ctypes path exists to avoid —
+        # and contention is precisely when it would fire. Surface instead.
+        raise KeychainWriteError(
+            f"Keychain framework lock not acquired within "
+            f"{_KEYCHAIN_FRAMEWORK_LOCK_TIMEOUT_SECS:.0f}s for set "
+            f"{service}/{account}; another keychain call appears wedged"
+        )
     try:
-        subprocess.run(
-            ["security", "delete-generic-password", "-s", service, "-a", account],
-            capture_output=True,
-            timeout=15,
+        status = lib.SecKeychainAddGenericPassword(
+            None,
+            len(svc_b), svc_b,
+            len(acct_b), acct_b,
+            len(val_b), val_b,
+            None,
         )
-        result = subprocess.run(
-            [
-                "security", "add-generic-password",
-                "-s", service, "-a", account, "-w", value,
-                "-U",
-                "-T", "/usr/bin/security",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        return result.returncode == 0
-    except FileNotFoundError:
+        if status == _ERR_SEC_DUPLICATE_ITEM:
+            # Item already exists; find it and overwrite the password data.
+            pw_len = ctypes.c_uint32(0)
+            pw_data = ctypes.c_void_p(None)
+            item_ref = ctypes.c_void_p(None)
+            find_status = lib.SecKeychainFindGenericPassword(
+                None,
+                len(svc_b), svc_b,
+                len(acct_b), acct_b,
+                ctypes.byref(pw_len),
+                ctypes.byref(pw_data),
+                ctypes.byref(item_ref),
+            )
+            if find_status != 0:
+                logger.warning("SecKeychainFindGenericPassword returned %d for %s/%s", find_status, service, account)
+                return False
+            try:
+                lib.SecKeychainItemFreeContent(None, pw_data)
+                mod_status = lib.SecKeychainItemModifyAttributesAndData(
+                    item_ref, None, len(val_b), val_b,
+                )
+                if mod_status != 0:
+                    logger.warning("SecKeychainItemModifyAttributesAndData returned %d for %s/%s", mod_status, service, account)
+                    return False
+            finally:
+                # itemRef is CF_RETURNS_RETAINED — release it so the update
+                # path doesn't leak a keychain item ref on every refresh.
+                _cf_release(item_ref)
+        elif status != 0:
+            logger.warning("SecKeychainAddGenericPassword returned %d for %s/%s", status, service, account)
+            return False
+        return True
+    except Exception:
+        logger.exception("Security framework call failed for %s/%s", service, account)
         return False
-    except subprocess.TimeoutExpired:
-        logger.warning("security add-generic-password timed out for %s/%s", service, account)
-        return False
+    finally:
+        _keychain_framework_lock.release()
 
 
 def _keychain_get_cli(service: str, account: str) -> str | None:
@@ -415,13 +412,34 @@ def _keychain_find_all(service: str) -> list[str]:
 
 
 def _load_secrets_file() -> dict:
-    """Load the secrets JSON file."""
+    """Load the secrets JSON index.
+
+    A missing file is the legitimate first-run/empty state. A present-but-corrupt
+    or unreadable one raises: this index enumerates every stored account, so
+    treating it as empty would silently hide real credentials from load_all /
+    export_all / delete_all.
+    """
     if not SECRETS_FILE.exists():
         return {}
     try:
-        return json.loads(SECRETS_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
+        raw = SECRETS_FILE.read_text()
+    except OSError as exc:
+        raise SecretsIndexError(
+            f"Could not read secrets index {SECRETS_FILE}: {exc}"
+        ) from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SecretsIndexError(
+            f"Secrets index {SECRETS_FILE} is corrupt (invalid JSON): {exc}. "
+            "Refusing to treat it as empty; fix or restore the file."
+        ) from exc
+    if not isinstance(data, dict):
+        raise SecretsIndexError(
+            f"Secrets index {SECRETS_FILE} is corrupt: expected a JSON object, "
+            f"got {type(data).__name__}."
+        )
+    return data
 
 
 def _save_secrets_file(data: dict) -> None:
@@ -517,8 +535,14 @@ def store_secret(namespace: str, key: str, value: str) -> None:
         # an orphaned Keychain item that is invisible to load_all/export/delete.
         # If _save_secrets_file raises here we never reach _keychain_set, so
         # nothing is orphaned; the exception propagates and the caller retries.
-        # If _keychain_set then fails we fall through to _file_set, which
-        # overwrites the "__keychain__" sentinel with the real value — correct.
+        # If _keychain_set returns False (a genuine SecKeychain error code) we
+        # fall through to _file_set, which overwrites the "__keychain__" sentinel
+        # with the real value — correct. If it RAISES KeychainWriteError (wedged
+        # or missing framework) we deliberately do NOT fall through: writing the
+        # secret to disk in plaintext would trade one leak for another. The
+        # sentinel is then left pointing at an item that was never written, which
+        # is harmless — load_secret returns None for it and export_all_secrets
+        # skips entries that don't resolve.
         with _secrets_file_lock:
             data = _load_secrets_file()
             data.setdefault(service, {})[key] = "__keychain__"
@@ -555,7 +579,16 @@ def load_secret(namespace: str, key: str) -> str | None:
         # Read-fallback to legacy Keychain service ID and migrate forward.
         legacy_value = _keychain_get(legacy_service, key)
         if legacy_value is not None:
-            if _keychain_set(service, key, legacy_value):
+            try:
+                migrated = _keychain_set(service, key, legacy_value)
+            except KeychainWriteError as exc:
+                # The forward-migration is opportunistic. Never let a *write*
+                # problem fail this *read* — return the value and retry later.
+                logger.warning(
+                    "Deferred legacy migration of %s/%s: %s", namespace, key, exc
+                )
+                migrated = False
+            if migrated:
                 with _secrets_file_lock:
                     data = _load_secrets_file()
                     data.setdefault(service, {})[key] = "__keychain__"
@@ -574,7 +607,16 @@ def load_secret(namespace: str, key: str) -> str | None:
     if value and value != "__keychain__":
         # Migrate to Keychain if on macOS
         if _is_macos():
-            if _keychain_set(service, key, value):
+            try:
+                migrated = _keychain_set(service, key, value)
+            except KeychainWriteError as exc:
+                # Opportunistic migration; a wedged Keychain must not fail a read.
+                logger.warning(
+                    "Deferred file→Keychain migration of %s/%s: %s",
+                    namespace, key, exc,
+                )
+                migrated = False
+            if migrated:
                 with _secrets_file_lock:
                     data = _load_secrets_file()
                     if service in data and key in data[service]:

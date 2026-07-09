@@ -598,8 +598,10 @@ async function loadYouTube() {
         reauthBtn.classList.remove('btn-warning');
         return;
     }
-    const title = data.channel_title || data.channel_id;
-    const handle = data.channel_handle ? ` (${data.channel_handle})` : '';
+    // Escaped here rather than at each use: both branches below interpolate these
+    // into innerHTML, and the values come from the YouTube channel resource.
+    const title = escapeHtml(data.channel_title || data.channel_id);
+    const handle = data.channel_handle ? ` (${escapeHtml(data.channel_handle)})` : '';
     if (data.needs_reauth) {
         info.innerHTML = `<span class="badge badge-draft">Needs re-auth</span>
             <span style="margin-left: 0.5rem;">Bound to <strong>${title}</strong>${handle}</span>
@@ -610,7 +612,7 @@ async function loadYouTube() {
         info.innerHTML = `<span class="badge badge-published">Connected</span>
             <span style="margin-left: 0.5rem;">Posting as <strong>${title}</strong>${handle}</span>
             <div style="color: var(--text-muted); font-size: 0.8rem; margin-top: 0.25rem;">
-                Channel id: <code>${data.channel_id}</code>
+                Channel id: <code>${escapeHtml(data.channel_id)}</code>
             </div>`;
         reauthBtn.classList.remove('btn-warning');
         reauthBtn.classList.add('btn-primary');
@@ -660,7 +662,7 @@ async function loadSocialDefaults() {
             .concat(credentials.map(c => {
                 const reauth = c.needs_reauth ? ' (needs re-auth)' : '';
                 const prem = isXPremium(c) ? ' · X Premium' : '';
-                return `<option value="${c.id}" ${c.id === currentId ? 'selected' : ''}>${c.label}${reauth}${prem}</option>`;
+                return `<option value="${c.id}" ${c.id === currentId ? 'selected' : ''}>${escapeHtml(c.label)}${reauth}${prem}</option>`;
             })).join('');
         const isMissing = currentId && !credentials.some(c => c.id === currentId);
         const currentCred = credentials.find(c => c.id === currentId);

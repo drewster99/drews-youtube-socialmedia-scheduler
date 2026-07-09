@@ -44,6 +44,17 @@
 <script>
 const projectSlug = "{{ current_project.slug }}";
 
+// Comment author/body and matched keyword reach this page from arbitrary YouTube
+// commenters, so they must never be interpolated raw into innerHTML.
+function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s)
+        .replaceAll('&','&amp;')
+        .replaceAll('<','&lt;')
+        .replaceAll('>','&gt;')
+        .replaceAll('"','&quot;');
+}
+
 // SQLite's datetime('now') returns naive UTC. Safari parses those as
 // local time; coerce to ISO-with-Z so they parse as UTC.
 function _ensureUtc(iso) {
@@ -64,7 +75,7 @@ async function loadBlocklist() {
     }
     area.innerHTML = `<ul class="keyword-list">${items.map(i => `
         <li>
-            <code>${i.keyword}</code>
+            <code>${escapeHtml(i.keyword)}</code>
             ${i.is_regex ? '<span class="badge">regex</span>' : ''}
             <button class="btn btn-sm btn-danger" onclick="removeKeyword(${i.id})">×</button>
         </li>
@@ -136,9 +147,9 @@ async function loadLog() {
             <tr>
                 <td>${new Date(_ensureUtc(i.created_at)).toLocaleString()}</td>
                 <td><a href="/projects/${projectSlug}/videos/${i.video_id}">${i.video_id}</a></td>
-                <td>${i.author || '—'}</td>
-                <td class="comment-preview">${(i.comment_text || '').slice(0, 80)}...</td>
-                <td><code>${i.matched_keyword}</code></td>
+                <td>${escapeHtml(i.author) || '—'}</td>
+                <td class="comment-preview">${escapeHtml((i.comment_text || '').slice(0, 80))}...</td>
+                <td><code>${escapeHtml(i.matched_keyword)}</code></td>
                 <td><span class="badge">${i.action}</span></td>
             </tr>
         `).join('')}</tbody>

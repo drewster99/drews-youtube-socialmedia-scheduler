@@ -225,26 +225,32 @@ async def test_send_scheduled_post_proceeds_when_video_public(app_db) -> None:
     )
     await db.commit()
 
-    # The video is public so the gate doesn't block; the post will
-    # progress to the claim+poster path. We can't mock the network here,
-    # so it'll fail at "not configured" — but the key invariant is that
-    # status moved past 'approved', proving the gate was passed.
+    # The video is public so the gate doesn't block; the post progresses to the
+    # claim+poster path. We can't mock the network here, so it stops at "not
+    # configured" — which is a *recoverable* condition (the user can connect the
+    # account and re-send), so the post is released back to 'approved' with both
+    # schedule columns cleared, matching publish_video_job. The invariant under
+    # test is which error we stopped on, not the status: reaching "not
+    # configured" at all proves the video-not-public gate let us through.
     await scheduler_mod._send_scheduled_post(pids[0])
 
     cursor = await db.execute(
-        "SELECT status FROM social_posts WHERE id = ?", (pids[0],)
+        "SELECT status, error, scheduled_at, scheduler_job_id "
+        "FROM social_posts WHERE id = ?",
+        (pids[0],),
     )
     row = await cursor.fetchone()
-    assert row["status"] in ("failed", "posted"), (
-        f"gate must not have blocked; got status={row['status']}"
+    assert row["error"], "expected the poster-resolution error"
+    assert "non-public" not in row["error"], (
+        f"gate must not have blocked; got error={row['error']}"
     )
-    # The error, if present, must NOT be the video-not-public error.
-    cursor = await db.execute(
-        "SELECT error FROM social_posts WHERE id = ?", (pids[0],)
+    assert "not configured" in row["error"]
+    assert row["status"] == "approved", (
+        f"'not configured' is recoverable; got status={row['status']}"
     )
-    row = await cursor.fetchone()
-    if row["error"]:
-        assert "non-public" not in row["error"]
+    # A spent DateTrigger must not be re-registered on the next restart.
+    assert row["scheduled_at"] is None
+    assert row["scheduler_job_id"] is None
 
 
 async def test_schedule_records_one_event_per_post(app_db) -> None:

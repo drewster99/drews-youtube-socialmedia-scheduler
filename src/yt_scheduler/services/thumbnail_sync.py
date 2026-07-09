@@ -193,15 +193,19 @@ async def maybe_refresh_youtube_thumbnail(
         # Fetch the new YouTube thumbnail to disk. The filename folds in
         # video id so multiple fetches don't collide with each other or
         # with the user's own upload (which uses its own filename).
-        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         target = UPLOAD_DIR / f"{video_id}_yt_thumb.jpg"
         new_etag: str | None = None
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.get(new_url, follow_redirects=True)
                 resp.raise_for_status()
+
+            def _save() -> str | None:
+                UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(resp.content)
-                new_etag = resp.headers.get("etag") or resp.headers.get("ETag")
+                return resp.headers.get("etag") or resp.headers.get("ETag")
+
+            new_etag = await asyncio.to_thread(_save)
         except Exception as exc:
             logger.warning(
                 "Could not download YouTube thumbnail for %s from %s: %s",
@@ -238,8 +242,9 @@ async def maybe_refresh_youtube_thumbnail(
     if not local.exists() or not yt_local.exists():
         return
 
-    local_bytes = local.read_bytes()
-    yt_bytes = yt_local.read_bytes()
+    local_bytes, yt_bytes = await asyncio.to_thread(
+        lambda: (local.read_bytes(), yt_local.read_bytes())
+    )
     local_sha = _sha256_bytes(local_bytes)
     yt_sha = _sha256_bytes(yt_bytes)
 
@@ -316,9 +321,13 @@ async def backfill_thumbnail(video_id: str) -> bool:
     if content is None:
         return False
 
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     target = UPLOAD_DIR / f"{video_id}_thumb.jpg"
-    target.write_bytes(content)
+
+    def _save() -> None:
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+
+    await asyncio.to_thread(_save)
     # Mirror the import path: thumbnail_source='youtube', and seed the
     # dual-thumbnail columns so a later maybe_refresh doesn't re-download
     # an identical image just to find nothing changed.

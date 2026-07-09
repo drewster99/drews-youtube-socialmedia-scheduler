@@ -151,7 +151,18 @@ def _repair_all_keychain_acls() -> int:
                 )
                 continue
 
-            if keychain._keychain_set(service, account, value):
+            try:
+                re_added = keychain._keychain_set(service, account, value)
+            except keychain.KeychainWriteError as exc:
+                # The original item is already deleted, so an escaping raise here
+                # would lose the secret outright. Fall into the restore branch.
+                logger.error(
+                    "Keychain ACL repair: keychain unavailable for %s/%s after "
+                    "delete (%s); restoring old-scheme item", service, account, exc,
+                )
+                re_added = False
+
+            if re_added:
                 readback = keychain._keychain_get(service, account)
                 if readback == value:
                     completed.add(item_id)

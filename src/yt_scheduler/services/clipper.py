@@ -854,7 +854,11 @@ async def _run_cut(
                     out_path.unlink(missing_ok=True)
         return out_path, uncertain
 
-    will_use_hardware = media_service.hardware_encoder_available("h264")
+    # Cold cache spawns `ffmpeg -encoders`; keep that subprocess off the event loop
+    # even though app startup normally warms it.
+    will_use_hardware = await asyncio.to_thread(
+        media_service.hardware_encoder_available, "h264"
+    )
     semaphore = (
         _get_hardware_cut_semaphore() if will_use_hardware
         else _get_software_cut_semaphore()

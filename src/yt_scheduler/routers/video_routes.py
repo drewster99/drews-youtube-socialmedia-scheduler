@@ -424,7 +424,13 @@ async def upload_video(payload: dict = Body(...)):
         raise HTTPException(400, str(exc)) from exc
     video_ext = upload_entry["ext"]
     video_path = UPLOAD_DIR / f"upload_{secrets.token_hex(8)}{video_ext}"
-    Path(upload_entry["path"]).rename(video_path)
+    try:
+        Path(upload_entry["path"]).rename(video_path)
+    except OSError as exc:
+        # consume_upload already popped the row, so on rename failure these bytes
+        # have no DB row and no reclaimable name — no sweep would ever free them.
+        Path(upload_entry["path"]).unlink(missing_ok=True)
+        raise HTTPException(500, f"Could not stage uploaded video: {exc}") from exc
     video_original_name = sanitized_original_filename(upload_entry["filename"])
 
     # Optional thumbnail (also via the chunked-upload protocol).
@@ -438,7 +444,16 @@ async def upload_video(payload: dict = Body(...)):
             raise HTTPException(400, str(exc)) from exc
         thumb_ext = thumb_entry["ext"] or ".jpg"
         thumbnail_path = UPLOAD_DIR / f"upload_{secrets.token_hex(8)}{thumb_ext}"
-        Path(thumb_entry["path"]).rename(thumbnail_path)
+        try:
+            Path(thumb_entry["path"]).rename(thumbnail_path)
+        except OSError as exc:
+            # Same orphan reasoning as the video rename above; the video is
+            # already staged, so abort cleans up both.
+            Path(thumb_entry["path"]).unlink(missing_ok=True)
+            video_path.unlink(missing_ok=True)
+            raise HTTPException(
+                500, f"Could not stage uploaded thumbnail: {exc}"
+            ) from exc
 
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
 
@@ -491,7 +506,7 @@ async def upload_video(payload: dict = Body(...)):
             thumbnail_error = str(e)
 
     # Probe duration locally so we can stamp the tier without a YouTube round-trip.
-    duration = tiers.probe_local_duration(video_path)
+    duration = await asyncio.to_thread(tiers.probe_local_duration, video_path)
     tier = tiers.tier_for_duration(duration)
 
     # Track in database. videos.url is set to the canonical YouTube URL
@@ -639,7 +654,11 @@ async def create_non_youtube_item(payload: dict = Body(...)):
         Path(entry["path"]).rename(thumbnail_path)
 
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
-    duration = tiers.probe_local_duration(video_path) if video_path else 0.0
+    duration = (
+        await asyncio.to_thread(tiers.probe_local_duration, video_path)
+        if video_path
+        else 0.0
+    )
     tier = tiers.tier_for_duration(duration) if duration else ""
 
     async with write_transaction() as db:
@@ -690,40 +709,71 @@ async def update_video(video_id: str, data: dict):
     before = dict(rows[0])
     before["tags"] = _decode_tags(before.get("tags"))
 
-    await _bind_project_for_video(video_id)
-    # Update on YouTube, then read back from YouTube to confirm. The
-    # API can silently coerce values (privacy clamped on managed
-    # channels, publish_at adjusted to comply with channel rules,
-    # tags trimmed past length limits) so writing what-we-sent to the
-    # DB drifts from reality. Always trust YouTube's response.
-    try:
-        await asyncio.to_thread(
-            youtube.update_video_metadata,
-            video_id=video_id,
-            title=data.get("title"),
-            description=data.get("description"),
-            tags=data.get("tags"),
-            privacy_status=data.get("privacy_status"),
-            publish_at=data.get("publish_at"),
-        )
-    except Exception as e:
-        raise HTTPException(500, f"YouTube update failed: {e}")
+    # Real YouTube video ids are 11 chars; standalone item ids this app mints are
+    # 22 (secrets.token_urlsafe(16)[:22]). Same discriminator the scheduler uses
+    # (LENGTH(id) = 11). A 22-char row has no YouTube video to update, so calling
+    # YouTube for one raises ValueError("not found") and 500s the whole edit.
+    is_youtube_backed = len(video_id) == 11
+
+    def _youtube_field_changed() -> bool:
+        """Has any YouTube-facing field actually changed?
+
+        The detail form always POSTs the full metadata block, so gating on mere
+        presence would never spare the round-trip on a tier/episode-only edit.
+        publish_at is always pushed when present: it drives channel-side
+        scheduling and its datetime normalisation is too error-prone to diff.
+        """
+        if "publish_at" in data:
+            return True
+        if "title" in data and data["title"] != before.get("title"):
+            return True
+        if "description" in data and (data["description"] or "") != (
+            before.get("description") or ""
+        ):
+            return True
+        if "tags" in data and list(data["tags"] or []) != list(before.get("tags") or []):
+            return True
+        if "privacy_status" in data and data["privacy_status"] != before.get(
+            "privacy_status"
+        ):
+            return True
+        return False
 
     confirmed = None
-    try:
-        fresh = await asyncio.to_thread(youtube.get_video, video_id)
-        if fresh:
-            snippet = fresh.get("snippet") or {}
-            status = fresh.get("status") or {}
-            confirmed = {
-                "title": snippet.get("title"),
-                "description": snippet.get("description"),
-                "tags": snippet.get("tags") or [],
-                "privacy_status": status.get("privacyStatus"),
-                "publish_at": status.get("publishAt"),
-            }
-    except Exception as e:
-        logger.warning("YouTube readback after metadata update failed: %s", e)
+    if is_youtube_backed and _youtube_field_changed():
+        await _bind_project_for_video(video_id)
+        # Update on YouTube, then read back from YouTube to confirm. The
+        # API can silently coerce values (privacy clamped on managed
+        # channels, publish_at adjusted to comply with channel rules,
+        # tags trimmed past length limits) so writing what-we-sent to the
+        # DB drifts from reality. Always trust YouTube's response.
+        try:
+            await asyncio.to_thread(
+                youtube.update_video_metadata,
+                video_id=video_id,
+                title=data.get("title"),
+                description=data.get("description"),
+                tags=data.get("tags"),
+                privacy_status=data.get("privacy_status"),
+                publish_at=data.get("publish_at"),
+            )
+        except Exception as e:
+            raise HTTPException(500, f"YouTube update failed: {e}")
+
+        try:
+            fresh = await asyncio.to_thread(youtube.get_video, video_id)
+            if fresh:
+                snippet = fresh.get("snippet") or {}
+                status = fresh.get("status") or {}
+                confirmed = {
+                    "title": snippet.get("title"),
+                    "description": snippet.get("description"),
+                    "tags": snippet.get("tags") or [],
+                    "privacy_status": status.get("privacyStatus"),
+                    "publish_at": status.get("publishAt"),
+                }
+        except Exception as e:
+            logger.warning("YouTube readback after metadata update failed: %s", e)
 
     # Update local record. Prefer YouTube's confirmed values for fields
     # that were touched in this request — that way a privacy clamp or
@@ -968,13 +1018,16 @@ async def transcribe_video(
         # to see verbatim rather than a bare 500.
         raise HTTPException(400, str(e))
 
-    # Save transcript, SRT, and JSON with word-level timestamps
-    srt_path = result.save_srt(video_file)
-    vtt_path = result.save_vtt(video_file)
+    # Save transcript, SRT, and JSON with word-level timestamps. Grouped into one
+    # thread hop because they always happen together and each blocks on disk.
+    def _persist_transcripts() -> tuple[Path, Path, Path]:
+        srt = result.save_srt(video_file)
+        vtt = result.save_vtt(video_file)
+        json_out = UPLOAD_DIR / f"{Path(video_file).stem}_transcript.json"
+        json_out.write_text(json.dumps(result.to_json(), indent=2), encoding="utf-8")
+        return srt, vtt, json_out
 
-    # Save full JSON transcript with word-level timestamps
-    json_path = UPLOAD_DIR / f"{Path(video_file).stem}_transcript.json"
-    json_path.write_text(json.dumps(result.to_json(), indent=2), encoding="utf-8")
+    srt_path, vtt_path, json_path = await asyncio.to_thread(_persist_transcripts)
 
     old_transcript = video.get("transcript") or ""
 
@@ -1237,8 +1290,17 @@ async def apply_description(video_id: str):
     if not desc:
         raise HTTPException(400, "No generated description. Generate one first.")
 
-    await _bind_project_for_video(video_id)
-    await asyncio.to_thread(youtube.update_video_metadata, video_id, description=desc)
+    # 22-char standalone items have no YouTube video — apply locally only.
+    # For real videos the push must succeed BEFORE we persist, or the DB would
+    # claim YouTube already has a description it never received.
+    if len(video_id) == 11:
+        await _bind_project_for_video(video_id)
+        try:
+            await asyncio.to_thread(
+                youtube.update_video_metadata, video_id, description=desc
+            )
+        except Exception as e:
+            raise HTTPException(500, f"YouTube update failed: {e}") from e
 
     old_description = video.get("description") or ""
     async with write_transaction() as db:

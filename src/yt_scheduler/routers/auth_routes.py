@@ -21,8 +21,13 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 @router.get("/status")
 async def auth_status(project_slug: str = DEFAULT_PROJECT_SLUG):
-    """Auth status for the given project."""
-    return get_auth_status(project_slug)
+    """Auth status for the given project.
+
+    get_auth_status does several blocking Keychain reads and may fire a blocking
+    Google token refresh, so it must not run on the event loop. One to_thread hop
+    covers the whole composition.
+    """
+    return await asyncio.to_thread(get_auth_status, project_slug)
 
 
 @router.post("/login")
@@ -45,7 +50,7 @@ async def login(project_slug: str = DEFAULT_PROJECT_SLUG):
 async def logout(project_slug: str = DEFAULT_PROJECT_SLUG):
     """Clear stored credentials for one project. Leaves client_secret intact."""
     try:
-        clear_credentials(project_slug)
+        await asyncio.to_thread(clear_credentials, project_slug)
         return {"status": "ok", "message": "Credentials removed"}
     except Exception as e:
         return {"status": "error", "message": f"Failed to clear credentials: {e}"}
@@ -63,7 +68,7 @@ async def upload_client_secret(file: UploadFile):
             f"File too large: client_secret JSON must be under {_MAX_CLIENT_SECRET_BYTES} bytes",
         )
     try:
-        store_client_secret_from_text(content.decode("utf-8"))
+        await asyncio.to_thread(store_client_secret_from_text, content.decode("utf-8"))
     except Exception as exc:
         raise HTTPException(400, f"Invalid client_secret JSON: {exc}") from exc
     return {"status": "ok", "message": "Client secret saved to Keychain"}
@@ -73,10 +78,10 @@ async def upload_client_secret(file: UploadFile):
 async def delete_client_secret():
     """Remove the install-wide OAuth client. All projects' tokens become unusable
     until a new client secret is uploaded and re-auth runs."""
-    clear_client_secret()
+    await asyncio.to_thread(clear_client_secret)
     return {"status": "ok"}
 
 
 @router.get("/client-secret/status")
 async def client_secret_status():
-    return {"uploaded": has_client_secret()}
+    return {"uploaded": await asyncio.to_thread(has_client_secret)}

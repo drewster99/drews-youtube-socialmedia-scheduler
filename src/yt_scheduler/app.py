@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -207,6 +208,16 @@ async def lifespan(app: FastAPI):
         await backfill_channel_assets()
     except Exception:
         logger.exception("backfill_channel_assets failed at startup; continuing")
+
+    # Warm the ffmpeg encoder-capability cache once, off the loop. Without this
+    # the first clip cut pays a synchronous `ffmpeg -encoders` spawn, and two
+    # concurrent cuts each spawn their own.
+    try:
+        from yt_scheduler.services import media as _media
+
+        await asyncio.to_thread(_media.hardware_encoder_available, "h264")
+    except Exception:
+        logger.exception("ffmpeg encoder probe failed at startup; continuing")
 
     # Seed the built-in templates into EVERY project that doesn't have
     # them yet. Per-project so one bad project doesn't skip the rest.

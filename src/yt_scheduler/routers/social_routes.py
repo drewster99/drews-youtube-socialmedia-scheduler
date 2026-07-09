@@ -1019,7 +1019,7 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
             platform=post["platform"],
             social_account_id=cred["id"] if cred else post.get("social_account_id"),
             content=post.get("content") or "",
-            media_path=post.get("media_path"),
+            media_paths=_decode_media_paths(post),
             exclude_post_id=post_id,
         )
         if dup is not None:
@@ -1133,6 +1133,7 @@ async def schedule_post(
                 platform=post["platform"],
                 social_account_id=cred["id"] if cred else post.get("social_account_id"),
                 content=post.get("content") or "",
+                media_paths=_decode_media_paths(post),
                 exclude_post_id=post_id,
             )
             if dup is not None:
@@ -1183,7 +1184,7 @@ async def send_all_posts(
                 platform=post["platform"],
                 social_account_id=cred["id"] if cred else post.get("social_account_id"),
                 content=post.get("content") or "",
-                media_path=post.get("media_path"),
+                media_paths=_decode_media_paths(post),
                 exclude_post_id=int(post["id"]),
             )
             if dup is not None:
@@ -1198,17 +1199,32 @@ async def send_all_posts(
                 "needs_confirm": True,
             })
 
-    results = {}
+    # A list, not a dict keyed by platform: a template can route two posts to two
+    # different accounts on the SAME platform, and keying by platform silently
+    # dropped one account's result.
+    results: list[dict] = []
+
+    def _entry(post: dict, cred: dict | None, **fields) -> dict:
+        return {
+            "post_id": int(post["id"]),
+            "platform": post["platform"],
+            "account_label": (cred or {}).get("label"),
+            **fields,
+        }
+
     for row in rows:
         post = dict(row)
+        cred = await _credential_for_post(post)
         try:
             poster = await _resolve_poster_for_post(post)
         except ValueError as exc:
-            results[post["platform"]] = {"status": "skipped", "reason": str(exc)}
+            results.append(_entry(post, cred, status="skipped", reason=str(exc)))
             continue
 
         if not await poster.is_configured():
-            results[post["platform"]] = {"status": "skipped", "reason": "not configured"}
+            results.append(
+                _entry(post, cred, status="skipped", reason="not configured")
+            )
             continue
 
         try:
@@ -1227,9 +1243,12 @@ async def send_all_posts(
                     WHERE id = ?""",
                     (result.get("url", ""), post["id"]),
                 )
-            results[post["platform"]] = {
-                "status": "posted", "url": result.get("url", ""), "warning": result.get("warning"),
-            }
+            results.append(_entry(
+                post, cred,
+                status="posted",
+                url=result.get("url", ""),
+                warning=result.get("warning"),
+            ))
             from datetime import datetime as _dt, timezone as _tz
             await events.record_event(
                 video_id,
@@ -1244,10 +1263,7 @@ async def send_all_posts(
         except social.CredentialAuthError as e:
             # See send_post: flag the resolved credential when the error
             # didn't carry a UUID, so the Reconnect button actually appears.
-            uuid_to_flag = e.uuid
-            if not uuid_to_flag:
-                cred = await _credential_for_post(post)
-                uuid_to_flag = cred.get("uuid") if cred else None
+            uuid_to_flag = e.uuid or (cred.get("uuid") if cred else None)
             if uuid_to_flag:
                 await mark_needs_reauth(uuid_to_flag)
             async with write_transaction() as db:
@@ -1256,10 +1272,11 @@ async def send_all_posts(
                     "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
                     (f"Credential needs re-auth: {e}", post["id"]),
                 )
-            results[post["platform"]] = {
-                "status": "needs_reauth",
-                "error": "Credential needs re-authentication. Reconnect from Settings.",
-            }
+            results.append(_entry(
+                post, cred,
+                status="needs_reauth",
+                error="Credential needs re-authentication. Reconnect from Settings.",
+            ))
         except Exception as e:
             logger.exception("Send failed for post %s", post["id"])
             async with write_transaction() as db:
@@ -1268,6 +1285,6 @@ async def send_all_posts(
                     "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
                     (str(e), post["id"]),
                 )
-            results[post["platform"]] = {"status": "failed", "error": str(e)}
+            results.append(_entry(post, cred, status="failed", error=str(e)))
 
     return results

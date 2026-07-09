@@ -179,11 +179,11 @@ async function loadVideos() {
                 <a href="/projects/${projectSlug}/videos/${v.id}" class="video-card${v.youtube_deleted ? ' video-card-deleted' : ''}">
                     <div class="video-thumb">
                         ${v.thumbnail_url
-                            ? `<img src="${v.thumbnail_url}" alt="${v.title}">`
+                            ? `<img src="${escapeAttr(v.thumbnail_url)}" alt="${escapeAttr(v.title)}">`
                             : '<div class="thumb-placeholder">No thumbnail</div>'}
                     </div>
                     <div class="video-info">
-                        <h3>${episodeChip}${v.title}</h3>
+                        <h3>${episodeChip}${escapeAttr(v.title)}</h3>
                         ${scheduleLine}
                         <div class="video-meta">
                             <span class="badge badge-type-${v.item_type || 'episode'}">${v.item_type || 'episode'}</span>
@@ -243,7 +243,7 @@ async function loadAvailableImports() {
         container.innerHTML = items.map(v => {
             const embed = v.embeddable
                 ? `<iframe src="https://www.youtube.com/embed/${v.video_id}" frameborder="0" allowfullscreen></iframe>`
-                : (v.thumbnail_url ? `<img src="${v.thumbnail_url}" alt="${v.title}">` : '<div class="thumb-placeholder">No thumbnail</div>');
+                : (v.thumbnail_url ? `<img src="${escapeAttr(v.thumbnail_url)}" alt="${escapeAttr(v.title)}">` : '<div class="thumb-placeholder">No thumbnail</div>');
             const durationLabel = formatDuration(v.duration_seconds);
             const durationBadge = durationLabel
                 ? `<span class="badge badge-duration">${durationLabel}</span>`
@@ -255,7 +255,7 @@ async function loadAvailableImports() {
                 <div class="video-card import-card">
                     <div class="video-thumb">${embed}</div>
                     <div class="video-info">
-                        <h3>${v.title}</h3>
+                        <h3>${escapeAttr(v.title)}</h3>
                         <div class="video-meta">
                             <span class="badge badge-${v.privacy_status || 'unlisted'}">${v.privacy_status || 'unknown'}</span>
                             ${ytKindBadge}

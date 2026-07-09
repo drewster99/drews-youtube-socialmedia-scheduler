@@ -49,7 +49,11 @@ async def set_active(video_id: str, payload: dict) -> dict:
     old_text = rows[0]["transcript"] or ""
 
     # Bind the active project so the YouTube caption upload below uses the
-    # right OAuth credentials.
+    # right OAuth credentials. This is safe across concurrent requests:
+    # _active_project_slug is a task-local ContextVar, each request runs in its
+    # own asyncio.Task (which copies the context), and asyncio.to_thread hands
+    # the worker a snapshot of *this* task's context — so a second request
+    # switching projects cannot redirect this upload to the wrong channel.
     project_id = rows[0]["project_id"]
     if project_id is not None:
         project = await get_project_by_id(int(project_id))
