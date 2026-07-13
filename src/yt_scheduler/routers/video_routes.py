@@ -1147,6 +1147,10 @@ async def generate_description(video_id: str, data: dict | None = None):
             "keyframes from. Re-import the video or upload a copy.",
         )
 
+    from yt_scheduler.services import templates as template_service
+
+    prompt_variables = await template_service.build_prompt_variables(video)
+
     try:
         if use_frames:
             frames = await asyncio.to_thread(
@@ -1163,6 +1167,7 @@ async def generate_description(video_id: str, data: dict | None = None):
                 frames=frames,
                 extra_instructions=extra,
                 project_id=project_id,
+                prompt_variables=prompt_variables,
             )
         else:
             description = await ai.generate_seo_description(
@@ -1170,6 +1175,7 @@ async def generate_description(video_id: str, data: dict | None = None):
                 transcript=transcript,
                 extra_instructions=extra,
                 project_id=project_id,
+                prompt_variables=prompt_variables,
             )
     except HTTPException:
         raise
@@ -1231,6 +1237,10 @@ async def generate_tags(video_id: str, data: dict | None = None):
     project_id = int(project_id)
     mode = ((data or {}).get("mode") or "metadata").strip()
 
+    from yt_scheduler.services import templates as template_service
+
+    prompt_variables = await template_service.build_prompt_variables(video)
+
     try:
         if mode == "frames":
             video_file = video.get("video_file_path") or ""
@@ -1254,6 +1264,7 @@ async def generate_tags(video_id: str, data: dict | None = None):
                 description=video.get("description", "") or "",
                 frames=frames,
                 project_id=project_id,
+                prompt_variables=prompt_variables,
             )
         else:
             tags = await ai.generate_tags_from_metadata(
@@ -1261,6 +1272,7 @@ async def generate_tags(video_id: str, data: dict | None = None):
                 description=video.get("description", "") or "",
                 transcript=video.get("transcript", "") or "",
                 project_id=project_id,
+                prompt_variables=prompt_variables,
             )
     except HTTPException:
         raise

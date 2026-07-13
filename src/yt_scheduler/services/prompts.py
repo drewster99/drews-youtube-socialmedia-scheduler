@@ -105,7 +105,7 @@ SEED_TAGS_FROM_METADATA_PROMPT = SeedPrompt(
         "Generate 8–15 YouTube tags that maximise discoverability for this video.\n\n"
         "Title: {{title}}\n"
         "Description: {{description}}\n"
-        "Transcript (first 4000 chars): {{transcript_truncated}}\n"
+        "Transcript (truncated): {{transcript_truncated}}\n"
         "{{parent_context_block??}}\n\n"
         "Instructions:\n"
         "- Output a comma-separated list, no numbering, no quotes.\n"

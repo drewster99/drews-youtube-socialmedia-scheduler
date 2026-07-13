@@ -197,6 +197,111 @@ def merge_variables(
     return merged
 
 
+async def build_prompt_variables(video: dict) -> dict[str, object]:
+    """Merged variable dict for AI prompt-template bodies (description /
+    tags generation): custom variables at every scope (global → project →
+    parent item → self item), the URL family, the parent-video fields with
+    ``parent_context_block``, the ``{{transcript*}}`` family, and the
+    video's own title/description.
+
+    The social-post path has its own richer context builder in
+    ``social_routes._build_render_context`` (images, media paths, a
+    YouTube tier lookup); this one is deliberately lighter — prompt
+    bodies never attach media, and a YouTube API round-trip per
+    description generation would be wasted quota.
+    """
+    # Lazy import: ai.py imports nothing from this module at load time,
+    # but _build_parent_context_block lives there next to its other
+    # prompt-assembly helpers, and this module is imported BY ai.py's
+    # render helper at call time — mirror that lazy style to keep the
+    # import graph acyclic.
+    from yt_scheduler.services.ai import _build_parent_context_block
+    from yt_scheduler.services.transcripts import transcript_prompt_variables
+
+    project_id = video.get("project_id")
+    if project_id in (None, 0):
+        raise ValueError(
+            f"Video {video.get('id')} has no project_id (data integrity error)."
+        )
+    project_id = int(project_id)
+
+    db = await get_db()
+
+    project_rows = await db.execute_fetchall(
+        "SELECT project_url FROM projects WHERE id = ?", (project_id,)
+    )
+    project_url = (
+        dict(project_rows[0]).get("project_url") or "" if project_rows else ""
+    )
+
+    parent: dict | None = None
+    if video.get("parent_item_id"):
+        parent_rows = await db.execute_fetchall(
+            "SELECT * FROM videos WHERE id = ?", (video["parent_item_id"],)
+        )
+        if parent_rows:
+            parent = dict(parent_rows[0])
+
+    global_rows = await db.execute_fetchall(
+        "SELECT key, value FROM global_variables"
+    )
+    global_vars = {r["key"]: r["value"] for r in global_rows}
+
+    project_var_rows = await db.execute_fetchall(
+        "SELECT key, value FROM project_variables WHERE project_id = ?",
+        (project_id,),
+    )
+    project_vars = {r["key"]: r["value"] for r in project_var_rows}
+
+    parent_item_vars: dict[str, str] = {}
+    if parent is not None:
+        parent_var_rows = await db.execute_fetchall(
+            "SELECT key, value FROM item_variables WHERE video_id = ?",
+            (parent["id"],),
+        )
+        parent_item_vars = {r["key"]: r["value"] for r in parent_var_rows}
+
+    self_var_rows = await db.execute_fetchall(
+        "SELECT key, value FROM item_variables WHERE video_id = ?",
+        (video["id"],),
+    )
+    self_item_vars = {r["key"]: r["value"] for r in self_var_rows}
+
+    parent_url = (parent or {}).get("url") or ""
+    parent_title = (parent or {}).get("title") or ""
+    parent_description = (parent or {}).get("description") or ""
+    parent_tags = ""
+    if parent is not None:
+        try:
+            parent_tags = ", ".join(json.loads(parent.get("tags") or "[]"))
+        except json.JSONDecodeError:
+            parent_tags = ""
+
+    self_builtins: dict[str, object] = {
+        "title": video.get("title") or "",
+        "description": video.get("description") or "",
+        "url": video.get("url") or "",
+        "episode_url": parent_url,
+        "project_url": project_url,
+        "parent_url": parent_url,
+        "parent_title": parent_title,
+        "parent_description": parent_description,
+        "parent_tags": parent_tags,
+        "parent_context_block": _build_parent_context_block(
+            parent_title, parent_url, parent_description, parent_tags
+        ),
+        **transcript_prompt_variables(video.get("transcript")),
+    }
+
+    return merge_variables(
+        global_vars=global_vars,
+        project_vars=project_vars,
+        parent_item_vars=parent_item_vars,
+        self_builtins=self_builtins,
+        self_item_vars=self_item_vars,
+    )
+
+
 def _is_blank(value: object) -> bool:
     """True when a variable value counts as "no content" for the section,
     required, and default placeholder forms: ``None`` or a string that is

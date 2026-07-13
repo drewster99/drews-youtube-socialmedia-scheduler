@@ -18,7 +18,7 @@ from yt_scheduler.config import (
 from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.services import events, social, templates as tmpl, youtube
 from yt_scheduler.services.scheduler import cancel_scheduled_post, get_publish_lock
-from yt_scheduler.services.transcripts import srt_to_plain_text
+from yt_scheduler.services.transcripts import transcript_prompt_variables
 
 
 from yt_scheduler.services import tiers
@@ -203,7 +203,7 @@ async def _build_render_context(db, video: dict) -> dict:
         "hashtags": " ".join(f"#{t.replace(' ', '')}" for t in tags[:5]),
         "thumbnail_path": video.get("thumbnail_path") or "",
         "tier": tier,
-        "transcript": srt_to_plain_text(video.get("transcript") or ""),
+        **transcript_prompt_variables(video.get("transcript")),
         "url": url_value,
         "episode_url": episode_url_value,
         "project_url": project_url_value,

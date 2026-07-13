@@ -343,9 +343,10 @@ async def _maybe_generate_tags(video: dict, project_id: int, column: dict) -> No
     ) else ""
 
     try:
+        prompt_variables = await tmpl.build_prompt_variables(video)
         new_tags = await ai.generate_tags_from_metadata(
             title=title, description=description, transcript=transcript,
-            project_id=project_id,
+            project_id=project_id, prompt_variables=prompt_variables,
         )
     except Exception as exc:
         logger.warning("auto-tags generation failed: %s", exc)
@@ -392,10 +393,12 @@ async def _maybe_generate_description(video: dict, project_id: int) -> str | Non
     if not transcript:
         return None
     try:
+        prompt_variables = await tmpl.build_prompt_variables(video)
         description = await ai.generate_seo_description(
             title=video.get("title", ""),
             transcript=transcript,
             project_id=project_id,
+            prompt_variables=prompt_variables,
         )
     except Exception as exc:
         logger.warning("auto-description failed: %s", exc)
@@ -513,7 +516,15 @@ async def _maybe_generate_socials(
         # fallback below stays disabled for this slot.
         body_declared_media = tmpl.body_declares_media(body)
         try:
-            slot_vars = {**ctx["variables"], "max_chars": str(slot_max)}
+            # user_message is a compose-flow input with no auto-path
+            # equivalent; defined-empty (a legitimate optional, unlike a
+            # missing required value) so {{user_message}} renders empty and
+            # {{#user_message}} sections drop instead of erroring the slot.
+            slot_vars = {
+                **ctx["variables"],
+                "user_message": "",
+                "max_chars": str(slot_max),
+            }
             # Sections resolve before the media pass so a directive inside
             # a dropped section never attaches media — same order as the
             # manual generate route.
@@ -1385,9 +1396,12 @@ async def _promo_step_description(video_id: str, project_id: int) -> None:
     """Generate a description from transcript (≥10 chars after trim) or
     from sampled keyframes."""
     db = await get_db()
+    # SELECT * — build_prompt_variables needs project_id, parent_item_id,
+    # url, and transcript in addition to the columns this step reads
+    # directly. A promo's whole point is referencing its parent, so the
+    # parent linkage columns must reach the variable builder.
     rows = await db.execute_fetchall(
-        "SELECT id, title, transcript, video_file_path, description "
-        "FROM videos WHERE id = ?",
+        "SELECT * FROM videos WHERE id = ?",
         (video_id,),
     )
     if not rows:
@@ -1403,9 +1417,12 @@ async def _promo_step_description(video_id: str, project_id: int) -> None:
     if transcript:
         plain_transcript = transcript_service.srt_to_plain_text(transcript).strip()
 
+    prompt_variables = await tmpl.build_prompt_variables(row)
+
     if len(plain_transcript) >= 10:
         description = await ai.generate_seo_description(
             title=title, transcript=transcript, project_id=project_id,
+            prompt_variables=prompt_variables,
         )
     else:
         video_file_path = row.get("video_file_path")
@@ -1419,6 +1436,7 @@ async def _promo_step_description(video_id: str, project_id: int) -> None:
         )
         description = await ai.generate_seo_description_from_frames(
             title=title, frames=frames, project_id=project_id,
+            prompt_variables=prompt_variables,
         )
 
     async with write_transaction() as db:
@@ -1436,8 +1454,9 @@ async def _promo_step_description(video_id: str, project_id: int) -> None:
 async def _promo_step_tags(video_id: str, project_id: int) -> None:
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT id, title, description, transcript, tags, tags_generated_at, video_file_path "
-        "FROM videos WHERE id = ?",
+        # SELECT * — build_prompt_variables needs project_id,
+        # parent_item_id, and url beyond the columns this step reads.
+        "SELECT * FROM videos WHERE id = ?",
         (video_id,),
     )
     if not rows:
@@ -1463,10 +1482,12 @@ async def _promo_step_tags(video_id: str, project_id: int) -> None:
         if transcript else ""
     )
 
+    prompt_variables = await tmpl.build_prompt_variables(row)
+
     if len(plain_transcript) >= 10:
         new_tags = await ai.generate_tags_from_metadata(
             title=title, description=description, transcript=transcript,
-            project_id=project_id,
+            project_id=project_id, prompt_variables=prompt_variables,
         )
     else:
         video_file_path = row.get("video_file_path")
@@ -1480,7 +1501,7 @@ async def _promo_step_tags(video_id: str, project_id: int) -> None:
         )
         new_tags = await ai.generate_tags_from_frames(
             title=title, description=description, frames=frames,
-            project_id=project_id,
+            project_id=project_id, prompt_variables=prompt_variables,
         )
 
     async with write_transaction() as db:

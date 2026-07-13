@@ -136,6 +136,69 @@ def srt_to_plain_text(srt: str) -> str:
             out.append("\n".join(lines))
     return "\n".join(out)
 
+# One character budget for {{transcript_truncated}} across every prompt
+# render path. Before this constant existed, the description prompt
+# truncated at 8000 chars and the tags prompt at 4000 — the same variable
+# name meant different things depending on which prompt you were editing.
+TRANSCRIPT_PROMPT_CHAR_BUDGET = 8000
+
+# SRT carries cue numbers and timestamp lines (roughly 2-3x the plain-text
+# character count for the same speech), so {{transcript_srt_truncated}}
+# gets its own budget rather than sharing the plain-text one.
+TRANSCRIPT_SRT_PROMPT_CHAR_BUDGET = 20000
+
+
+def truncate_srt_at_cue_boundary(srt: str, char_budget: int) -> str:
+    """Cut an SRT transcript down to ``char_budget`` characters without
+    splitting a cue: whole cues (blank-line-separated blocks) are kept
+    until the next one would exceed the budget.
+
+    A transcript whose *first* cue alone exceeds the budget (or plain text
+    with no cue structure at all) falls back to a hard character cut —
+    a partial block beats returning nothing.
+    """
+    if len(srt) <= char_budget:
+        return srt
+    normalized = srt.replace("\r\n", "\n")
+    kept: list[str] = []
+    used = 0
+    for block in normalized.split("\n\n"):
+        # +2 for the blank-line separator this block costs when joined.
+        cost = len(block) + (2 if kept else 0)
+        if used + cost > char_budget:
+            break
+        kept.append(block)
+        used += cost
+    if not kept:
+        return normalized[:char_budget]
+    return "\n\n".join(kept)
+
+
+def transcript_prompt_variables(srt_text: str | None) -> dict[str, str]:
+    """The ``{{transcript*}}`` variable family from a stored transcript,
+    shared by every render path (prompt templates AND social-post
+    templates) so the four names always mean the same thing:
+
+    * ``transcript`` — full plain text (SRT structure stripped).
+    * ``transcript_truncated`` — plain text capped at
+      :data:`TRANSCRIPT_PROMPT_CHAR_BUDGET`.
+    * ``transcript_srt`` — the stored transcript verbatim (canonically
+      SRT, so timestamps survive for chapter-style prompts).
+    * ``transcript_srt_truncated`` — SRT capped at
+      :data:`TRANSCRIPT_SRT_PROMPT_CHAR_BUDGET`, cut at a cue boundary.
+    """
+    srt = srt_text or ""
+    plain = srt_to_plain_text(srt)
+    return {
+        "transcript": plain,
+        "transcript_truncated": plain[:TRANSCRIPT_PROMPT_CHAR_BUDGET],
+        "transcript_srt": srt,
+        "transcript_srt_truncated": truncate_srt_at_cue_boundary(
+            srt, TRANSCRIPT_SRT_PROMPT_CHAR_BUDGET
+        ),
+    }
+
+
 TranscriptSource = Literal[
     "youtube",
     "apple_speech",

@@ -278,20 +278,22 @@ async def generate_seo_description(
     project_id: int,
     channel_name: str = "",
     extra_instructions: str = "",
+    prompt_variables: dict[str, object] | None = None,
 ) -> str:
     """Generate an SEO-friendly video description from a transcript.
 
     Prompt body comes from the ``description_from_transcript_prompt`` row
     in ``prompt_templates``; the seed default kicks in when the row is
     missing. No system prompt — instructions live in the user message.
+
+    ``prompt_variables`` is the merged dict from
+    ``templates.build_prompt_variables`` (parent fields, custom variables,
+    URL family) so prompt bodies can reference ``{{parent_context_block}}``,
+    ``{{episode_url}}``, or any inherited item variable. The explicit
+    arguments below win on key collision.
     """
     from yt_scheduler.services import prompts as prompt_service
-    from yt_scheduler.services.transcripts import srt_to_plain_text
-
-    # Transcripts are stored canonically as SRT (preserves timestamps for
-    # YouTube round-trip). For Claude we strip to plain text so cue numbers
-    # and timestamp lines don't eat the context budget.
-    plain = srt_to_plain_text(transcript) if transcript else ""
+    from yt_scheduler.services.transcripts import transcript_prompt_variables
 
     prompt = await prompt_service.get_prompt_with_fallback(
         "description_from_transcript_prompt", project_id=project_id
@@ -299,11 +301,11 @@ async def generate_seo_description(
     rendered = await _render_template_body(
         prompt["body"],
         {
+            **(prompt_variables or {}),
             "title": title,
             "channel_name": channel_name,
             "channel_name_block": f"Channel: {channel_name}" if channel_name else "",
-            "transcript": plain,
-            "transcript_truncated": plain[:8000],
+            **transcript_prompt_variables(transcript),
             "extra_instructions": extra_instructions,
         },
     )
@@ -328,6 +330,7 @@ async def generate_seo_description_from_frames(
     project_id: int,
     channel_name: str = "",
     extra_instructions: str = "",
+    prompt_variables: dict[str, object] | None = None,
 ) -> str:
     """Generate an SEO description from a list of JPEG keyframes.
 
@@ -351,6 +354,7 @@ async def generate_seo_description_from_frames(
     instructions = await _render_template_body(
         prompt["body"],
         {
+            **(prompt_variables or {}),
             "title": title,
             "channel_name": channel_name,
             "channel_name_block": f"Channel: {channel_name}\n" if channel_name else "",
@@ -389,6 +393,7 @@ async def generate_tags_from_frames(
     frames: list[bytes],
     *,
     project_id: int,
+    prompt_variables: dict[str, object] | None = None,
 ) -> list[str]:
     """Generate YouTube tags using the title + (optionally generated)
     description + the keyframes, when there's no transcript to feed
@@ -410,6 +415,7 @@ async def generate_tags_from_frames(
     instructions = await _render_template_body(
         prompt["body"],
         {
+            **(prompt_variables or {}),
             "title": title,
             "description": description,
             "description_or_none": description or "(none yet)",
@@ -446,13 +452,18 @@ async def generate_tags_from_metadata(
     transcript: str = "",
     *,
     project_id: int,
+    prompt_variables: dict[str, object] | None = None,
 ) -> list[str]:
     """Generate YouTube tags based on title/description/transcript using the
-    user-editable prompt template."""
-    from yt_scheduler.services import prompts as prompt_service
-    from yt_scheduler.services.transcripts import srt_to_plain_text
+    user-editable prompt template.
 
-    plain = srt_to_plain_text(transcript) if transcript else ""
+    ``prompt_variables`` is the merged dict from
+    ``templates.build_prompt_variables`` so the prompt body's parent
+    references (``{{parent_tags}}``, ``{{parent_context_block}}``) resolve
+    for promo children. Explicit arguments win on key collision.
+    """
+    from yt_scheduler.services import prompts as prompt_service
+    from yt_scheduler.services.transcripts import transcript_prompt_variables
 
     prompt = await prompt_service.get_prompt_with_fallback(
         "tags_from_metadata_prompt", project_id=project_id
@@ -460,10 +471,10 @@ async def generate_tags_from_metadata(
     rendered = await _render_template_body(
         prompt["body"],
         {
+            **(prompt_variables or {}),
             "title": title,
             "description": description,
-            "transcript": plain,
-            "transcript_truncated": plain[:4000],
+            **transcript_prompt_variables(transcript),
         },
     )
 
