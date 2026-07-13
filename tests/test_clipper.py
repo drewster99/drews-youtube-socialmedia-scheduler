@@ -165,6 +165,7 @@ def test_seed_prompts_render_cap_from_output_cap():
             {
                 "parent_title": "X",
                 "parent_duration_human": "1h",
+                "parent_transcript": "0.0s hello world",
                 "existing_ranges_block": "",
                 "crop_constraints": "",
                 "min_seconds": str(int(mn)),
@@ -197,6 +198,7 @@ def test_seed_prompts_render_bounds_from_per_kind_bounds():
             {
                 "parent_title": "X",
                 "parent_duration_human": "1h",
+                "parent_transcript": "0.0s hello world",
                 "existing_ranges_block": "",
                 "crop_constraints": "",
                 "min_seconds": str(int(mn)),

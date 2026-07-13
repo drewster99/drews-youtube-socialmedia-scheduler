@@ -103,16 +103,47 @@ BUILTIN_TEMPLATE_NAMES = {"announce_video", "send_message"}
 
 
 class MissingRequiredVariable(KeyError):
-    """Raised when a ``{{name!}}`` placeholder has no value in the variables
-    dict. The required marker is opt-in: plain ``{{name}}`` misses still
-    render literally."""
+    """Raised when a ``{{name!}}`` placeholder has no usable value: the name
+    is absent from the variables dict, or present but blank (empty or
+    whitespace-only). The required marker declares "this must not render
+    without content" — a blank value violates that intent just as much as
+    a missing key."""
 
     def __init__(self, name: str):
         self.name = name
         super().__init__(name)
 
     def __str__(self) -> str:
-        return f"Required template variable not provided: {{{{{self.name}!}}}}"
+        return (
+            f"Required template variable missing or empty: {{{{{self.name}!}}}}"
+        )
+
+
+class UndefinedTemplateVariables(KeyError):
+    """Raised when bare ``{{name}}`` placeholders reference names that are
+    absent from the variables dict. Every undefined name in the pass is
+    collected before raising so callers can report all of them at once.
+
+    A *defined but blank* value does NOT raise — bare placeholders render
+    blank values as empty text. Only a name that isn't supplied at all is
+    an authoring error (a typo, or a variable that doesn't exist in this
+    render context)."""
+
+    def __init__(self, names: list[str]):
+        self.names = sorted(set(names))
+        super().__init__(", ".join(self.names))
+
+    def __str__(self) -> str:
+        placeholders = ", ".join("{{" + name + "}}" for name in self.names)
+        return f"Undefined template variable(s): {placeholders}"
+
+
+class SectionTagError(ValueError):
+    """Raised when ``{{#name}}`` / ``{{^name}}`` / ``{{/name}}`` section tags
+    don't pair up: an opener that is never closed, a closer with no opener,
+    or a closer whose name doesn't match the innermost open section. A
+    malformed section silently rendering (or silently vanishing) is exactly
+    the quiet wrong output this engine refuses to produce, so it raises."""
 
 
 class UnknownImageShortname(KeyError):
@@ -166,12 +197,117 @@ def merge_variables(
     return merged
 
 
+def _is_blank(value: object) -> bool:
+    """True when a variable value counts as "no content" for the section,
+    required, and default placeholder forms: ``None`` or a string that is
+    empty / whitespace-only after coercion."""
+    return value is None or str(value).strip() == ""
+
+
+# {{#name}} (keep content when name has content), {{^name}} (inverted: keep
+# when name is missing or blank), {{/name}} (close). Resolved as the FIRST
+# render pass, so content inside a dropped section is discarded before
+# variable substitution, media-directive extraction, or any {{ai:}} call
+# can act on it.
+_SECTION_TAG_PATTERN = re.compile(r"\{\{([#^/])(\w+)\}\}")
+
+# Anything that *looks* like a section tag ({{ followed by #, ^, or /) but
+# doesn't parse as one — e.g. {{#bad-name}}, {{# name}}, {{ /url}}. These
+# raise instead of passing through: a section tag that silently renders as
+# literal text is a template bug the author needs to see.
+_SECTION_TAG_CANDIDATE_PATTERN = re.compile(r"\{\{\s*[#^/][^}]*\}\}")
+
+
+def resolve_sections(
+    text: str, variables: dict[str, object] | None = None
+) -> str:
+    """Resolve ``{{#name}}…{{/name}}`` / ``{{^name}}…{{/name}}`` blocks.
+
+    A ``#`` section's content is kept when its variable has content
+    (present in ``variables`` and non-blank after string coercion); a
+    ``^`` (inverted) section's content is kept when it does NOT. Sections
+    nest; close tags match by name against the innermost open section, so
+    the parser never counts raw braces and is indifferent to ``{{ai: …}}``
+    nesting inside section content. Raises :class:`SectionTagError` on an
+    unclosed opener, a stray closer, or a close-tag name mismatch.
+
+    Public (not just a :func:`render` internal) so callers that pre-process
+    a body — e.g. media-directive extraction before the main render — can
+    resolve sections first and never attach media from a section that
+    isn't rendering.
+    """
+    variables = variables or {}
+
+    valid_tag_spans = {m.span() for m in _SECTION_TAG_PATTERN.finditer(text)}
+    for candidate in _SECTION_TAG_CANDIDATE_PATTERN.finditer(text):
+        if candidate.span() not in valid_tag_spans:
+            raise SectionTagError(
+                f"Malformed section tag {candidate.group(0)!r} — expected "
+                "{{#name}}, {{^name}}, or {{/name}} with a name of letters, "
+                "digits, and underscores"
+            )
+
+    def section_has_content(name: str) -> bool:
+        return name in variables and not _is_blank(variables[name])
+
+    root_parts: list[str] = []
+    # Each frame: (marker, name, parts collected inside that section).
+    open_sections: list[tuple[str, str, list[str]]] = []
+    cursor = 0
+    for match in _SECTION_TAG_PATTERN.finditer(text):
+        current_parts = open_sections[-1][2] if open_sections else root_parts
+        current_parts.append(text[cursor:match.start()])
+        cursor = match.end()
+        marker, name = match.group(1), match.group(2)
+        if marker in "#^":
+            open_sections.append((marker, name, []))
+            continue
+        if not open_sections:
+            raise SectionTagError(
+                f"Section close tag {{{{/{name}}}}} has no matching opener"
+            )
+        open_marker, open_name, inner_parts = open_sections.pop()
+        if open_name != name:
+            raise SectionTagError(
+                f"Section close tag {{{{/{name}}}}} does not match the "
+                f"innermost open section {{{{{open_marker}{open_name}}}}}"
+            )
+        keep = (
+            section_has_content(name)
+            if open_marker == "#"
+            else not section_has_content(name)
+        )
+        if keep:
+            parent_parts = open_sections[-1][2] if open_sections else root_parts
+            parent_parts.append("".join(inner_parts))
+    if open_sections:
+        open_marker, open_name, _ = open_sections[-1]
+        raise SectionTagError(
+            f"Section {{{{{open_marker}{open_name}}}}} is never closed "
+            f"(expected {{{{/{open_name}}}}})"
+        )
+    root_parts.append(text[cursor:])
+    return "".join(root_parts)
+
+
 # {{video}}, {{thumbnail}}, {{image:shortname}}, {{image:*}}.
 # `image:*` is the wildcard; `image:<shortname>` requires lowercase
 # alphanumerics + hyphens (matches the validation rule in `item_images`).
 _MEDIA_DIRECTIVE_PATTERN = re.compile(
     r"\{\{(video|thumbnail|image:(?:\*|[a-z0-9-]+))\}\}"
 )
+
+
+def body_declares_media(body: str) -> bool:
+    """True when the body contains any media directive (``{{video}}``,
+    ``{{thumbnail}}``, ``{{image:…}}``).
+
+    Callers check this on the PRE-section-resolution body to decide
+    whether the slot author took manual control of media: a directive
+    that a dropped ``{{#…}}`` section removed must not be resurrected by
+    the legacy per-slot media fallback — the author said "media only under
+    this condition," and the condition is false."""
+    return bool(_MEDIA_DIRECTIVE_PATTERN.search(body))
 
 
 def extract_media_directives(
@@ -242,6 +378,7 @@ async def async_render(
     model: str | None = None,
     max_tokens: int = 512,
     trace: list[dict] | None = None,
+    on_undefined: str = "error",
 ) -> str:
     """Async-safe wrapper around :func:`render`.
 
@@ -255,6 +392,7 @@ async def async_render(
         render, template_text, variables,
         default_system_prompt=default_system_prompt,
         model=model, max_tokens=max_tokens, trace=trace,
+        on_undefined=on_undefined,
     )
 
 
@@ -266,24 +404,36 @@ def render(
     model: str | None = None,
     max_tokens: int = 512,
     trace: list[dict] | None = None,
+    on_undefined: str = "error",
 ) -> str:
-    """Single rendering primitive. Two passes:
+    """Single rendering primitive. Three passes:
 
-    1. **Variable substitution.** Three placeholder forms:
+    1. **Section resolution.** ``{{#name}}…{{/name}}`` keeps its content
+       when ``name`` has content (present and non-blank); the inverted
+       form ``{{^name}}…{{/name}}`` keeps its content when it does NOT.
+       Content inside a dropped section is discarded before any later
+       pass sees it — no variable errors, no ``{{ai:}}`` calls, no media.
+       Malformed section tags raise :class:`SectionTagError`.
 
-       * ``{{name}}`` — optional. Missing key stays literal in the output
-         so the user can spot typos.
-       * ``{{name!}}`` — required. Missing key raises
+    2. **Variable substitution.** Three placeholder forms:
+
+       * ``{{name}}`` — plain. An undefined name raises
+         :class:`UndefinedTemplateVariables` (every undefined name in the
+         template is collected into one error). A defined-but-blank value
+         renders as empty text. ``on_undefined="literal"`` restores the
+         old leave-it-literal behavior for callers where the user has
+         explicitly acknowledged unresolved names.
+       * ``{{name!}}`` — required. Missing OR blank raises
          :class:`MissingRequiredVariable`.
-       * ``{{name??default text}}`` — optional with fallback. Missing key
-         renders ``default text`` (which may be empty for ``{{name??}}``).
+       * ``{{name??default text}}`` — fallback. Missing OR blank renders
+         ``default text`` (which may be empty for ``{{name??}}``).
          Default text is taken as a literal string — no recursive
          substitution inside it.
 
        ``ai:`` and ``ai[...]:`` openers survive this pass because ``\\w+``
        can't cross the colon or bracket.
 
-    2. **AI block evaluation.** ``{{ai: prompt}}`` and the system-override
+    3. **AI block evaluation.** ``{{ai: prompt}}`` and the system-override
        form ``{{ai[system text]: prompt}}`` are matched with a balanced-
        brace walker (Python ``re`` can't handle balanced delimiters).
        Inner blocks resolve first and their output is spliced into the
@@ -312,7 +462,12 @@ def render(
             "kind": "variables",
             "values": {k: ("" if v is None else str(v)) for k, v in variables.items()},
         })
-    text = _substitute_variables(template_text, variables)
+    text = resolve_sections(template_text, variables)
+    if trace is not None and text != template_text:
+        # Only traced when section tags actually changed the body, so
+        # section-free templates keep the familiar three-step trace.
+        trace.append({"kind": "sections", "text": text})
+    text = _substitute_variables(text, variables, on_undefined=on_undefined)
     if trace is not None:
         trace.append({"kind": "substituted", "text": _restore_braces(text)})
     # Output boundary: everything below this line is what the user actually sees,
@@ -365,23 +520,59 @@ def _restore_braces(text: str) -> str:
     return text.replace(_SENTINEL_OPEN, "{{").replace(_SENTINEL_CLOSE, "}}")
 
 
-def _substitute_variables(text: str, variables: dict[str, object]) -> str:
+def _substitute_variables(
+    text: str,
+    variables: dict[str, object],
+    *,
+    on_undefined: str = "error",
+) -> str:
+    """Substitute ``{{name}}`` / ``{{name!}}`` / ``{{name??default}}``.
+
+    ``on_undefined`` controls what a bare ``{{name}}`` does when the name
+    is absent from ``variables``:
+
+    * ``"error"`` (default) — collect every undefined name across the whole
+      pass, then raise :class:`UndefinedTemplateVariables` naming all of
+      them. Raising happens before any ``{{ai: …}}`` block can fire, so a
+      typo never costs a Claude call.
+    * ``"literal"`` — leave the placeholder text in the output. Only for
+      callers where the user has explicitly acknowledged unresolved names
+      (the generate-posts 409 → ack flow).
+    """
+    undefined_names: list[str] = []
+
     def replace(match: re.Match) -> str:
         name = match.group(1)
         required = match.group(2) is not None
         default_text = match.group(3)  # None when no `??...` was present
-        if name in variables:
-            value = variables[name]
-            if value is None:
-                return ""
-            return _sanitize_value(str(value))
+        value = variables.get(name)
+        has_content = name in variables and not _is_blank(value)
         if required:
-            raise MissingRequiredVariable(name)
+            # {{name!}} means "must render with content" — blank violates
+            # that intent just as much as a missing key.
+            if not has_content:
+                raise MissingRequiredVariable(name)
+            return _sanitize_value(str(value))
         if default_text is not None:
-            return default_text
-        return match.group(0)
+            # {{name??default}} covers "nothing to say" (missing OR blank),
+            # not merely missing keys — a blank value with a dangling label
+            # in front of it is the bug this form exists to prevent.
+            if not has_content:
+                return default_text
+            return _sanitize_value(str(value))
+        if name not in variables:
+            if on_undefined == "literal":
+                return match.group(0)
+            undefined_names.append(name)
+            return ""
+        if value is None:
+            return ""
+        return _sanitize_value(str(value))
 
-    return _VAR_PATTERN.sub(replace, text)
+    substituted = _VAR_PATTERN.sub(replace, text)
+    if undefined_names:
+        raise UndefinedTemplateVariables(undefined_names)
+    return substituted
 
 
 # Hard limits applied per render() call to prevent runaway cost and recursion.

@@ -480,6 +480,49 @@ async def generate_posts(
 
             body = slot.get("body", "") or ""
 
+            slot_max = slot.get("max_chars")
+            if not slot_max:
+                raise HTTPException(
+                    500, f"Slot {slot.get('id')} ({platform}) has no max_chars"
+                )
+
+            # The exact variable dict this slot will render with — sections
+            # must resolve against it (not just ctx) so {{#user_message}} /
+            # forced-empty choices behave identically in both passes.
+            slot_vars = {
+                **ctx["variables"], **forced_empty,
+                "max_chars": str(slot_max),
+            }
+
+            # Whether the author declared media in the raw body — checked
+            # before section resolution so a directive dropped by a false
+            # section still counts as "author took manual control" and the
+            # legacy media fallback below stays disabled for this slot.
+            body_declared_media = tmpl.body_declares_media(body)
+
+            # Resolve {{#name}}/{{^name}} sections BEFORE the media pass so
+            # a directive inside a dropped section never attaches media, and
+            # BEFORE the URL-reference scan so {{#url}}-guarded references
+            # to an empty URL don't produce a false warning.
+            if body:
+                try:
+                    body = tmpl.resolve_sections(body, slot_vars)
+                except tmpl.SectionTagError as e:
+                    error_trace: list[dict] = [{"kind": "error", "message": str(e)}]
+                    render_targets.append({
+                        "slot": slot,
+                        "platform": platform,
+                        "slot_max": int(slot_max),
+                        "slot_vars": slot_vars,
+                        "body_declared_media": body_declared_media,
+                        "cleaned_body": "",
+                        "media_paths": [],
+                        "rendered": f"[Error generating: {e}]",
+                        "trace": error_trace,
+                        "skip_render": True,
+                    })
+                    continue
+
             # Scan the body for url-family references before rendering so we
             # know which ones got referenced even if they substitute to "".
             url_refs_in_body = {m.group(1) for m in _URL_VAR_REF_RE.finditer(body)}
@@ -492,12 +535,6 @@ async def generate_posts(
                     "on Threads yet (its API posts text only)."
                 )
                 continue
-
-            slot_max = slot.get("max_chars")
-            if not slot_max:
-                raise HTTPException(
-                    500, f"Slot {slot.get('id')} ({platform}) has no max_chars"
-                )
 
             cleaned_body = ""
             media_paths: list[str] = []
@@ -514,11 +551,13 @@ async def generate_posts(
                     # call would have run — record an error trace and
                     # carry on with an empty render. Same shape the old
                     # exception path produced.
-                    error_trace: list[dict] = [{"kind": "error", "message": str(e)}]
+                    error_trace = [{"kind": "error", "message": str(e)}]
                     render_targets.append({
                         "slot": slot,
                         "platform": platform,
                         "slot_max": int(slot_max),
+                        "slot_vars": slot_vars,
+                        "body_declared_media": body_declared_media,
                         "cleaned_body": "",
                         "media_paths": [],
                         "rendered": f"[Error generating: {e}]",
@@ -531,6 +570,8 @@ async def generate_posts(
                 "slot": slot,
                 "platform": platform,
                 "slot_max": int(slot_max),
+                "slot_vars": slot_vars,
+                "body_declared_media": body_declared_media,
                 "cleaned_body": cleaned_body,
                 "media_paths": media_paths,
                 "rendered": None,  # filled in by the parallel render
@@ -547,18 +588,28 @@ async def generate_posts(
                 if target.get("rendered") is None:
                     target["rendered"] = ""
                 return target
-            slot_vars = {
-                **ctx["variables"], **forced_empty,
-                "max_chars": str(target["slot_max"]),
-            }
             try:
                 rendered = await asyncio.to_thread(
                     tmpl.render,
                     target["cleaned_body"],
-                    slot_vars,
+                    target["slot_vars"],
                     default_system_prompt=default_ai_system,
                     trace=target["trace"],
+                    # Once the user has acknowledged unresolved names via the
+                    # 409 flow below, honor that choice by leaving them
+                    # literal; the first attempt is strict so the 409 can
+                    # list every undefined name up-front.
+                    on_undefined="literal" if unresolved_ack else "error",
                 )
+            except tmpl.UndefinedTemplateVariables as e:
+                # Feed the names into the 409 unresolved gate below — this
+                # is a user-fixable template/variable mismatch, not a
+                # render crash.
+                target["undefined_names"] = list(e.names)
+                rendered = ""
+                target["media_paths"] = []
+                if target["trace"] is not None:
+                    target["trace"].append({"kind": "error", "message": str(e)})
             except Exception as e:
                 rendered = f"[Error generating: {e}]"
                 target["media_paths"] = []
@@ -578,10 +629,15 @@ async def generate_posts(
             slot = target["slot"]
             platform = target["platform"]
             rendered = (target.get("rendered") or "").strip()
+            unresolved_names.update(target.get("undefined_names") or [])
             unresolved_names.update(_UNRESOLVED_VAR_RE.findall(rendered))
 
             media_paths = target.get("media_paths") or []
-            if not media_paths:
+            # The legacy per-slot media fallback only applies when the body
+            # never declared media at all. A directive that a dropped
+            # {{#…}} section removed means "media only under this
+            # condition" — don't resurrect it.
+            if not media_paths and not target.get("body_declared_media"):
                 fallback = _legacy_media_for_slot(slot, ctx)
                 if fallback:
                     media_paths = [fallback]

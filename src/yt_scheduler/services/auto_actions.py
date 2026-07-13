@@ -503,23 +503,34 @@ async def _maybe_generate_socials(
         body = slot.get("body") or ""
         if not body:
             continue
-        # Threads can't attach media (text-only API) — skip a {{video}} slot
-        # rather than auto-post it without the video.
-        if platform == "threads" and video_directive_re.search(body):
-            logger.info("auto-social: skipping Threads slot for %s — uses {{video}}", video_id)
-            continue
         slot_max = slot.get("max_chars")
         if not slot_max:
             logger.warning("auto-social: slot %s (%s) has no max_chars; skipping", slot.get("id"), platform)
             continue
+        # Whether the author declared media in the raw body — checked before
+        # section resolution so a directive dropped by a false section still
+        # counts as "author took manual control" and the legacy media
+        # fallback below stays disabled for this slot.
+        body_declared_media = tmpl.body_declares_media(body)
         try:
+            slot_vars = {**ctx["variables"], "max_chars": str(slot_max)}
+            # Sections resolve before the media pass so a directive inside
+            # a dropped section never attaches media — same order as the
+            # manual generate route.
+            body = tmpl.resolve_sections(body, slot_vars)
+            # Threads can't attach media (text-only API) — skip a {{video}}
+            # slot rather than auto-post it without the video. Checked after
+            # section resolution so a {{video}} inside a dropped section
+            # doesn't skip a slot that would render text-only anyway.
+            if platform == "threads" and video_directive_re.search(body):
+                logger.info("auto-social: skipping Threads slot for %s — uses {{video}}", video_id)
+                continue
             cleaned, media_paths, _alts = tmpl.extract_media_directives(
                 body,
                 video_path=ctx["video_path"],
                 thumbnail_path=ctx["thumb_path"],
                 images=ctx["images"],
             )
-            slot_vars = {**ctx["variables"], "max_chars": str(slot_max)}
             rendered = (await tmpl.async_render(
                 cleaned, slot_vars, default_system_prompt=default_ai_system,
             )).strip()
@@ -527,7 +538,7 @@ async def _maybe_generate_socials(
             logger.warning("auto-social render failed for %s: %s", platform, exc)
             continue
 
-        if not media_paths:
+        if not media_paths and not body_declared_media:
             fallback = _legacy_media_for_slot(slot, ctx)
             if fallback:
                 media_paths = [fallback]

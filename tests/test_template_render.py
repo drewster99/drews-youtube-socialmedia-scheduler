@@ -31,9 +31,35 @@ def test_plain_variable_substitution():
     assert out == "Hello Drew!"
 
 
-def test_unknown_variable_left_literal():
-    out = templates.render("Hello {{name}}!", {})
+def test_unknown_variable_raises_and_collects_all_names():
+    """Bare {{name}} with an undefined name is an authoring error — the
+    render raises, naming every undefined variable in one exception."""
+    with pytest.raises(templates.UndefinedTemplateVariables) as exc_info:
+        templates.render("Hello {{name}} of {{place}}!", {})
+    assert exc_info.value.names == ["name", "place"]
+    assert "{{name}}" in str(exc_info.value)
+    assert "{{place}}" in str(exc_info.value)
+
+
+def test_unknown_variable_literal_mode_preserves_old_behavior():
+    """on_undefined='literal' is the explicit opt-out used by the
+    generate-posts ack flow — placeholders stay in the output."""
+    out = templates.render("Hello {{name}}!", {}, on_undefined="literal")
     assert out == "Hello {{name}}!"
+
+
+def test_defined_blank_variable_renders_empty_without_error():
+    """Strictness is about *undefined* names only — a supplied empty value
+    renders as empty text (builtins are always defined, often blank)."""
+    out = templates.render("Hello {{name}}!", {"name": ""})
+    assert out == "Hello !"
+
+
+def test_undefined_variable_raises_before_any_ai_call():
+    with patch.object(templates, "call_ai_block") as mock_call:
+        with pytest.raises(templates.UndefinedTemplateVariables):
+            templates.render("{{ai: write about {{title}}}}", {})
+    mock_call.assert_not_called()
 
 
 def test_required_variable_present():
@@ -46,6 +72,18 @@ def test_required_variable_missing_raises():
         templates.render("Hello {{name!}}!", {})
     assert exc_info.value.name == "name"
     assert "name" in str(exc_info.value)
+
+
+def test_required_variable_empty_raises():
+    """{{name!}} means "must render with content" — a defined-but-empty
+    value violates that intent just like a missing key."""
+    with pytest.raises(templates.MissingRequiredVariable):
+        templates.render("Hello {{name!}}!", {"name": ""})
+
+
+def test_required_variable_whitespace_only_raises():
+    with pytest.raises(templates.MissingRequiredVariable):
+        templates.render("Hello {{name!}}!", {"name": "   "})
 
 
 def test_required_variable_inside_ai_block():
@@ -70,6 +108,15 @@ def test_empty_default_text():
     """{{var??}} renders empty when missing — replaces the on_missing='empty' use case."""
     out = templates.render("Hello {{name??}}!", {})
     assert out == "Hello !"
+
+
+def test_default_text_used_when_variable_blank():
+    """{{name??default}} covers "nothing to say" — a defined-but-blank
+    value fires the default, so labels never dangle in front of nothing."""
+    out = templates.render("Hello {{name??stranger}}!", {"name": ""})
+    assert out == "Hello stranger!"
+    out = templates.render("Hello {{name??stranger}}!", {"name": "  "})
+    assert out == "Hello stranger!"
 
 
 def test_default_text_with_spaces_and_punctuation():
@@ -428,5 +475,170 @@ def test_extract_media_does_not_touch_regular_variables():
     )
     assert cleaned == "Hello {{title}}! See  also {{ai: write something}}"
     assert paths == ["/u/clip.mp4"]
+
+
+# --- section blocks {{#name}} / {{^name}} / {{/name}} ---------------------
+
+
+def test_section_kept_when_variable_has_content():
+    out = templates.render(
+        "Intro. {{#url}}Watch: {{url}}{{/url}} Done.",
+        {"url": "https://yt/x"},
+    )
+    assert out == "Intro. Watch: https://yt/x Done."
+
+
+def test_section_dropped_when_variable_blank():
+    """Builtins are always defined (often as '') — a blank value must drop
+    the section, or every parentless video gets a dangling label."""
+    out = templates.render(
+        "Intro. {{#parent_url}}Full episode: {{parent_url}}{{/parent_url}} Done.",
+        {"parent_url": ""},
+    )
+    assert out == "Intro.  Done."
+
+
+def test_section_dropped_when_variable_undefined():
+    out = templates.render("A{{#repo}} repo: {{repo}}{{/repo}}B", {})
+    assert out == "AB"
+
+
+def test_section_dropped_when_variable_whitespace_only():
+    out = templates.render("A{{#x}}content{{/x}}B", {"x": "   "})
+    assert out == "AB"
+
+
+def test_inverted_section_rendered_when_variable_blank():
+    out = templates.render(
+        "{{^parent_url}}No parent link.{{/parent_url}}", {"parent_url": ""}
+    )
+    assert out == "No parent link."
+
+
+def test_inverted_section_dropped_when_variable_has_content():
+    out = templates.render(
+        "{{^parent_url}}No parent link.{{/parent_url}}",
+        {"parent_url": "https://yt/x"},
+    )
+    assert out == ""
+
+
+def test_sections_nest():
+    template_text = (
+        "{{#a}}A[{{#b}}B={{b}}{{/b}}{{^b}}no-b{{/b}}]{{/a}}"
+    )
+    assert templates.render(template_text, {"a": "yes", "b": "bee"}) == "A[B=bee]"
+    assert templates.render(template_text, {"a": "yes", "b": ""}) == "A[no-b]"
+    assert templates.render(template_text, {"a": "", "b": "bee"}) == ""
+
+
+def test_undefined_variable_inside_dropped_section_does_not_raise():
+    """Content in a dropped section is discarded before the variable pass —
+    names inside it can't produce undefined-variable errors."""
+    out = templates.render(
+        "ok{{#missing}} uses {{also_missing}}{{/missing}}", {}
+    )
+    assert out == "ok"
+
+
+def test_ai_block_inside_dropped_section_never_fires():
+    with patch.object(templates, "call_ai_block") as mock_call:
+        out = templates.render(
+            "x{{#flag}}{{ai: expensive call}}{{/flag}}y", {"flag": ""}
+        )
+    mock_call.assert_not_called()
+    assert out == "xy"
+
+
+def test_ai_block_inside_kept_section_fires():
+    with patch.object(templates, "call_ai_block", side_effect=_fake_ai):
+        out = templates.render(
+            "{{#flag}}{{ai: write about {{topic}}}}{{/flag}}",
+            {"flag": "on", "topic": "rain"},
+        )
+    assert out == "[AI(write about rain)]"
+
+
+def test_unclosed_section_raises():
+    with pytest.raises(templates.SectionTagError) as exc_info:
+        templates.render("{{#url}}Watch: {{url}}", {"url": "x"})
+    assert "#url" in str(exc_info.value)
+
+
+def test_stray_section_close_raises():
+    with pytest.raises(templates.SectionTagError) as exc_info:
+        templates.render("Watch{{/url}}", {"url": "x"})
+    assert "/url" in str(exc_info.value)
+
+
+def test_mismatched_section_close_raises():
+    with pytest.raises(templates.SectionTagError) as exc_info:
+        templates.render("{{#a}}{{#b}}x{{/a}}{{/b}}", {"a": "1", "b": "2"})
+    message = str(exc_info.value)
+    assert "/a" in message and "#b" in message
+
+
+def test_section_tags_in_variable_values_stay_inert():
+    """A value containing section syntax must not execute as a section —
+    values substitute after the section pass, so the text stays literal."""
+    out = templates.render(
+        "Post: {{user_message}}",
+        {"user_message": "{{#x}}sneaky{{/x}}"},
+    )
+    assert out == "Post: {{#x}}sneaky{{/x}}"
+
+
+def test_resolve_sections_public_function():
+    """Callers that extract media before rendering resolve sections first —
+    the public function matches render()'s section semantics."""
+    resolved = templates.resolve_sections(
+        "{{#has_clip}}{{video}}{{/has_clip}}text", {"has_clip": ""}
+    )
+    assert resolved == "text"
+    cleaned, paths, _ = templates.extract_media_directives(
+        resolved, video_path="/u/clip.mp4"
+    )
+    assert paths == []
+
+
+def test_malformed_section_tag_raises():
+    """A tag that looks like a section but doesn't parse ({{#bad-name}},
+    {{# spaced}}) must raise, not leak literal braces into a post."""
+    for bad in (
+        "{{#bad-name}}x{{/bad-name}}",
+        "{{# name}}x{{/name}}",
+        "{{ #name}}x{{/name}}",
+        "{{/ url}}",
+    ):
+        with pytest.raises(templates.SectionTagError):
+            templates.render(bad, {"name": "x", "url": "y"})
+
+
+def test_body_declares_media():
+    assert templates.body_declares_media("Watch {{video}}") is True
+    assert templates.body_declares_media("{{thumbnail}}") is True
+    assert templates.body_declares_media("{{image:cat}}") is True
+    assert templates.body_declares_media("{{image:*}}") is True
+    assert (
+        templates.body_declares_media("{{#flag}}{{video}}{{/flag}}") is True
+    )
+    assert templates.body_declares_media("Just {{title}} text") is False
+
+
+def test_section_trace_records_resolution():
+    """A 'sections' trace step appears only when section tags changed the
+    body, keeping section-free traces in their familiar shape."""
+    trace: list[dict] = []
+    templates.render(
+        "{{#x}}yes{{/x}}", {"x": "1"}, trace=trace,
+    )
+    kinds = [e["kind"] for e in trace]
+    assert kinds == ["template_body", "variables", "sections", "substituted"]
+
+    plain_trace: list[dict] = []
+    templates.render("Hello {{x}}", {"x": "1"}, trace=plain_trace)
+    assert [e["kind"] for e in plain_trace] == [
+        "template_body", "variables", "substituted",
+    ]
 
 

@@ -34,12 +34,17 @@ async def expand_text(data: dict) -> dict:
 
     Template syntax:
 
-    - ``{{name}}`` — substitute. Missing keys stay literal so typos surface.
-    - ``{{name!}}`` — required. Missing key → 400 with
+    - ``{{name}}`` — substitute. Undefined names → 400 with
+      ``{"detail": {"undefined_variables": ["<name>", ...]}}`` listing
+      every undefined name at once. Defined-but-blank renders empty.
+    - ``{{name!}}`` — required. Missing or blank value → 400 with
       ``{"detail": {"missing_required": "<name>"}}``.
-    - ``{{name??default text}}`` — fallback. Missing key renders the
-      literal default text (no recursive substitution inside it). Empty
-      default is allowed: ``{{name??}}``.
+    - ``{{name??default text}}`` — fallback. A missing or blank value
+      renders the literal default text (no recursive substitution inside
+      it). Empty default is allowed: ``{{name??}}``.
+    - ``{{#name}}…{{/name}}`` — section: content renders only when
+      ``name`` has content. ``{{^name}}…{{/name}}`` is the inverse.
+      Malformed tags → 400 with ``{"detail": {"section_error": "<msg>"}}``.
     - ``{{ai: prompt}}`` — evaluate against Claude using
       ``default_system_prompt`` (or the built-in social-copywriter default).
     - ``{{ai[system text]: prompt}}`` — per-block system override.
@@ -79,5 +84,9 @@ async def expand_text(data: dict) -> dict:
         return {"rendered": rendered}
     except tmpl.MissingRequiredVariable as exc:
         raise HTTPException(400, {"missing_required": exc.name}) from exc
+    except tmpl.UndefinedTemplateVariables as exc:
+        raise HTTPException(400, {"undefined_variables": exc.names}) from exc
+    except tmpl.SectionTagError as exc:
+        raise HTTPException(400, {"section_error": str(exc)}) from exc
     except Exception as exc:
         return {"rendered": None, "error": str(exc)}
