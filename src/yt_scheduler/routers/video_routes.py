@@ -1150,6 +1150,7 @@ async def generate_description(video_id: str, data: dict | None = None):
     from yt_scheduler.services import templates as template_service
 
     prompt_variables = await template_service.build_prompt_variables(video)
+    video_is_promo = bool(video.get("parent_item_id"))
 
     try:
         if use_frames:
@@ -1168,6 +1169,7 @@ async def generate_description(video_id: str, data: dict | None = None):
                 extra_instructions=extra,
                 project_id=project_id,
                 prompt_variables=prompt_variables,
+                is_promo=video_is_promo,
             )
         else:
             description = await ai.generate_seo_description(
@@ -1176,6 +1178,7 @@ async def generate_description(video_id: str, data: dict | None = None):
                 extra_instructions=extra,
                 project_id=project_id,
                 prompt_variables=prompt_variables,
+                is_promo=video_is_promo,
             )
     except HTTPException:
         raise
@@ -1240,6 +1243,7 @@ async def generate_tags(video_id: str, data: dict | None = None):
     from yt_scheduler.services import templates as template_service
 
     prompt_variables = await template_service.build_prompt_variables(video)
+    video_is_promo = bool(video.get("parent_item_id"))
 
     try:
         if mode == "frames":
@@ -1265,6 +1269,7 @@ async def generate_tags(video_id: str, data: dict | None = None):
                 frames=frames,
                 project_id=project_id,
                 prompt_variables=prompt_variables,
+                is_promo=video_is_promo,
             )
         else:
             tags = await ai.generate_tags_from_metadata(
@@ -1273,6 +1278,7 @@ async def generate_tags(video_id: str, data: dict | None = None):
                 transcript=video.get("transcript", "") or "",
                 project_id=project_id,
                 prompt_variables=prompt_variables,
+                is_promo=video_is_promo,
             )
     except HTTPException:
         raise

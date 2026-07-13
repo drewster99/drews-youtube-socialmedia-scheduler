@@ -143,7 +143,7 @@ async def test_generate_description_falls_back_to_frames(
 
     monkeypatch.setattr(media, "extract_keyframes", lambda path, count, **kw: [b"F1", b"F2"])
 
-    async def _fake_from_frames(*, title, frames, channel_name="", extra_instructions="", project_id=1, prompt_variables=None):
+    async def _fake_from_frames(*, title, frames, channel_name="", extra_instructions="", project_id=1, prompt_variables=None, is_promo=False):
         # Verify the route handed us the mocked frames, not a transcript.
         assert frames == [b"F1", b"F2"]
         return "Visually-described summary."

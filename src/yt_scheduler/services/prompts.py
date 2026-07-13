@@ -64,6 +64,18 @@ class SeedPrompt:
 
 # Fallback bodies if a row is missing — kept in code so existing installs that
 # haven't run migration 006 / 014 yet still produce something useful.
+# Shared by the description seeds: everything build_prompt_variables +
+# the generator's explicit arguments supply to the render.
+_DESCRIPTION_PROMPT_VARIABLES: tuple[str, ...] = (
+    "title", "channel_name", "channel_name_block",
+    "transcript", "transcript_truncated",
+    "transcript_srt", "transcript_srt_truncated",
+    "extra_instructions",
+    "url", "episode_url", "project_url",
+    "parent_url", "parent_title", "parent_description", "parent_tags",
+    "parent_context_block",
+)
+
 SEED_DESCRIPTION_FROM_TRANSCRIPT_PROMPT = SeedPrompt(
     key="description_from_transcript_prompt",
     name="Description from transcript",
@@ -71,13 +83,18 @@ SEED_DESCRIPTION_FROM_TRANSCRIPT_PROMPT = SeedPrompt(
         "Generate an SEO-friendly YouTube video description.\n\n"
         "Video title: {{title}}\n"
         "{{channel_name_block}}\n"
-        "Transcript:\n{{transcript_truncated}}\n"
+        "Transcript (SRT — cue timestamps preserved; may be truncated):\n"
+        "{{transcript_srt_truncated}}\n"
         "{{parent_context_block??}}\n\n"
         "Instructions:\n"
         "- Write a compelling description that summarizes the video content\n"
         "- Include relevant keywords naturally\n"
         "- Use short paragraphs for readability\n"
-        "- Include timestamps if the transcript suggests distinct sections\n"
+        "- If the transcript suggests distinct sections, include a chapter "
+        "list: one 'M:SS Title' line per section, first line 0:00, "
+        "converting the SRT cue times (HH:MM:SS,mmm) to M:SS. If the "
+        "transcript looks truncated, only list chapters for the part you "
+        "can see.\n"
         "- Do NOT include links (those will be added separately)\n"
         "- Do NOT include hashtags (those will be added separately)\n"
         "- Do NOT use the literal characters '<' or '>' anywhere — "
@@ -88,13 +105,40 @@ SEED_DESCRIPTION_FROM_TRANSCRIPT_PROMPT = SeedPrompt(
         "{{extra_instructions}}\n\n"
         "Return ONLY the description text, no preamble."
     ),
-    variables=(
-        "title", "channel_name", "channel_name_block",
-        "transcript", "transcript_truncated", "extra_instructions",
-        "parent_url", "parent_title", "parent_description", "parent_tags",
-        "parent_context_block",
-    ),
+    variables=_DESCRIPTION_PROMPT_VARIABLES,
     # No system prompt — instructions live in the user message body.
+    system=None,
+)
+
+SEED_DESCRIPTION_FROM_TRANSCRIPT_PROMPT_PROMO = SeedPrompt(
+    key="description_from_transcript_prompt_promo",
+    name="Description from transcript (promo clips)",
+    body=(
+        "Generate a YouTube description for a short promo clip cut from a "
+        "longer parent video.\n\n"
+        "Clip title: {{title}}\n"
+        "{{channel_name_block}}\n"
+        "Clip transcript:\n{{transcript_truncated}}\n"
+        "{{parent_context_block??}}\n\n"
+        "Instructions:\n"
+        "- Write 1-3 short, punchy paragraphs that hook the viewer and "
+        "make them want to watch the full video.\n"
+        "- Include relevant keywords naturally.\n"
+        "- Do NOT include hashtags (those will be added separately).\n"
+        "- Do NOT use the literal characters '<' or '>' anywhere — "
+        "YouTube rejects descriptions containing them. When referencing "
+        "code symbols (e.g. UIView, NSObject) write them in backticks "
+        "or quotes instead.\n"
+        "- Keep the prose under 1000 characters.\n"
+        "{{extra_instructions}}\n"
+        "{{#episode_url}}\n"
+        "End the description with this line exactly as written, on its "
+        "own line:\n"
+        "Full episode: {{episode_url}}\n"
+        "{{/episode_url}}\n\n"
+        "Return ONLY the description text, no preamble."
+    ),
+    variables=_DESCRIPTION_PROMPT_VARIABLES,
     system=None,
 )
 
@@ -481,6 +525,7 @@ _SEEDS_BY_KEY: dict[str, SeedPrompt] = {
     SEED_SHORTEN_POST_PROMPT.key: SEED_SHORTEN_POST_PROMPT,
     SEED_TITLE_FROM_FILENAME_PROMPT.key: SEED_TITLE_FROM_FILENAME_PROMPT,
     SEED_DESCRIPTION_FROM_TRANSCRIPT_PROMPT.key: SEED_DESCRIPTION_FROM_TRANSCRIPT_PROMPT,
+    SEED_DESCRIPTION_FROM_TRANSCRIPT_PROMPT_PROMO.key: SEED_DESCRIPTION_FROM_TRANSCRIPT_PROMPT_PROMO,
     SEED_DESCRIPTION_FROM_FRAMES_PROMPT.key: SEED_DESCRIPTION_FROM_FRAMES_PROMPT,
     SEED_TAGS_FROM_METADATA_PROMPT.key: SEED_TAGS_FROM_METADATA_PROMPT,
     SEED_TAGS_FROM_FRAMES_PROMPT.key: SEED_TAGS_FROM_FRAMES_PROMPT,
@@ -525,24 +570,13 @@ async def get_prompt_template(key: str, *, project_id: int) -> dict | None:
     return _row_to_dict(rows[0]) if rows else None
 
 
-async def get_prompt_with_fallback(key: str, *, project_id: int) -> dict:
-    """Return ``{"body": str, "system": str | None}`` for ``key``,
-    merging the saved row with the seed.
-
-    Resolution order per field:
-
-    1. The user-edited row (if any).
-    2. The seed default.
-
-    The two fields fall back independently — a user who has saved a custom
+def _merge_record_and_seed(
+    key: str, record: dict | None, seed: SeedPrompt | None
+) -> dict:
+    """Per-field merge of one saved row with one seed — the body and the
+    system prompt fall back independently, so a user who saved a custom
     body but left the system prompt untouched gets their body + the seed
-    system. Raises ``KeyError`` for unknown keys.
-    """
-    record = await get_prompt_template(key, project_id=project_id)
-    seed = _SEEDS_BY_KEY.get(key)
-    if record is None and seed is None:
-        raise KeyError(f"No prompt template for key '{key}'")
-
+    system."""
     seed_body = seed.body if seed is not None else ""
     if record is not None:
         body = record.get("body")
@@ -567,6 +601,60 @@ async def get_prompt_with_fallback(key: str, *, project_id: int) -> dict:
         system = None
 
     return {"body": body, "system": system}
+
+
+async def get_prompt_with_fallback(
+    key: str, *, project_id: int, prefer_promo_variant: bool = False
+) -> dict:
+    """Return ``{"body": str, "system": str | None}`` for ``key``.
+
+    With ``prefer_promo_variant=False`` (default), resolution per field is:
+
+    1. The user-edited row (if any).
+    2. The seed default.
+
+    With ``prefer_promo_variant=True`` (the video being generated for is a
+    promo child), the ``<key>_promo`` variant is a *distinct prompt* that
+    wins outright when it exists in any form:
+
+    1. Saved ``<key>_promo`` row (paired with the promo seed for
+       field-level fallback).
+    2. The ``<key>_promo`` seed.
+    3. Saved ``<key>`` row (paired with the base seed).
+    4. The ``<key>`` seed.
+
+    The promo seed deliberately beats a saved base row: migration 006
+    seeds base ROWS into ``prompt_templates`` on every install, so "a base
+    row exists" cannot distinguish a user customisation from install
+    defaults. The resulting mental model is simple — promos use the promo
+    prompt, everything else uses the base prompt — and each is separately
+    editable in Project Settings.
+
+    Raises ``KeyError`` for unknown keys.
+    """
+    base_seed = _SEEDS_BY_KEY.get(key)
+
+    if prefer_promo_variant:
+        promo_key = f"{key}_promo"
+        promo_seed = _SEEDS_BY_KEY.get(promo_key)
+        promo_record = await get_prompt_template(promo_key, project_id=project_id)
+        if promo_record is not None:
+            return _merge_record_and_seed(
+                promo_key, promo_record, promo_seed or base_seed
+            )
+        if promo_seed is not None:
+            return _merge_record_and_seed(promo_key, None, promo_seed)
+        base_record = await get_prompt_template(key, project_id=project_id)
+        if base_record is not None:
+            return _merge_record_and_seed(key, base_record, base_seed)
+        if base_seed is None:
+            raise KeyError(f"No prompt template for key '{key}'")
+        return _merge_record_and_seed(key, None, base_seed)
+
+    record = await get_prompt_template(key, project_id=project_id)
+    if record is None and base_seed is None:
+        raise KeyError(f"No prompt template for key '{key}'")
+    return _merge_record_and_seed(key, record, base_seed)
 
 
 async def get_prompt_body_with_fallback(key: str, *, project_id: int) -> str:

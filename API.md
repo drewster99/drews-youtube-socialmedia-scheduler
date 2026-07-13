@@ -376,7 +376,7 @@ Stored values are merged on top of the defaults from `services/project_settings.
     "is_default": true,
     "default_body": "Generate an SEO-friendly YouTube video description...",
     "default_system": null,
-    "variables": ["title", "channel_name", "channel_name_block", "transcript", "transcript_truncated", "extra_instructions"],
+    "variables": ["title", "channel_name", "channel_name_block", "transcript", "transcript_truncated", "transcript_srt", "transcript_srt_truncated", "extra_instructions", "url", "episode_url", "project_url", "parent_url", "parent_title", "parent_description", "parent_tags", "parent_context_block"],
     "system_variables": [],
     "body_required": true
   }
@@ -783,7 +783,7 @@ Returns **400** when `backend` is unknown, or when a Whisper backend (`mlx-whisp
 
 **Side effects** — Calls Anthropic API; for frames mode also calls `ffmpeg` to extract keyframes; writes `videos.generated_description`. The applied description includes `pinned_links` appended after the AI text.
 
-**Renderer** — `mode=transcript` (and the transcript leg of `auto`) substitutes the prompt body from `prompt_templates.description_from_transcript_prompt` through the same engine as [`POST /api/expand_text`](#post-apiexpand_text), then sends the substituted prompt to Claude in a single call. Any `{{ai: ...}}`, `{{var!}}`, or `{{var??default}}` syntax in the prompt-template body is honoured. `mode=frames` substitutes `prompt_templates.description_from_frames_prompt` and attaches the keyframes to the same user turn. Both modes also send the saved `system_body` (if any) to Claude — edit it in Project Settings → LLM prompt templates.
+**Renderer** — `mode=transcript` (and the transcript leg of `auto`) substitutes the prompt body from `prompt_templates.description_from_transcript_prompt` through the same engine as [`POST /api/expand_text`](#post-apiexpand_text), then sends the substituted prompt to Claude in a single call. Any `{{ai: ...}}`, `{{var!}}`, `{{var??default}}`, or `{{#var}}…{{/var}}` section syntax in the prompt-template body is honoured. For a promo child (row has `parent_item_id`), resolution prefers the `description_from_transcript_prompt_promo` variant: saved promo row → promo seed → saved base row → base seed. `mode=frames` substitutes `prompt_templates.description_from_frames_prompt` and attaches the keyframes to the same user turn. Both modes render with the merged prompt-variable dict (parent fields, `episode_url`, inherited item variables, the `transcript*` family) and also send the saved `system_body` (if any) to Claude — edit it in Project Settings → LLM prompt templates.
 
 ### `POST /api/videos/{video_id}/generate-tags`
 
@@ -807,7 +807,7 @@ Returns **400** when `backend` is unknown, or when a Whisper backend (`mlx-whisp
 
 **Side effects** — Calls Anthropic API; for frames mode also calls `ffmpeg` to extract keyframes. No DB write.
 
-**Renderer** — `mode=metadata` substitutes the prompt body from `prompt_templates.tags_from_metadata_prompt` through the same engine as [`POST /api/expand_text`](#post-apiexpand_text). `mode=frames` substitutes `prompt_templates.tags_from_frames_prompt` and sends it alongside the keyframes. Each row's saved `system_body` (or the seed's default — "You return ONLY a comma-separated list of tags, no preamble.") is sent as the system message; edit either in Project Settings → LLM prompt templates.
+**Renderer** — `mode=metadata` substitutes the prompt body from `prompt_templates.tags_from_metadata_prompt` through the same engine as [`POST /api/expand_text`](#post-apiexpand_text). `mode=frames` substitutes `prompt_templates.tags_from_frames_prompt` and sends it alongside the keyframes. Both render with the merged prompt-variable dict (parent fields and inherited item variables), so the seed's parent-tags guidance actually sees the parent's tags for promo children. (No `_promo` seed ships for the tags prompts yet, so promo resolution falls through to the base prompt.) Each row's saved `system_body` (or the seed's default — "You return ONLY a comma-separated list of tags, no preamble.") is sent as the system message; edit either in Project Settings → LLM prompt templates.
 
 ### `POST /api/videos/{video_id}/apply-description`
 

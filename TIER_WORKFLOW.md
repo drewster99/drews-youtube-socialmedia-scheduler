@@ -70,8 +70,13 @@ For each newly uploaded file (sequential, one at a time):
    settings).
 5. **Description + tags:**
    * If transcript (after trim) ≥ 10 chars: `description_from_transcript_prompt`
-     and `tags_from_metadata_prompt` (which sees the transcript).
+     and `tags_from_metadata_prompt` (which sees the transcript). Promo
+     children prefer the `description_from_transcript_prompt_promo`
+     variant (saved promo row → promo seed → saved base row → base seed).
    * Else: `description_from_frames_prompt` and `tags_from_frames_prompt`.
+   * All four render with the merged prompt-variable dict: parent fields
+     (`{{episode_url}}`, `{{parent_context_block}}`, …) plus custom
+     variables inherited global → project → parent item → self item.
 6. **Metadata update to YouTube** — single `videos.update` call with
    title, description, tags. Never a re-upload.
 
@@ -227,14 +232,19 @@ you want fallback control.
 ### Seed updates (default body changes only — user-edited DB rows
 untouched)
 
-* `description_from_transcript_prompt` — gains a parent-context block
-  that runs only when `{{parent_title}}` is non-empty: "If this is a
-  promo for a parent video, mention/link the parent (`{{parent_url}}`,
-  `{{parent_title}}`)."
-* `description_from_frames_prompt` — same.
-* `tags_from_metadata_prompt` — include `{{parent_tags??}}` as
-  suggested seed tags.
-* `tags_from_frames_prompt` — same.
+* All description/tags seeds include `{{parent_context_block??}}` —
+  the parent summary paragraph, empty for non-promos.
+* `description_from_transcript_prompt` — feeds
+  `{{transcript_srt_truncated}}` (timestamps preserved) with explicit
+  chapter-conversion guidance, so the "include chapters" instruction is
+  grounded in real cue times.
+* `description_from_transcript_prompt_promo` — separate promo-clip
+  variant: shorter punchier prose, plus a `{{#episode_url}}` section
+  footer instructing Claude to end with `Full episode: <parent URL>`.
+  Preferred automatically for promo children (see step 5 above).
+* `tags_from_metadata_prompt` / `tags_from_frames_prompt` — reuse the
+  parent's tags (visible via the parent context block) so promos stay
+  discoverable alongside the parent.
 
 ## Schema changes
 

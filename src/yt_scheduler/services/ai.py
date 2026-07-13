@@ -279,6 +279,7 @@ async def generate_seo_description(
     channel_name: str = "",
     extra_instructions: str = "",
     prompt_variables: dict[str, object] | None = None,
+    is_promo: bool = False,
 ) -> str:
     """Generate an SEO-friendly video description from a transcript.
 
@@ -296,7 +297,8 @@ async def generate_seo_description(
     from yt_scheduler.services.transcripts import transcript_prompt_variables
 
     prompt = await prompt_service.get_prompt_with_fallback(
-        "description_from_transcript_prompt", project_id=project_id
+        "description_from_transcript_prompt", project_id=project_id,
+        prefer_promo_variant=is_promo,
     )
     rendered = await _render_template_body(
         prompt["body"],
@@ -331,6 +333,7 @@ async def generate_seo_description_from_frames(
     channel_name: str = "",
     extra_instructions: str = "",
     prompt_variables: dict[str, object] | None = None,
+    is_promo: bool = False,
 ) -> str:
     """Generate an SEO description from a list of JPEG keyframes.
 
@@ -345,7 +348,8 @@ async def generate_seo_description_from_frames(
         raise ValueError("generate_seo_description_from_frames called with no frames")
 
     prompt = await prompt_service.get_prompt_with_fallback(
-        "description_from_frames_prompt", project_id=project_id
+        "description_from_frames_prompt", project_id=project_id,
+        prefer_promo_variant=is_promo,
     )
     extra_block = (
         f"\n\nAdditional instructions:\n{extra_instructions}\n"
@@ -394,6 +398,7 @@ async def generate_tags_from_frames(
     *,
     project_id: int,
     prompt_variables: dict[str, object] | None = None,
+    is_promo: bool = False,
 ) -> list[str]:
     """Generate YouTube tags using the title + (optionally generated)
     description + the keyframes, when there's no transcript to feed
@@ -410,7 +415,8 @@ async def generate_tags_from_frames(
         raise ValueError("generate_tags_from_frames called with no frames")
 
     prompt = await prompt_service.get_prompt_with_fallback(
-        "tags_from_frames_prompt", project_id=project_id
+        "tags_from_frames_prompt", project_id=project_id,
+        prefer_promo_variant=is_promo,
     )
     instructions = await _render_template_body(
         prompt["body"],
@@ -453,6 +459,7 @@ async def generate_tags_from_metadata(
     *,
     project_id: int,
     prompt_variables: dict[str, object] | None = None,
+    is_promo: bool = False,
 ) -> list[str]:
     """Generate YouTube tags based on title/description/transcript using the
     user-editable prompt template.
@@ -466,7 +473,8 @@ async def generate_tags_from_metadata(
     from yt_scheduler.services.transcripts import transcript_prompt_variables
 
     prompt = await prompt_service.get_prompt_with_fallback(
-        "tags_from_metadata_prompt", project_id=project_id
+        "tags_from_metadata_prompt", project_id=project_id,
+        prefer_promo_variant=is_promo,
     )
     rendered = await _render_template_body(
         prompt["body"],

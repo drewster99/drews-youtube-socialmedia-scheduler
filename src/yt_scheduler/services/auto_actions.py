@@ -347,6 +347,7 @@ async def _maybe_generate_tags(video: dict, project_id: int, column: dict) -> No
         new_tags = await ai.generate_tags_from_metadata(
             title=title, description=description, transcript=transcript,
             project_id=project_id, prompt_variables=prompt_variables,
+            is_promo=bool(video.get("parent_item_id")),
         )
     except Exception as exc:
         logger.warning("auto-tags generation failed: %s", exc)
@@ -399,6 +400,7 @@ async def _maybe_generate_description(video: dict, project_id: int) -> str | Non
             transcript=transcript,
             project_id=project_id,
             prompt_variables=prompt_variables,
+            is_promo=bool(video.get("parent_item_id")),
         )
     except Exception as exc:
         logger.warning("auto-description failed: %s", exc)
@@ -1418,11 +1420,12 @@ async def _promo_step_description(video_id: str, project_id: int) -> None:
         plain_transcript = transcript_service.srt_to_plain_text(transcript).strip()
 
     prompt_variables = await tmpl.build_prompt_variables(row)
+    video_is_promo = bool(row.get("parent_item_id"))
 
     if len(plain_transcript) >= 10:
         description = await ai.generate_seo_description(
             title=title, transcript=transcript, project_id=project_id,
-            prompt_variables=prompt_variables,
+            prompt_variables=prompt_variables, is_promo=video_is_promo,
         )
     else:
         video_file_path = row.get("video_file_path")
@@ -1436,7 +1439,7 @@ async def _promo_step_description(video_id: str, project_id: int) -> None:
         )
         description = await ai.generate_seo_description_from_frames(
             title=title, frames=frames, project_id=project_id,
-            prompt_variables=prompt_variables,
+            prompt_variables=prompt_variables, is_promo=video_is_promo,
         )
 
     async with write_transaction() as db:
@@ -1483,11 +1486,13 @@ async def _promo_step_tags(video_id: str, project_id: int) -> None:
     )
 
     prompt_variables = await tmpl.build_prompt_variables(row)
+    video_is_promo = bool(row.get("parent_item_id"))
 
     if len(plain_transcript) >= 10:
         new_tags = await ai.generate_tags_from_metadata(
             title=title, description=description, transcript=transcript,
             project_id=project_id, prompt_variables=prompt_variables,
+            is_promo=video_is_promo,
         )
     else:
         video_file_path = row.get("video_file_path")
@@ -1502,6 +1507,7 @@ async def _promo_step_tags(video_id: str, project_id: int) -> None:
         new_tags = await ai.generate_tags_from_frames(
             title=title, description=description, frames=frames,
             project_id=project_id, prompt_variables=prompt_variables,
+            is_promo=video_is_promo,
         )
 
     async with write_transaction() as db:

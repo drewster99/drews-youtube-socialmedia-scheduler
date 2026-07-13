@@ -67,7 +67,7 @@ async def test_tags_generated_at_set_skips_ai_call(db, monkeypatch) -> None:
 
     ai_call_count = 0
 
-    async def _fake_generate_tags(*, title, description, transcript, project_id, prompt_variables=None):
+    async def _fake_generate_tags(*, title, description, transcript, project_id, prompt_variables=None, is_promo=False):
         nonlocal ai_call_count
         ai_call_count += 1
         return ["new_tag"]
@@ -107,7 +107,7 @@ async def test_tags_generated_at_set_preserves_existing_tags(db, monkeypatch) ->
     """When tags_generated_at is set, the tags column must not be modified."""
     auto_actions = importlib.import_module("yt_scheduler.services.auto_actions")
 
-    async def _fake_generate_tags(*, title, description, transcript, project_id, prompt_variables=None):
+    async def _fake_generate_tags(*, title, description, transcript, project_id, prompt_variables=None, is_promo=False):
         return ["replacement_tag"]
 
     monkeypatch.setattr(auto_actions.ai, "generate_tags_from_metadata", _fake_generate_tags)
@@ -148,7 +148,7 @@ async def test_no_tags_generated_at_does_call_ai(db, monkeypatch) -> None:
 
     ai_call_count = 0
 
-    async def _fake_generate_tags(*, title, description, transcript, project_id, prompt_variables=None):
+    async def _fake_generate_tags(*, title, description, transcript, project_id, prompt_variables=None, is_promo=False):
         nonlocal ai_call_count
         ai_call_count += 1
         return ["generated_tag"]
