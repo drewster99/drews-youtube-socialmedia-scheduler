@@ -93,6 +93,41 @@ async def _release_post_to_approved(post_id: int) -> None:
         )
 
 
+async def _fail_render_error_post(post: dict) -> str | None:
+    """If this (already-claimed) post's content is a render-error
+    placeholder, mark it failed — clearing its scheduling columns so a
+    restart's restore pass can't resurrect and send it — and return the
+    reason. Returns ``None`` when the content is real.
+
+    Shared by every send path (the video publish job and the independent
+    per-post job), so error text can never reach a platform regardless of
+    which job wins the atomic claim.
+    """
+    content_value = (post.get("content") or "").strip()
+    if not content_value.startswith(RENDER_ERROR_CONTENT_PREFIX):
+        return None
+    reason = (
+        "blocked: post content is a render-error placeholder, "
+        "not real content — regenerate the post"
+    )
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE social_posts SET status = 'failed', error = ?, "
+            "scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
+            (reason, post["id"]),
+        )
+    logger.error(
+        "Blocked post %s — content is a render-error placeholder",
+        post["id"],
+    )
+    await events.record_event(
+        post["video_id"],
+        "social_post_blocked_render_error",
+        {"platform": post.get("platform"), "post_id": post["id"]},
+    )
+    return reason
+
+
 async def publish_video_job(video_id: str) -> dict:
     """Publish a video and fire all approved social posts.
 
@@ -175,6 +210,44 @@ async def publish_video_job(video_id: str) -> dict:
         needs_youtube_publish = item_type in ("episode", "short", "segment") or (
             item_type == "hook" and "youtu.be" in item_url
         )
+
+        # Last-line content gate: never flip a video public while its
+        # description is still the promo chain's placeholder — that text
+        # going public is always wrong. The schedule endpoint blocks this
+        # too (overridably); this fire-time check is deliberately not
+        # overridable — fix the description instead.
+        if needs_youtube_publish:
+            desc_cursor = await db.execute(
+                "SELECT description FROM videos WHERE id = ?", (video_id,)
+            )
+            desc_row = await desc_cursor.fetchone()
+            description_value = (
+                (desc_row["description"] if desc_row else "") or ""
+            ).strip()
+            if description_value == DESCRIPTION_PENDING_PLACEHOLDER:
+                logger.error(
+                    "publish_video_job: refusing to publish %s — description "
+                    "is still the pending-generation placeholder", video_id,
+                )
+                await events.record_event(
+                    video_id,
+                    "publish_blocked",
+                    {
+                        "platform": "youtube",
+                        "reason": "description is still the 'pending "
+                                  "generation' placeholder",
+                    },
+                )
+                # Clear the spent schedule (video back to 'ready', pending
+                # per-post jobs cancelled). Leaving status='scheduled' with a
+                # past publish_at would make every restart's missed-job
+                # restore re-attempt this publish at an arbitrary time.
+                await cancel_scheduled_publish(video_id)
+                results["publish_blocked"] = (
+                    "description is still the pending-generation placeholder"
+                )
+                return results
+
         if needs_youtube_publish:
             try:
                 # APScheduler runs jobs on the asyncio loop; the sync
@@ -263,6 +336,13 @@ async def publish_video_job(video_id: str) -> dict:
             if not await _claim_post_for_send(post_id):
                 results["social_results"][platform].append(
                     {"post_id": post_id, "status": "skipped", "reason": "already claimed by another worker"}
+                )
+                continue
+
+            blocked_reason = await _fail_render_error_post(post)
+            if blocked_reason is not None:
+                results["social_results"][platform].append(
+                    {"post_id": post_id, "status": "failed", "reason": blocked_reason}
                 )
                 continue
 
@@ -455,6 +535,11 @@ async def _send_scheduled_post(post_id: int) -> None:
     if not await _claim_post_for_send(post_id):
         # Either it wasn't 'approved' (e.g. user already manually sent
         # or unscheduled it) or another worker beat us to the claim.
+        return
+
+    # Same render-error guard as publish_video_job — this per-post job can
+    # win the claim independently, so it needs its own check.
+    if await _fail_render_error_post(post) is not None:
         return
 
     # Duplicate guard. Same rule as publish_video_job: an unattended
@@ -1591,6 +1676,78 @@ def _decode_tags(raw: str | None) -> list:
     return []
 
 
+# The Promo upload step inserts this exact string until
+# _promo_step_description overwrites it. Both the readiness check and the
+# publish gates match on equality so a user-edited description happening to
+# mention "Description pending generation..." still counts as real content.
+DESCRIPTION_PENDING_PLACEHOLDER = "Description pending generation."
+
+# Failed slot renders store this prefix as the post's content (see
+# social_routes._render_target). Such a post must never reach a platform.
+RENDER_ERROR_CONTENT_PREFIX = "[Error generating"
+
+
+async def publish_content_blockers(video_id: str) -> list[str]:
+    """Content problems that should stop this video from being scheduled
+    (or, for the placeholder case, flipped public): a missing/placeholder
+    description on a YouTube-listed item, a failed auto-action chain, or
+    social posts holding render-error text instead of content.
+
+    Returns human-readable reasons; empty list = clear to schedule. Distinct
+    from :func:`is_ready_for_schedule` (the promo batch's stricter
+    tags/thumbnail readiness spec) — this gate only blocks on states that
+    are outright errors, not on optional polish.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT description, item_type, url, auto_action_state, "
+        "auto_action_last_error FROM videos WHERE id = ?",
+        (video_id,),
+    )
+    if not rows:
+        return []
+    video = dict(rows[0])
+    blockers: list[str] = []
+
+    item_type = video.get("item_type") or "episode"
+    item_url = video.get("url") or ""
+    listed_on_youtube = item_type in ("episode", "short", "segment") or (
+        item_type == "hook" and "youtu.be" in item_url
+    )
+    description = (video.get("description") or "").strip()
+    if listed_on_youtube:
+        if not description:
+            blockers.append("description is empty")
+        elif description == DESCRIPTION_PENDING_PLACEHOLDER:
+            blockers.append(
+                "description is still the 'pending generation' placeholder"
+            )
+
+    state = video.get("auto_action_state") or ""
+    if state.startswith("failed:"):
+        step = state[len("failed:"):]
+        last_error = (video.get("auto_action_last_error") or "").strip()
+        reason = f"auto-action chain failed at step '{step}'"
+        if last_error:
+            reason += f": {last_error[:200]}"
+        blockers.append(reason)
+
+    error_post_rows = await db.execute_fetchall(
+        "SELECT COUNT(*) AS n FROM social_posts "
+        "WHERE video_id = ? AND status IN ('draft', 'approved') "
+        "AND content LIKE ? || '%'",
+        (video_id, RENDER_ERROR_CONTENT_PREFIX),
+    )
+    error_post_count = int(dict(error_post_rows[0])["n"]) if error_post_rows else 0
+    if error_post_count:
+        blockers.append(
+            f"{error_post_count} social post(s) contain a render error "
+            "instead of content"
+        )
+
+    return blockers
+
+
 def is_ready_for_schedule(video: dict) -> tuple[bool, list[str]]:
     """Per the spec: transcript present (any source, not whitespace),
     description present, ≥3 tags, and a thumbnail (custom or YouTube
@@ -1604,13 +1761,15 @@ def is_ready_for_schedule(video: dict) -> tuple[bool, list[str]]:
     if not transcript:
         missing.append("transcript")
     description = (video.get("description") or "").strip()
-    # The Promo upload step inserts an exact placeholder string until
-    # _promo_step_description overwrites it. Match on equality so a
-    # user-edited description happening to mention "Description pending
-    # generation..." still counts as ready.
-    placeholder = "Description pending generation."
-    if not description or description == placeholder:
+    if not description or description == DESCRIPTION_PENDING_PLACEHOLDER:
         missing.append("description")
+    # A failed auto-action chain means some generated content is absent or
+    # wrong — same class of blocker the single-video schedule gate raises.
+    auto_state = video.get("auto_action_state") or ""
+    if auto_state.startswith("failed:"):
+        missing.append(
+            f"auto-action chain failed at '{auto_state[len('failed:'):]}'"
+        )
     tags = _decode_tags(video.get("tags"))
     if len(tags) < 3:
         missing.append("tags (need ≥ 3)")

@@ -848,7 +848,7 @@ Returns **400** when `backend` is unknown, or when a Whisper backend (`mlx-whisp
 
 **Purpose** — Schedule a video to flip to public (and fire its social posts) at a specific future time. User-driven reschedule path — also fires the promo cascade.
 
-**Request body** — `{"publish_at": "2026-04-28T15:00:00-07:00"}` (ISO 8601).
+**Request body** — `{"publish_at": "2026-04-28T15:00:00-07:00", "force": false}` (ISO 8601; `force` optional).
 
 **Response 200**:
 
@@ -857,7 +857,7 @@ Returns **400** when `backend` is unknown, or when a Whisper backend (`mlx-whisp
   "cascaded_children": ["..."], "cascaded_siblings": ["..."], "message": "..." }
 ```
 
-**Errors** — `400` (missing `publish_at`, invalid format, time not in future).
+**Errors** — `400` (missing `publish_at`, invalid format, time not in future). `409` with `{"detail": {"publish_blockers": ["..."], "hint": "..."}}` when the video's content is in an error state: empty/placeholder description on a YouTube-listed item, a `failed:*` auto-action chain, or draft/approved social posts holding render-error text. Re-send with `force: true` to schedule anyway — except the pending-generation placeholder, which the fire-time job refuses to push public regardless (fix the description). The fire-time job also refuses to send any approved post whose content is a render-error placeholder, marking it `failed` with the reason.
 
 **Cascades** —
 

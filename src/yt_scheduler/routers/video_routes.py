@@ -1361,9 +1361,20 @@ async def schedule_video(video_id: str, data: dict):
     targets shift their auto-anchored children by the same delta;
     child targets shift later same-tier siblings by the same delta.
     Manually-overridden rows are left in place.
+
+    Content gate: scheduling is refused (409 with the concrete reasons)
+    when the video's content is in an error state — empty/placeholder
+    description on a YouTube-listed item, a failed auto-action chain, or
+    social posts holding render-error text. Pass ``force: true`` to
+    schedule anyway; the fire-time job still refuses to push the
+    pending-generation placeholder public, so fix the description rather
+    than forcing past that one.
     """
     from datetime import datetime as dt, timezone
-    from yt_scheduler.services.scheduler import apply_user_reschedule
+    from yt_scheduler.services.scheduler import (
+        apply_user_reschedule,
+        publish_content_blockers,
+    )
 
     publish_at_str = data.get("publish_at")
     if not publish_at_str:
@@ -1379,6 +1390,18 @@ async def schedule_video(video_id: str, data: dict):
 
     if publish_at <= dt.now(timezone.utc):
         raise HTTPException(400, "publish_at must be in the future")
+
+    blockers = await publish_content_blockers(video_id)
+    # Strict boolean: a string like "false" (or any other truthy junk) must
+    # not silently bypass the gate.
+    if blockers and data.get("force") is not True:
+        raise HTTPException(
+            409,
+            {
+                "publish_blockers": blockers,
+                "hint": "Fix these, or re-send with force=true to schedule anyway.",
+            },
+        )
 
     cascade = await apply_user_reschedule(video_id, publish_at)
     await events.record_event(
