@@ -875,6 +875,7 @@ body {
 }
 .tag-known { color: var(--success); }
 .tag-media { color: var(--accent); }
+.tag-section { color: var(--accent); font-weight: 600; }
 .tag-unknown { color: var(--warning); }
 .tag-unresolved { color: var(--danger); font-weight: 600; }
 .slot-threads-warn { color: var(--danger); }

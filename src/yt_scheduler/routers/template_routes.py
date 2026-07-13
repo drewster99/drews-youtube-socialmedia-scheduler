@@ -161,6 +161,17 @@ async def duplicate_template(name: str, data: dict, project_slug: str | None = N
 # --- Slot CRUD --------------------------------------------------------------
 
 
+def _validate_slot_body_sections(body: str) -> None:
+    """Reject a slot body whose {{#…}}/{{^…}}/{{/…}} section tags don't pair
+    up — at save time, when the author is looking at the editor, instead of
+    at generation time. Variable truthiness doesn't affect tag pairing, so
+    validating against an empty dict checks pure syntax."""
+    try:
+        tmpl.resolve_sections(body, {})
+    except tmpl.SectionTagError as exc:
+        raise HTTPException(400, {"section_error": str(exc)}) from exc
+
+
 async def _resolve_template_id(name: str, project_id: int) -> int:
     template = await tmpl.get_template(name, project_id=project_id)
     if not template:
@@ -208,6 +219,7 @@ async def add_template_slot(name: str, data: dict, project_slug: str | None = No
             raise HTTPException(400, "max_chars must be an integer") from exc
     else:
         max_chars_value = tmpl.default_max_chars(platform)
+    _validate_slot_body_sections(str(data.get("body", "")))
     try:
         return await tmpl.add_slot(
             template_id,
@@ -237,6 +249,8 @@ async def update_template_slot(name: str, slot_id: int, data: dict, project_slug
     for field in ("body", "media", "is_disabled", "order_index"):
         if field in data:
             kwargs[field] = data[field]
+    if "body" in kwargs:
+        _validate_slot_body_sections(str(kwargs["body"] or ""))
     if "max_chars" in data:
         kwargs["max_chars"] = data["max_chars"]
     if "social_account_id" in data:

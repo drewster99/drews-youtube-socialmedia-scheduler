@@ -31,21 +31,29 @@
     <div class="template-help card">
         <h4>Template syntax</h4>
         {% raw %}
-        <p><strong>Variables</strong> — replaced with values from the surrounding context.</p>
+        <p><strong>Variables</strong> — replaced with values from the surrounding context. "Empty" below means missing, empty, or whitespace-only.</p>
         <ul>
-            <li><code>{{name}}</code> — substitute. If the variable is missing, the placeholder stays literal so you can spot the typo.</li>
-            <li><code>{{name!}}</code> — <em>required</em>. If the variable is missing, rendering fails (the API returns 400 with the missing name; the auto-paths log and skip the slot).</li>
-            <li><code>{{name??default text}}</code> — substitute, or fall back to the literal default text when missing. The default text is absolute — a <code>{{title}}</code> inside the default stays literal, no recursion. Use <code>{{name??}}</code> for empty fallback.</li>
+            <li><code>{{name}}</code> — substitute. An <em>undefined</em> name is an error (generation stops and names every undefined variable); a defined-but-empty value renders as nothing. Built-ins are always defined, so this only fires on typos or variables that don't exist in the render context.</li>
+            <li><code>{{name!}}</code> — <em>required content</em>. Rendering fails when the value is missing <em>or empty</em> — use this for "never post without this link".</li>
+            <li><code>{{name??default text}}</code> — substitute, or use the literal default text when the value is missing <em>or empty</em>. The default text is absolute — no variables, and no <code>{{</code>/<code>}}</code> braces at all, inside it. Use <code>{{name??}}</code> to render nothing.</li>
+        </ul>
+        <p><strong>Sections</strong> — include a whole block only when a variable has content.</p>
+        <ul>
+            <li><code>{{#name}}…{{/name}}</code> — the content between the tags renders only when <code>name</code> has a non-empty value. Anything inside a dropped section is skipped entirely: its variables aren't checked, its <code>{{ai:}}</code> blocks never call Claude, and its media directives attach nothing.</li>
+            <li><code>{{^name}}…{{/name}}</code> — the inverse ("else"): renders only when <code>name</code> is missing or empty.</li>
+            <li>Sections nest, and can span multiple lines. Example:<br><code>{{#episode_url}}Full episode: {{episode_url}}{{/episode_url}}{{^episode_url}}More at {{project_url}}{{/episode_url}}</code></li>
+            <li>An unclosed, mismatched, or malformed section tag is an error — nothing renders, so a broken tag can never leak into a post.</li>
         </ul>
         <p><strong>Built-in variables</strong></p>
         <ul>
-            <li><code>{{title}}</code>, <code>{{description}}</code>, <code>{{description_short}}</code> (≤150), <code>{{description_medium}}</code> (≤500), <code>{{tags}}</code>, <code>{{hashtags}}</code>, <code>{{tier}}</code>, <code>{{transcript}}</code>, <code>{{user_message}}</code>, <code>{{thumbnail_path}}</code></li>
+            <li><code>{{title}}</code>, <code>{{description}}</code>, <code>{{description_short}}</code> (≤150), <code>{{description_medium}}</code> (≤500), <code>{{tags}}</code>, <code>{{hashtags}}</code>, <code>{{tier}}</code>, <code>{{user_message}}</code>, <code>{{thumbnail_path}}</code></li>
+            <li><code>{{transcript}}</code> — full plain-text transcript (no timestamps). <code>{{transcript_truncated}}</code> — the same, capped (all render paths use one shared cap). <code>{{transcript_srt}}</code> — the stored SRT verbatim, timestamps intact. <code>{{transcript_srt_truncated}}</code> — SRT capped at a cue boundary. Mind the token bill when putting the untruncated forms inside <code>{{ai:}}</code> blocks on long episodes.</li>
             <li><code>{{url}}</code> — this item's URL (YouTube URL for YT-uploaded items, or whatever you set on a standalone item).</li>
             <li><code>{{episode_url}}</code> — the parent episode's URL when this item has a parent (e.g. a hook pointing at its primary episode).</li>
-            <li><code>{{parent_url}}</code>, <code>{{parent_title}}</code>, <code>{{parent_description}}</code>, <code>{{parent_tags}}</code> — fields from the parent video when this item has one; empty strings otherwise. Use <code>{{parent_url??}}</code> for silent fallback.</li>
+            <li><code>{{parent_url}}</code>, <code>{{parent_title}}</code>, <code>{{parent_description}}</code>, <code>{{parent_tags}}</code> — fields from the parent video when this item has one; empty strings otherwise. Wrap parent-dependent content in a section (<code>{{#parent_url}}…{{/parent_url}}</code>) so items without a parent don't get dangling labels.</li>
             <li><code>{{parent_context_block}}</code> — a ready-to-paste paragraph summarising the parent video (title, URL, description, tags), or empty when there's no parent. Designed to be opt-in via <code>{{parent_context_block??}}</code> inside prompt bodies.</li>
             <li><code>{{project_url}}</code> — the project's URL (auto-filled from the YouTube channel handle on YT projects, or set explicitly on GitHub / social-only projects).</li>
-            <li><code>{{max_chars}}</code> — this slot's "Max characters" value, as a number. Handy inside an <code>{{ai:}}</code> block so the model knows the limit, e.g. <code>{{ai: Write a post under {{max_chars}} chars about {{title}}}}</code>. (Resolves in real post generation and in the preview below; it stays literal in other render paths.)</li>
+            <li><code>{{max_chars}}</code> — this slot's "Max characters" value, as a number. Handy inside an <code>{{ai:}}</code> block so the model knows the limit, e.g. <code>{{ai: Write a post under {{max_chars}} chars about {{title}}}}</code>. (Defined in post generation and the preview below; it doesn't exist in prompt-template bodies, where a bare reference is an error.)</li>
         </ul>
         <p><strong>Custom variables</strong> — define your own at three scopes; later wins on collision.</p>
         <ul>
@@ -234,8 +242,10 @@ function defaultMaxCharsForPlatform(platform) {
 // --- Live template-tag syntax highlighting (overlay backdrop behind a transparent textarea) ---
 const BUILTIN_VARS = new Set([
     'title', 'description', 'description_short', 'description_medium', 'tags', 'hashtags',
-    'tier', 'transcript', 'user_message', 'thumbnail_path', 'url', 'episode_url',
+    'tier', 'transcript', 'transcript_truncated', 'transcript_srt', 'transcript_srt_truncated',
+    'user_message', 'thumbnail_path', 'url', 'episode_url',
     'project_url', 'max_chars',
+    'parent_url', 'parent_title', 'parent_description', 'parent_tags', 'parent_context_block',
 ]);
 let knownCustomVars = new Set();   // global + project custom-variable names
 
@@ -246,20 +256,26 @@ function highlightUnresolved(escapedHtml) {
 
 function renderHighlight(text) {
     // Colorize variable tokens (name, name with a required-marker, name with a
-    // default) and media directives. AI-block wrappers are left at default
-    // color; any variable inside an AI block still gets colored.
-    return escapeHtml(text).replace(
-        /\{\{\s*([A-Za-z_]\w*|video|thumbnail|image:[^{}]*?)\s*(!|\?\?[^{}]*?)?\}\}/g,
-        (m, name, suffix) => {
-            const n = name.trim();
-            let cls;
-            if (n === 'video' || n === 'thumbnail' || n.startsWith('image:')) cls = 'tag-media';
-            else if (suffix && suffix.startsWith('??')) cls = 'tag-known';   // has a fallback — never unresolved
-            else if (BUILTIN_VARS.has(n) || knownCustomVars.has(n)) cls = 'tag-known';
-            else cls = 'tag-unknown';
-            return `<span class="${cls}">${m}</span>`;
-        }
-    );
+    // default), section tags (#name / ^name / /name in double braces), and
+    // media directives. AI-block wrappers are left at default color; any
+    // variable inside an AI block still gets colored.
+    return escapeHtml(text)
+        .replace(
+            /\{\{([#^\/])(\w+)\}\}/g,
+            (m, marker, name) => `<span class="tag-section">${m}</span>`
+        )
+        .replace(
+            /\{\{\s*([A-Za-z_]\w*|video|thumbnail|image:[^{}]*?)\s*(!|\?\?[^{}]*?)?\}\}/g,
+            (m, name, suffix) => {
+                const n = name.trim();
+                let cls;
+                if (n === 'video' || n === 'thumbnail' || n.startsWith('image:')) cls = 'tag-media';
+                else if (suffix && suffix.startsWith('??')) cls = 'tag-known';   // has a fallback — never unresolved
+                else if (BUILTIN_VARS.has(n) || knownCustomVars.has(n)) cls = 'tag-known';
+                else cls = 'tag-unknown';
+                return `<span class="${cls}">${m}</span>`;
+            }
+        );
 }
 
 function renderSlotHighlight(slotId) {
@@ -576,7 +592,25 @@ async function previewAll() {
                 body: JSON.stringify({template: body, variables: slotVars}),
             });
             const result = await resp.json();
-            results.push({slot, rendered: result.rendered || result.error || 'Error'});
+            let rendered;
+            if (resp.ok) {
+                rendered = result.rendered ?? result.error ?? 'Error';
+            } else {
+                // Structured 400s from the strict renderer — turn them into
+                // actionable messages instead of a bare 'Error'.
+                const detail = result.detail;
+                if (detail && detail.undefined_variables) {
+                    rendered = `Error: undefined variable(s): ${detail.undefined_variables.join(', ')}` +
+                        ` — add test values above (or fix the template).`;
+                } else if (detail && detail.missing_required) {
+                    rendered = `Error: required variable ${detail.missing_required} is missing or empty.`;
+                } else if (detail && detail.section_error) {
+                    rendered = `Error: ${detail.section_error}`;
+                } else {
+                    rendered = `Error: ${typeof detail === 'string' ? detail : JSON.stringify(detail)}`;
+                }
+            }
+            results.push({slot, rendered});
         } catch (e) {
             results.push({slot, rendered: `Error: ${e.message}`});
         }

@@ -666,7 +666,7 @@ The endpoint refuses with `400` when the target project has no YouTube channel b
 
 **Side effects** — Saves files to `UPLOAD_DIR`; calls `youtube.upload_video` (~100 quota); inserts into `videos` with `item_type`, `parent_item_id`, and `url = "https://youtu.be/<id>"` populated from the upload result; records `created` (carrying `item_type`) and `uploaded` events; fires `auto_actions.run_post_create_actions(... source="upload")` in the background (transcribe / describe / etc.).
 
-**Renderer (background path)** — When the project's auto-actions matrix has auto-gen-socials enabled, the background job renders each platform's slot body through the same engine as [`POST /api/expand_text`](#post-apiexpand_text). Same variables and same `{{var!}}` / `{{var??default}}` / `{{ai: ...}}` / `{{ai[system]: ...}}` semantics — there is no separate template engine for the auto path.
+**Renderer (background path)** — When the project's auto-actions matrix has auto-gen-socials enabled, the background job renders each platform's slot body through the same engine as [`POST /api/expand_text`](#post-apiexpand_text). Same variables and same `{{var!}}` / `{{var??default}}` / `{{#var}}…{{/var}}` / `{{ai: ...}}` / `{{ai[system]: ...}}` semantics — there is no separate template engine for the auto path.
 
 ### `POST /api/videos/items`
 
@@ -1101,7 +1101,7 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 - `400` — `slot_ids` is present but not a list of integers.
 - `500` — A non-disabled slot has no `max_chars` (a data bug — every slot is created with a positive value).
 
-**Side effects** — Holds the per-video publish lock. Renders every slot up front (before any destructive op) so the unresolved-vars gate can fire harmlessly. When `confirm_overwrite_scheduled=true`, calls `cancel_scheduled_post()` on each scheduled row first (tearing down its APScheduler `DateTrigger`) so no orphan jobs remain. Then deletes existing `social_posts` for the video where `status NOT IN ('posted','sending')` and inserts one fresh `draft` row per non-disabled, matching slot (each carrying the slot's `max_chars`). Threads slots whose body contains `{{video}}` are skipped (and reported in `warnings`). Template variables exposed: `title`, `url`, `description`, `description_short` (≤150), `description_medium` (≤500), `tags`, `hashtags`, `thumbnail_path`, `tier`, `transcript` (plain text, SRT stripped), `user_message`, `max_chars` (the slot's "Max characters" value). Also calls `youtube.get_video` to read the duration tier.
+**Side effects** — Holds the per-video publish lock. Renders every slot up front (before any destructive op) so the unresolved-vars gate can fire harmlessly. When `confirm_overwrite_scheduled=true`, calls `cancel_scheduled_post()` on each scheduled row first (tearing down its APScheduler `DateTrigger`) so no orphan jobs remain. Then deletes existing `social_posts` for the video where `status NOT IN ('posted','sending')` and inserts one fresh `draft` row per non-disabled, matching slot (each carrying the slot's `max_chars`). Threads slots whose body contains `{{video}}` are skipped (and reported in `warnings`). Template variables exposed: `title`, `url`, `description`, `description_short` (≤150), `description_medium` (≤500), `tags`, `hashtags`, `thumbnail_path`, `tier`, the `transcript*` family (`transcript`, `transcript_truncated`, `transcript_srt`, `transcript_srt_truncated`), `user_message`, `max_chars` (the slot's "Max characters" value). Slot bodies resolve `{{#var}}…{{/var}}` sections before the media pass, so a media directive inside a dropped section attaches nothing (and the legacy per-slot media fallback stays disabled for any body that declares a media directive, even one a section dropped). Also calls `youtube.get_video` to read the duration tier.
 
 **Renderer** — Each slot's `body` is rendered through the same engine as [`POST /api/expand_text`](#post-apiexpand_text) (`services/templates.render`). All variables, `{{var!}}` / `{{var??default}}` / `{{ai: ...}}` / `{{ai[system]: ...}}` syntax, and recursive AI-block evaluation behave identically.
 
@@ -1356,7 +1356,7 @@ Values are coerced to strings server-side (numbers → str, booleans → str, `n
 
 **Response 200** — The newly created slot dict.
 
-**Errors** — `400` (missing `platform`, non-int `social_account_id`, service-layer validation error), `404` (unknown template name).
+**Errors** — `400` (missing `platform`, non-int `social_account_id`, service-layer validation error, or `{"detail": {"section_error": "..."}}` when the body's `{{#…}}`/`{{^…}}`/`{{/…}}` section tags don't pair up), `404` (unknown template name).
 
 ### `PATCH /api/templates/{name}/slots/{slot_id}`
 
@@ -1366,7 +1366,7 @@ Values are coerced to strings server-side (numbers → str, booleans → str, `n
 
 **Response 200** — Updated slot dict.
 
-**Errors** — `404` (unknown template name, slot not found in this template), `400` (non-int `social_account_id`, validation failure).
+**Errors** — `404` (unknown template name, slot not found in this template), `400` (non-int `social_account_id`, validation failure, or `{"detail": {"section_error": "..."}}` when the body's section tags don't pair up).
 
 ### `DELETE /api/templates/{name}/slots/{slot_id}`
 
@@ -1402,11 +1402,14 @@ This is the canonical text-expansion endpoint. Every server-side rendering path 
 
 Only `template` is required; everything else has defaults.
 
-**Template syntax**
+**Template syntax** ("empty" below means missing, empty, or whitespace-only)
 
-- `{{name}}` — substitute. Missing keys are left literal in the output so the user can see what didn't resolve.
-- `{{name!}}` — required substitute. Missing key returns **400** with `{"detail": {"missing_required": "<name>"}}`. No fallback; use `??` if you want one.
-- `{{name??default text}}` — optional with explicit fallback. When `name` is missing, the literal string between `??` and `}}` is rendered. Default text is **absolute** — a `{{title}}` inside the default stays literal, no recursive substitution. For empty fallback write `{{name??}}`.
+- `{{name}}` — substitute. An **undefined** name returns **400** with `{"detail": {"undefined_variables": ["<name>", ...]}}` listing every undefined name at once; a defined-but-empty value renders as empty text. (Pass `variables` for every bare name the template references.)
+- `{{name!}}` — required content. A missing **or empty** value returns **400** with `{"detail": {"missing_required": "<name>"}}`. No fallback; use `??` if you want one.
+- `{{name??default text}}` — optional with explicit fallback. When `name` is missing **or empty**, the literal string between `??` and `}}` is rendered. Default text is **absolute** — no variables, and no `{{`/`}}` braces at all, inside it. For empty fallback write `{{name??}}`.
+- `{{#name}}…{{/name}}` — section: the enclosed content renders only when `name` has content. Content inside a dropped section is discarded before any other pass — its variables aren't checked, its `{{ai:}}` blocks never fire, its media directives attach nothing. Sections nest; close tags match by name.
+- `{{^name}}…{{/name}}` — inverted section ("else"): renders only when `name` is missing or empty.
+- An unclosed, stray, mismatched, or malformed section tag returns **400** with `{"detail": {"section_error": "<message>"}}`.
 - `{{ai: prompt}}` — evaluate against Claude using `default_system_prompt` (or the built-in social-copywriter default).
 - `{{ai[system text]: prompt}}` — per-block system override. `default_system_prompt` is ignored for this block. Inner blocks without their own `[...]` inherit `default_system_prompt`, **not** the outer override.
 - AI blocks may be nested arbitrarily deep. The walker uses balanced `{{` / `}}` matching (Python `re` can't), resolves leaves first, splices each result into the parent prompt, then sends the parent. Sibling blocks are independent.
@@ -1421,8 +1424,9 @@ Only `template` is required; everything else has defaults.
 
 **Built-in variables** provided by the post-generation paths (`/api/social/generate-posts/{video_id}` and the auto-actions background path) on top of whatever the caller passes:
 
-- `{{title}}`, `{{description}}`, `{{description_short}}` (≤150), `{{description_medium}}` (≤500), `{{tags}}` (comma-joined), `{{hashtags}}` (top 5 as `#CamelCase`), `{{thumbnail_path}}`, `{{tier}}`, `{{transcript}}` (plain-text, SRT stripped), `{{user_message}}`.
-- `{{max_chars}}` — the rendering slot's "Max characters" value, as a string of digits. Only the slot-rendering paths supply it (`/api/social/generate-posts/{video_id}`, the template-editor preview, and the auto-gen-socials job); other render paths leave `{{max_chars}}` literal. Handy inside an `{{ai:}}` block so the model knows the platform limit.
+- `{{title}}`, `{{description}}`, `{{description_short}}` (≤150), `{{description_medium}}` (≤500), `{{tags}}` (comma-joined), `{{hashtags}}` (top 5 as `#CamelCase`), `{{thumbnail_path}}`, `{{tier}}`, `{{user_message}}`.
+- The transcript family (same values in every render path): `{{transcript}}` (plain text, SRT stripped), `{{transcript_truncated}}` (plain text, shared cap), `{{transcript_srt}}` (stored SRT verbatim), `{{transcript_srt_truncated}}` (SRT capped at a cue boundary).
+- `{{max_chars}}` — the rendering slot's "Max characters" value, as a string of digits. Only the slot-rendering paths supply it (`/api/social/generate-posts/{video_id}`, the template-editor preview, and the auto-gen-socials job); a bare `{{max_chars}}` in other render paths is an undefined-variable error. Handy inside an `{{ai:}}` block so the model knows the platform limit.
 - `{{url}}` — `videos.url`. Populated from the YouTube URL at upload / import for YT-backed items, NULL→empty string for standalone items unless explicitly set.
 - `{{episode_url}}` — when the item has `parent_item_id` set, the parent's `url`; empty otherwise.
 - `{{project_url}}` — `projects.project_url`. Auto-populated from the YouTube channel handle on OAuth bind for YT projects; set explicitly via `POST /api/projects` for non-YT projects; editable via `PATCH /api/projects/{slug}` and refreshable via `POST /api/projects/{slug}/youtube/refresh-channel-url`.
@@ -1435,7 +1439,7 @@ Only `template` is required; everything else has defaults.
 
 **Errors**
 
-- `400` if `template` is empty, or `{"detail": {"missing_required": "<name>"}}` when a `{{var!}}` placeholder isn't supplied.
+- `400` if `template` is empty; `{"detail": {"missing_required": "<name>"}}` when a `{{var!}}` value is missing or empty; `{"detail": {"undefined_variables": [...]}}` when bare `{{var}}` names aren't supplied; `{"detail": {"section_error": "<message>"}}` for malformed `{{#…}}`/`{{^…}}`/`{{/…}}` section tags.
 
 ---
 

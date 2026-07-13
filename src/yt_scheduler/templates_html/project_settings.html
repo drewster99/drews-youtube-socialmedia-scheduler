@@ -142,15 +142,28 @@
             <summary style="cursor: pointer; font-weight: 600; padding: 0.25rem 0;">Test variables (used by Preview)</summary>
             <p class="form-hint" style="margin: 0.5rem 0;">
                 Edit these values, then click <strong>Preview</strong> on any prompt to
-                see what Claude would actually receive. Some variables
-                (<code>{{ '{{' }}channel_name_block{{ '}}' }}</code>, <code>{{ '{{' }}transcript_truncated{{ '}}' }}</code>,
-                <code>{{ '{{' }}extra_instructions_block{{ '}}' }}</code>, <code>{{ '{{' }}description_or_none{{ '}}' }}</code>)
-                are derived automatically from the values below — same way the
-                AI service derives them at generation time.
+                see what Claude would actually receive. Derived variables
+                (<code>{{ '{{' }}channel_name_block{{ '}}' }}</code>, the
+                <code>{{ '{{' }}transcript*{{ '}}' }}</code> family —
+                <code>transcript</code>, <code>transcript_truncated</code>,
+                <code>transcript_srt</code>, <code>transcript_srt_truncated</code> —
+                <code>{{ '{{' }}extra_instructions_block{{ '}}' }}</code>, <code>{{ '{{' }}description_or_none{{ '}}' }}</code>,
+                and the parent family <code>{{ '{{' }}episode_url{{ '}}' }}</code> /
+                <code>{{ '{{' }}parent_context_block{{ '}}' }}</code>)
+                come from the values below — same way the AI service derives
+                them at generation time. Section blocks
+                (<code>{{ '{{' }}#episode_url{{ '}}' }}</code>…<code>{{ '{{' }}/episode_url{{ '}}' }}</code>)
+                render only when the variable has content.
             </p>
             <div class="form-row">
                 <label>Title<input type="text" id="pv-title" value="My Latest Video"></label>
                 <label>Channel name<input type="text" id="pv-channel-name" value="My Channel"></label>
+            </div>
+            <div class="form-row">
+                <label>Parent / episode URL (promo prompts; blank = no parent)
+                    <input type="text" id="pv-episode-url" value="https://youtu.be/PARENT_ID"></label>
+                <label>Filename (title-from-filename prompt)
+                    <input type="text" id="pv-filename" value="screen_recording_2026-07-04_demo.mp4"></label>
             </div>
             <div class="form-group">
                 <label>Description</label>
@@ -930,6 +943,8 @@ function buildPromptTestVariables() {
     const description = document.getElementById('pv-description')?.value || '';
     const transcript = document.getElementById('pv-transcript')?.value || '';
     const extra = document.getElementById('pv-extra')?.value || '';
+    const episodeUrl = document.getElementById('pv-episode-url')?.value || '';
+    const filename = document.getElementById('pv-filename')?.value || 'screen_recording_2026-07-04_demo.mp4';
     const targetChars = document.getElementById('pv-target-chars')?.value || '280';
     const postText = document.getElementById('pv-post-text')?.value || '';
     return {
@@ -941,18 +956,42 @@ function buildPromptTestVariables() {
         // ai.generate_tags_from_frames: description or '(none yet)'
         description_or_none: description || '(none yet)',
         transcript,
-        // ai.generate_seo_description: srt_to_plain(transcript)[:8000]; for the
-        // preview the test transcript is already plain text, so just truncate.
+        // transcripts.transcript_prompt_variables: the test transcript is
+        // plain text, so the plain and SRT forms are the same string here.
         transcript_truncated: transcript.slice(0, 8000),
+        transcript_srt: transcript,
+        transcript_srt_truncated: transcript.slice(0, 20000),
+        // templates.build_prompt_variables URL family + parent fields —
+        // the parent values derive from the episode-URL test input so the
+        // promo seed's episode-url section footer previews realistically.
+        url: 'https://youtu.be/EXAMPLE',
+        project_url: '',
+        episode_url: episodeUrl,
+        parent_url: episodeUrl,
+        parent_title: episodeUrl ? 'Parent Video Title' : '',
+        parent_description: '',
+        parent_tags: '',
+        parent_context_block: episodeUrl
+            ? `This is a promo clip from a parent video:\nParent title: Parent Video Title\nParent URL: ${episodeUrl}`
+            : '',
         extra_instructions: extra,
         // ai.generate_seo_description_from_frames:
         //   f"\n\nAdditional instructions:\n{extra_instructions}\n" if extra_instructions else ""
         extra_instructions_block: extra
             ? `\n\nAdditional instructions:\n${extra}\n`
             : '',
+        // title_from_filename_prompt input — the raw upload filename.
+        filename,
         // shorten_post_prompt variables — see services/prompts.SEED_SHORTEN_POST_PROMPT.
         target_chars: targetChars,
         post_text: postText,
+        // Clip-proposal prompt fixtures so those seeds preview too. Real
+        // values come from clipper.py at generation time.
+        parent_transcript: '[00:00] hello and welcome\n[00:05] to the show',
+        parent_duration_human: '1h 02m',
+        min_seconds: '5',
+        max_seconds: '30',
+        max_proposals: '8',
     };
 }
 
@@ -975,9 +1014,19 @@ async function renderPromptPreview(body, outputBox, opts) {
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok) {
             const detail = data && data.detail;
-            const msg = (detail && detail.missing_required)
-                ? `Missing required variable: {${detail.missing_required}}`
-                : (typeof detail === 'string' ? detail : `HTTP ${resp.status}`);
+            let msg;
+            // Built from pieces so the Jinja2 template parser never sees a
+            // literal double-brace in this file's JS.
+            const OPEN_BRACES = '{' + '{';
+            if (detail && detail.missing_required) {
+                msg = `Missing or empty required variable: ${OPEN_BRACES}${detail.missing_required}!}}`;
+            } else if (detail && detail.undefined_variables) {
+                msg = `Undefined variable(s): ${detail.undefined_variables.join(', ')} — add test values or fix the prompt.`;
+            } else if (detail && detail.section_error) {
+                msg = detail.section_error;
+            } else {
+                msg = typeof detail === 'string' ? detail : `HTTP ${resp.status}`;
+            }
             outputBox.textContent = `Preview failed: ${msg}`;
             return;
         }
