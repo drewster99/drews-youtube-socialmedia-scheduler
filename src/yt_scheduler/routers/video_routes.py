@@ -14,6 +14,7 @@ import weakref
 from pathlib import Path
 
 from fastapi import APIRouter, Body, Request, UploadFile, File, HTTPException, Query
+from fastapi.responses import JSONResponse
 
 from yt_scheduler.config import (
     UPLOAD_DIR,
@@ -189,20 +190,26 @@ async def list_video_events(video_id: str, limit: int = 200):
 
 @router.get("/{video_id}/auto-actions")
 async def get_auto_actions_state(video_id: str) -> dict:
-    """Per-video Promo-flow progress for the polling UI.
+    """Per-video background-chain progress for the polling UI.
 
     Returned shape:
-        ``{"state": str | None, "last_error": str | None, "updated_at": str}``
+        ``{"state": str | None, "last_error": str | None,
+           "progress_message": str | None, "updated_at": str}``
 
     ``state`` is one of the ``PROMO_STATE_*`` strings or
     ``"failed:<step>"``; ``None`` means the row has never been touched
-    by the Promo chain. Detail pages poll this every 3s while the state
+    by a background chain. Detail pages poll this every 3s while the state
     is non-terminal and back off to 15s once it lands on ``ready`` or
     ``failed:*``.
+
+    Written by the Promo flow and by the detail page's transcribe-then-describe
+    chain. ``progress_message`` carries the live line for steps that report
+    granular progress ("Transcribing on-device… 42%"); it is NULL otherwise.
     """
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT auto_action_state, auto_action_last_error, updated_at "
+        "SELECT auto_action_state, auto_action_last_error, "
+        "auto_action_progress_message, updated_at "
         "FROM videos WHERE id = ?",
         (video_id,),
     )
@@ -212,6 +219,7 @@ async def get_auto_actions_state(video_id: str) -> dict:
     return {
         "state": row.get("auto_action_state"),
         "last_error": row.get("auto_action_last_error"),
+        "progress_message": row.get("auto_action_progress_message"),
         "updated_at": row.get("updated_at"),
     }
 
@@ -369,9 +377,16 @@ async def upload_video(payload: dict = Body(...)):
     title = payload.get("title")
     if not isinstance(title, str) or not title:
         raise HTTPException(400, "title (str) is required")
-    description = str(payload.get("description") or "")
+    # YouTube forbids '<' and '>' in titles and descriptions, so they are
+    # swapped for guillemets the moment the text enters the app — not on the
+    # way out. Otherwise the DB would keep the literal brackets while YouTube
+    # served the substituted ones, and the two would silently disagree.
+    # pinned_links is folded into the description at generation time, so it is
+    # held to the same rule.
+    title = youtube.sanitize_youtube_text(title)
+    description = youtube.sanitize_youtube_text(str(payload.get("description") or ""))
     tags = str(payload.get("tags") or "")
-    pinned_links = str(payload.get("pinned_links") or "")
+    pinned_links = youtube.sanitize_youtube_text(str(payload.get("pinned_links") or ""))
     privacy_status = str(payload.get("privacy_status") or "unlisted")
     publish_at = str(payload.get("publish_at") or "")
     project_slug = str(payload.get("project_slug") or "default")
@@ -701,6 +716,14 @@ async def create_non_youtube_item(payload: dict = Body(...)):
 async def update_video(video_id: str, data: dict):
     """Update video metadata."""
     db = await get_db()
+
+    # Substitute YouTube's two forbidden characters before anything else reads
+    # ``data`` — the change-detection diff below must compare the values we are
+    # actually going to store and push, or an edit that only introduced a '<'
+    # would look like a no-op change and skip the YouTube round-trip.
+    for field in ("title", "description", "pinned_links"):
+        if isinstance(data.get(field), str):
+            data[field] = youtube.sanitize_youtube_text(data[field])
 
     # Snapshot the existing row so we can build a diff payload after the update.
     rows = await db.execute_fetchall("SELECT * FROM videos WHERE id = ?", (video_id,))
@@ -1096,16 +1119,23 @@ async def transcribe_video(
 
 @router.post("/{video_id}/generate-description")
 async def generate_description(video_id: str, data: dict | None = None):
-    """Generate an SEO description from the video's transcript, or from
-    keyframes when no transcript exists.
+    """Generate an SEO description from the video's transcript.
 
     Optional body keys:
       * ``extra_instructions``: appended to the prompt verbatim.
       * ``mode``: ``"transcript"`` (default), ``"frames"``, or ``"auto"``.
-        ``auto`` uses transcript when present, falls back to frames when
-        the video has a local file. ``frames`` forces frame-based even
-        if a transcript exists (useful when the transcript is wrong or
-        the visuals are the actual content).
+        ``frames`` forces frame-based generation even if a transcript exists
+        (the escape hatch for a video whose content is purely visual, or whose
+        transcript is wrong).
+
+    With no transcript, ``transcript``/``auto`` no longer fall back to
+    keyframes. Keyframes describe a *different source* than the caller asked
+    for, and they route through a different prompt — one that can silently omit
+    whatever a project's transcript prompt requires. So instead we transcribe
+    first and then describe, in the background: this returns HTTP 202 with
+    ``{"queued": true}`` and progress lands in ``auto_action_state`` /
+    ``auto_action_progress_message`` for the detail page to poll. The user can
+    navigate away and come back to a finished description.
     """
     from pathlib import Path as _P
 
@@ -1125,26 +1155,75 @@ async def generate_description(video_id: str, data: dict | None = None):
     extra = (data or {}).get("extra_instructions", "")
     mode = ((data or {}).get("mode") or "auto").strip()
 
-    use_frames: bool
-    if mode == "transcript":
-        if not transcript:
-            raise HTTPException(
-                400,
-                "No transcript available yet. Wait for captions or upload one — "
-                "or pass mode='frames' to describe from keyframes instead.",
-            )
-        use_frames = False
-    elif mode == "frames":
-        use_frames = True
-    else:  # auto
-        use_frames = not transcript
+    valid_modes = {"auto", "transcript", "frames"}
+    if mode not in valid_modes:
+        # Naming the bad value beats quietly treating it as the default — a
+        # typo'd mode used to fall through to the transcript path, which with no
+        # transcript would kick off a multi-minute transcription nobody asked for.
+        raise HTTPException(
+            400, f"mode must be one of {sorted(valid_modes)}; got {mode!r}."
+        )
 
     video_file = video.get("video_file_path") or ""
-    if use_frames and not (video_file and _P(video_file).exists()):
+    has_local_file = bool(video_file and _P(video_file).exists())
+
+    # Truthiness is not enough: a row can hold " ", or SRT cues with no words in
+    # them. That is not a transcript to describe from — treat it as absent and
+    # transcribe, using the same "usable speech" threshold the chain applies
+    # after it transcribes, so the two can't disagree about what counts.
+    plain_transcript = (
+        transcript_service.srt_to_plain_text(transcript).strip() if transcript else ""
+    )
+    has_usable_transcript = (
+        len(plain_transcript) >= auto_actions.TRANSCRIPT_MIN_USABLE_CHARS
+    )
+
+    use_frames = mode == "frames"
+
+    if not use_frames and not has_usable_transcript:
+        # Transcribe first, then describe — as a detached background chain,
+        # because on-device transcription of a full episode runs for minutes.
+        if not has_local_file:
+            raise HTTPException(
+                400,
+                "No usable transcript, and no local video file to transcribe from. "
+                "Re-import the video or upload a copy.",
+            )
+        # Atomic claim: without it, two tabs (or a double-click) would each spawn
+        # a chain and run the same transcription twice, racing on every column
+        # they write. Losing the claim is not an error — a job is already doing
+        # exactly what the caller asked for, so report it and let them poll.
+        claimed = await auto_actions.claim_describe_chain(video_id)
+        if not claimed:
+            state_rows = await db.execute_fetchall(
+                "SELECT auto_action_state FROM videos WHERE id = ?", (video_id,)
+            )
+            current = dict(state_rows[0]).get("auto_action_state")
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "queued": False,
+                    "state": current,
+                    "message": "A background job is already running for this video.",
+                },
+            )
+        auto_actions.transcribe_then_describe(
+            video_id, project_id, extra_instructions=extra,
+        )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "queued": True,
+                "state": auto_actions.PROMO_STATE_TRANSCRIBING,
+                "message": "Transcribing on-device, then generating the description.",
+            },
+        )
+
+    if use_frames and not has_local_file:
         raise HTTPException(
             400,
-            "No transcript available, and no local video file to extract "
-            "keyframes from. Re-import the video or upload a copy.",
+            "No local video file to extract keyframes from. "
+            "Re-import the video or upload a copy.",
         )
 
     from yt_scheduler.services import templates as template_service
@@ -1203,18 +1282,13 @@ async def generate_description(video_id: str, data: dict | None = None):
             )
         raise HTTPException(502, f"Claude API call failed: {msg}")
 
-    # Compose full description with pinned links appended at the end — keeps
-    # the AI-written hook at the top (which is what viewers see in the collapsed
-    # description on YouTube) and pushes boilerplate links below.
-    pinned = video.get("pinned_links", "")
-    full_description = f"{description}\n\n{pinned}" if pinned else description
-
-    # Store generated description
-    async with write_transaction() as db:
-        await db.execute(
-            "UPDATE videos SET generated_description = ?, updated_at = datetime('now') WHERE id = ?",
-            (full_description, video_id),
-        )
+    # Compose with the pinned links and stage it. Shared with the background
+    # transcribe-then-describe chain so the two can't drift on composition —
+    # the AI-written hook stays at the top (what viewers see in the collapsed
+    # description on YouTube) and boilerplate links go below.
+    full_description = await auto_actions.store_generated_description(
+        video_id, description, video.get("pinned_links") or ""
+    )
 
     return {"description": full_description, "raw_ai_description": description}
 

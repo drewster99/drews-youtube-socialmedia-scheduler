@@ -598,9 +598,9 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 
 ### `GET /api/videos/{video_id}/auto-actions`
 
-**Purpose** — Promo-flow per-video progress for the polling UI.
+**Purpose** — Per-video background-chain progress for the polling UI. Written by the Promo flow **and** by the detail page's transcribe-then-describe chain (see [`POST .../generate-description`](#post-apivideosvideo_idgenerate-description)).
 
-**Response 200** — `{"state": "...", "last_error": "..." | null, "updated_at": "..."}`. `state` is one of the persisted `videos.auto_action_state` values (`generating_title`, `uploading`, `probing`, `transcribing`, `generating_desc`, `generating_tags`, `pushing_metadata`, `ready`) or `failed:<step>` after a failure; `null` means the chain has never touched this row.
+**Response 200** — `{"state": "...", "last_error": "..." | null, "progress_message": "..." | null, "updated_at": "..."}`. `state` is one of the persisted `videos.auto_action_state` values (`generating_title`, `uploading`, `probing`, `transcribing`, `generating_desc`, `generating_tags`, `pushing_metadata`, `ready`) or `failed:<step>` after a failure; `null` means no chain has ever touched this row. `progress_message` is the live human-readable line for steps that report granular progress (e.g. `"Transcribing on-device… 42%"`, from the Apple SpeechAnalyzer backend — the Whisper backends report none) and is `null` otherwise.
 
 **Errors** — `404` (video not found).
 
@@ -763,7 +763,7 @@ Returns **400** when `backend` is unknown, or when a Whisper backend (`mlx-whisp
 
 ### `POST /api/videos/{video_id}/generate-description`
 
-**Purpose** — Generate an SEO description from the video's transcript, or from extracted keyframes when no transcript exists.
+**Purpose** — Generate an SEO description from the video's transcript. With no transcript, transcribes the video on-device first and then describes from the result (in the background).
 
 **Request body** (optional):
 
@@ -771,17 +771,19 @@ Returns **400** when `backend` is unknown, or when a Whisper backend (`mlx-whisp
 { "extra_instructions": "...", "mode": "auto" | "transcript" | "frames" }
 ```
 
-`mode=auto` (default) uses transcript if present, falls back to frames. `transcript` is hard-fail if no transcript. `frames` forces frame-based even when a transcript exists.
+`mode=auto` (default) and `mode=transcript` both describe from the transcript. **Neither falls back to keyframes** — keyframes describe a different source than the caller asked for and route through a different prompt, which can silently drop whatever a project's transcript prompt requires. When no transcript exists, the route instead queues a background transcribe-then-describe chain and returns `202`. `frames` forces frame-based generation even when a transcript exists — the explicit escape hatch for a video whose content is purely visual.
 
 **Response 200** — `{"description": "<full text incl. pinned_links>", "raw_ai_description": "<just the AI output>"}`.
+
+**Response 202** — `{"queued": true, "state": "transcribing", "message": "..."}`. No transcript existed, so on-device transcription started in the background and the description will follow. Progress is published to `videos.auto_action_state` + `auto_action_progress_message` — poll [`GET /api/videos/{video_id}/auto-actions`](#get-apivideosvideo_idauto-actions). The work is detached from the request, so the client may navigate away. On completion the description is staged in `videos.generated_description` and the state becomes `ready`; a video with no usable speech ends at `failed:transcribing` with an error saying so rather than quietly falling back to keyframes.
 
 **Errors**
 
 - `404` — Video not found.
-- `400` — `mode=transcript` without a transcript, or `mode=frames`/auto-frames without a local video file.
+- `400` — No transcript and no local video file to transcribe from, or `mode=frames` without a local video file.
 - `502` — Anthropic auth/transport failure (special-cased for 401 with a message asking the user to update their API key) or ffmpeg returning no usable keyframes.
 
-**Side effects** — Calls Anthropic API; for frames mode also calls `ffmpeg` to extract keyframes; writes `videos.generated_description`. The applied description includes `pinned_links` appended after the AI text.
+**Side effects** — Calls Anthropic API; for frames mode also calls `ffmpeg` to extract keyframes; writes `videos.generated_description`. The applied description includes `pinned_links` appended after the AI text. The `202` path additionally runs on-device transcription and writes the transcript columns (as the upload/import auto-action chain does). Angle brackets (`<`, `>`) are substituted for guillemets in generated titles/descriptions — YouTube rejects them outright.
 
 **Renderer** — `mode=transcript` (and the transcript leg of `auto`) substitutes the prompt body from `prompt_templates.description_from_transcript_prompt` through the same engine as [`POST /api/expand_text`](#post-apiexpand_text), then sends the substituted prompt to Claude in a single call. Any `{{ai: ...}}`, `{{var!}}`, `{{var??default}}`, or `{{#var}}…{{/var}}` section syntax in the prompt-template body is honoured. For a promo child (row has `parent_item_id`), resolution prefers the `description_from_transcript_prompt_promo` variant: saved promo row → promo seed → saved base row → base seed. `mode=frames` substitutes `prompt_templates.description_from_frames_prompt` and attaches the keyframes to the same user turn. Both modes render with the merged prompt-variable dict (parent fields, `episode_url`, inherited item variables, the `transcript*` family) and also send the saved `system_body` (if any) to Claude — edit it in Project Settings → LLM prompt templates.
 

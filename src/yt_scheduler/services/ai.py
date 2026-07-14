@@ -271,6 +271,28 @@ def _clean_tags(raw: str) -> list[str]:
     return cleaned
 
 
+def _sanitized_for_youtube(text: str) -> str:
+    """Strip the characters YouTube forbids from a generated title/description.
+
+    The prompts tell Claude to avoid ``<`` and ``>``, but a prompt is a
+    request, not a guarantee — so every YouTube-bound string the model returns
+    passes through the same substitution the API layer applies, in the same
+    spirit as :func:`_clean_tags`. Doing it here (rather than at each of the
+    four DB write sites) means the text is already clean *before* it is
+    persisted, so the database holds exactly what YouTube holds.
+
+    Deliberately NOT applied to social-post copy or ``{{ai:}}`` blocks: X,
+    Bluesky, Mastodon et al. accept angle brackets, and mangling them there
+    would corrupt perfectly valid posts.
+
+    Imported lazily to keep ``googleapiclient`` out of this module's import
+    graph — ai.py is imported by paths that never talk to YouTube.
+    """
+    from yt_scheduler.services.youtube import sanitize_youtube_text
+
+    return sanitize_youtube_text(text)
+
+
 async def generate_seo_description(
     title: str,
     transcript: str,
@@ -322,7 +344,7 @@ async def generate_seo_description(
 
     client = get_client()
     message = await asyncio.to_thread(client.messages.create, **kwargs)
-    return _extract_text(message).strip()
+    return _sanitized_for_youtube(_extract_text(message).strip())
 
 
 async def generate_seo_description_from_frames(
@@ -388,7 +410,7 @@ async def generate_seo_description_from_frames(
 
     client = get_client()
     message = await asyncio.to_thread(client.messages.create, **kwargs)
-    return _extract_text(message).strip()
+    return _sanitized_for_youtube(_extract_text(message).strip())
 
 
 async def generate_tags_from_frames(
@@ -581,7 +603,7 @@ async def generate_title_from_filename(
     # Some models still wrap output in quotes despite the system prompt.
     if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
         raw = raw[1:-1].strip()
-    return raw[:100]
+    return _sanitized_for_youtube(raw[:100])
 
 
 _FILENAME_PREFIX_STRIPS = (
@@ -624,7 +646,7 @@ def fallback_title_from_filename(filename: str) -> str:
     base = re.sub(r"\s+", " ", base).strip()
     if not base:
         return "Untitled video"
-    return base.title()[:100]
+    return _sanitized_for_youtube(base.title()[:100])
 
 
 # Seed fallback for ``ai_block_default_system_prompt`` — kept here so an

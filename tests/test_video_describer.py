@@ -116,10 +116,67 @@ async def test_tags_from_frames_returns_lowercase_list(app_db) -> None:
     assert tags == ["foo", "bar baz", "qux", "tag-five"]
 
 
-# --- /api/videos/{id}/generate-description fallback ------------------------
+# --- /api/videos/{id}/generate-description: no transcript ------------------
+#
+# With no transcript the route used to silently describe from keyframes. It no
+# longer does: keyframes describe a different source than the caller asked for
+# and route through a different prompt, so a project whose transcript prompt
+# requires (say) a show link would quietly get a description without one.
+# Instead the route transcribes first and then describes, in the background.
+# Keyframes remain available, but only when explicitly asked for.
 
 
-async def test_generate_description_falls_back_to_frames(
+async def test_generate_description_queues_transcription_when_no_transcript(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("DYS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DYS_HOST", "127.0.0.1")
+    (tmp_path / "uploads").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "templates").mkdir(parents=True, exist_ok=True)
+    for mod in list(sys.modules.keys()):
+        if mod.startswith("yt_scheduler"):
+            sys.modules.pop(mod, None)
+
+    keychain = importlib.import_module("yt_scheduler.services.keychain")
+    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    keychain.store_secret("anthropic", "api_key", "sk-ant-test-fake")
+    app_module = importlib.import_module("yt_scheduler.app")
+    auto_actions = importlib.import_module("yt_scheduler.services.auto_actions")
+
+    fake_video = tmp_path / "uploads" / "fake.mp4"
+    fake_video.write_bytes(b"\x00" * 32)
+
+    spawned: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        auto_actions, "transcribe_then_describe",
+        lambda video_id, project_id, **kw: spawned.append((video_id, project_id)),
+    )
+
+    from fastapi.testclient import TestClient
+    with TestClient(app_module.app) as c:
+        from yt_scheduler.database import get_db
+        db = await get_db()
+        await db.execute(
+            "INSERT INTO videos (id, project_id, title, status, video_file_path, transcript) "
+            "VALUES ('vidQ', 1, 'Test', 'uploaded', ?, '')",
+            (str(fake_video),),
+        )
+        await db.commit()
+
+        resp = c.post("/api/videos/vidQ/generate-description", json={})
+        assert resp.status_code == 202, resp.text
+        body = resp.json()
+        assert body["queued"] is True
+        assert body["state"] == "transcribing"
+
+    # The chain was handed off to the background, not run inline.
+    assert spawned == [("vidQ", 1)]
+
+    from yt_scheduler.database import close_db
+    await close_db()
+
+
+async def test_generate_description_frames_mode_is_still_explicit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("DYS_DATA_DIR", str(tmp_path))
@@ -161,7 +218,9 @@ async def test_generate_description_falls_back_to_frames(
         )
         await db.commit()
 
-        resp = c.post("/api/videos/vidF/generate-description", json={})
+        resp = c.post(
+            "/api/videos/vidF/generate-description", json={"mode": "frames"}
+        )
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["description"] == "Visually-described summary."

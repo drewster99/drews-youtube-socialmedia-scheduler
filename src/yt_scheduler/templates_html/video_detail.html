@@ -76,10 +76,11 @@
                         </button>
                         <button type="button" class="btn btn-sm" id="btn-regen-desc-transcript"
                                 onclick="regenerateDescription('transcript')" style="display:none;"
-                                title="Generate from the transcript text. Disabled until a transcript exists.">
+                                title="Generate from the transcript text.">
                             Generate from transcript
                         </button>
                     </div>
+                    <div id="desc-chain-status" class="form-hint" style="display:none; margin-top:0.5rem;"></div>
                 </div>
                 <div class="form-group" data-field="tags">
                     <label>Tags</label>
@@ -836,6 +837,7 @@ async function loadVideo() {
     const attachBtn = document.getElementById('btn-attach-source');
     if (attachBtn) attachBtn.addEventListener('click', openFileInfoModal);
     maybePollWhileBusy(video);
+    maybeResumeDescriptionChain(video);
 
     // Player
     document.getElementById('video-player').innerHTML = `
@@ -2069,10 +2071,18 @@ function updateRegenerateVisibility() {
         ? "Sample keyframes from the video file and have Claude describe what's visible."
         : "No local video file. Re-import the video or upload a copy to use this.";
 
-    fromTranscript.disabled = !hasTranscript;
+    // With no transcript this button no longer sits disabled: it transcribes
+    // on-device first and then describes from the result. Keyframes stay an
+    // explicit choice rather than a silent substitute for speech.
+    fromTranscript.disabled = !hasTranscript && !hasLocalFile;
+    fromTranscript.textContent = hasTranscript
+        ? 'Generate from transcript'
+        : 'Transcribe + generate';
     fromTranscript.title = hasTranscript
         ? "Generate from the transcript text."
-        : "No transcript yet. Wait for captions, transcribe locally, or upload one.";
+        : (hasLocalFile
+            ? "No transcript yet — transcribe the video on-device, then generate from it. Runs in the background; you can leave this page."
+            : "No transcript and no local video file. Re-import the video or upload a copy.");
 }
 
 async function regenerateDescription(mode) {
@@ -2088,24 +2098,151 @@ async function regenerateDescription(mode) {
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ mode }),
         });
-        if (resp.ok) {
-            const result = await resp.json();
-            // Drop the new description into the editor as a dirty edit; user
-            // saves with "Update to YouTube" or rolls back with Revert.
-            document.getElementById('meta-description').value = result.description;
-            refreshDirtyState();
-            showToast(
-                mode === 'frames'
-                    ? 'Description generated from video frames — review and save'
-                    : 'Description generated from transcript — review and save',
-                'info',
-            );
+
+        // 202: no transcript, so the server is transcribing first and will then
+        // describe. The work outlives this request — poll for it.
+        if (resp.status === 202) {
+            const queued = await resp.json();
+            showDescriptionChainStatus(queued.message || 'Working…');
+            startDescriptionChainPolling();
+            return;
         }
+
+        if (!resp.ok) {
+            const detail = await resp.json().catch(() => ({}));
+            showToast('Description generation failed: '
+                + (detail.detail || `HTTP ${resp.status}`), 'error');
+            return;
+        }
+
+        const result = await resp.json();
+        // Drop the new description into the editor as a dirty edit; user
+        // saves with "Update to YouTube" or rolls back with Revert.
+        document.getElementById('meta-description').value = result.description;
+        refreshDirtyState();
+        showToast(
+            mode === 'frames'
+                ? 'Description generated from video frames — review and save'
+                : 'Description generated from transcript — review and save',
+            'info',
+        );
     } finally {
         btn.disabled = false;
         btn.textContent = oldText;
         // Re-evaluate disabled state in case transcript appeared during the call.
         updateRegenerateVisibility();
+    }
+}
+
+// --- transcribe-then-describe background chain ---------------------------
+// The chain runs server-side and persists its progress, so this poller is just
+// a view onto it: closing the page doesn't cancel the work, and coming back
+// re-attaches (loadVideo calls maybeResumeDescriptionChain).
+
+let _descChainTimer = null;
+
+const DESC_CHAIN_LABELS = {
+    transcribing: 'Transcribing on-device…',
+    generating_desc: 'Generating description…',
+};
+
+function showDescriptionChainStatus(text) {
+    const el = document.getElementById('desc-chain-status');
+    if (!el) return;
+    el.textContent = text;
+    el.style.display = 'block';
+}
+
+function hideDescriptionChainStatus() {
+    const el = document.getElementById('desc-chain-status');
+    if (el) el.style.display = 'none';
+    if (_descChainTimer) {
+        clearInterval(_descChainTimer);
+        _descChainTimer = null;
+    }
+}
+
+function startDescriptionChainPolling() {
+    if (_descChainTimer) return;
+    setDescriptionButtonsBusy(true);
+    _descChainTimer = setInterval(pollDescriptionChain, 3000);
+    pollDescriptionChain();
+}
+
+function setDescriptionButtonsBusy(busy) {
+    for (const id of ['btn-regen-desc-frames', 'btn-regen-desc-transcript']) {
+        const btn = document.getElementById(id);
+        if (btn) btn.disabled = busy;
+    }
+}
+
+// A single dropped poll is nothing (sleep/wake, a blip). A poll that keeps
+// failing is something the user has to know about — otherwise the page spins
+// "Transcribing…" forever while the server is actually erroring, which is the
+// worst kind of lie the UI can tell. Fail loudly after a few consecutive misses.
+let _descChainPollFailures = 0;
+const DESC_CHAIN_MAX_POLL_FAILURES = 3;
+
+async function pollDescriptionChain() {
+    let state;
+    try {
+        const resp = await fetch(`/api/videos/${videoId}/auto-actions`);
+        if (!resp.ok) {
+            const detail = await resp.json().catch(() => ({}));
+            throw new Error(detail.detail || `HTTP ${resp.status}`);
+        }
+        state = await resp.json();
+        _descChainPollFailures = 0;
+    } catch (err) {
+        _descChainPollFailures += 1;
+        if (_descChainPollFailures >= DESC_CHAIN_MAX_POLL_FAILURES) {
+            hideDescriptionChainStatus();
+            setDescriptionButtonsBusy(false);
+            _descChainPollFailures = 0;
+            showToast(
+                "Lost track of the transcription job: " + (err.message || err)
+                + ". It may still be running — reload to re-check.",
+                'error',
+            );
+        }
+        return;
+    }
+
+    if (state.state === 'transcribing' || state.state === 'generating_desc') {
+        // progress_message carries the live percent when the backend reports it
+        // (Apple SpeechAnalyzer does; the Whisper backends don't).
+        showDescriptionChainStatus(
+            state.progress_message || DESC_CHAIN_LABELS[state.state] || 'Working…'
+        );
+        return;
+    }
+
+    hideDescriptionChainStatus();
+    setDescriptionButtonsBusy(false);
+
+    if (typeof state.state === 'string' && state.state.startsWith('failed:')) {
+        showToast(state.last_error || 'Transcription or description failed.', 'error');
+        await loadVideo();
+        return;
+    }
+
+    if (state.state === 'ready') {
+        await loadVideo();
+        const generated = videoData?.generated_description;
+        if (generated) {
+            document.getElementById('meta-description').value = generated;
+            refreshDirtyState();
+            showToast('Transcript and description ready — review and save', 'info');
+        }
+    }
+}
+
+function maybeResumeDescriptionChain(video) {
+    // Re-attach on page load so a chain started before a reload/navigation
+    // still shows its progress.
+    const state = video?.auto_action_state;
+    if (state === 'transcribing' || state === 'generating_desc') {
+        startDescriptionChainPolling();
     }
 }
 

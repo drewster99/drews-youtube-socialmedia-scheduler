@@ -24,6 +24,7 @@ already done so a Retry resumes from the failing step.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ import secrets
 import shutil
 import subprocess
 from pathlib import Path
+from collections.abc import Callable
 from typing import Literal
 
 from yt_scheduler.config import UPLOAD_DIR, sanitized_original_filename
@@ -278,22 +280,48 @@ async def _maybe_transcribe(
     backend: str | None,
     model: str | None,
 ) -> None:
+    """Best-effort transcribe for the fire-and-forget upload/import chain.
+
+    Swallows failures on purpose: this runs unattended behind an upload, and a
+    transcription that didn't work should not blow up the rest of the chain.
+    The user-initiated path wants the opposite (a visible error), so it calls
+    :func:`transcribe_and_store` directly.
+    """
     if not video_file_path or not Path(video_file_path).exists():
         return
     try:
-        from yt_scheduler.services import transcription
-        # Both may be None: that means "no backend configured for this column",
-        # which transcribe() resolves to Apple SpeechAnalyzer. Substituting a
-        # model here would silently re-enable the 3 GB large-v3 MLX path.
-        result = await asyncio.to_thread(
-            transcription.transcribe,
-            video_path=video_file_path,
-            model=model,
-            backend=backend,
+        await transcribe_and_store(
+            video_id, video_file_path, backend=backend, model=model
         )
     except Exception as exc:
         logger.warning("auto-transcribe failed: %s", exc)
-        return
+
+
+async def transcribe_and_store(
+    video_id: str,
+    video_file_path: str,
+    *,
+    backend: str | None,
+    model: str | None,
+    progress_callback: Callable[[float, float], None] | None = None,
+) -> str:
+    """Transcribe, persist to the transcript table + videos row, return the SRT.
+
+    Raises on failure — callers that want the errors swallowed wrap it
+    themselves. ``progress_callback`` is handed straight to the transcriber;
+    only the Apple SpeechAnalyzer backend actually reports progress.
+    """
+    from yt_scheduler.services import transcription
+    # Both may be None: that means "no backend configured for this column",
+    # which transcribe() resolves to Apple SpeechAnalyzer. Substituting a
+    # model here would silently re-enable the 3 GB large-v3 MLX path.
+    result = await asyncio.to_thread(
+        transcription.transcribe,
+        video_path=video_file_path,
+        model=model,
+        backend=backend,
+        progress_callback=progress_callback,
+    )
 
     backend_to_source = {
         "mlx-whisper": "mlx_whisper",
@@ -324,6 +352,7 @@ async def _maybe_transcribe(
         video_id, "metadata_updated",
         {"transcript": {"old": "", "new": canonical}},
     )
+    return canonical
 
 
 async def _maybe_generate_tags(video: dict, project_id: int, column: dict) -> None:
@@ -1072,6 +1101,244 @@ async def _set_promo_state(
         )
 
 
+# A transcript this short means the transcriber ran and heard nothing usable —
+# a silent or music-only video. Same threshold the promo chain uses.
+TRANSCRIPT_MIN_USABLE_CHARS = 10
+
+NO_SPEECH_ERROR = (
+    "Transcription finished but produced no usable speech — this video may have "
+    "no dialogue. Use “Describe from video frames” if that's expected."
+)
+
+
+async def _set_auto_action_progress(video_id: str, message: str | None) -> None:
+    """Update only the human-readable progress line, leaving state/error alone."""
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE videos SET auto_action_progress_message = ?, "
+            "updated_at = datetime('now') WHERE id = ?",
+            (message, video_id),
+        )
+
+
+async def store_generated_description(
+    video_id: str, raw_description: str, pinned_links: str
+) -> str:
+    """Compose the AI description with the pinned links and stage it.
+
+    Staged in ``generated_description`` (not ``description``): the user reviews
+    it in the editor and pushes it to YouTube themselves. Shared by the
+    synchronous route and the background chain so the two can't drift on how a
+    description gets composed.
+    """
+    full = (
+        f"{raw_description}\n\n{pinned_links}" if pinned_links else raw_description
+    )
+    # raw_description is already clean (ai.py sanitizes what it returns), but
+    # pinned_links may be a pre-sanitizer row still holding raw angle brackets.
+    # sanitize_youtube_text is idempotent, so re-running it costs nothing.
+    full = youtube.sanitize_youtube_text(full)
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE videos SET generated_description = ?, "
+            "updated_at = datetime('now') WHERE id = ?",
+            (full, video_id),
+        )
+    return full
+
+
+async def claim_describe_chain(video_id: str) -> bool:
+    """Atomically claim this video for a transcribe-then-describe run.
+
+    Returns True if we won the claim, False if a background chain is already
+    working on this row. ``spawn_background`` does NOT dedup by task name, so
+    without this a double-click, a second browser tab, or any repeated API call
+    would start a second on-device transcription of the same file — two chains
+    racing on the same transcript, progress line, description, and terminal
+    state. The conditional UPDATE is the gate: SQLite applies it atomically, so
+    exactly one caller sees rowcount 1.
+
+    The WHERE clause also refuses to trample a chain that is mid-flight for some
+    OTHER reason (a Promo chain cutting/uploading/pushing), because every one of
+    those states is non-terminal and therefore excluded here.
+    """
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            "UPDATE videos SET auto_action_state = ?, auto_action_last_error = NULL, "
+            "auto_action_progress_message = ?, updated_at = datetime('now') "
+            "WHERE id = ? AND ("
+            "  auto_action_state IS NULL"
+            "  OR auto_action_state = ?"
+            "  OR auto_action_state LIKE 'failed:%'"
+            ")",
+            (
+                PROMO_STATE_TRANSCRIBING,
+                "Transcribing on-device…",
+                video_id,
+                PROMO_STATE_READY,
+            ),
+        )
+    return (cursor.rowcount or 0) > 0
+
+
+def transcribe_then_describe(
+    video_id: str, project_id: int, *, extra_instructions: str = ""
+) -> None:
+    """Kick off "transcribe, then describe from that transcript" in the background.
+
+    Returns immediately. Progress lands in ``videos.auto_action_state`` +
+    ``auto_action_progress_message``, which the detail page polls — so the user
+    is free to navigate away and come back to a finished description.
+
+    The caller must have won :func:`claim_describe_chain` first.
+    """
+    spawn_background(
+        _run_transcribe_then_describe(video_id, project_id, extra_instructions),
+        name=f"transcribe-then-describe:{video_id}",
+    )
+
+
+async def _run_transcribe_then_describe(
+    video_id: str, project_id: int, extra_instructions: str
+) -> None:
+    # Nothing below may raise past this point. The HTTP request already returned
+    # 202 and the row already says "transcribing", so an escaping exception would
+    # strand the row in a running state forever with the UI spinning and the real
+    # error buried in the log — the exact "misleading fine state" we forbid.
+    try:
+        await _transcribe_then_describe_steps(
+            video_id, project_id, extra_instructions
+        )
+    except Exception as exc:
+        logger.exception("transcribe-then-describe: unexpected failure for %s", video_id)
+        await _set_auto_action_progress(video_id, None)
+        await _set_promo_state(
+            video_id, f"failed:{PROMO_STATE_TRANSCRIBING}",
+            error=f"{type(exc).__name__}: {exc}"[:500],
+        )
+
+
+async def _transcribe_then_describe_steps(
+    video_id: str, project_id: int, extra_instructions: str
+) -> None:
+    project_row = await get_project_by_id(project_id)
+    if project_row:
+        set_active_project(project_row["slug"])
+
+    db = await get_db()
+    rows = await db.execute_fetchall("SELECT * FROM videos WHERE id = ?", (video_id,))
+    if not rows:
+        return
+    video = dict(rows[0])
+    video_file_path = video.get("video_file_path") or ""
+
+    actions = await project_settings.get_auto_actions(project_id)
+    upload_column = actions.get("upload", {})
+    backend = upload_column.get("auto_transcribe_backend")
+    model = upload_column.get("auto_transcribe_model")
+
+    # --- Step 1: transcribe -------------------------------------------------
+    # claim_describe_chain already persisted these; set them again so the chain
+    # is still correct when called directly (tests, future callers).
+    await _set_promo_state(video_id, PROMO_STATE_TRANSCRIBING)
+    await _set_auto_action_progress(video_id, "Transcribing on-device…")
+
+    # transcribe() calls this from its worker thread, so it can't await. Stash
+    # the latest percent and let a poller task push it to the DB — writing a row
+    # per callback would hammer SQLite for a multi-minute transcription.
+    latest_percent: dict[str, int | None] = {"value": None}
+
+    def _on_progress(done_seconds: float, total_seconds: float) -> None:
+        if total_seconds > 0:
+            pct = max(0, min(100, int(round(done_seconds / total_seconds * 100))))
+            latest_percent["value"] = pct
+
+    async def _publish_progress() -> None:
+        last_written: int | None = None
+        while True:
+            await asyncio.sleep(2)
+            pct = latest_percent["value"]
+            if pct is not None and pct != last_written:
+                last_written = pct
+                await _set_auto_action_progress(
+                    video_id, f"Transcribing on-device… {pct}%"
+                )
+
+    progress_task = asyncio.create_task(_publish_progress())
+    try:
+        async with _get_whisper_semaphore():
+            await transcribe_and_store(
+                video_id, video_file_path,
+                backend=backend, model=model,
+                progress_callback=_on_progress,
+            )
+    except Exception as exc:
+        logger.warning("transcribe-then-describe: transcription failed for %s: %s",
+                       video_id, exc)
+        await _set_auto_action_progress(video_id, None)
+        await _set_promo_state(
+            video_id, f"failed:{PROMO_STATE_TRANSCRIBING}",
+            error=f"Transcription failed: {exc}"[:500],
+        )
+        return
+    finally:
+        # Await the cancellation: a bare cancel() leaves the task's own failure
+        # (e.g. SQLite blew up inside the publisher) unretrieved, which surfaces
+        # later as a stray "Task exception was never retrieved".
+        progress_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await progress_task
+
+    # --- Step 2: is there any speech to describe? ---------------------------
+    rows = await db.execute_fetchall("SELECT * FROM videos WHERE id = ?", (video_id,))
+    if not rows:
+        return
+    video = dict(rows[0])
+    transcript = (video.get("transcript") or "").strip()
+    plain = (
+        transcript_service.srt_to_plain_text(transcript).strip() if transcript else ""
+    )
+    if len(plain) < TRANSCRIPT_MIN_USABLE_CHARS:
+        # Deliberately NOT falling through to the keyframe describer: that would
+        # quietly produce a description from a different source than the user
+        # asked for, and skip prompts whose required variables are the whole
+        # point (e.g. a project whose description prompt demands a show link).
+        await _set_auto_action_progress(video_id, None)
+        await _set_promo_state(
+            video_id, f"failed:{PROMO_STATE_TRANSCRIBING}", error=NO_SPEECH_ERROR,
+        )
+        return
+
+    # --- Step 3: describe ---------------------------------------------------
+    await _set_promo_state(video_id, PROMO_STATE_GENERATING_DESC)
+    await _set_auto_action_progress(video_id, "Generating description…")
+    try:
+        prompt_variables = await tmpl.build_prompt_variables(video)
+        description = await ai.generate_seo_description(
+            title=video.get("title") or "",
+            transcript=transcript,
+            extra_instructions=extra_instructions,
+            project_id=project_id,
+            prompt_variables=prompt_variables,
+            is_promo=bool(video.get("parent_item_id")),
+        )
+        await store_generated_description(
+            video_id, description, video.get("pinned_links") or ""
+        )
+    except Exception as exc:
+        logger.warning("transcribe-then-describe: description failed for %s: %s",
+                       video_id, exc)
+        await _set_auto_action_progress(video_id, None)
+        await _set_promo_state(
+            video_id, f"failed:{PROMO_STATE_GENERATING_DESC}",
+            error=f"{type(exc).__name__}: {exc}"[:500],
+        )
+        return
+
+    await _set_auto_action_progress(video_id, None)
+    await _set_promo_state(video_id, PROMO_STATE_READY)
+
+
 async def _load_parent_context(parent_id: str | None) -> dict:
     """Fetch parent fields for the title-from-filename prompt. Returns an
     empty dict when there's no parent (caller passes empty strings)."""
@@ -1199,6 +1466,14 @@ async def _run_promo_chain_inner(job_id: str) -> None:
                 exc_info=True,
             )
             title = ai.fallback_title_from_filename(job["filename"])
+
+    # A pre-supplied title (Generate-from-source proposes one, and the user can
+    # edit it in the review screen) never passed through the AI generators, so
+    # it never got sanitized. Without this, upload_video would sanitize it on the
+    # way to YouTube while the INSERT below stored the raw '<'/'>' — exactly the
+    # DB-disagrees-with-YouTube split this is all meant to prevent. Idempotent,
+    # so the AI-generated branch is unaffected.
+    title = youtube.sanitize_youtube_text(title)
     job["title"] = title
 
     # Step 2 — YouTube upload
@@ -1422,7 +1697,7 @@ async def _promo_step_description(video_id: str, project_id: int) -> None:
     prompt_variables = await tmpl.build_prompt_variables(row)
     video_is_promo = bool(row.get("parent_item_id"))
 
-    if len(plain_transcript) >= 10:
+    if len(plain_transcript) >= TRANSCRIPT_MIN_USABLE_CHARS:
         description = await ai.generate_seo_description(
             title=title, transcript=transcript, project_id=project_id,
             prompt_variables=prompt_variables, is_promo=video_is_promo,
@@ -1488,7 +1763,7 @@ async def _promo_step_tags(video_id: str, project_id: int) -> None:
     prompt_variables = await tmpl.build_prompt_variables(row)
     video_is_promo = bool(row.get("parent_item_id"))
 
-    if len(plain_transcript) >= 10:
+    if len(plain_transcript) >= TRANSCRIPT_MIN_USABLE_CHARS:
         new_tags = await ai.generate_tags_from_metadata(
             title=title, description=description, transcript=transcript,
             project_id=project_id, prompt_variables=prompt_variables,

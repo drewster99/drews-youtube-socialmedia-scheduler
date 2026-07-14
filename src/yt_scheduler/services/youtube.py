@@ -51,8 +51,8 @@ def upload_video(
 
     body = {
         "snippet": {
-            "title": title,
-            "description": description,
+            "title": sanitize_youtube_text(title),
+            "description": sanitize_youtube_text(description),
             "tags": tags or [],
             "categoryId": category_id,
         },
@@ -141,17 +141,24 @@ def upload_video(
     return response
 
 
-def sanitize_youtube_description(text: str) -> str:
-    """Replace characters YouTube rejects in a video description.
+def sanitize_youtube_text(text: str) -> str:
+    """Replace the two characters YouTube forbids in a title or description.
 
-    YouTube's videos.update API rejects descriptions containing literal
-    ``<`` or ``>`` (reason ``invalidDescription`` at
-    ``body.snippet.description``) — it treats them as embedded markup.
-    AI-generated descriptions for technical content can easily slip
-    those in while referencing code symbols (``<NSObject>``,
-    ``<UIView>``, ``<MyComponent>``). Swap them for the visually
-    similar single guillemets so the symbol convention survives the
-    push without information loss.
+    Google documents the restriction on the Videos resource: ``snippet.title``
+    and ``snippet.description`` "may contain all valid UTF-8 characters except
+    ``<`` and ``>``". Sending either one fails the request (``invalidTitle`` /
+    ``invalidDescription``); the assumed motive is HTML-injection defence.
+    Google documents no escape hatch — ``&lt;`` is undocumented folklore, so we
+    do not rely on it.
+
+    AI-generated copy for technical content trips this constantly while
+    referencing code symbols (``<NSObject>``, ``<UIView>``). Swap in the
+    visually similar single guillemets, which keeps the symbol convention
+    readable and loses no information.
+
+    Idempotent: guillemets are not themselves replacement targets, so applying
+    this twice is the same as applying it once. That matters because it runs
+    both where text enters the app and again on the way out to YouTube.
     """
     return text.replace("<", "‹").replace(">", "›")
 
@@ -187,9 +194,9 @@ def update_video_metadata(
     snippet = {k: v for k, v in snippet_src.items() if k in allowed_snippet}
 
     if title is not None:
-        snippet["title"] = title
+        snippet["title"] = sanitize_youtube_text(title)
     if description is not None:
-        snippet["description"] = sanitize_youtube_description(description)
+        snippet["description"] = sanitize_youtube_text(description)
     if tags is not None:
         snippet["tags"] = tags
     if category_id is not None:
