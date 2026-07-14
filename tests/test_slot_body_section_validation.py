@@ -15,7 +15,7 @@ import pytest
 
 
 @pytest.fixture
-def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+async def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("DYS_DATA_DIR", str(tmp_path))
     (tmp_path / "uploads").mkdir(parents=True, exist_ok=True)
     for mod in list(sys.modules.keys()):
@@ -27,6 +27,10 @@ def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     from fastapi.testclient import TestClient
     with TestClient(app_module.app) as c:
         yield c
+    # Close the shared aiosqlite connection so its non-daemon thread can't
+    # wedge interpreter shutdown (see conftest's leaked-connection note).
+    database = importlib.import_module("yt_scheduler.database")
+    await database.close_db()
 
 
 def _create_template(client, name: str) -> None:

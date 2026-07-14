@@ -159,7 +159,7 @@ Business logic layer, each service wraps one concern:
 - **`youtube.py`** — YouTube Data API v3 (upload, metadata, captions, comments)
 - **`ai.py`** — Claude API for description generation and template AI blocks
 - **`social.py`** — Multi-platform posting (Twitter/X via tweepy, Bluesky via atproto, Mastodon, LinkedIn, Threads)
-- **`templates.py`** — Template engine with `{{variable}}` and `{{ai: prompt}}` syntax
+- **`templates.py`** — Template engine: `{{variable}}` (strict — undefined names raise), `{{variable!}}` (required non-empty), `{{variable??default}}` (default on missing/blank), `{{#variable}}…{{/variable}}` / `{{^variable}}…{{/variable}}` sections, and `{{ai: prompt}}` blocks
 - **`auth.py`** — YouTube OAuth flow + credential storage (Keychain on macOS, encrypted JSON fallback)
 - **`scheduler.py`** — APScheduler background jobs (scheduled publish, caption polling, comment moderation)
 - **`moderation.py`** — Comment filtering against blocklist (supports plain text and regex)
@@ -182,7 +182,7 @@ Native SwiftUI app that embeds a Python runtime and manages the server as a subp
 - **Single SQLite database** — No external DB server; `aiosqlite` for async access; schema auto-migrates via `CREATE TABLE IF NOT EXISTS`
 - **Global DB connection** — `database.get_db()` returns a module-level singleton connection
 - **Credentials in Keychain** — On macOS, social media tokens stored in system Keychain (`com.nuclearcyborg.drews-socialmedia-scheduler.*`), with encrypted JSON fallback on other platforms
-- **Template syntax** — `{{variable}}` for metadata substitution, `{{ai: prompt}}` for Claude generation; variables inside AI blocks are resolved first
+- **Template syntax** — `{{variable}}` for metadata substitution (strict: an undefined name is an error naming every undefined variable; defined-but-blank renders empty), `{{variable!}}` required-non-empty, `{{variable??default}}` default on missing/blank, `{{#variable}}…{{/variable}}` sections (content renders only when the variable has content; `{{^variable}}` is the inverse; resolved before media/AI passes), `{{ai: prompt}}` for Claude generation; variables inside AI blocks are resolved first. Promo children resolve description prompts via the `<key>_promo` variant chain (saved promo row → promo seed → saved base row → base seed).
 - **Video lifecycle** — `draft → uploaded → captioned → ready → published`; captions polled every 15 min via background job
 - **Scheduled publishing** — Sets `publish_at` on video, APScheduler fires at that time to flip privacy to public and send all approved social posts
 - **Promo source-file provenance** — `videos.source_file_origin` (migration 026) tracks where the local file came from: `uploaded` (manual upload), `youtube_download` (re-fetched from YouTube, lossy), `user_attached` (Replace-source master), or `generated_clip` (Generate-from-source cut). Replace-source and the YouTube re-download path both honour this enum so a user-attached master can't be silently clobbered.

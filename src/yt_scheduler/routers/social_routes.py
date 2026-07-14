@@ -909,10 +909,25 @@ async def shorten_post(post_id: int, data: dict | None = None):
         "target_chars": str(target),
         "post_text": old,
     }
-    user_prompt = await tmpl.async_render(seed["body"], variables)
-    system_prompt = (
-        await tmpl.async_render(seed["system"], variables) if seed["system"] else None
-    )
+    try:
+        user_prompt = await tmpl.async_render(seed["body"], variables)
+        system_prompt = (
+            await tmpl.async_render(seed["system"], variables)
+            if seed["system"] else None
+        )
+    except tmpl.MissingRequiredVariable as exc:
+        raise HTTPException(400, {"missing_required": exc.name}) from exc
+    except tmpl.UndefinedTemplateVariables as exc:
+        raise HTTPException(
+            400,
+            {
+                "undefined_variables": exc.names,
+                "hint": "The shorten prompt only receives target_chars and "
+                        "post_text — remove other bare variables from it.",
+            },
+        ) from exc
+    except tmpl.SectionTagError as exc:
+        raise HTTPException(400, {"section_error": str(exc)}) from exc
     try:
         new = (await asyncio.to_thread(
             ai.call_ai_block,

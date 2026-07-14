@@ -1182,6 +1182,15 @@ async def generate_description(video_id: str, data: dict | None = None):
             )
     except HTTPException:
         raise
+    except (
+        template_service.MissingRequiredVariable,
+        template_service.UndefinedTemplateVariables,
+        template_service.SectionTagError,
+    ) as e:
+        # Template-authoring problems in the (user-editable) prompt body are
+        # 400s naming the problem — not "Claude API call failed", which
+        # would send the user hunting through API keys for a prompt typo.
+        raise HTTPException(400, f"Prompt template error: {e}")
     except Exception as e:
         # Surface Anthropic auth / rate-limit / transport failures as a clean 502
         # instead of bubbling up as an uncaught 500 (which breaks the JSON client).
@@ -1282,6 +1291,15 @@ async def generate_tags(video_id: str, data: dict | None = None):
             )
     except HTTPException:
         raise
+    except (
+        template_service.MissingRequiredVariable,
+        template_service.UndefinedTemplateVariables,
+        template_service.SectionTagError,
+    ) as e:
+        # Template-authoring problems in the (user-editable) prompt body are
+        # 400s naming the problem — not "Claude API call failed", which
+        # would send the user hunting through API keys for a prompt typo.
+        raise HTTPException(400, f"Prompt template error: {e}")
     except Exception as e:
         msg = str(e)
         if "authentication_error" in msg or "invalid x-api-key" in msg or "401" in msg:

@@ -155,3 +155,29 @@ async def test_shorten_post_explicit_empty_system_suppresses(app_client) -> None
     # Empty string passes through render() as empty; call site treats
     # falsy as "don't send system".
     assert captured["system"] in (None, "")
+
+
+async def test_shorten_post_undefined_variable_is_a_clean_400(app_client) -> None:
+    """A customised shorten prompt referencing a variable this action
+    doesn't supply must surface as a structured 400 naming the variable —
+    not an opaque 500 from the strict renderer."""
+    client, _db = app_client
+    from yt_scheduler.services import ai
+    from yt_scheduler.services import prompts
+
+    await prompts.upsert_prompt_template(
+        key="shorten_post_prompt",
+        name="Broken shorten",
+        body="Shorten {{post_text}} for {{channel_name}} to {{target_chars}}.",
+        project_id=1,
+    )
+
+    with patch.object(ai, "call_ai_block") as mock_call:
+        resp = await client.post(
+            "/api/social/posts/101/shorten",
+            json={"target_chars": 60},
+        )
+    mock_call.assert_not_called()
+    assert resp.status_code == 400, resp.text
+    detail = resp.json()["detail"]
+    assert detail["undefined_variables"] == ["channel_name"]
