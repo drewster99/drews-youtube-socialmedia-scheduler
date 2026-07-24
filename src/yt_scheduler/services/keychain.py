@@ -1,9 +1,14 @@
-"""Secure credential storage — macOS Keychain with file fallback.
+"""Credential storage — the macOS Keychain, plus a non-macOS file branch.
 
 On macOS: writes secrets directly via the Security framework (ctypes) to avoid
 exposing secret values on the process argv; reads them back via the `security` CLI.
-On other platforms: stores secrets in a JSON file at ~/.drews-yt-scheduler/secrets.json
-with restrictive file permissions (600).
+This is the ONLY supported store for real credentials.
+
+On other platforms: writes `<DATA_DIR>/secrets.json` as **plaintext** JSON with
+owner-only permissions (0600). It is not encrypted — despite what this docstring
+claimed for a long time — so it must not hold production secrets. See CLAUDE.md
+rule E. It survives as the seam the test suite substitutes for the real Keychain
+(pointed at a throwaway data dir), not as a credential store.
 
 Each credential is stored as a separate Keychain item identified by
 (service, account) — e.g.,

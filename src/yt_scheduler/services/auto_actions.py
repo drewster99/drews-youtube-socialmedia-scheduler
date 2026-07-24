@@ -1967,22 +1967,49 @@ async def _run_promo_description_updates(
     try:
         await _run_promo_description_updates_inner(project_id, video_ids)
     except Exception as exc:
-        logger.exception(
-            "Description-update batch failed before it could report per-clip "
-            "results; failing all %d claimed clip(s)", len(video_ids),
-        )
+        logger.exception("Description-update batch raised outside its per-clip handler")
+        try:
+            stranded = await _fail_unfinished_description_updates(
+                video_ids,
+                f"Batch failed: {type(exc).__name__}: {exc}"[:500],
+            )
+            logger.error(
+                "Failed %d clip(s) left mid-update by that error", stranded,
+            )
+        except Exception:
+            logger.exception(
+                "Could not settle clips left mid-update; %d row(s) may be "
+                "stranded until the next restart", len(video_ids),
+            )
+
+
+async def _fail_unfinished_description_updates(
+    video_ids: list[str], error: str
+) -> int:
+    """Fail only the clips still sitting in ``updating_desc``.
+
+    Scoped by state, not just id: if the batch raised AFTER some clips finished,
+    blanket-failing every id would overwrite a ``ready`` row and claim its update
+    failed when YouTube has already accepted the new description — and would
+    invite the user to re-spend quota re-running work that succeeded.
+    """
+    failed = 0
+    async with write_transaction() as db:
         for video_id in video_ids:
-            try:
-                await _set_auto_action_progress(video_id, None)
-                await _set_promo_state(
-                    video_id,
+            cursor = await db.execute(
+                "UPDATE videos SET auto_action_state = ?, "
+                "auto_action_last_error = ?, auto_action_progress_message = NULL, "
+                "updated_at = datetime('now') "
+                "WHERE id = ? AND auto_action_state = ?",
+                (
                     f"failed:{PROMO_STATE_UPDATING_DESC}",
-                    error=f"Batch setup failed: {type(exc).__name__}: {exc}"[:500],
-                )
-            except Exception:
-                logger.exception(
-                    "Could not mark %s failed after batch setup failure", video_id,
-                )
+                    error,
+                    video_id,
+                    PROMO_STATE_UPDATING_DESC,
+                ),
+            )
+            failed += cursor.rowcount or 0
+    return failed
 
 
 async def _run_promo_description_updates_inner(

@@ -413,8 +413,9 @@ def test_transient_rate_limit_does_not_stop_the_batch(
     # Every clip was tried, and none was told the daily quota was exhausted.
     assert len(attempts) == len(children)
     for child in children:
-        assert "daily API quota is exhausted" not in _column(
-            child, "auto_action_last_error")
+        assert "daily API quota is exhausted" not in (
+            _column(child, "auto_action_last_error") or ""
+        )
 
 
 def test_partial_claim_failure_wedges_no_clip(
@@ -451,6 +452,54 @@ def test_partial_claim_failure_wedges_no_clip(
     assert len(calls) == 3
     # The two claims that had already succeeded were rolled back with the rest.
     assert [_column(c, "auto_action_state") for c in children] == [None] * 5
+
+
+def test_batch_failure_does_not_clobber_clips_that_already_finished() -> None:
+    """The batch-level rescue is scoped by state, not just id.
+
+    A blanket "fail every id" would overwrite a clip that had already been
+    updated — claiming its update failed when YouTube has the new description,
+    and inviting the user to re-spend quota redoing work that succeeded.
+    """
+    async def scenario() -> tuple[str, str, int]:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            import os
+            os.environ["DYS_DATA_DIR"] = tmp
+            for mod in list(sys.modules.keys()):
+                if mod.startswith("yt_scheduler"):
+                    sys.modules.pop(mod, None)
+            database = importlib.import_module("yt_scheduler.database")
+            auto_actions = importlib.import_module(
+                "yt_scheduler.services.auto_actions"
+            )
+            db = await database.get_db()
+            try:
+                await db.execute(
+                    "INSERT INTO videos (id, project_id, title, auto_action_state) "
+                    "VALUES ('doneAAAAAAA', 1, 'finished', 'ready')"
+                )
+                await db.execute(
+                    "INSERT INTO videos (id, project_id, title, auto_action_state) "
+                    "VALUES ('stuckBBBBBB', 1, 'mid-flight', 'updating_desc')"
+                )
+                await db.commit()
+                stranded = await auto_actions._fail_unfinished_description_updates(
+                    ["doneAAAAAAA", "stuckBBBBBB"], "boom",
+                )
+                rows = await db.execute_fetchall(
+                    "SELECT id, auto_action_state FROM videos ORDER BY id"
+                )
+                states = {r["id"]: r["auto_action_state"] for r in rows}
+                return states["doneAAAAAAA"], states["stuckBBBBBB"], stranded
+            finally:
+                await database.close_db()
+
+    done_state, stuck_state, stranded = asyncio.run(scenario())
+    assert done_state == "ready"                      # untouched
+    assert stuck_state == "failed:updating_desc"      # rescued
+    assert stranded == 1
 
 
 def test_empty_tier_selection_is_refused_not_treated_as_everything(
