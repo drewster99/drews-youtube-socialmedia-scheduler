@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -33,9 +34,45 @@ def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     for mod in list(sys.modules.keys()):
         if mod.startswith("yt_scheduler"):
             sys.modules.pop(mod, None)
+    # Force the encrypted-file keychain. Without this the suite reads the real
+    # login Keychain, which is exactly what the project forbids touching from
+    # automated runs.
+    keychain = importlib.import_module("yt_scheduler.services.keychain")
+    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
     app_module = importlib.import_module("yt_scheduler.app")
     with TestClient(app_module.app) as c:
         yield c
+
+
+def _quota_http_error(
+    *, reason: str = "quotaExceeded", extra_error_fields: dict | None = None,
+):
+    """A real googleapiclient HttpError shaped like YouTube's actual refusal.
+
+    Not a RuntimeError carrying a lookalike string: the whole point of the
+    classifier is that it reads the response body, so a fake that has no body
+    would let the test pass while detection was broken against the live API.
+    """
+    import httplib2
+    from googleapiclient.errors import HttpError
+
+    message = (
+        "The request cannot be completed because you have exceeded your quota."
+    )
+    error = {
+        "code": 403,
+        "message": message,
+        "errors": [
+            {"message": message, "domain": "youtube.quota", "reason": reason}
+        ],
+    }
+    error.update(extra_error_fields or {})
+    return HttpError(
+        httplib2.Response({"status": 403, "reason": "Forbidden"}),
+        json.dumps({"error": error}).encode(),
+        uri="https://youtube.googleapis.com/youtube/v3/videos"
+            "?part=snippet%2Cstatus&alt=json",
+    )
 
 
 # A transcript comfortably over TRANSCRIPT_MIN_USABLE_CHARS.
@@ -300,7 +337,7 @@ def test_quota_exhaustion_stops_the_batch(
 
     def quota_wall(video_id: str, **kwargs):
         attempts.append(video_id)
-        raise RuntimeError("HttpError 403: quotaExceeded")
+        raise _quota_http_error()
 
     monkeypatch.setattr(youtube, "update_video_metadata", quota_wall)
 
@@ -316,6 +353,130 @@ def test_quota_exhaustion_stops_the_batch(
     # The whole point: we stopped calling YouTube rather than burning a
     # doomed request per clip.
     assert len(attempts) < len(children)
+
+
+def test_quota_reason_is_read_from_the_body_not_the_rendered_string(
+    client: TestClient,
+) -> None:
+    """HttpError renders only the FIRST of detail/details/errors/message, so a
+    payload that also carries `details` stringifies with no reason code in it at
+    all — the shape that silently defeats substring matching."""
+    from yt_scheduler.services.youtube import daily_quota_exhausted_reason
+
+    assert daily_quota_exhausted_reason(_quota_http_error()) == "quotaExceeded"
+
+    with_details = _quota_http_error(extra_error_fields={
+        "status": "RESOURCE_EXHAUSTED",
+        "details": [{
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            "reason": "RATE_LIMIT_EXCEEDED",
+        }],
+    })
+    assert "quotaExceeded" not in str(with_details)
+    assert daily_quota_exhausted_reason(with_details) == "quotaExceeded"
+
+    # Transient throttling is not an exhausted day; it must not stop a batch.
+    assert daily_quota_exhausted_reason(
+        _quota_http_error(reason="rateLimitExceeded")) is None
+    # Text that merely mentions the word is not the machine-readable signal —
+    # a transcript, a variable name or an HTML error page must never be able to
+    # claim the user's quota is gone.
+    assert daily_quota_exhausted_reason(
+        RuntimeError("the transcript discusses the quotaExceeded error")) is None
+
+
+def test_transient_rate_limit_does_not_stop_the_batch(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, fake_generation: list,
+) -> None:
+    """rateLimitExceeded means "slow down", not "your day is over". Aborting on
+    it would abandon clips that were about to succeed and tell the user
+    something untrue about their quota."""
+    _insert(PARENT, item_type="episode", duration_seconds=600.0)
+    children = [f"rate{i:07d}" for i in range(6)]
+    for child in children:
+        _insert(child, parent_item_id=PARENT, item_type="hook",
+                transcript=TRANSCRIPT)
+    youtube = importlib.import_module("yt_scheduler.services.youtube")
+
+    attempts: list[str] = []
+
+    def throttled(video_id: str, **kwargs):
+        attempts.append(video_id)
+        raise _quota_http_error(reason="rateLimitExceeded")
+
+    monkeypatch.setattr(youtube, "update_video_metadata", throttled)
+
+    r = client.post(f"{_base()}/update-descriptions", json={})
+    assert r.status_code == 202
+    _wait_for_states(children)
+
+    # Every clip was tried, and none was told the daily quota was exhausted.
+    assert len(attempts) == len(children)
+    for child in children:
+        assert "daily API quota is exhausted" not in _column(
+            child, "auto_action_last_error")
+
+
+def test_partial_claim_failure_wedges_no_clip(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DB fault part-way through the claim loop must not commit the claims
+    that already succeeded. A claimed row with no runner behind it is
+    unclaimable, renders as a permanent spinner with no Retry, and is only
+    settled by a server restart."""
+    _insert(PARENT, item_type="episode", duration_seconds=600.0)
+    children = [f"wedge{i:06d}" for i in range(5)]
+    for child in children:
+        _insert(child, parent_item_id=PARENT, item_type="hook",
+                transcript=TRANSCRIPT)
+
+    auto_actions = importlib.import_module("yt_scheduler.services.auto_actions")
+    promo_routes = importlib.import_module("yt_scheduler.routers.promo_routes")
+    real_claim = auto_actions.claim_description_update
+    calls: list[str] = []
+
+    async def failing_claim(video_id: str) -> bool:
+        calls.append(video_id)
+        if len(calls) == 3:
+            raise sqlite3.OperationalError("disk I/O error")
+        return await real_claim(video_id)
+
+    monkeypatch.setattr(
+        promo_routes.auto_actions, "claim_description_update", failing_claim
+    )
+
+    with pytest.raises(sqlite3.OperationalError):
+        client.post(f"{_base()}/update-descriptions", json={})
+
+    assert len(calls) == 3
+    # The two claims that had already succeeded were rolled back with the rest.
+    assert [_column(c, "auto_action_state") for c in children] == [None] * 5
+
+
+def test_empty_tier_selection_is_refused_not_treated_as_everything(
+    client: TestClient,
+) -> None:
+    """`[]` means "nothing selected". Reading it as "every tier" would spend a
+    Claude call and ~51 quota units per clip that nobody asked for."""
+    _seed_parent_with_two_hooks()
+
+    r = client.post(f"{_base()}/update-descriptions", json={"tiers": []})
+    assert r.status_code == 400
+    assert "tiers" in r.json()["detail"]
+    assert [_column(c, "auto_action_state") for c in (CHILD_A, CHILD_B)] == [None] * 2
+
+    assert client.get(f"{_base()}/update-descriptions/preview?tiers=").status_code == 400
+
+
+def test_tiers_is_a_real_list_not_a_comma_string(client: TestClient) -> None:
+    """The POST takes a JSON list, so ["hook,segment"] is one unknown tier —
+    not two tiers smuggled through a string round-trip."""
+    _seed_parent_with_two_hooks()
+    r = client.post(
+        f"{_base()}/update-descriptions", json={"tiers": ["hook,segment"]},
+    )
+    assert r.status_code == 400
+    assert "hook,segment" in r.json()["detail"]
 
 
 def test_busy_clip_is_not_claimed(client: TestClient, fake_generation: list) -> None:

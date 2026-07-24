@@ -694,8 +694,9 @@ async function startDescriptionUpdate(payload) {
         ? ` ${skipped} clip(s) skipped — see the confirm dialog for why.`
         : '';
     showUpdateDescriptionsBanner(
-        `Updating ${started} description(s) — about ${data.quota_units_estimate} ` +
-        `YouTube quota units. Watch each card for progress.${escapeHtml(skippedNote)}`,
+        `Updating ${started} description(s) — about ` +
+        `${escapeHtml(data.quota_units_estimate)} YouTube quota units. ` +
+        `Watch each card for progress.${escapeHtml(skippedNote)}`,
         false);
     await loadPromos();
     scheduleNextPoll();
@@ -737,8 +738,8 @@ function renderDescriptionUpdatePreview(preview) {
         </p>
         <p class="form-hint">
             Costs ${eligible} Claude call(s) and about
-            <strong>${preview.quota_units_estimate}</strong> of YouTube's 10,000
-            daily quota units.
+            <strong>${escapeHtml(preview.quota_units_estimate)}</strong> of
+            YouTube's 10,000 daily quota units.
         </p>
         ${skippedBlock}`;
 }

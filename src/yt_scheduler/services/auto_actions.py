@@ -712,11 +712,14 @@ _UPLOAD_JOBS: dict[str, dict] = {}
 _UPLOAD_JOB_FAILED_TTL_SECONDS: float = 10 * 60  # 10 minutes
 
 
-# Cap on simultaneously-running promo chains. The chain itself fans out
-# to ffprobe + whisper + 2-3 Claude calls + a YouTube upload; 16 chains
-# in parallel would saturate a Mac (whisper alone is CPU-bound and
-# YouTube's upload SDK isn't reentrant per-token). 4 is comfortable on
-# wide hardware and keeps individual jobs from starving each other.
+# Cap on simultaneously-running promo work. Full chains (ffprobe + whisper +
+# 2-3 Claude calls + a YouTube upload), mid-stream retries, and bulk description
+# updates all take THIS one semaphore, so it is the single ceiling on background
+# Claude + YouTube pressure — deliberately shared rather than one semaphore per
+# kind of work, which would make the real ceiling 4+N against the same
+# rate-limited APIs. 16 chains in parallel would saturate a Mac (whisper alone is
+# CPU-bound and YouTube's upload SDK isn't reentrant per-token). 4 is comfortable
+# on wide hardware and keeps individual jobs from starving each other.
 #
 # Lazily initialised on first use so that the semaphore is always
 # created on the running event loop — avoids "bound to a different loop"
@@ -1856,28 +1859,14 @@ async def _promo_step_push_metadata(video_id: str) -> None:
 # youtube.update_video_metadata, which merges rather than blind-writes.
 DESCRIPTION_UPDATE_QUOTA_UNITS_PER_CLIP = 51
 
-# Reasons Google returns when the DAILY quota is gone. One clip hitting this
-# means every remaining clip in the batch would too, so the run stops instead of
-# burning through 90 identical failures.
-#
-# Deliberately excludes rateLimitExceeded / userRateLimitExceeded: those are
-# transient "slow down" signals, and treating one as exhaustion would abort a
-# batch that was about to succeed while telling the user something untrue about
-# their quota. Those fail their own clip, which is retryable.
-_QUOTA_EXHAUSTED_MARKERS = (
-    "quotaExceeded",
-    "dailyLimitExceeded",
-)
-
+# Set when one clip proves the daily quota is gone: every remaining clip would
+# hit the same wall, so the run stops instead of burning through 90 identical
+# failures. What counts as "gone" is youtube.daily_quota_exhausted_reason —
+# the server's machine-readable reason code, not the exception's printed form.
 _QUOTA_ABORT_MESSAGE = (
     "Stopped: YouTube's daily API quota is exhausted. The remaining clips were "
     "not updated — run this again after the quota resets (midnight Pacific)."
 )
-
-
-def _is_quota_exhaustion(exc: BaseException) -> bool:
-    text = str(exc)
-    return any(marker in text for marker in _QUOTA_EXHAUSTED_MARKERS)
 
 
 async def fail_interrupted_description_updates() -> int:
@@ -1971,8 +1960,34 @@ async def _run_promo_description_updates(
 
     Nothing may escape this coroutine: every row is already claimed and showing
     "Updating description…", so an exception here would strand all of them in a
-    running state forever.
+    running state forever — spawn_background only logs it, and a non-terminal
+    state is unclaimable, so no retry could reach them. The setup below runs
+    inside the same guarantee, not just the per-clip work.
     """
+    try:
+        await _run_promo_description_updates_inner(project_id, video_ids)
+    except Exception as exc:
+        logger.exception(
+            "Description-update batch failed before it could report per-clip "
+            "results; failing all %d claimed clip(s)", len(video_ids),
+        )
+        for video_id in video_ids:
+            try:
+                await _set_auto_action_progress(video_id, None)
+                await _set_promo_state(
+                    video_id,
+                    f"failed:{PROMO_STATE_UPDATING_DESC}",
+                    error=f"Batch setup failed: {type(exc).__name__}: {exc}"[:500],
+                )
+            except Exception:
+                logger.exception(
+                    "Could not mark %s failed after batch setup failure", video_id,
+                )
+
+
+async def _run_promo_description_updates_inner(
+    project_id: int, video_ids: list[str]
+) -> None:
     project_row = await get_project_by_id(project_id)
     if project_row:
         # Binds this task's YouTube credentials. spawn_background gives the task
@@ -2004,12 +2019,24 @@ async def _run_promo_description_updates(
             try:
                 await _regenerate_and_push_description(video_id, project_id)
             except Exception as exc:
-                if _is_quota_exhaustion(exc):
+                quota_reason = youtube.daily_quota_exhausted_reason(exc)
+                if quota_reason:
                     quota_abort = True
                 logger.warning(
                     "Description update failed for %s: %s", video_id, exc,
                 )
-                await _fail(video_id, f"{type(exc).__name__}: {exc}"[:500])
+                detail = f"{type(exc).__name__}: {exc}"
+                if quota_reason:
+                    # Reason first: a raw HttpError renders ~450 characters with
+                    # its reason code LAST, so the [:500] cap sits a few dozen
+                    # characters from cutting away the evidence for why the whole
+                    # run stopped.
+                    detail = (
+                        f"YouTube refused with {quota_reason} — its daily API "
+                        f"quota is exhausted, so the rest of this run was "
+                        f"stopped. {detail}"
+                    )
+                await _fail(video_id, detail[:500])
                 return
         await _set_auto_action_progress(video_id, None)
         await _set_promo_state(video_id, PROMO_STATE_READY, error=None)

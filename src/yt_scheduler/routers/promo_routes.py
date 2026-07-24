@@ -911,17 +911,31 @@ async def delete_generate_rejection(
     return {"deleted": bool(cursor.rowcount)}
 
 
-def _parse_tier_filter(tiers: str | None) -> list[str] | None:
-    """``"hook,short"`` → ``["hook", "short"]``; ``None``/empty → no filter.
+def _normalize_tier_selection(raw_tiers: list) -> list[str]:
+    """Normalize an explicit ``tiers`` selection to hook|short|segment.
 
-    An unknown tier is a 400 rather than a silent drop — otherwise a typo'd
-    filter would quietly update nothing and report success.
+    Called only when the caller actually supplied ``tiers`` — "every tier" is
+    the caller omitting the key, never something this function infers. An empty
+    selection is a 400 rather than "every tier", because guessing there spends a
+    Claude call and ~51 YouTube quota units per clip nobody asked for. An
+    unknown tier is likewise a 400 rather than a silent drop, or a typo'd filter
+    would update nothing and report success.
     """
-    if tiers is None:
-        return None
-    wanted = [t.strip().lower() for t in tiers.split(",") if t.strip()]
-    if not wanted:
-        return None
+    if not raw_tiers:
+        raise HTTPException(
+            400,
+            "'tiers' was supplied but names no tier. Omit it to include every "
+            f"tier, or name at least one of {sorted(_VALID_FORCED_ITEM_TYPES)}.",
+        )
+    malformed = [
+        entry for entry in raw_tiers
+        if not isinstance(entry, str) or not entry.strip()
+    ]
+    if malformed:
+        raise HTTPException(
+            400, f"'tiers' entries must be non-empty strings; got {malformed!r}.",
+        )
+    wanted = list(dict.fromkeys(entry.strip().lower() for entry in raw_tiers))
     unknown = sorted(set(wanted) - _VALID_FORCED_ITEM_TYPES)
     if unknown:
         raise HTTPException(
@@ -992,6 +1006,7 @@ async def update_descriptions_preview(
     """Dry run for the "Update all descriptions" confirm dialog.
 
     ``tiers`` is an optional comma-separated subset of hook|short|segment.
+    Omit it for every tier; supplying it empty is a 400, not "everything".
 
     Returns the clips that would be re-described, the ones that would be
     skipped (each with a reason), and the YouTube quota this would spend —
@@ -999,7 +1014,13 @@ async def update_descriptions_preview(
     season is a meaningful slice of the 10,000-unit daily budget.
     """
     project, _parent = await _ensure_primary(slug, parent_id)
-    tier_filter = _parse_tier_filter(tiers)
+    # Splitting is this endpoint's business, not the validator's: only a query
+    # string is comma-separated. `?tiers=` therefore reaches the validator as an
+    # empty selection and is rejected there, exactly like a POST body's `[]`, so
+    # the preview can never disagree with the commit about what "empty" means.
+    tier_filter = None if tiers is None else _normalize_tier_selection(
+        [piece for piece in tiers.split(",") if piece.strip()]
+    )
     eligible, ineligible = await _description_update_candidates(
         parent_id, int(project["id"]), tier_filter,
     )
@@ -1042,8 +1063,7 @@ async def update_descriptions(
     if raw_tiers is not None and not isinstance(raw_tiers, list):
         raise HTTPException(400, "'tiers' must be a list of hook|short|segment.")
     tier_filter = (
-        _parse_tier_filter(",".join(str(t) for t in raw_tiers))
-        if raw_tiers is not None else None
+        None if raw_tiers is None else _normalize_tier_selection(raw_tiers)
     )
 
     eligible, ineligible = await _description_update_candidates(
@@ -1081,13 +1101,26 @@ async def update_descriptions(
 
     started: list[dict] = []
     busy: list[dict] = []
-    for clip in eligible:
-        if await auto_actions.claim_description_update(clip["id"]):
-            started.append(clip)
-        else:
-            # Lost the claim between the candidate scan and here — another tab
-            # or a chain that just started owns the row now.
-            busy.append({**clip, "reason": "Another job claimed this clip."})
+    # One transaction for the whole batch — for atomicity, not speed. A failure
+    # part-way through must not leave already-claimed rows reading
+    # 'updating_desc' with no runner behind them: such a row is unclaimable
+    # (every claim helper refuses non-terminal states), its card renders as a
+    # permanent spinner with no Retry, and only the boot-time sweep settles it.
+    # claim_description_update JOINS this transaction rather than opening its
+    # own; its conditional UPDATE's rowcount still distinguishes winner from
+    # loser inside the join. Nothing in here does I/O, so the process-wide write
+    # lock is held for N primary-key UPDATEs and nothing else — and per
+    # write_transaction's IRON RULES it must stay that way. Do NOT wrap the loop
+    # body in try/except: swallowing an inner failure would keep the
+    # transaction open and commit a partial claim set anyway.
+    async with write_transaction():
+        for clip in eligible:
+            if await auto_actions.claim_description_update(clip["id"]):
+                started.append(clip)
+            else:
+                # Lost the claim between the candidate scan and here — another
+                # tab or a chain that just started owns the row now.
+                busy.append({**clip, "reason": "Another job claimed this clip."})
 
     if not started:
         raise HTTPException(
@@ -1096,6 +1129,10 @@ async def update_descriptions(
             "Wait for it to finish and try again.",
         )
 
+    # Outside the transaction above, and necessarily so: a task detached inside
+    # it would take its first slice at the commit's await, then block on the
+    # write lock the request still holds — and it would be running against
+    # claims that hadn't committed yet.
     auto_actions.start_promo_description_updates(int(project["id"]), [
         clip["id"] for clip in started
     ])

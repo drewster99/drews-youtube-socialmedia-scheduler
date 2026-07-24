@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import socket
 import time
@@ -14,6 +15,47 @@ from googleapiclient.http import MediaFileUpload
 from yt_scheduler.services.auth import get_youtube_service
 
 logger = logging.getLogger(__name__)
+
+
+# Google's machine-readable reasons for "this project's DAILY quota is gone".
+# Deliberately excludes rateLimitExceeded / userRateLimitExceeded: those are
+# transient "slow down" signals, and calling one exhaustion would abort work
+# that was about to succeed while telling the user something untrue about
+# their quota.
+DAILY_QUOTA_EXHAUSTED_REASONS = frozenset({"quotaExceeded", "dailyLimitExceeded"})
+
+
+def daily_quota_exhausted_reason(exc: BaseException) -> str | None:
+    """Google's reason code when ``exc`` is YouTube refusing on the daily quota.
+
+    Reads the raw response body rather than ``str(exc)``. ``HttpError`` renders
+    only the FIRST of detail/details/errors/message that the payload contains,
+    so a response carrying ``details`` stringifies with no reason code in it at
+    all — the body always has it. Matching the rendered string would also let
+    any exception that merely mentions the word (a transcript, a variable name,
+    an HTML error page) claim the quota is gone and stop a healthy batch.
+
+    Only the exception itself is inspected, never ``__cause__`` / ``__context__``:
+    walking those would let a bug raised *inside* an ``except HttpError`` block
+    inherit the original's quota verdict.
+    """
+    if not isinstance(exc, HttpError):
+        return None
+    try:
+        errors = json.loads(exc.content.decode("utf-8"))["error"]["errors"]
+    except (
+        AttributeError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError
+    ):
+        return None
+    if not isinstance(errors, list):
+        return None
+    for item in errors:
+        if (
+            isinstance(item, dict)
+            and item.get("reason") in DAILY_QUOTA_EXHAUSTED_REASONS
+        ):
+            return item["reason"]
+    return None
 
 
 class PrivateVideoError(Exception):
