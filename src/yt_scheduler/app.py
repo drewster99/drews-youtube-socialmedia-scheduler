@@ -42,9 +42,6 @@ from yt_scheduler.routers import (
 )
 from yt_scheduler.services.auth import backfill_channel_assets, backfill_channel_ids
 from yt_scheduler.services.keychain_acl_repair import repair_keychain_acls
-from yt_scheduler.services.keychain_migration import (
-    migrate_to_per_credential_bundles,
-)
 from yt_scheduler.services.projects import (
     DEFAULT_PROJECT_SLUG,
     ensure_default_project,
@@ -187,12 +184,10 @@ async def lifespan(app: FastAPI):
     import os as _os
 
     db = await get_db()
-    # Repair stale Keychain ACLs BEFORE any in-process secret read. The
-    # per-credential migration below reads via the Security framework, which
-    # would otherwise trigger one "python3.12 wants to use…" prompt per item
-    # for secrets written under the old `/usr/bin/security` scheme.
+    # Repair stale Keychain ACLs BEFORE any in-process secret read, so items
+    # written under the old `/usr/bin/security` scheme don't each trigger a
+    # "python3.12 wants to use…" prompt when the framework first reads them.
     await repair_keychain_acls()
-    await migrate_to_per_credential_bundles()
     await ensure_default_project()
 
     # Write the PID file only after the critical startup path succeeds. If boot
