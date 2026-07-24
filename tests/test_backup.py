@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import install_in_memory_keychain
+
 
 @pytest.fixture
 def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -29,7 +31,7 @@ def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     config = importlib.import_module("yt_scheduler.config")
     keychain = importlib.import_module("yt_scheduler.services.keychain")
     backup = importlib.import_module("yt_scheduler.services.backup")
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    install_in_memory_keychain(monkeypatch, keychain)
     config.ensure_dirs()
     yield config, keychain, backup, tmp_path
 

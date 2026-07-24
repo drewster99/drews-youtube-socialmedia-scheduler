@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import install_in_memory_keychain
+
 
 @pytest.fixture
 def keychain(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -99,7 +101,7 @@ def test_corrupt_index_raises_rather_than_reading_as_empty(keychain, payload):
 
 def test_corrupt_index_surfaces_through_enumerating_helpers(keychain, monkeypatch):
     """A corrupt index must not make export/load-all quietly report zero secrets."""
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    install_in_memory_keychain(monkeypatch, keychain)
     keychain.SECRETS_FILE.write_text("{corrupt")
 
     with pytest.raises(keychain.SecretsIndexError):
@@ -111,7 +113,7 @@ def test_corrupt_index_surfaces_through_enumerating_helpers(keychain, monkeypatc
 
 
 def test_valid_index_still_loads(keychain, monkeypatch):
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    install_in_memory_keychain(monkeypatch, keychain)
     keychain.SECRETS_FILE.write_text(json.dumps({"svc": {"k": "v"}}))
 
     assert keychain._load_secrets_file() == {"svc": {"k": "v"}}

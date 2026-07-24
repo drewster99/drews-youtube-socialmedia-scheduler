@@ -1,14 +1,20 @@
-"""Credential storage — the macOS Keychain, plus a non-macOS file branch.
+"""Credential storage — the macOS Keychain, and nothing else.
 
-On macOS: writes secrets directly via the Security framework (ctypes) to avoid
-exposing secret values on the process argv; reads them back via the `security` CLI.
-This is the ONLY supported store for real credentials.
+Secret VALUES live only in the system Keychain: written via the Security
+framework (ctypes) so they never appear on the process argv, read back via the
+`security` CLI. Off macOS every entry point raises :class:`UnsupportedPlatform`.
 
-On other platforms: writes `<DATA_DIR>/secrets.json` as **plaintext** JSON with
-owner-only permissions (0600). It is not encrypted — despite what this docstring
-claimed for a long time — so it must not hold production secrets. See CLAUDE.md
-rule E. It survives as the seam the test suite substitutes for the real Keychain
-(pointed at a throwaway data dir), not as a credential store.
+There used to be a plaintext-JSON "fallback" that stored real secrets on disk
+when the Keychain write failed, and it was reachable on macOS, not just on other
+platforms. It's gone: a fallback that quietly downgrades your credential
+security is worse than the error it was hiding.
+
+What remains on disk is `<DATA_DIR>/secrets.json` — an INDEX, not a store. The
+Keychain can only answer questions about an exact (service, account) pair, so
+something has to remember which keys exist for `load_all_secrets`,
+`delete_all_secrets` and `export_all_secrets` to have anything to ask about.
+Every value in that file is the literal :data:`KEYCHAIN_SENTINEL`; no secret is
+ever written there.
 
 Each credential is stored as a separate Keychain item identified by
 (service, account) — e.g.,
@@ -36,7 +42,32 @@ logger = logging.getLogger(__name__)
 
 KEYCHAIN_SERVICE_PREFIX = "com.nuclearcyborg.drews-socialmedia-scheduler"
 LEGACY_KEYCHAIN_SERVICE_PREFIX = "com.youtube-publisher"
+
+# The index of which (service, account) pairs exist. Holds this sentinel as
+# every value — never a secret. It answers "which keys should I ask the
+# Keychain for?", which is exactly what a keyed store can't answer itself.
 SECRETS_FILE = DATA_DIR / "secrets.json"
+KEYCHAIN_SENTINEL = "__keychain__"
+
+
+class UnsupportedPlatform(RuntimeError):
+    """Raised when secret storage is attempted off macOS.
+
+    There is exactly one secret store: the macOS Keychain. The plaintext-file
+    fallback that used to stand in here was removed — a fallback that writes
+    real credentials to disk trades one failure for a worse one, silently.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Secret storage requires macOS: the system Keychain is the only "
+            "supported store. Refusing to write credentials anywhere else."
+        )
+
+
+def _require_macos() -> None:
+    if not _is_macos():
+        raise UnsupportedPlatform()
 
 
 class KeychainWriteError(RuntimeError):
@@ -197,8 +228,9 @@ def _keychain_set(service: str, account: str, value: str) -> bool:
     There is no safe non-argv CLI write (`security` accepts the password only
     via `-w <value>` or an interactive TTY prompt), so when the framework is
     unusable this raises ``KeychainWriteError`` rather than leaking the secret.
-    A genuine SecKeychain error code still returns False, leaving the caller's
-    existing encrypted-file fallback intact.
+    A genuine SecKeychain error code still returns False; ``store_secret`` turns
+    that into a raised ``KeychainWriteError`` too, since there is nowhere else a
+    secret is allowed to go.
     """
     svc_b = service.encode()
     acct_b = account.encode()
@@ -403,17 +435,13 @@ def _keychain_delete(service: str, account: str) -> bool:
         return False
 
 
-def _keychain_find_all(service: str) -> list[str]:
-    """Find all account names for a Keychain service.
-
-    Uses `security dump-keychain` which is slow but there's no better option.
-    Falls back to tracking accounts in the secrets file index.
-    """
-    # We track account names in a local index to avoid parsing dump-keychain
-    return _file_list_accounts(service)
-
-
-# --- File-based storage (fallback + account index) ---
+# --- Key index -----------------------------------------------------------
+#
+# The Keychain is a keyed store: it answers "what is the value for this exact
+# (service, account)?" and nothing else. Something has to remember which keys
+# were ever written, or load_all / delete_all / export_all have nothing to ask
+# for. That is this index's only job. It records the sentinel per key and never
+# a secret value.
 
 
 def _load_secrets_file() -> dict:
@@ -478,24 +506,21 @@ def _save_secrets_file(data: dict) -> None:
         raise
 
 
-def _file_set(service: str, account: str, value: str) -> None:
-    """Store a value in the secrets file."""
+def _index_record(service: str, account: str) -> None:
+    """Note that (service, account) exists in the Keychain.
+
+    Records the sentinel only. Secret VALUES are never written here — that is
+    the whole point of the index: it is the list of keys to ask the Keychain
+    for, not a second copy of the answers.
+    """
     with _secrets_file_lock:
         data = _load_secrets_file()
-        if service not in data:
-            data[service] = {}
-        data[service][account] = value
+        data.setdefault(service, {})[account] = KEYCHAIN_SENTINEL
         _save_secrets_file(data)
 
 
-def _file_get(service: str, account: str) -> str | None:
-    """Load a value from the secrets file."""
-    data = _load_secrets_file()
-    return data.get(service, {}).get(account)
-
-
-def _file_delete(service: str, account: str) -> None:
-    """Delete a value from the secrets file."""
+def _index_forget(service: str, account: str) -> None:
+    """Drop (service, account) from the index."""
     with _secrets_file_lock:
         data = _load_secrets_file()
         if service in data and account in data[service]:
@@ -505,8 +530,8 @@ def _file_delete(service: str, account: str) -> None:
             _save_secrets_file(data)
 
 
-def _file_list_accounts(service: str) -> list[str]:
-    """List all account names for a service in the secrets file."""
+def _index_list_accounts(service: str) -> list[str]:
+    """Account names recorded for a service."""
     data = _load_secrets_file()
     return list(data.get(service, {}).keys())
 
@@ -532,39 +557,34 @@ def store_secret(namespace: str, key: str, value: str) -> None:
         key: Credential key (e.g., "access_token", "api_key")
         value: The secret value
     """
+    _require_macos()
     service = _service_name(namespace)
 
-    if _is_macos():
-        # Write the index sentinel BEFORE calling Keychain so that a crash
-        # between the two leaves a stale-but-harmless index entry rather than
-        # an orphaned Keychain item that is invisible to load_all/export/delete.
-        # If _save_secrets_file raises here we never reach _keychain_set, so
-        # nothing is orphaned; the exception propagates and the caller retries.
-        # If _keychain_set returns False (a genuine SecKeychain error code) we
-        # fall through to _file_set, which overwrites the "__keychain__" sentinel
-        # with the real value — correct. If it RAISES KeychainWriteError (wedged
-        # or missing framework) we deliberately do NOT fall through: writing the
-        # secret to disk in plaintext would trade one leak for another. The
-        # sentinel is then left pointing at an item that was never written, which
-        # is harmless — load_secret returns None for it and export_all_secrets
-        # skips entries that don't resolve.
-        with _secrets_file_lock:
-            data = _load_secrets_file()
-            data.setdefault(service, {})[key] = "__keychain__"
-            _save_secrets_file(data)
-        if _keychain_set(service, key, value):
-            return
-        logger.warning("Keychain store failed for %s/%s, using file fallback", namespace, key)
-
-    _file_set(service, key, value)
+    # Write the index sentinel BEFORE calling Keychain so that a crash between
+    # the two leaves a stale-but-harmless index entry rather than an orphaned
+    # Keychain item that is invisible to load_all/export/delete. If the index
+    # write raises we never reach _keychain_set, so nothing is orphaned; the
+    # exception propagates and the caller retries.
+    _index_record(service, key)
+    if _keychain_set(service, key, value):
+        return
+    # A False return is a genuine SecKeychain error code. There is nowhere else
+    # to put this: writing the secret to disk in plaintext would trade one
+    # failure for a worse, silent one. Surface it. The sentinel is left pointing
+    # at an item that was never written, which is harmless — load_secret returns
+    # None for it and export_all_secrets skips entries that don't resolve.
+    raise KeychainWriteError(
+        f"macOS Keychain refused to store {namespace}/{key}. The credential was "
+        "NOT saved; nothing was written to disk in its place."
+    )
 
 
 def load_secret(namespace: str, key: str) -> str | None:
     """Load a secret credential.
 
-    Tries the current Keychain service ID first, then the legacy ID
-    (`com.youtube-publisher.*`) and the file fallback. When a value is found
-    under the legacy ID, it is migrated forward to the new ID transparently.
+    Tries the current Keychain service ID, then the legacy ID
+    (`com.youtube-publisher.*`). When a value is found under the legacy ID, it
+    is migrated forward to the new ID transparently.
 
     Args:
         namespace: Credential group
@@ -573,82 +593,55 @@ def load_secret(namespace: str, key: str) -> str | None:
     Returns:
         The secret value, or None if not found.
     """
+    _require_macos()
     service = _service_name(namespace)
     legacy_service = _legacy_service_name(namespace)
 
-    if _is_macos():
-        value = _keychain_get(service, key)
-        if value is not None:
-            return value
-
-        # Read-fallback to legacy Keychain service ID and migrate forward.
-        legacy_value = _keychain_get(legacy_service, key)
-        if legacy_value is not None:
-            try:
-                migrated = _keychain_set(service, key, legacy_value)
-            except KeychainWriteError as exc:
-                # The forward-migration is opportunistic. Never let a *write*
-                # problem fail this *read* — return the value and retry later.
-                logger.warning(
-                    "Deferred legacy migration of %s/%s: %s", namespace, key, exc
-                )
-                migrated = False
-            if migrated:
-                with _secrets_file_lock:
-                    data = _load_secrets_file()
-                    data.setdefault(service, {})[key] = "__keychain__"
-                    _save_secrets_file(data)
-                logger.info("Migrated %s/%s from legacy Keychain ID", namespace, key)
-            return legacy_value
-
-    # Fallback to file (current then legacy service name)
-    value = _file_get(service, key)
-    if value is None:
-        value = _file_get(legacy_service, key)
-        if value is not None and value != "__keychain__":
-            # Move legacy file entry forward
-            _file_set(service, key, value)
-            _file_delete(legacy_service, key)
-    if value and value != "__keychain__":
-        # Migrate to Keychain if on macOS
-        if _is_macos():
-            try:
-                migrated = _keychain_set(service, key, value)
-            except KeychainWriteError as exc:
-                # Opportunistic migration; a wedged Keychain must not fail a read.
-                logger.warning(
-                    "Deferred file→Keychain migration of %s/%s: %s",
-                    namespace, key, exc,
-                )
-                migrated = False
-            if migrated:
-                with _secrets_file_lock:
-                    data = _load_secrets_file()
-                    if service in data and key in data[service]:
-                        data[service][key] = "__keychain__"
-                        _save_secrets_file(data)
-                logger.info(f"Migrated {namespace}/{key} to Keychain")
+    value = _keychain_get(service, key)
+    if value is not None:
         return value
+
+    # Read-fallback to legacy Keychain service ID and migrate forward. This is a
+    # fallback between two Keychain IDs, not between two stores — the secret
+    # never leaves the Keychain.
+    legacy_value = _keychain_get(legacy_service, key)
+    if legacy_value is not None:
+        try:
+            migrated = _keychain_set(service, key, legacy_value)
+        except KeychainWriteError as exc:
+            # The forward-migration is opportunistic. Never let a *write*
+            # problem fail this *read* — return the value and retry later.
+            logger.warning(
+                "Deferred legacy migration of %s/%s: %s", namespace, key, exc
+            )
+            migrated = False
+        if migrated:
+            _index_record(service, key)
+            logger.info("Migrated %s/%s from legacy Keychain ID", namespace, key)
+        return legacy_value
 
     return None
 
 
 def delete_secret(namespace: str, key: str) -> None:
-    """Delete a secret credential."""
+    """Delete a secret credential and drop it from the index."""
+    _require_macos()
     service = _service_name(namespace)
-    if _is_macos():
-        _keychain_delete(service, key)
-    _file_delete(service, key)
+    _keychain_delete(service, key)
+    _index_forget(service, key)
 
 
 def load_all_secrets(namespace: str) -> dict[str, str]:
     """Load all secrets for a namespace.
 
+    Keys come from the index, values from the Keychain — the index exists
+    precisely because a keyed store can't tell you which keys to ask for.
+
     Returns:
         Dict of key -> value for all stored credentials in this namespace.
     """
     service = _service_name(namespace)
-    accounts = _file_list_accounts(service)
+    accounts = _index_list_accounts(service)
     result = {}
     for account in accounts:
         value = load_secret(namespace, account)
@@ -660,14 +653,18 @@ def load_all_secrets(namespace: str) -> dict[str, str]:
 def delete_all_secrets(namespace: str) -> None:
     """Delete all secrets for a namespace."""
     service = _service_name(namespace)
-    accounts = _file_list_accounts(service)
+    accounts = _index_list_accounts(service)
     for account in accounts:
         delete_secret(namespace, account)
 
 
 def get_storage_type() -> str:
-    """Return the active storage backend name."""
-    return "keychain" if _is_macos() else "file"
+    """Return the active storage backend name.
+
+    There is only one, and there is deliberately no second value to report:
+    anything else raises :class:`UnsupportedPlatform` long before this is asked.
+    """
+    return "keychain"
 
 
 def _namespace_from_service(service: str) -> str | None:
@@ -720,7 +717,7 @@ def import_all_secrets(data: dict[str, dict[str, str]]) -> int:
 
 # --- Async wrappers for use from FastAPI / scheduler paths --------------
 # The sync helpers above shell out to the macOS `security` CLI per call
-# (~100ms-1s each) and do blocking file I/O on the fallback path. Calling
+# (~100ms-1s each) and do blocking file I/O to maintain the key index. Calling
 # them directly from async code freezes the event loop for every other
 # request. Wrap with `asyncio.to_thread` at every async call site.
 

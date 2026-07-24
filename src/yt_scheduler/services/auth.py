@@ -1,6 +1,7 @@
 """YouTube OAuth 2.0 authentication.
 
-Storage layout in Keychain (or the encrypted-file fallback):
+Storage layout in the macOS Keychain (the only secret store — see CLAUDE.md
+rule E):
 
 * ``youtube`` / ``client_secret`` — the JSON downloaded from Google Cloud
   Console (one app-level identity, shared by every project on this install).

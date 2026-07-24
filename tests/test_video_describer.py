@@ -16,6 +16,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.conftest import install_in_memory_keychain
+
 
 @pytest.fixture
 async def app_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -25,7 +27,7 @@ async def app_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             sys.modules.pop(mod, None)
     importlib.import_module("yt_scheduler.config")
     keychain = importlib.import_module("yt_scheduler.services.keychain")
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    install_in_memory_keychain(monkeypatch, keychain)
     keychain.store_secret("anthropic", "api_key", "sk-ant-test-fake")
     database = importlib.import_module("yt_scheduler.database")
     projects = importlib.import_module("yt_scheduler.services.projects")
@@ -138,7 +140,7 @@ async def test_generate_description_queues_transcription_when_no_transcript(
             sys.modules.pop(mod, None)
 
     keychain = importlib.import_module("yt_scheduler.services.keychain")
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    install_in_memory_keychain(monkeypatch, keychain)
     keychain.store_secret("anthropic", "api_key", "sk-ant-test-fake")
     app_module = importlib.import_module("yt_scheduler.app")
     auto_actions = importlib.import_module("yt_scheduler.services.auto_actions")
@@ -188,7 +190,7 @@ async def test_generate_description_frames_mode_is_still_explicit(
             sys.modules.pop(mod, None)
 
     keychain = importlib.import_module("yt_scheduler.services.keychain")
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    install_in_memory_keychain(monkeypatch, keychain)
     keychain.store_secret("anthropic", "api_key", "sk-ant-test-fake")
     app_module = importlib.import_module("yt_scheduler.app")
     media = importlib.import_module("yt_scheduler.services.media")
@@ -241,7 +243,7 @@ async def test_generate_description_400s_when_no_transcript_and_no_file(
             sys.modules.pop(mod, None)
 
     keychain = importlib.import_module("yt_scheduler.services.keychain")
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    install_in_memory_keychain(monkeypatch, keychain)
     keychain.store_secret("anthropic", "api_key", "sk-ant-test-fake")
     app_module = importlib.import_module("yt_scheduler.app")
 

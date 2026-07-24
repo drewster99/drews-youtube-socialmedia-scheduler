@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 
 import pytest
+
+from tests.conftest import install_in_memory_keychain
 from httpx import ASGITransport, AsyncClient
 
 
@@ -19,7 +21,7 @@ async def app_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             sys.modules.pop(mod, None)
     importlib.import_module("yt_scheduler.config")
     keychain = importlib.import_module("yt_scheduler.services.keychain")
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    install_in_memory_keychain(monkeypatch, keychain)
     keychain.store_secret("anthropic", "api_key", "sk-ant-test-fake")
 
     database = importlib.import_module("yt_scheduler.database")

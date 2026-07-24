@@ -2,9 +2,9 @@
 
 Mirrors the YouTube ``client_secret.json`` pattern in ``services/auth.py`` —
 the install owns one app-level identity per platform, the user enters it
-once in Settings, and it persists in Keychain (or the encrypted secrets
-file fallback) so the OAuth start endpoints don't have to prompt the user
-every time they connect a new account.
+once in Settings, and it persists in the macOS Keychain (the only secret
+store — see CLAUDE.md rule E) so the OAuth start endpoints don't have to
+prompt the user every time they connect a new account.
 
 Storage layout::
 

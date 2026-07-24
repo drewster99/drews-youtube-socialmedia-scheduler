@@ -143,21 +143,56 @@ def _purge_yt_scheduler_modules() -> None:
             sys.modules.pop(name, None)
 
 
+def install_in_memory_keychain(
+    monkeypatch: pytest.MonkeyPatch, keychain_module
+) -> dict[tuple[str, str], str]:
+    """Swap the macOS Keychain primitives for a dict, and return it.
+
+    Tests need a *fake secret*, never a real one — nothing in this suite makes a
+    real API call. The substitution happens at the three Keychain primitives, so
+    everything above them (the key index, the legacy-namespace migration, the
+    public API) is the same code that runs in production; only the system call
+    at the bottom is faked.
+
+    ``_is_macos`` is forced TRUE rather than false. There is no longer a
+    non-macOS store to fall back to — off macOS the module raises — and pinning
+    it here means the suite behaves identically wherever it runs. Nothing
+    touches the real login Keychain, and no secret is written to disk.
+    """
+    store: dict[tuple[str, str], str] = {}
+
+    def _set(service: str, account: str, value: str) -> bool:
+        store[(service, account)] = value
+        return True
+
+    def _get(service: str, account: str) -> str | None:
+        return store.get((service, account))
+
+    def _delete(service: str, account: str) -> bool:
+        return store.pop((service, account), None) is not None
+
+    monkeypatch.setattr(keychain_module, "_is_macos", lambda: True)
+    monkeypatch.setattr(keychain_module, "_keychain_set", _set)
+    monkeypatch.setattr(keychain_module, "_keychain_get", _get)
+    monkeypatch.setattr(keychain_module, "_keychain_delete", _delete)
+    return store
+
+
 @pytest.fixture
 def isolated_data_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Path]:
-    """Point ``yt_scheduler`` at a throwaway data dir and force the file keychain.
+    """Point ``yt_scheduler`` at a throwaway data dir with a fake Keychain.
 
     Import-time frozen config is why both halves are needed: the env var must be
     set *before* ``yt_scheduler.config`` is (re)imported, and the module cache
-    must be purged so that re-import actually happens. Forcing ``_is_macos``
-    false keeps every test off the real login Keychain.
+    must be purged so that re-import actually happens. The in-memory keychain
+    keeps every test off the real login Keychain.
     """
     monkeypatch.setenv("DYS_DATA_DIR", str(tmp_path))
     (tmp_path / "uploads").mkdir(parents=True, exist_ok=True)
     _purge_yt_scheduler_modules()
 
     keychain = importlib.import_module("yt_scheduler.services.keychain")
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    install_in_memory_keychain(monkeypatch, keychain)
 
     yield tmp_path
 

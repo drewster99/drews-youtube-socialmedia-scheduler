@@ -194,6 +194,9 @@ def test_plaintext_fallback_entries_are_skipped(repair_env) -> None:
 
 
 def test_noop_off_macos(repair_env, monkeypatch) -> None:
+    # This test is specifically about the off-macOS branch, so it forces
+    # _is_macos false rather than installing the in-memory Keychain (which
+    # pins it true).
     keychain, repair, fake, _ = repair_env
     monkeypatch.setattr(keychain, "_is_macos", lambda: False)
     svc = keychain._service_name("youtube")

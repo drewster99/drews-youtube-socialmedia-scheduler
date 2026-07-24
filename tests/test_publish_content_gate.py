@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import install_in_memory_keychain
+
 
 @pytest.fixture
 def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -115,7 +117,7 @@ async def test_schedule_endpoint_blocks_and_force_overrides(
         if mod.startswith("yt_scheduler"):
             sys.modules.pop(mod, None)
     keychain = importlib.import_module("yt_scheduler.services.keychain")
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    install_in_memory_keychain(monkeypatch, keychain)
     app_module = importlib.import_module("yt_scheduler.app")
     scheduler = importlib.import_module("yt_scheduler.services.scheduler")
 

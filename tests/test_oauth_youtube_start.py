@@ -13,6 +13,8 @@ import sys
 from pathlib import Path
 
 import pytest
+
+from tests.conftest import install_in_memory_keychain
 from fastapi.testclient import TestClient
 
 
@@ -30,7 +32,7 @@ def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     # actually has a client_secret stored from manual testing — that
     # would make ``test_no_client_secret_returns_400`` falsely 200).
     keychain = importlib.import_module("yt_scheduler.services.keychain")
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    install_in_memory_keychain(monkeypatch, keychain)
     app_module = importlib.import_module("yt_scheduler.app")
     with TestClient(app_module.app) as c:
         yield c, monkeypatch

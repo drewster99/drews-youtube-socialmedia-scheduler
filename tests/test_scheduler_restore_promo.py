@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import install_in_memory_keychain
+
 
 @pytest.fixture
 async def restore_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -28,7 +30,7 @@ async def restore_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             sys.modules.pop(mod, None)
 
     keychain = importlib.import_module("yt_scheduler.services.keychain")
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    install_in_memory_keychain(monkeypatch, keychain)
 
     db_module = importlib.import_module("yt_scheduler.database")
     db_conn = await db_module.get_db()

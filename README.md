@@ -46,8 +46,8 @@ yt-scheduler            # serves http://127.0.0.1:8008
 ```
 
 Set your Anthropic API key from the web UI (Settings → Anthropic). It is stored
-in the system Keychain (encrypted-file fallback on non-macOS) — never in `.env`
-or any env var.
+only in the macOS system Keychain — never in `.env` or any env var, and never
+in a file. (The app requires macOS for this reason.)
 
 ### Install (macOS .app)
 

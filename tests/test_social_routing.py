@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import install_in_memory_keychain
+
 
 @pytest.fixture
 async def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -23,7 +25,7 @@ async def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             sys.modules.pop(mod, None)
     importlib.import_module("yt_scheduler.config")
     keychain = importlib.import_module("yt_scheduler.services.keychain")
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    install_in_memory_keychain(monkeypatch, keychain)
     database = importlib.import_module("yt_scheduler.database")
     projects = importlib.import_module("yt_scheduler.services.projects")
     social_routes = importlib.import_module("yt_scheduler.routers.social_routes")

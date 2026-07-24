@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import install_in_memory_keychain
+
 
 @pytest.fixture
 async def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -22,7 +24,7 @@ async def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         if mod.startswith("yt_scheduler"):
             sys.modules.pop(mod, None)
     keychain = importlib.import_module("yt_scheduler.services.keychain")
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    install_in_memory_keychain(monkeypatch, keychain)
     app_module = importlib.import_module("yt_scheduler.app")
     from fastapi.testclient import TestClient
     with TestClient(app_module.app) as c:

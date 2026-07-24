@@ -48,7 +48,7 @@ Static checks are still the cheap first pass, not a substitute: `ruff check`, `p
 
 **E. Secrets only in the macOS Keychain — never a file.** The Anthropic key and OAuth/YouTube tokens live only in the macOS Keychain, set via Settings. Never read or store them from env vars, `.env`, or anywhere on disk, and never add an env-var fallback. Non-secret config (host/port/intervals/model name) in `.env` is fine.
 
-The `_is_macos()`-false branch in `keychain.py` writes `<DATA_DIR>/secrets.json` as **plaintext JSON** (0600 permissions, no encryption — earlier revisions of this file and of `services/keychain.py`'s docstring called it "encrypted", which was never true). Storing real secrets that way is not acceptable: the file-based store must never hold production credentials. Do not extend it, do not route new secrets through it, and do not present it as a supported configuration.
+`keychain.py` has exactly one secret store, the macOS Keychain, and off macOS every entry point raises `UnsupportedPlatform`. There is no file fallback: the old `_is_macos()`-false branch wrote `<DATA_DIR>/secrets.json` as **plaintext JSON** (and was reachable on macOS too, when a Keychain write returned an error code), and it was removed — a fallback that silently downgrades credential security is worse than the error it hid. What remains on disk is `secrets.json` as a **key index only** (every value is the `KEYCHAIN_SENTINEL`, never a secret): the Keychain answers questions about an exact (service, account) pair, so something must record which keys exist for `load_all`/`delete_all`/`export_all`. Tests use an in-memory Keychain (`tests/conftest.install_in_memory_keychain`) — a fake secret for fake calls, never the real login Keychain and never a file.
 
 **F. Frontend ↔ server contract.** The web UI talks to `/api/...` for everything (all reads and writes). The ONLY direct file access is read-only `GET /uploads/<name>`. The server vends ready URLs and owns naming/sanitization — never hand the browser absolute filesystem paths, and don't add `StaticFiles` mounts over data dirs.
 
@@ -162,7 +162,7 @@ Business logic layer, each service wraps one concern:
 - **`ai.py`** — Claude API for description generation and template AI blocks
 - **`social.py`** — Multi-platform posting (Twitter/X via tweepy, Bluesky via atproto, Mastodon, LinkedIn, Threads)
 - **`templates.py`** — Template engine: `{{variable}}` (strict — undefined names raise), `{{variable!}}` (required non-empty), `{{variable??default}}` (default on missing/blank), `{{#variable}}…{{/variable}}` / `{{^variable}}…{{/variable}}` sections, and `{{ai: prompt}}` blocks
-- **`auth.py`** — YouTube OAuth flow + credential storage (macOS Keychain; see rule E — the non-macOS file branch is plaintext and must not hold real credentials)
+- **`auth.py`** — YouTube OAuth flow + credential storage (macOS Keychain only; see rule E)
 - **`scheduler.py`** — APScheduler background jobs (scheduled publish, caption polling, comment moderation)
 - **`moderation.py`** — Comment filtering against blocklist (supports plain text and regex)
 - **`transcription.py`** — On-device transcription. Auto-detect order is Apple SpeechAnalyzer (`macos-speech`) → `whisper.cpp`. **MLX Whisper is opt-in only** — never auto-selected, because MLX never returns freed Metal buffers to the OS (a 12-clip batch once left 30 GB resident on an idle server). When it is chosen, the buffer cache is capped, trimmed after every run, and the cached model weights are dropped after an idle timeout. There is no default `model`: naming a Whisper backend without one is an error, not a silent `large-v3`.
@@ -183,7 +183,7 @@ Native SwiftUI app that embeds a Python runtime and manages the server as a subp
 
 - **Single SQLite database** — No external DB server; `aiosqlite` for async access; schema auto-migrates via `CREATE TABLE IF NOT EXISTS`
 - **Global DB connection** — `database.get_db()` returns a module-level singleton connection
-- **Credentials in the macOS Keychain only** — Social media tokens live in the system Keychain (`com.nuclearcyborg.drews-socialmedia-scheduler.*`). The non-macOS `secrets.json` branch is plaintext and is not a supported store for real credentials (rule E)
+- **Credentials in the macOS Keychain only** — Social media tokens live in the system Keychain (`com.nuclearcyborg.drews-socialmedia-scheduler.*`). There is no file store for secret values; `secrets.json` is a key index only (rule E)
 - **Template syntax** — `{{variable}}` for metadata substitution (strict: an undefined name is an error naming every undefined variable; defined-but-blank renders empty), `{{variable!}}` required-non-empty, `{{variable??default}}` default on missing/blank, `{{#variable}}…{{/variable}}` sections (content renders only when the variable has content; `{{^variable}}` is the inverse; resolved before media/AI passes), `{{ai: prompt}}` for Claude generation; variables inside AI blocks are resolved first. Promo children resolve description prompts via the `<key>_promo` variant chain (saved promo row → promo seed → saved base row → base seed).
 - **Video lifecycle** — `draft → uploaded → captioned → ready → published`; captions polled every 15 min via background job
 - **Scheduled publishing** — Sets `publish_at` on video, APScheduler fires at that time to flip privacy to public and send all approved social posts

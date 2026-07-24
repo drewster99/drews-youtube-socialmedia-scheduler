@@ -1,4 +1,9 @@
-"""Keychain rename fallback — file backend only (macOS Keychain not exercised in CI)."""
+"""Keychain service-name migration and framework-call serialization.
+
+The real macOS Keychain is never touched: round-trip tests run against the
+in-memory primitives, and the serialization tests substitute a fake Security
+framework underneath the real ``_keychain_set`` / ``_keychain_get``.
+"""
 
 from __future__ import annotations
 
@@ -10,35 +15,61 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import install_in_memory_keychain
 
-@pytest.fixture
-def isolated_keychain(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """Return a freshly imported keychain module pointing at tmp_path / secrets.json."""
+
+def _fresh_keychain_module(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Re-import keychain with DATA_DIR (and so SECRETS_FILE) under tmp_path."""
     monkeypatch.setenv("DYS_DATA_DIR", str(tmp_path))
-    # Reload config + keychain so DATA_DIR + SECRETS_FILE pick up the new env var.
     for mod in ("yt_scheduler.services.keychain", "yt_scheduler.config"):
         sys.modules.pop(mod, None)
     config = importlib.import_module("yt_scheduler.config")
     keychain = importlib.import_module("yt_scheduler.services.keychain")
-    # Force the file backend even on macOS so the test doesn't poke the real Keychain.
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
     assert config.DATA_DIR == tmp_path
+    return keychain
+
+
+@pytest.fixture
+def isolated_keychain(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Keychain module with the system primitives replaced by a dict.
+
+    The default for anything that stores or loads: no real Keychain item is
+    read or written, and no secret reaches disk.
+    """
+    keychain = _fresh_keychain_module(monkeypatch, tmp_path)
+    install_in_memory_keychain(monkeypatch, keychain)
     yield keychain
 
 
-def test_legacy_file_entry_is_migrated_forward(isolated_keychain) -> None:
+@pytest.fixture
+def keychain_with_real_primitives(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Keychain module with ``_keychain_set`` / ``_keychain_get`` INTACT.
+
+    Only for tests that exercise those functions themselves; they must
+    substitute a fake Security framework via ``_get_sec_lib`` so the real
+    Keychain is still never touched. Never call ``load_secret`` /
+    ``store_secret`` from a test using this — that would hit the real Keychain.
+    """
+    keychain = _fresh_keychain_module(monkeypatch, tmp_path)
+    monkeypatch.setattr(keychain, "_is_macos", lambda: True)
+    yield keychain
+
+
+def test_legacy_keychain_service_is_migrated_forward(isolated_keychain) -> None:
+    """A secret still filed under the pre-rename service ID is returned and
+    copied to the current one, so the next read hits the new ID directly."""
     keychain = isolated_keychain
-
     legacy_service = keychain._legacy_service_name("twitter")
-    keychain._file_set(legacy_service, "api_key", "secret-key")
-
-    value = keychain.load_secret("twitter", "api_key")
-    assert value == "secret-key"
-
-    # Legacy entry should be gone, new entry present
     new_service = keychain._service_name("twitter")
-    assert keychain._file_get(legacy_service, "api_key") is None
-    assert keychain._file_get(new_service, "api_key") == "secret-key"
+
+    # Seed the fake Keychain directly under the legacy service ID.
+    keychain._keychain_set(legacy_service, "api_key", "secret-key")
+
+    assert keychain.load_secret("twitter", "api_key") == "secret-key"
+
+    # Migrated forward, and the index now records the new service ID.
+    assert keychain._keychain_get(new_service, "api_key") == "secret-key"
+    assert keychain._index_list_accounts(new_service) == ["api_key"]
 
 
 def test_store_uses_new_service_name(isolated_keychain) -> None:
@@ -53,6 +84,36 @@ def test_store_uses_new_service_name(isolated_keychain) -> None:
 def test_load_returns_none_for_missing(isolated_keychain) -> None:
     keychain = isolated_keychain
     assert keychain.load_secret("twitter", "api_key") is None
+
+
+def test_index_records_only_the_sentinel_never_the_value(isolated_keychain) -> None:
+    """The on-disk index is a key list, not a second copy of the secret."""
+    keychain = isolated_keychain
+    keychain.store_secret("twitter", "api_key", "super-secret-value")
+
+    raw = keychain.SECRETS_FILE.read_text()
+    assert "super-secret-value" not in raw
+    service = keychain._service_name("twitter")
+    assert keychain._load_secrets_file()[service]["api_key"] == keychain.KEYCHAIN_SENTINEL
+
+
+def test_off_macos_refuses_rather_than_writing_a_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The invariant this whole change exists to guarantee: with no Keychain,
+    a secret is never written to disk — the call raises instead."""
+    keychain = _fresh_keychain_module(monkeypatch, tmp_path)
+    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+
+    with pytest.raises(keychain.UnsupportedPlatform):
+        keychain.store_secret("twitter", "api_key", "super-secret-value")
+    with pytest.raises(keychain.UnsupportedPlatform):
+        keychain.load_secret("twitter", "api_key")
+    with pytest.raises(keychain.UnsupportedPlatform):
+        keychain.delete_secret("twitter", "api_key")
+
+    # Nothing about the secret reached disk — not even the index sentinel.
+    assert not keychain.SECRETS_FILE.exists()
 
 
 class _FakeSecLib:
@@ -103,11 +164,11 @@ def _run_concurrently(target, count: int = 8, join_timeout: float = 10.0) -> lis
     return threads
 
 
-def test_keychain_set_serializes_framework_calls(isolated_keychain, monkeypatch) -> None:
+def test_keychain_set_serializes_framework_calls(keychain_with_real_primitives, monkeypatch) -> None:
     """Regression for the 2026-06 deadlock: two threads inside Security.framework
     at once wedged the whole server. ``_keychain_set`` must let only one thread
     into the framework at a time."""
-    keychain = isolated_keychain
+    keychain = keychain_with_real_primitives
     fake = _FakeSecLib()
     monkeypatch.setattr(keychain, "_get_sec_lib", lambda: fake)
 
@@ -122,10 +183,10 @@ def test_keychain_set_serializes_framework_calls(isolated_keychain, monkeypatch)
     )
 
 
-def test_keychain_get_serializes_framework_calls(isolated_keychain, monkeypatch) -> None:
+def test_keychain_get_serializes_framework_calls(keychain_with_real_primitives, monkeypatch) -> None:
     """The read path takes the same lock — a write and a read must not be inside
     the framework simultaneously either."""
-    keychain = isolated_keychain
+    keychain = keychain_with_real_primitives
     fake = _FakeSecLib()
     monkeypatch.setattr(keychain, "_get_sec_lib", lambda: fake)
 

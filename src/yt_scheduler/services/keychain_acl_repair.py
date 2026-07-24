@@ -42,10 +42,12 @@ logger = logging.getLogger(__name__)
 
 STATE_FILE_NAME = "keychain_acl_repair.json"
 
-# Items whose index sentinel is exactly this are stored in the Keychain and so
-# may carry a stale ACL. Any other index value is a plaintext file-fallback
-# secret (no Keychain item to repair).
-_KEYCHAIN_SENTINEL = "__keychain__"
+# Every index entry now carries this sentinel — the plaintext file-fallback that
+# could put some other value here is gone. Kept as a filter so an index written
+# by an older build (which could hold a real secret) is skipped rather than
+# treated as a Keychain item to repair. Imported rather than re-declared so
+# there is one definition of what the index stores.
+_KEYCHAIN_SENTINEL = keychain.KEYCHAIN_SENTINEL
 
 
 def _state_path():

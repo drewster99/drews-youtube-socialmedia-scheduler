@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import install_in_memory_keychain
+
 
 def _days_ago(n: int) -> str:
     """SQLite-friendly UTC timestamp ``n`` days before now.
@@ -43,7 +45,7 @@ async def app_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             sys.modules.pop(mod, None)
     importlib.import_module("yt_scheduler.config")
     keychain = importlib.import_module("yt_scheduler.services.keychain")
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    install_in_memory_keychain(monkeypatch, keychain)
     database = importlib.import_module("yt_scheduler.database")
     projects = importlib.import_module("yt_scheduler.services.projects")
     social = importlib.import_module("yt_scheduler.services.social")
@@ -266,7 +268,7 @@ async def test_update_post_trims_content_on_write(
             sys.modules.pop(mod, None)
 
     keychain = importlib.import_module("yt_scheduler.services.keychain")
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    install_in_memory_keychain(monkeypatch, keychain)
 
     app_module = importlib.import_module("yt_scheduler.app")
 
@@ -317,7 +319,7 @@ async def test_send_post_returns_409_on_duplicate(
             sys.modules.pop(mod, None)
 
     keychain = importlib.import_module("yt_scheduler.services.keychain")
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    install_in_memory_keychain(monkeypatch, keychain)
 
     app_module = importlib.import_module("yt_scheduler.app")
     creds_mod = importlib.import_module("yt_scheduler.services.social_credentials")

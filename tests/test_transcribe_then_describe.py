@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import install_in_memory_keychain
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -32,7 +34,7 @@ async def _boot(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             sys.modules.pop(mod, None)
 
     keychain = importlib.import_module("yt_scheduler.services.keychain")
-    monkeypatch.setattr(keychain, "_is_macos", lambda: False)
+    install_in_memory_keychain(monkeypatch, keychain)
     keychain.store_secret("anthropic", "api_key", "sk-ant-test-fake")
     importlib.import_module("yt_scheduler.app")
 
