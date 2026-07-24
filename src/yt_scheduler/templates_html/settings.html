@@ -175,7 +175,9 @@ async function loadAuthStatus() {
     const resp = await fetch('/auth/status');
     const data = await resp.json();
     const el = document.getElementById('auth-info');
-    const storage = data.storage === 'keychain' ? 'macOS Keychain' : 'encrypted secrets file';
+    // The server has exactly one secret store now (see keychain.get_storage_type);
+    // it always reports 'keychain'.
+    const storage = 'macOS Keychain';
 
     /* Two independent states:
      *   1) client_secret.json (the app's OAuth credential): required to
@@ -244,7 +246,7 @@ async function loadAnthropicStatus() {
     const removeBtn = document.getElementById('btn-remove-anthropic');
     const storageEl = document.getElementById('anthropic-storage-type');
 
-    storageEl.textContent = data.storage === 'keychain' ? 'macOS Keychain' : 'encrypted secrets file';
+    storageEl.textContent = 'macOS Keychain';
 
     const input = document.getElementById('anthropic-api-key');
     const saveBtn = document.getElementById('btn-save-anthropic');
@@ -291,8 +293,7 @@ async function saveAnthropicKey() {
     });
     if (resp.ok) {
         const result = await resp.json();
-        const where = result.storage === 'keychain' ? 'Keychain' : 'secrets file';
-        showToast(`Saved (key in ${where}, model in DB)`, 'success');
+        showToast('Saved (key in Keychain, model in DB)', 'success');
         document.getElementById('anthropic-api-key').value = '';
         loadAnthropicStatus();
     }
