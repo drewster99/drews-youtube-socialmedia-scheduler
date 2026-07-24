@@ -388,6 +388,7 @@ async function loadPromos() {
             ? cards.join('')
             : '<p class="empty-state">No videos in this section yet.</p>';
     }
+    maybeFinishDescriptionUpdate(buckets);
     bindRetryButtons();
 }
 
@@ -650,10 +651,47 @@ const updateDescriptionsBanner = document.getElementById('update-descriptions-ba
 
 const promosBase = `/api/projects/${projectSlug}/videos/${parentId}/promos`;
 
+// Tracks an in-flight "Update all descriptions" run so the top banner can flip
+// from "Updating…" to a completion summary once every clip has left the
+// updating_desc state. Session-scoped to the tab that started the run: after a
+// reload the per-card states remain the source of truth, but there's no run to
+// summarise, so the banner stays hidden rather than guessing.
+let descUpdateWatch = null;  // { ids: Set<string>, total: number } | null
+
 function showUpdateDescriptionsBanner(html, isError) {
     updateDescriptionsBanner.className = 'banner ' + (isError ? 'banner-danger' : 'banner-info');
     updateDescriptionsBanner.innerHTML = html;
     updateDescriptionsBanner.style.display = '';
+}
+
+// Called on every poll with the freshly-fetched children. When none of the
+// watched clips are still updating, replace the "Updating…" banner with a
+// terminal summary and stop watching (one-shot). A watched id that's no longer
+// present — archived mid-run — counts as finished, not failed.
+function maybeFinishDescriptionUpdate(buckets) {
+    if (!descUpdateWatch) return;
+    const stateById = new Map();
+    for (const tier of ['segment', 'short', 'hook']) {
+        for (const c of (buckets[tier] || [])) {
+            stateById.set(c.id, c.auto_action_state || null);
+        }
+    }
+    let pending = 0;
+    let failed = 0;
+    for (const id of descUpdateWatch.ids) {
+        const state = stateById.get(id);
+        if (state === 'updating_desc') pending++;
+        else if (state === 'failed:updating_desc') failed++;
+    }
+    if (pending > 0) return;  // still running
+
+    const total = descUpdateWatch.total;
+    descUpdateWatch = null;   // one-shot: don't re-fire on later polls
+    const succeeded = total - failed;
+    const failNote = failed ? ` ${failed} failed — see the cards for the error.` : '';
+    showUpdateDescriptionsBanner(
+        `Updated ${succeeded} description(s).${escapeHtml(failNote)}`,
+        failed > 0);
 }
 
 // FastAPI puts the message in `detail`; it's a string for our HTTPExceptions
@@ -688,11 +726,18 @@ async function startDescriptionUpdate(payload) {
         return;
     }
     const data = await resp.json();
-    const started = (data.started || []).length;
+    const startedClips = data.started || [];
+    const started = startedClips.length;
     const skipped = (data.skipped || []).length;
     const skippedNote = skipped
         ? ` ${skipped} clip(s) skipped — see the confirm dialog for why.`
         : '';
+    // Arm the completion watch BEFORE the first loadPromos so it's evaluated on
+    // every poll from here on. The first pass sees them all still updating, so
+    // it won't fire early.
+    descUpdateWatch = started
+        ? { ids: new Set(startedClips.map(c => c.id)), total: started }
+        : null;
     showUpdateDescriptionsBanner(
         `Updating ${started} description(s) — about ` +
         `${escapeHtml(data.quota_units_estimate)} YouTube quota units. ` +
