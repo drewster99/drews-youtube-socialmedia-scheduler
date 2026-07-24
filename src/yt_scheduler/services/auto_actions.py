@@ -657,6 +657,14 @@ PROMO_STATE_GENERATING_TAGS = "generating_tags"
 PROMO_STATE_PUSHING_METADATA = "pushing_metadata"
 PROMO_STATE_READY = "ready"
 
+# Description-only re-generation, driven by the Promo screen's "Update all
+# descriptions" button after a prompt-template edit. Deliberately NOT a member
+# of PROMO_STEP_ORDER below: it is a standalone operation, not a chain step, and
+# a failed:updating_desc row must not offer the chain's Retry. That retry would
+# find a non-empty description, skip generation entirely, and push the OLD text
+# to YouTube while reporting success.
+PROMO_STATE_UPDATING_DESC = "updating_desc"
+
 # Ordered. ``_resume_from`` walks this list to determine which steps to
 # (re-)run on a Retry. Names match the persisted state column. CUTTING
 # is the Generate-from-source pre-step (job.has_cut_request) that runs
@@ -1688,6 +1696,19 @@ async def _promo_step_description(video_id: str, project_id: int) -> None:
         row.get("description") != "Description pending generation."
     ):
         return
+    description = await _generate_promo_description(row, project_id)
+    await _store_promo_description(video_id, row.get("description") or "", description)
+
+
+async def _generate_promo_description(row: dict, project_id: int) -> str:
+    """Produce the description text for a promo row. Writes nothing.
+
+    Split out from the chain step so the deliberate re-generation path
+    (:func:`_regenerate_and_push_description`) can push the result to YouTube
+    *before* persisting it, without duplicating how a promo description is
+    composed. ``row`` must be a full ``videos`` row — the prompt-variable
+    builder reads the parent linkage columns off it.
+    """
     title = row.get("title") or ""
     transcript = (row.get("transcript") or "").strip()
     plain_transcript = transcript
@@ -1698,25 +1719,29 @@ async def _promo_step_description(video_id: str, project_id: int) -> None:
     video_is_promo = bool(row.get("parent_item_id"))
 
     if len(plain_transcript) >= TRANSCRIPT_MIN_USABLE_CHARS:
-        description = await ai.generate_seo_description(
+        return await ai.generate_seo_description(
             title=title, transcript=transcript, project_id=project_id,
             prompt_variables=prompt_variables, is_promo=video_is_promo,
         )
-    else:
-        video_file_path = row.get("video_file_path")
-        if not video_file_path or not Path(video_file_path).exists():
-            raise RuntimeError(
-                "No local file for keyframe-based description fallback"
-            )
-        from yt_scheduler.services import media as media_service
-        frames = await asyncio.to_thread(
-            media_service.extract_keyframes, video_file_path, 6,
+    video_file_path = row.get("video_file_path")
+    if not video_file_path or not Path(video_file_path).exists():
+        raise RuntimeError(
+            "No local file for keyframe-based description fallback"
         )
-        description = await ai.generate_seo_description_from_frames(
-            title=title, frames=frames, project_id=project_id,
-            prompt_variables=prompt_variables, is_promo=video_is_promo,
-        )
+    from yt_scheduler.services import media as media_service
+    frames = await asyncio.to_thread(
+        media_service.extract_keyframes, video_file_path, 6,
+    )
+    return await ai.generate_seo_description_from_frames(
+        title=title, frames=frames, project_id=project_id,
+        prompt_variables=prompt_variables, is_promo=video_is_promo,
+    )
 
+
+async def _store_promo_description(
+    video_id: str, old_description: str, description: str
+) -> None:
+    """Persist a generated promo description and record the change event."""
     async with write_transaction() as db:
         await db.execute(
             """UPDATE videos SET description = ?, description_generated_at = datetime('now'),
@@ -1725,7 +1750,7 @@ async def _promo_step_description(video_id: str, project_id: int) -> None:
         )
     await events.record_event(
         video_id, "metadata_updated",
-        {"description": {"old": row.get("description") or "", "new": description}},
+        {"description": {"old": old_description, "new": description}},
     )
 
 
@@ -1816,4 +1841,247 @@ async def _promo_step_push_metadata(video_id: str) -> None:
         title=row.get("title") or "",
         description=row.get("description") or "",
         tags=tag_list,
+    )
+
+
+# --- Bulk description re-generation ---------------------------------------
+#
+# "Update all descriptions" on the Promo screen: after editing the promo
+# description prompt template, re-run generation for every clip under a parent
+# and push the new text to YouTube. Per-clip progress rides on the SAME
+# ``videos.auto_action_state`` column the promo cards already poll, so a browser
+# reload (or a second tab) picks the run up mid-flight.
+
+# videos.list (1) to read the current snippet + videos.update (50) — see
+# youtube.update_video_metadata, which merges rather than blind-writes.
+DESCRIPTION_UPDATE_QUOTA_UNITS_PER_CLIP = 51
+
+# Reasons Google returns when the DAILY quota is gone. One clip hitting this
+# means every remaining clip in the batch would too, so the run stops instead of
+# burning through 90 identical failures.
+#
+# Deliberately excludes rateLimitExceeded / userRateLimitExceeded: those are
+# transient "slow down" signals, and treating one as exhaustion would abort a
+# batch that was about to succeed while telling the user something untrue about
+# their quota. Those fail their own clip, which is retryable.
+_QUOTA_EXHAUSTED_MARKERS = (
+    "quotaExceeded",
+    "dailyLimitExceeded",
+)
+
+_QUOTA_ABORT_MESSAGE = (
+    "Stopped: YouTube's daily API quota is exhausted. The remaining clips were "
+    "not updated — run this again after the quota resets (midnight Pacific)."
+)
+
+
+def _is_quota_exhaustion(exc: BaseException) -> bool:
+    text = str(exc)
+    return any(marker in text for marker in _QUOTA_EXHAUSTED_MARKERS)
+
+
+async def fail_interrupted_description_updates() -> int:
+    """Boot-time sweep: fail any row left mid description-update by a shutdown.
+
+    Nothing can be re-generating at process start, so every ``updating_desc``
+    row is by definition abandoned. Left alone it would spin "Updating
+    description…" forever — and worse, be permanently unclaimable, because both
+    claim helpers refuse a non-terminal state. There is no repair path from the
+    UI for that.
+
+    Failing them (rather than silently resuming) is deliberate: a resume would
+    re-spend Claude calls and YouTube quota at boot for work the user never
+    re-authorised, bypassing the confirm dialog that exists to show that cost.
+    The clip still has its previous, valid description, so nothing is broken by
+    waiting — and the card's "Retry description update" button puts the decision
+    back in the user's hands.
+
+    Deliberately NOT limited to the resume window the chain uses: a row stranded
+    for longer than that window would otherwise stay wedged forever.
+    """
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            "UPDATE videos SET auto_action_state = ?, auto_action_last_error = ?, "
+            "auto_action_progress_message = NULL, updated_at = datetime('now') "
+            "WHERE auto_action_state = ?",
+            (
+                f"failed:{PROMO_STATE_UPDATING_DESC}",
+                "Interrupted by a server restart before this clip was updated. "
+                "Its previous description is unchanged — run the update again.",
+                PROMO_STATE_UPDATING_DESC,
+            ),
+        )
+    count = cursor.rowcount or 0
+    if count:
+        logger.warning(
+            "Failed %d description update(s) left in flight by a previous shutdown",
+            count,
+        )
+    return count
+
+
+async def claim_description_update(video_id: str) -> bool:
+    """Atomically claim one promo row for a description re-generation.
+
+    Returns True when this caller won the claim. False means the row is already
+    mid-chain (uploading, transcribing, a previous update still running) — in
+    that case we leave it alone rather than racing two writers on the same
+    description. Mirrors :func:`claim_describe_chain`: only terminal states
+    (NULL / ready / failed:*) are claimable, and SQLite applies the conditional
+    UPDATE atomically so exactly one caller sees rowcount 1.
+    """
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            "UPDATE videos SET auto_action_state = ?, auto_action_last_error = NULL, "
+            "auto_action_progress_message = ?, updated_at = datetime('now') "
+            "WHERE id = ? AND ("
+            "  auto_action_state IS NULL"
+            "  OR auto_action_state = ?"
+            "  OR auto_action_state LIKE 'failed:%'"
+            ")",
+            (
+                PROMO_STATE_UPDATING_DESC,
+                "Queued for description update…",
+                video_id,
+                PROMO_STATE_READY,
+            ),
+        )
+    return (cursor.rowcount or 0) > 0
+
+
+def start_promo_description_updates(project_id: int, video_ids: list[str]) -> None:
+    """Re-generate + push the description for each claimed clip, in the
+    background. Returns immediately.
+
+    The caller must have won :func:`claim_description_update` for every id, so
+    each row already reads ``updating_desc`` by the time the HTTP response goes
+    out and the page shows progress on the very next poll.
+    """
+    ids = list(video_ids)
+    spawn_background(
+        _run_promo_description_updates(project_id, ids),
+        name=f"promo-desc-update:project-{project_id}:{len(ids)}-clips",
+    )
+
+
+async def _run_promo_description_updates(
+    project_id: int, video_ids: list[str]
+) -> None:
+    """Fan the batch out under the shared promo-chain semaphore.
+
+    Nothing may escape this coroutine: every row is already claimed and showing
+    "Updating description…", so an exception here would strand all of them in a
+    running state forever.
+    """
+    project_row = await get_project_by_id(project_id)
+    if project_row:
+        # Binds this task's YouTube credentials. spawn_background gives the task
+        # its own copy of the context, so this cannot leak into other requests.
+        set_active_project(project_row["slug"])
+
+    # Set by the first clip to hit a quota wall; every clip that has not started
+    # yet then fails fast with the same explanation instead of retrying it.
+    quota_abort = False
+
+    async def _fail(video_id: str, error: str) -> None:
+        await _set_auto_action_progress(video_id, None)
+        await _set_promo_state(
+            video_id, f"failed:{PROMO_STATE_UPDATING_DESC}", error=error,
+        )
+
+    async def _update_one(video_id: str) -> None:
+        nonlocal quota_abort
+        # Checked twice on purpose: once before queuing behind the semaphore,
+        # and again after acquiring it, since the wall may have been hit while
+        # this clip sat in the queue.
+        if quota_abort:
+            await _fail(video_id, _QUOTA_ABORT_MESSAGE)
+            return
+        async with _get_promo_chain_semaphore():
+            if quota_abort:
+                await _fail(video_id, _QUOTA_ABORT_MESSAGE)
+                return
+            try:
+                await _regenerate_and_push_description(video_id, project_id)
+            except Exception as exc:
+                if _is_quota_exhaustion(exc):
+                    quota_abort = True
+                logger.warning(
+                    "Description update failed for %s: %s", video_id, exc,
+                )
+                await _fail(video_id, f"{type(exc).__name__}: {exc}"[:500])
+                return
+        await _set_auto_action_progress(video_id, None)
+        await _set_promo_state(video_id, PROMO_STATE_READY, error=None)
+
+    # return_exceptions: _update_one already converts the real work's failures
+    # into a per-clip failed state, so anything reaching here is a DB-level
+    # fault. Log it against the clip rather than letting one bad row abort the
+    # gather and leave the rest of the batch unaccounted for.
+    outcomes = await asyncio.gather(
+        *(_update_one(vid) for vid in video_ids), return_exceptions=True
+    )
+    for video_id, outcome in zip(video_ids, outcomes):
+        if isinstance(outcome, BaseException):
+            logger.error(
+                "Description update for %s raised outside its handler",
+                video_id, exc_info=outcome,
+            )
+
+
+async def _regenerate_and_push_description(video_id: str, project_id: int) -> None:
+    """Re-generate one clip's description, push it, then persist it.
+
+    Push BEFORE the local write, for the reason ``apply_description`` states: if
+    the order were reversed, a failed push would leave the row claiming YouTube
+    holds a description it never received. These clips are mostly already
+    published, so nothing would ever reconcile that — the app would show one
+    description and viewers another.
+
+    Refuses rather than falling back when there's no usable transcript. The
+    keyframe fallback answers a different question (what is on screen) through a
+    different prompt template, so it would quietly produce a description missing
+    everything the transcript prompt asks for — including the episode links this
+    whole operation exists to add.
+    """
+    db = await get_db()
+    # SELECT * — _generate_promo_description hands the row to the prompt-variable
+    # builder, which reads the parent linkage columns off it.
+    rows = await db.execute_fetchall("SELECT * FROM videos WHERE id = ?", (video_id,))
+    if not rows:
+        raise RuntimeError(f"videos row {video_id} missing")
+    row = dict(rows[0])
+    transcript = (row.get("transcript") or "").strip()
+    plain_transcript = (
+        transcript_service.srt_to_plain_text(transcript).strip() if transcript else ""
+    )
+    if len(plain_transcript) < TRANSCRIPT_MIN_USABLE_CHARS:
+        raise RuntimeError(
+            "No usable transcript, so the description can't be re-generated from "
+            "speech. Transcribe this clip first (its detail page), then re-run."
+        )
+
+    await _set_auto_action_progress(video_id, "Re-generating description…")
+    description = await _generate_promo_description(row, project_id)
+    if not description.strip():
+        raise RuntimeError(
+            "Generation produced an empty description — nothing pushed."
+        )
+    await _set_auto_action_progress(video_id, "Pushing description to YouTube…")
+    await _push_description_to_youtube(video_id, description)
+    await _store_promo_description(video_id, row.get("description") or "", description)
+
+
+async def _push_description_to_youtube(video_id: str, description: str) -> None:
+    """Send ONLY the description to YouTube.
+
+    Deliberately narrower than :func:`_promo_step_push_metadata`: a description
+    refresh must not overwrite a title or tag list that was edited on YouTube
+    since the clip was uploaded. ``update_video_metadata`` merges into the live
+    snippet, so the untouched fields keep whatever YouTube currently holds.
+    """
+    await asyncio.to_thread(
+        youtube.update_video_metadata,
+        video_id=video_id,
+        description=description,
     )

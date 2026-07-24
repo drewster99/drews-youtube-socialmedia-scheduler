@@ -32,6 +32,7 @@ import secrets
 import shutil
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 
 from pathlib import Path
 
@@ -43,6 +44,7 @@ from yt_scheduler.services import (
     clipper,
     media as media_service,
     projects as project_service,
+    transcripts as transcript_service,
 )
 
 logger = logging.getLogger(__name__)
@@ -907,6 +909,207 @@ async def delete_generate_rejection(
             (rejection_id, parent_id, int(project["id"])),
         )
     return {"deleted": bool(cursor.rowcount)}
+
+
+def _parse_tier_filter(tiers: str | None) -> list[str] | None:
+    """``"hook,short"`` → ``["hook", "short"]``; ``None``/empty → no filter.
+
+    An unknown tier is a 400 rather than a silent drop — otherwise a typo'd
+    filter would quietly update nothing and report success.
+    """
+    if tiers is None:
+        return None
+    wanted = [t.strip().lower() for t in tiers.split(",") if t.strip()]
+    if not wanted:
+        return None
+    unknown = sorted(set(wanted) - _VALID_FORCED_ITEM_TYPES)
+    if unknown:
+        raise HTTPException(
+            400,
+            f"Unknown tier(s) {unknown}; expected any of "
+            f"{sorted(_VALID_FORCED_ITEM_TYPES)}.",
+        )
+    return wanted
+
+
+async def _description_update_candidates(
+    parent_id: str, project_id: int, tiers: list[str] | None,
+) -> tuple[list[dict], list[dict]]:
+    """Split this parent's promo clips into (eligible, ineligible).
+
+    Eligible = a live YouTube-backed clip we can re-describe and push. Every
+    exclusion carries the concrete reason so the confirm dialog can say why a
+    clip is being left out instead of silently shrinking the count.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id, title, item_type, status, transcript, auto_action_state, "
+        "youtube_deleted FROM videos "
+        "WHERE parent_item_id = ? AND project_id = ? AND COALESCE(archived, 0) = 0 "
+        "ORDER BY item_type, created_at ASC",
+        (parent_id, project_id),
+    )
+    eligible: list[dict] = []
+    ineligible: list[dict] = []
+    for row in rows:
+        clip = dict(row)
+        item_type = clip.get("item_type") or ""
+        if tiers is not None and item_type not in tiers:
+            continue
+        summary = {
+            "id": clip["id"],
+            "title": clip.get("title") or "",
+            "item_type": item_type,
+            "status": clip.get("status") or "",
+        }
+        transcript = (clip.get("transcript") or "").strip()
+        plain = (
+            transcript_service.srt_to_plain_text(transcript).strip()
+            if transcript else ""
+        )
+        state = str(clip.get("auto_action_state") or "")
+        if len(clip["id"]) != 11:
+            summary["reason"] = "Not on YouTube (local-only item)."
+        elif clip.get("youtube_deleted"):
+            summary["reason"] = "The YouTube video has been deleted."
+        elif len(plain) < auto_actions.TRANSCRIPT_MIN_USABLE_CHARS:
+            summary["reason"] = (
+                "No usable transcript to describe from — transcribe it first."
+            )
+        elif state and state != auto_actions.PROMO_STATE_READY and not state.startswith("failed:"):
+            summary["reason"] = f"Busy: {state}."
+        else:
+            eligible.append(summary)
+            continue
+        ineligible.append(summary)
+    return eligible, ineligible
+
+
+@router.get("/update-descriptions/preview")
+async def update_descriptions_preview(
+    slug: str, parent_id: str, tiers: str | None = None,
+) -> dict:
+    """Dry run for the "Update all descriptions" confirm dialog.
+
+    ``tiers`` is an optional comma-separated subset of hook|short|segment.
+
+    Returns the clips that would be re-described, the ones that would be
+    skipped (each with a reason), and the YouTube quota this would spend —
+    the numbers matter, because a full parent is ~20 clips and a whole
+    season is a meaningful slice of the 10,000-unit daily budget.
+    """
+    project, _parent = await _ensure_primary(slug, parent_id)
+    tier_filter = _parse_tier_filter(tiers)
+    eligible, ineligible = await _description_update_candidates(
+        parent_id, int(project["id"]), tier_filter,
+    )
+    counts: dict[str, int] = {"segment": 0, "short": 0, "hook": 0}
+    for clip in eligible:
+        if clip["item_type"] in counts:
+            counts[clip["item_type"]] += 1
+    return {
+        "eligible": eligible,
+        "ineligible": ineligible,
+        "counts": counts,
+        "quota_units_estimate": (
+            len(eligible) * auto_actions.DESCRIPTION_UPDATE_QUOTA_UNITS_PER_CLIP
+        ),
+    }
+
+
+@router.post("/update-descriptions")
+async def update_descriptions(
+    slug: str, parent_id: str, payload: dict | None = None,
+) -> JSONResponse:
+    """Re-generate every eligible promo description and push it to YouTube.
+
+    Body (all optional):
+        ``{"tiers": ["hook", "short"], "video_ids": ["<id>", ...]}``
+
+    ``video_ids`` narrows the run to specific clips (the per-card "Retry
+    description update" uses it); every id must be an eligible clip under this
+    parent or the whole request is a 400 naming the offenders.
+
+    Returns 202 immediately. Per-clip progress lands in
+    ``videos.auto_action_state`` (``updating_desc`` → ``ready``, or
+    ``failed:updating_desc`` with the real error), which the Promo screen
+    already polls.
+    """
+    project, _parent = await _ensure_primary(slug, parent_id)
+    payload = payload or {}
+
+    raw_tiers = payload.get("tiers")
+    if raw_tiers is not None and not isinstance(raw_tiers, list):
+        raise HTTPException(400, "'tiers' must be a list of hook|short|segment.")
+    tier_filter = (
+        _parse_tier_filter(",".join(str(t) for t in raw_tiers))
+        if raw_tiers is not None else None
+    )
+
+    eligible, ineligible = await _description_update_candidates(
+        parent_id, int(project["id"]), tier_filter,
+    )
+
+    raw_ids = payload.get("video_ids")
+    if raw_ids is not None:
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise HTTPException(400, "'video_ids' must be a non-empty list.")
+        # dict.fromkeys de-dupes while preserving order: a repeated id would
+        # otherwise be claimed once and then reported as "busy" against itself.
+        wanted = list(dict.fromkeys(str(v) for v in raw_ids))
+        by_id = {clip["id"]: clip for clip in eligible}
+        missing = [vid for vid in wanted if vid not in by_id]
+        if missing:
+            reasons = {clip["id"]: clip["reason"] for clip in ineligible}
+            detail = ", ".join(
+                f"{vid} ({reasons.get(vid, 'not a promo clip under this parent')})"
+                for vid in missing
+            )
+            raise HTTPException(400, f"Not eligible for a description update: {detail}")
+        eligible = [by_id[vid] for vid in wanted]
+        # The caller named its clips, so the rest of the parent isn't
+        # "skipped" — it was never in scope. Reporting it as skipped makes a
+        # one-clip retry claim it ignored twenty others.
+        ineligible = []
+
+    if not eligible:
+        raise HTTPException(
+            400,
+            "No promo clips under this parent are eligible for a description "
+            "update. See /update-descriptions/preview for the per-clip reasons.",
+        )
+
+    started: list[dict] = []
+    busy: list[dict] = []
+    for clip in eligible:
+        if await auto_actions.claim_description_update(clip["id"]):
+            started.append(clip)
+        else:
+            # Lost the claim between the candidate scan and here — another tab
+            # or a chain that just started owns the row now.
+            busy.append({**clip, "reason": "Another job claimed this clip."})
+
+    if not started:
+        raise HTTPException(
+            409,
+            "Every eligible clip is already being worked on by another job. "
+            "Wait for it to finish and try again.",
+        )
+
+    auto_actions.start_promo_description_updates(int(project["id"]), [
+        clip["id"] for clip in started
+    ])
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "started": started,
+            "skipped": ineligible + busy,
+            "quota_units_estimate": (
+                len(started) * auto_actions.DESCRIPTION_UPDATE_QUOTA_UNITS_PER_CLIP
+            ),
+        },
+    )
 
 
 @router.post("/schedule-all/preview")

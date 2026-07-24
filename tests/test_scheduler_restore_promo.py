@@ -206,3 +206,53 @@ async def test_pre_insert_states_normalized_to_transcribing(
             "pre-INSERT states must be normalised"
         )
     assert len(retry_calls) == 4
+
+
+async def test_interrupted_description_update_is_settled_not_resumed(
+    restore_env, monkeypatch
+) -> None:
+    """``updating_desc`` is not a chain step, so it must be settled by the
+    description-update sweep BEFORE the promo-resume query sees it.
+
+    Without that ordering, restore hands 'updating_desc' to retry_promo_step,
+    which rejects the unknown step — and the row stays in a non-terminal state
+    forever, unclaimable by either claim helper and with no repair path in the
+    UI. It must also be settled regardless of age: the resume window doesn't
+    apply, or a row stranded longer than the window stays wedged.
+    """
+    scheduler, auto_actions, db = restore_env
+
+    await db.execute(
+        "INSERT INTO videos (id, project_id, title, status, description, "
+        "                    auto_action_state, item_type, updated_at) "
+        "VALUES ('DESCUPD0001', 1, 'Interrupted', 'ready', 'Old text', "
+        "        'updating_desc', 'hook', datetime('now', '-40 hours'))"
+    )
+    await db.commit()
+
+    retry_calls: list[tuple[str, str]] = []
+
+    async def _fake_retry_promo_step(video_id: str, step: str) -> None:
+        retry_calls.append((video_id, step))
+
+    async def _fake_run_post_create_actions(video_id, project_id, source):
+        pass
+
+    monkeypatch.setattr(auto_actions, "retry_promo_step", _fake_retry_promo_step)
+    monkeypatch.setattr(
+        auto_actions, "run_post_create_actions", _fake_run_post_create_actions
+    )
+    sys.modules["yt_scheduler.services.auto_actions"] = auto_actions  # type: ignore[assignment]
+
+    await scheduler.restore_pending_auto_actions()
+
+    assert retry_calls == [], (
+        "A description update is not a chain step and must never be handed to "
+        f"retry_promo_step; got {retry_calls}"
+    )
+    cursor = await db.execute(
+        "SELECT auto_action_state, description FROM videos WHERE id = 'DESCUPD0001'"
+    )
+    row = await cursor.fetchone()
+    assert row["auto_action_state"] == "failed:updating_desc"
+    assert row["description"] == "Old text"

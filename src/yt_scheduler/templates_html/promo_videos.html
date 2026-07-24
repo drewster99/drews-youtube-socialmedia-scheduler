@@ -12,6 +12,7 @@
     </h1>
     <div style="display:flex; gap:0.5rem;">
         <a class="btn btn-secondary" href="/projects/{{ current_project.slug }}/videos/{{ parent_id }}/promos/generate">Generate from source</a>
+        <button type="button" class="btn btn-secondary" id="update-descriptions-btn">Update all descriptions</button>
         <button type="button" class="btn btn-secondary" id="schedule-all-btn">Schedule all</button>
         <button type="button" class="btn btn-secondary" id="toggle-archived-btn" style="display:none;"></button>
         <label for="add-files-all" class="btn btn-primary" id="add-files-all-label">
@@ -39,7 +40,19 @@
     </form>
 </dialog>
 
+<dialog id="update-descriptions-modal" class="modal modal-wide">
+    <h3>Update all descriptions</h3>
+    <div id="update-descriptions-body">Loading…</div>
+    <form id="update-descriptions-form">
+        <div class="form-actions" style="display:flex; justify-content: space-between; margin-top: 0.75rem;">
+            <button type="button" class="btn btn-secondary" id="update-descriptions-cancel">Cancel</button>
+            <button type="submit" class="btn btn-primary" id="update-descriptions-confirm">Re-generate and push</button>
+        </div>
+    </form>
+</dialog>
+
 <div id="upload-error-banner" class="banner banner-error" style="display:none;"></div>
+<div id="update-descriptions-banner" class="banner" style="display:none;"></div>
 
 <div class="section" id="promo-section-segment">
     <div class="section-header">
@@ -99,8 +112,17 @@ const PROMO_STATE_LABELS = {
     generating_desc: 'Generating description…',
     generating_tags: 'Generating tags…',
     pushing_metadata: 'Pushing metadata to YouTube…',
+    // Standalone "Update all descriptions" run — deliberately not one of
+    // PROMO_STEPS_IN_ORDER (see auto_actions.PROMO_STATE_UPDATING_DESC).
+    updating_desc: 'Updating description…',
     ready: 'Ready',
 };
+
+// The chain's Retry re-enters PROMO_STEPS_IN_ORDER, whose description step
+// skips a row that already has one — so a failed description UPDATE must
+// retry through its own endpoint instead, or "Retry" would push the OLD
+// text to YouTube and report success.
+const DESCRIPTION_UPDATE_STATE = 'updating_desc';
 
 // Step names in order — used for the Retry button (re-runs from the
 // failed step onward). Mirror of services.auto_actions.PROMO_STEP_ORDER.
@@ -159,14 +181,19 @@ function progressStripFor(state, lastError) {
         const failedStep = state.slice('failed:'.length);
         const stepLabel = PROMO_STATE_LABELS[failedStep] || failedStep;
         const errorMsg = lastError ? `<div class="promo-error-msg">${escapeHtml(lastError)}</div>` : '';
+        const retryButton = failedStep === DESCRIPTION_UPDATE_STATE
+            ? `<button class="btn btn-sm btn-secondary promo-retry-btn" data-retry-description="1">
+                   Retry description update
+               </button>`
+            : `<button class="btn btn-sm btn-secondary promo-retry-btn"
+                       data-retry-step="${escapeHtml(failedStep)}">
+                   Retry ${escapeHtml(stepLabel.toLowerCase())}
+               </button>`;
         return `
             <div class="promo-progress promo-progress-failed">
                 Failed at: ${escapeHtml(stepLabel)}
                 ${errorMsg}
-                <button class="btn btn-sm btn-secondary promo-retry-btn"
-                        data-retry-step="${escapeHtml(failedStep)}">
-                    Retry ${escapeHtml(stepLabel.toLowerCase())}
-                </button>
+                ${retryButton}
             </div>`;
     }
     const label = PROMO_STATE_LABELS[state] || state;
@@ -383,6 +410,18 @@ function bindRetryButtons() {
             setTimeout(loadPromos, 1500);
         });
     }
+    for (const btn of document.querySelectorAll('[data-retry-description]')) {
+        btn.addEventListener('click', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const card = btn.closest('[data-child-id]');
+            if (!card) return;
+            const videoId = card.getAttribute('data-child-id');
+            btn.disabled = true;
+            btn.textContent = 'Retrying…';
+            await startDescriptionUpdate({video_ids: [videoId]});
+        });
+    }
     for (const btn of document.querySelectorAll('[data-dismiss-job]')) {
         btn.addEventListener('click', (e) => {
             e.preventDefault();
@@ -592,6 +631,149 @@ function scheduleNextPoll() {
 }
 
 loadPromos().then(scheduleNextPoll);
+
+// --- Update all descriptions -------------------------------------------
+//
+// Re-runs description generation for this episode's promo clips against the
+// CURRENT promo prompt template and pushes each result to YouTube. Per-clip
+// progress rides on the same auto_action_state the cards already render, so
+// there's no second progress system here — just the confirm dialog and a
+// summary banner.
+
+const updateDescriptionsBtn = document.getElementById('update-descriptions-btn');
+const updateDescriptionsModal = document.getElementById('update-descriptions-modal');
+const updateDescriptionsForm = document.getElementById('update-descriptions-form');
+const updateDescriptionsCancel = document.getElementById('update-descriptions-cancel');
+const updateDescriptionsConfirm = document.getElementById('update-descriptions-confirm');
+const updateDescriptionsBody = document.getElementById('update-descriptions-body');
+const updateDescriptionsBanner = document.getElementById('update-descriptions-banner');
+
+const promosBase = `/api/projects/${projectSlug}/videos/${parentId}/promos`;
+
+function showUpdateDescriptionsBanner(html, isError) {
+    updateDescriptionsBanner.className = 'banner ' + (isError ? 'banner-danger' : 'banner-info');
+    updateDescriptionsBanner.innerHTML = html;
+    updateDescriptionsBanner.style.display = '';
+}
+
+// FastAPI puts the message in `detail`; it's a string for our HTTPExceptions
+// but an object for validation errors, so stringify defensively.
+async function errorDetail(resp) {
+    try {
+        const body = await resp.json();
+        const detail = body.detail;
+        if (typeof detail === 'string') return detail;
+        if (detail) return JSON.stringify(detail);
+    } catch (err) { /* non-JSON body falls through */ }
+    return `HTTP ${resp.status}`;
+}
+
+async function startDescriptionUpdate(payload) {
+    let resp;
+    try {
+        resp = await fetch(`${promosBase}/update-descriptions`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload || {}),
+        });
+    } catch (err) {
+        showUpdateDescriptionsBanner(`Could not reach the server: ${escapeHtml(String(err))}`, true);
+        return;
+    }
+    if (!resp.ok) {
+        showUpdateDescriptionsBanner(escapeHtml(await errorDetail(resp)), true);
+        // Re-render so a per-card "Retrying…" button that never started drops
+        // back to its normal state instead of waiting out the poll interval.
+        await loadPromos();
+        return;
+    }
+    const data = await resp.json();
+    const started = (data.started || []).length;
+    const skipped = (data.skipped || []).length;
+    const skippedNote = skipped
+        ? ` ${skipped} clip(s) skipped — see the confirm dialog for why.`
+        : '';
+    showUpdateDescriptionsBanner(
+        `Updating ${started} description(s) — about ${data.quota_units_estimate} ` +
+        `YouTube quota units. Watch each card for progress.${escapeHtml(skippedNote)}`,
+        false);
+    await loadPromos();
+    scheduleNextPoll();
+}
+
+function renderDescriptionUpdatePreview(preview) {
+    const counts = preview.counts || {};
+    const eligible = (preview.eligible || []).length;
+    if (!eligible) {
+        updateDescriptionsConfirm.disabled = true;
+        const reasons = (preview.ineligible || [])
+            .map(c => `<li>${escapeHtml(c.title || c.id)} — ${escapeHtml(c.reason || '')}</li>`)
+            .join('');
+        updateDescriptionsBody.innerHTML =
+            `<p>No clips here can have their description updated right now.</p>` +
+            (reasons ? `<ul>${reasons}</ul>` : '');
+        return;
+    }
+    updateDescriptionsConfirm.disabled = false;
+    const breakdown = ['segment', 'short', 'hook']
+        .filter(t => counts[t])
+        .map(t => `${counts[t]} ${t}${counts[t] === 1 ? '' : 's'}`)
+        .join(', ');
+    const skipped = (preview.ineligible || []);
+    const skippedBlock = skipped.length
+        ? `<details style="margin-top:0.5rem;">
+               <summary>${skipped.length} clip(s) will be skipped</summary>
+               <ul>${skipped.map(c =>
+                   `<li>${escapeHtml(c.title || c.id)} — ${escapeHtml(c.reason || '')}</li>`).join('')}</ul>
+           </details>`
+        : '';
+    updateDescriptionsBody.innerHTML = `
+        <p>Re-generate the description for <strong>${eligible}</strong> promo clip(s)
+           (${escapeHtml(breakdown)}) using the project's current promo description
+           prompt, then push each one to YouTube.</p>
+        <p class="form-hint">
+            Every description is written fresh by Claude, so the <em>whole</em> text
+            changes — not just the links. Already-published clips are updated too.
+        </p>
+        <p class="form-hint">
+            Costs ${eligible} Claude call(s) and about
+            <strong>${preview.quota_units_estimate}</strong> of YouTube's 10,000
+            daily quota units.
+        </p>
+        ${skippedBlock}`;
+}
+
+updateDescriptionsBtn.addEventListener('click', async () => {
+    updateDescriptionsBody.textContent = 'Loading…';
+    updateDescriptionsConfirm.disabled = true;
+    updateDescriptionsModal.showModal();
+    let resp;
+    try {
+        resp = await fetch(`${promosBase}/update-descriptions/preview`);
+    } catch (err) {
+        updateDescriptionsBody.textContent = `Could not reach the server: ${err}`;
+        return;
+    }
+    if (!resp.ok) {
+        updateDescriptionsBody.textContent = await errorDetail(resp);
+        return;
+    }
+    renderDescriptionUpdatePreview(await resp.json());
+});
+
+updateDescriptionsCancel.addEventListener('click', () => updateDescriptionsModal.close());
+
+updateDescriptionsForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    updateDescriptionsConfirm.disabled = true;
+    updateDescriptionsConfirm.textContent = 'Starting…';
+    try {
+        await startDescriptionUpdate({});
+    } finally {
+        updateDescriptionsConfirm.textContent = 'Re-generate and push';
+        updateDescriptionsModal.close();
+    }
+});
 
 // --- Schedule-all modal -------------------------------------------------
 

@@ -1260,6 +1260,18 @@ async def restore_pending_auto_actions() -> None:
     except Exception as exc:
         logger.warning("Could not resume pending promo jobs: %s", exc)
 
+    # Bulk description updates are NOT chain steps and can't be resumed by
+    # retry_promo_step, so they're settled first — before the promo sweep below
+    # selects non-terminal states and would otherwise hand it a step name it
+    # doesn't know, leaving the row wedged in a running state forever.
+    from yt_scheduler.services.auto_actions import (
+        fail_interrupted_description_updates,
+    )
+    try:
+        await fail_interrupted_description_updates()
+    except Exception as exc:
+        logger.warning("Could not settle interrupted description updates: %s", exc)
+
     # Resume Promo Videos chains that were mid-step at shutdown. Same
     # window cap as the standard chain, so an idle box can't burn its
     # OAuth tokens / quota replaying historic chains. Promo state lives

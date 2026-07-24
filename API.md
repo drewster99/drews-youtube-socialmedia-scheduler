@@ -2128,6 +2128,28 @@ Terminal jobs (`done` / `failed`) are evicted from the in-memory job dict 30 min
 
 **Errors** — `400` (empty `accepted`, no usable entries after defensive filtering, parent has no local file, or supplied `job_id` is unknown / expired — the in-memory generate-job dict TTL-evicts 30 minutes past terminal), `404` (project / parent missing). Defensive filter drops entries with non-finite `start_seconds` / `end_seconds`, wrong kind, end before start, range outside parent bounds, or empty title.
 
+### `GET /api/projects/{slug}/videos/{parent_id}/promos/update-descriptions/preview`
+
+**Purpose** — Dry run for the "Update all descriptions" confirm dialog: which promo clips under this parent would have their description re-generated, which would be skipped and why, and what it costs.
+
+**Query params** — `tiers` (optional): comma-separated subset of `hook|short|segment`.
+
+**Response 200** — `{"eligible": [{"id","title","item_type","status"}, ...], "ineligible": [{..., "reason": "..."}, ...], "counts": {"segment": N, "short": N, "hook": N}, "quota_units_estimate": N}`. A clip is ineligible when it has no YouTube video (non-11-char id), its YouTube video is deleted, it has no usable transcript to describe from, or a background chain currently owns the row. `quota_units_estimate` is `len(eligible) × 51` — `videos.list` (1) to read the live snippet plus `videos.update` (50).
+
+**Errors** — `404` (project / parent missing), `400` (parent is itself a child, or an unknown tier in `tiers`).
+
+### `POST /api/projects/{slug}/videos/{parent_id}/promos/update-descriptions`
+
+**Purpose** — Re-generate the description for this parent's promo clips against the **current** promo description prompt template and push each result to YouTube. This is the "I edited the prompt, now bring the back catalogue in line" path; it deliberately overrides the chain's "already has a description" short-circuit.
+
+**Request body** (all optional) — `{"tiers": ["hook", "short"], "video_ids": ["<id>", ...]}`. `video_ids` narrows the run to specific clips (used by the per-card "Retry description update"); every id must appear in the eligible set or the whole request is rejected.
+
+**Response 202** — `{"started": [{"id","title","item_type","status"}, ...], "skipped": [{..., "reason"}, ...], "quota_units_estimate": N}`. Work is detached; per-clip progress lands in `videos.auto_action_state` as `updating_desc` → `ready`, or `failed:updating_desc` with the real error in `auto_action_last_error`.
+
+**Errors** — `404` (project / parent missing), `400` (parent is itself a child, unknown tier, empty/ineligible `video_ids`, or nothing eligible under this parent), `409` (every eligible clip was claimed by another job between the scan and the claim).
+
+**Side effects** — Per clip, in this order: one Claude call (the `description_from_transcript_prompt_promo` variant chain), then a `youtube.update_video_metadata` call carrying **only** the description, then the write to `videos.description` + `description_generated_at` and a `metadata_updated` event. Push-before-persist matches [`apply-description`](#post-apivideosvideo_idapply-description): a failed push must not leave the row claiming YouTube holds text it never received, which for an already-published clip nothing would ever reconcile. Title and tags are left as YouTube currently holds them, so an edit made on YouTube isn't clobbered. Generation is refused (per clip) rather than falling back to keyframes when the transcript is unusable, because the frames prompt is a different template and would silently drop whatever the transcript prompt requires. Concurrency is bounded by the shared promo-chain semaphore (4); the first clip to hit a YouTube quota error stops the batch and the remaining clips fail with that explanation.
+
 ### `POST /api/projects/{slug}/videos/{parent_id}/promos/schedule-all/preview`
 
 **Purpose** — Dry-run for the review modal. Computes per-tier independent schedule chains anchored to the parent's `publish_at` (or `parent_publish_at` when the parent isn't scheduled yet, or now when the parent is already published).
