@@ -110,6 +110,17 @@
     </div>
 </div>
 
+<!-- Missed is derived from scheduled_at being in the past, computed on load.
+     There is no sweeper and no stored flag, so this is always accurate. -->
+<div class="section" id="sq-missed-section" style="display:none;">
+    <h2>Didn't go out</h2>
+    <p class="form-hint">
+        These were scheduled but never posted. Nothing is retried automatically —
+        pick what should happen to each.
+    </p>
+    <div id="sq-missed-list"></div>
+</div>
+
 <div class="section">
     <h2>Selection</h2>
     <div style="display:flex; gap:0.5rem; align-items:center;">
@@ -487,10 +498,75 @@ document.getElementById('sq-delete-btn').addEventListener('click', async () => {
     }
 });
 
+async function loadMissed() {
+    if (!queueId) return;
+    try {
+        const data = await apiCall(
+            `/api/projects/${projectSlug}/smart-queues/${queueId}/missed`
+        );
+        const missed = data.missed || [];
+        document.getElementById('sq-missed-section').style.display =
+            missed.length ? '' : 'none';
+        document.getElementById('sq-missed-list').innerHTML = missed.map(row => {
+            const when = row.scheduled_at
+                ? new Date(row.scheduled_at).toLocaleString(undefined,
+                    {weekday:'short', month:'numeric', day:'numeric',
+                     hour:'numeric', minute:'2-digit'})
+                : 'unscheduled';
+            // Within the post-late window, posting now is the expected action
+            // rather than an override — say so instead of leaving it ambiguous.
+            const grace = row.within_grace
+                ? '<span class="form-hint"> (still inside the post-late window)</span>'
+                : '';
+            return `<div style="display:flex; gap:0.6rem; align-items:center; padding:0.25rem 0; flex-wrap:wrap;">
+                <span style="color: var(--text-dim); min-width:11rem;">${escapeHtml(when)}</span>
+                <span style="min-width:5rem;">${escapeHtml(row.platform)}</span>
+                <span>${escapeHtml(row.title)}</span>
+                <span style="color: var(--danger);">${escapeHtml(row.missed_reason)}</span>${grace}
+                <span style="margin-left:auto; display:flex; gap:0.35rem;">
+                    <button class="btn btn-sm sq-dispose" data-post="${row.post_id}" data-action="post_now">Post now</button>
+                    <button class="btn btn-sm sq-dispose" data-post="${row.post_id}" data-action="reschedule_end">Move to end</button>
+                    <button class="btn btn-sm sq-dispose" data-post="${row.post_id}" data-action="remove">Remove</button>
+                </span>
+            </div>`;
+        }).join('');
+    } catch (err) {
+        showError(err.message);
+    }
+}
+
+document.getElementById('sq-missed-list').addEventListener('click', async (event) => {
+    const button = event.target.closest('.sq-dispose');
+    if (!button) return;
+    const action = button.dataset.action;
+    if (action === 'remove' &&
+        !confirm('Remove this from the queue? The video becomes eligible to add again later.')) return;
+    button.disabled = true;
+    showError('');
+    try {
+        const result = await apiCall(
+            `/api/projects/${projectSlug}/smart-queues/${queueId}/missed/${button.dataset.post}`,
+            {method: 'POST', headers: {'Content-Type': 'application/json'},
+             body: JSON.stringify({action})}
+        );
+        // Post-now can come back having failed for the original reason; that
+        // is a result, not an exception, and the user needs to see it.
+        if (result.status && result.status !== 'posted' && result.error) {
+            showError(`Still couldn't post: ${result.error}`);
+        }
+        await loadMissed();
+    } catch (err) {
+        showError(err.message);
+    } finally {
+        button.disabled = false;
+    }
+});
+
 (async function init() {
     try {
         await loadTemplates();
         await loadQueue();
+        await loadMissed();
     } catch (err) {
         showError(err.message);
     }

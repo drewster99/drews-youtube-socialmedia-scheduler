@@ -2243,6 +2243,26 @@ A render failure is scoped to its own slot: the other platforms still schedule. 
 
 Order and rendered text are preserved; only *when* each item goes out moves. The UI calls this when the user answers yes to "re-flow existing scheduled postings?" — answering no simply doesn't call it, so the new times apply to items added from then on and what is already on the books stays put. Posted and in-flight posts are never re-stamped.
 
+### `GET /api/projects/{slug}/smart-queues/{queue_id}/missed`
+
+**Purpose** — Posts this queue owns that didn't go out and need a decision.
+
+**Response 200** — `{"missed": [{"post_id", "platform", "status", "scheduled_at", "error", "item_id", "video_id", "title", "missed_reason", "within_grace"}], "missed_policy": ..., "missed_grace_hours": ...}`.
+
+**Missed is derived, not stored** — a post whose `scheduled_at` is in the past and which hasn't been sent. There is no `missed` flag and no background sweeper, so the state can't go stale and nothing has to keep it up to date. A `failed` post is included regardless of time: from the user's point of view "it didn't go out and needs a decision" is the same situation.
+
+`skipped` rows are excluded — a skip was a decision, not a failure, so it needs no disposition. `within_grace` reports whether the queue's post-late window still covers the row, so the UI can present "post now" as the expected action rather than an override.
+
+### `POST /api/projects/{slug}/smart-queues/{queue_id}/missed/{post_id}`
+
+**Body** — `action`: `post_now` | `reschedule_end` | `remove`.
+
+Acts per **post**, not per queue item: one platform failing shouldn't drag the others with it, and the right answer can differ per platform.
+
+* `post_now` — returns a `failed` row to `approved` (the send path's claim only takes `approved`) and sends through the **ordinary** send path, so the same duplicate check, liveness check, and media preparation apply. **Response** carries `status`/`error`/`post_url`: a send that fails again is a result, not an exception, and is reported rather than raised.
+* `reschedule_end` — moves the item behind everything else at the next free posting time, and re-registers its trigger.
+* `remove` — cancels the trigger and marks the item `removed`. Since `removed` is neither `scheduled` nor `posted`, the standing filters stop excluding that video, so it becomes eligible to add again — via Auto-select + Accept, never automatically (its auto-add marker is already spent).
+
 ### `GET /api/projects/{slug}/smart-queues/{queue_id}/activity`
 
 **Query** — `limit` (default 10) per list.

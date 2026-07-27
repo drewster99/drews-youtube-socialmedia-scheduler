@@ -17,6 +17,7 @@ from yt_scheduler.database import get_db
 from yt_scheduler.services import projects as project_service
 from yt_scheduler.services import smart_queue as smart_queue_service
 from yt_scheduler.services import smart_queue_accept
+from yt_scheduler.services import smart_queue_disposition
 from yt_scheduler.services.smart_queue import SmartQueueError
 
 logger = logging.getLogger(__name__)
@@ -264,6 +265,49 @@ async def _default_ai_system(project_id: int) -> str:
         "ai_block_default_system_prompt", project_id=project_id
     )
     return resolved["system"]
+
+
+@router.get("/{queue_id}/missed")
+async def list_missed(slug: str, queue_id: int):
+    """Posts this queue owns that didn't go out and need a decision.
+
+    Derived at read time from ``scheduled_at`` being in the past — there is no
+    stored "missed" flag and no background sweeper, so this is always accurate
+    without anything keeping it up to date.
+
+    ``within_grace`` says whether the queue's post-late window still covers it,
+    so the UI can present "post now" as the expected action rather than an
+    override.
+    """
+    queue = await _queue_in_project_or_404(slug, queue_id)
+    items = await smart_queue_disposition.missed_items(queue_id)
+    for item in items:
+        item["within_grace"] = await smart_queue_disposition.within_grace(
+            queue, item["scheduled_at"]
+        )
+    return {
+        "missed": items,
+        "missed_policy": queue["missed_policy"],
+        "missed_grace_hours": queue["missed_grace_hours"],
+    }
+
+
+@router.post("/{queue_id}/missed/{post_id}")
+async def dispose_missed(slug: str, queue_id: int, post_id: int, data: dict):
+    """Act on one missed post.
+
+    **Body** — ``action``: ``post_now`` | ``reschedule_end`` | ``remove``.
+
+    Per post, not per queue item: one platform failing shouldn't drag the
+    others with it, and the right answer can differ per platform.
+    """
+    await _queue_in_project_or_404(slug, queue_id)
+    try:
+        return await smart_queue_disposition.dispose(
+            queue_id, post_id, (data or {}).get("action") or ""
+        )
+    except SmartQueueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @router.get("/{queue_id}/activity")
