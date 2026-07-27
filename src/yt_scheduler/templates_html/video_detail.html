@@ -1267,6 +1267,12 @@ function renderEvent(ev) {
             // section is scrolled off-screen on a long detail page.
             return `${ts} <span style="color: var(--danger);">Social post failed — YouTube video is ${escapeHtml(priv)}, not public [${escapeHtml(platform)}] <a href="#" class="event-failed-post-link" data-platform="${escapeHtml(platform)}" style="margin-left: 0.4rem;">Find the post →</a></span>`;
         }
+        case 'social_post_recovery_refused': {
+            const platform = ev.payload?.platform || 'social';
+            const count = ev.payload?.overdue_count ?? '?';
+            const limit = ev.payload?.limit ?? '?';
+            return `${ts} <span style="color: var(--danger);">Social post not sent — ${escapeHtml(String(count))} posts were overdue at startup (limit ${escapeHtml(String(limit))}), so automatic recovery was refused [${escapeHtml(platform)}] <a href="#" class="event-failed-post-link" data-platform="${escapeHtml(platform)}" style="margin-left: 0.4rem;">Find the post →</a></span>`;
+        }
         case 'credential_invalid': {
             const scope = ev.payload?.scope || 'account';
             const label = ev.payload?.account_label || (scope === 'youtube' ? 'YouTube' : 'social');

@@ -785,9 +785,62 @@ async def cancel_scheduled_post(post_id: int) -> bool:
 
 _MISSED_POST_STAGGER_SECONDS = 5
 
+# Above this many overdue posts at startup, recovery is refused outright
+# instead of fired. A machine that slept for a week comes back with a backlog
+# whose only sane resolution is a human deciding what is still worth posting —
+# auto-sending dozens of stale posts seconds apart is indistinguishable from
+# spam, and no per-post retry can undo it after the fact.
+_MAX_MISSED_POST_AUTO_RECOVERY = 10
+
+
+async def _refuse_missed_post_recovery(overdue: list[dict]) -> None:
+    """Mark every overdue post failed rather than sending it.
+
+    Clears the scheduling columns so a later restart's restore pass can't
+    resurrect them — the same guard :func:`_fail_render_error_post` applies.
+    Each post stays individually re-sendable from its card in the UI, which
+    is the point: the user decides what is still worth posting.
+    """
+    reason = (
+        f"not sent — {len(overdue)} scheduled posts were already overdue when "
+        f"the server started, over the limit of {_MAX_MISSED_POST_AUTO_RECOVERY}. "
+        "Automatic recovery was refused so a backlog couldn't post itself all "
+        "at once. Send this manually if it's still worth posting."
+    )
+    async with write_transaction() as db:
+        for row in overdue:
+            await db.execute(
+                "UPDATE social_posts SET status = 'failed', error = ?, "
+                "scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
+                (reason, row["id"]),
+            )
+    logger.error(
+        "Refused automatic recovery of %d overdue social post(s) (limit %d); "
+        "each is marked failed and can be sent manually",
+        len(overdue), _MAX_MISSED_POST_AUTO_RECOVERY,
+    )
+    # Recorded outside the transaction above: record_event opens its own.
+    for row in overdue:
+        await events.record_event(
+            row["video_id"],
+            "social_post_recovery_refused",
+            {
+                "platform": row["platform"],
+                "post_id": row["id"],
+                "overdue_count": len(overdue),
+                "limit": _MAX_MISSED_POST_AUTO_RECOVERY,
+            },
+        )
+
 
 async def restore_scheduled_posts() -> None:
-    """Re-register pending per-post jobs after a server restart."""
+    """Re-register pending per-post jobs after a server restart.
+
+    Posts still in the future are re-registered as-is. Posts whose window
+    passed while the process was down are recovered immediately — unless
+    there are more than :data:`_MAX_MISSED_POST_AUTO_RECOVERY` of them, in
+    which case none are sent and all are marked failed for manual triage.
+    """
     # On a fresh process nothing is sending yet, so any post still marked
     # 'sending' was stranded by a crash/kill mid-send. Reset it to 'approved'
     # so it can be re-claimed and retried — otherwise both publish_video_job
@@ -804,11 +857,16 @@ async def restore_scheduled_posts() -> None:
         )
 
     rows = await db.execute_fetchall(
-        "SELECT id, scheduled_at FROM social_posts "
+        "SELECT id, video_id, platform, scheduled_at FROM social_posts "
         "WHERE scheduled_at IS NOT NULL AND status != 'posted'"
     )
     now = datetime.now(timezone.utc)
-    missed_index = 0
+
+    # Classify every row before acting on any: the overdue count decides
+    # whether ANY overdue post may be recovered, so nothing can be sent
+    # until the whole backlog is known.
+    upcoming: list[tuple[int, datetime]] = []
+    overdue: list[dict] = []
     for row in rows:
         when = _parse_iso_datetime(row["scheduled_at"])
         if when is None:
@@ -817,32 +875,44 @@ async def restore_scheduled_posts() -> None:
                 "scheduled_at %r", row["id"], row["scheduled_at"],
             )
             continue
+        if when > now:
+            upcoming.append((int(row["id"]), when))
+        else:
+            overdue.append(dict(row))
+
+    for post_id, when in upcoming:
         try:
-            if when > now:
-                await schedule_social_post(int(row["id"]), when)
-            else:
-                # Missed window — schedule an immediate, staggered recovery job
-                # rather than awaiting inline. Mirrors the missed-publish path:
-                # startup completes without waiting on platform I/O, and one
-                # hung send can't block the others or the rest of restore.
-                run_at = now + timedelta(
-                    seconds=missed_index * _MISSED_POST_STAGGER_SECONDS
-                )
-                missed_index += 1
-                scheduler.add_job(
-                    _send_scheduled_post,
-                    "date",
-                    run_date=run_at,
-                    args=[int(row["id"])],
-                    id=f"missed_social_post_{row['id']}",
-                    replace_existing=True,
-                    misfire_grace_time=300,
-                    coalesce=True,
-                )
-                logger.warning(
-                    "Missed post window for %s, scheduled recovery job at %s",
-                    row["id"], run_at.isoformat(),
-                )
+            await schedule_social_post(post_id, when)
+        except Exception as exc:
+            logger.error("Failed to restore scheduled post %s: %s", post_id, exc)
+
+    if len(overdue) > _MAX_MISSED_POST_AUTO_RECOVERY:
+        await _refuse_missed_post_recovery(overdue)
+        return
+
+    for missed_index, row in enumerate(overdue):
+        try:
+            # Missed window — schedule an immediate, staggered recovery job
+            # rather than awaiting inline. Mirrors the missed-publish path:
+            # startup completes without waiting on platform I/O, and one
+            # hung send can't block the others or the rest of restore.
+            run_at = now + timedelta(
+                seconds=missed_index * _MISSED_POST_STAGGER_SECONDS
+            )
+            scheduler.add_job(
+                _send_scheduled_post,
+                "date",
+                run_date=run_at,
+                args=[int(row["id"])],
+                id=f"missed_social_post_{row['id']}",
+                replace_existing=True,
+                misfire_grace_time=300,
+                coalesce=True,
+            )
+            logger.warning(
+                "Missed post window for %s, scheduled recovery job at %s",
+                row["id"], run_at.isoformat(),
+            )
         except Exception as exc:
             logger.error("Failed to restore scheduled post %s: %s", row["id"], exc)
 

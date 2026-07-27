@@ -15,6 +15,9 @@ through ``record_event``. The payload shape is event-type specific:
                                  "scheduled_at": iso, "text": str}``
 * ``social_post_published`` — ``{"platform": str, "social_account_id": int | null,
                                  "post_url": str, "posted_at": iso}``
+* ``social_post_recovery_refused``
+                            — ``{"platform": str, "post_id": int,
+                                 "overdue_count": int, "limit": int}``
 """
 
 from __future__ import annotations
