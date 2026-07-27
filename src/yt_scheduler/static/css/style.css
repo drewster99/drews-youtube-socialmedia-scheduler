@@ -334,6 +334,85 @@ body {
 
 .form-row .flex-2 { flex: 2; }
 
+/* Settings-form row: one caption in a fixed column, its controls and any
+ * trailing hint on the same line.
+ *
+ * Distinct from .form-row, which lays out several stacked caption-above-input
+ * groups side by side — its `.form-row label` rule turns every label into a
+ * column, which silently puts a checkbox and its own text on separate lines.
+ * The two shapes want opposite things from a <label>, so they get separate
+ * classes rather than one class with exceptions. */
+.field-row {
+    display: grid;
+    grid-template-columns: var(--field-label-width, 11rem) minmax(0, 1fr);
+    gap: 0.35rem 1rem;
+    /* Baseline, not center: the caption lines up with the text inside the
+     * control rather than with the middle of its box, and stays put when the
+     * control column wraps onto a second line. */
+    align-items: baseline;
+    margin-bottom: 0.85rem;
+}
+
+.field-row > .field-label {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    line-height: 1.45;
+}
+
+/* Everything that is not the caption shares one wrapping flex line, so a row
+ * can hold a control plus its hint without a third grid column. */
+.field-control {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem 0.75rem;
+    min-width: 0;
+}
+
+.field-control > .form-hint { margin: 0; }
+
+/* Same treatment as .form-group's controls, sized for sitting inline next to a
+ * caption. Without this the controls are browser defaults, which follow the
+ * system appearance rather than the app's. */
+.field-control input:not([type="checkbox"]):not([type="radio"]),
+.field-control select {
+    padding: 0.4rem 0.5rem;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-size: 0.9rem;
+    font-family: inherit;
+}
+
+.field-control input:not([type="checkbox"]):not([type="radio"]):focus,
+.field-control select:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.field-row > .field-control input[type="text"] { min-width: 18rem; }
+
+/* Checkbox glued to its own caption. inline-flex keeps the box and the text on
+ * one line no matter what the surrounding layout does. */
+.field-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.9rem;
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+.field-check input[type="checkbox"] { margin: 0; flex: none; }
+
+@media (max-width: 700px) {
+    .field-row {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 0.25rem;
+    }
+}
+
 .form-actions {
     display: flex;
     gap: 0.75rem;

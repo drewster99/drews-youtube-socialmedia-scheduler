@@ -185,6 +185,17 @@ async def test_config_page_renders(client):
         assert "Smart schedule" in response.text
 
 
+async def test_config_page_does_not_use_the_stacking_row_class(client):
+    """`.form-row label` is `flex-direction: column` — it exists for the
+    caption-above-input shape other screens use. This screen's rows are
+    caption-beside-control, so borrowing that class put every checkbox on a
+    different line from its own text."""
+    http, _db, _template_id = client
+    body = (await http.get("/projects/default/smart-queues/new")).text
+    assert 'class="form-row"' not in body
+    assert body.count('class="field-check"') == 5, "every checkbox needs it"
+
+
 async def test_forecast_starts_after_the_existing_schedule(client):
     """The forecast must predict what Accept will actually do.
 
@@ -296,3 +307,224 @@ async def test_candidates_reports_the_waiting_count(client):
 
     assert body["waiting"] == 1
     assert body["eligible"] == [], "a queued video is in the queue, not a candidate"
+
+
+async def test_counts_report_posting_from_the_posts_not_the_item_state(client):
+    """The dashboard chip read `smart_queue_items.state`, but sending only ever
+    updates `social_posts.status` — nothing writes 'posted' to the item. So a
+    queue whose video had gone out still read "48 scheduled · 0 posted", right
+    above a Recent list showing the post.
+    """
+    http, db, template_id = client
+    for video_id in ("sent", "waiting"):
+        await db.execute(
+            "INSERT INTO videos (id, project_id, title, item_type, "
+            "duration_seconds, privacy_status, width, height) "
+            "VALUES (?, 1, 'A clip', 'hook', 60, 'public', 1080, 1920)",
+            (video_id,),
+        )
+    await db.commit()
+    created = await http.post(
+        "/api/projects/default/smart-queues", json=_payload(template_id)
+    )
+    queue_id = created.json()["id"]
+
+    # Both items stay 'scheduled' — that is exactly what the real code leaves
+    # behind after one of them has posted.
+    for position, video_id in enumerate(("sent", "waiting")):
+        cursor = await db.execute(
+            "INSERT INTO smart_queue_items (queue_id, video_id, position, "
+            "scheduled_at, state) VALUES (?, ?, ?, '2026-01-01T09:00:00+00:00', "
+            "'scheduled')",
+            (queue_id, video_id, position),
+        )
+        await db.execute(
+            "INSERT INTO social_posts (video_id, platform, content, status, "
+            "smart_queue_item_id) VALUES (?, 'bluesky', 'x', ?, ?)",
+            (video_id, "posted" if video_id == "sent" else "approved",
+             int(cursor.lastrowid)),
+        )
+    await db.commit()
+
+    listed = await http.get("/api/projects/default/smart-queues")
+    counts = listed.json()["queues"][0]["counts"]
+
+    assert counts.get("posted") == 1, f"a sent post must count as posted: {counts}"
+    assert counts.get("scheduled") == 1, f"only the unsent one is pending: {counts}"
+
+
+async def test_reflow_leaves_already_sent_items_alone(client, monkeypatch):
+    """Re-flow re-stamps pending items onto the new posting times. It selected
+    on `state = 'scheduled'`, but sending never moves an item off that state —
+    so a video that had already gone out was handed a fresh future occurrence,
+    pushing every remaining video back one slot on every re-flow.
+    """
+    import importlib
+
+    http, db, template_id = client
+    scheduler = importlib.import_module("yt_scheduler.services.scheduler")
+
+    async def noop(post_id, when):
+        return None
+
+    monkeypatch.setattr(scheduler, "schedule_social_post", noop)
+
+    for video_id in ("sent", "pending"):
+        await db.execute(
+            "INSERT INTO videos (id, project_id, title, item_type, "
+            "duration_seconds, privacy_status, width, height) "
+            "VALUES (?, 1, 'A clip', 'hook', 60, 'public', 1080, 1920)",
+            (video_id,),
+        )
+    await db.commit()
+    created = await http.post(
+        "/api/projects/default/smart-queues", json=_payload(template_id)
+    )
+    queue_id = created.json()["id"]
+
+    was = "2020-01-06T09:00:00+00:00"
+    item_ids = {}
+    for position, video_id in enumerate(("sent", "pending")):
+        cursor = await db.execute(
+            "INSERT INTO smart_queue_items (queue_id, video_id, position, "
+            "scheduled_at, state) VALUES (?, ?, ?, ?, 'scheduled')",
+            (queue_id, video_id, position, was),
+        )
+        item_ids[video_id] = int(cursor.lastrowid)
+        await db.execute(
+            "INSERT INTO social_posts (video_id, platform, content, status, "
+            "smart_queue_item_id) VALUES (?, 'bluesky', 'x', ?, ?)",
+            (video_id, "posted" if video_id == "sent" else "approved",
+             item_ids[video_id]),
+        )
+    await db.commit()
+
+    response = await http.post(
+        f"/api/projects/default/smart-queues/{queue_id}/re-flow"
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["reflowed"] == 1, "only the unsent item moves"
+
+    rows = {
+        r["video_id"]: r["scheduled_at"]
+        for r in await db.execute_fetchall(
+            "SELECT video_id, scheduled_at FROM smart_queue_items"
+        )
+    }
+    assert rows["sent"] == was, "an already-posted video must not be re-dated"
+    assert rows["pending"] != was, "the unsent one moves onto the new times"
+
+
+async def test_reflow_uses_todays_slot_when_it_is_still_ahead(client, monkeypatch):
+    """Deleting Mon 6:00pm and adding Mon 6:14pm at 6:11pm must schedule the
+    next video for 6:14pm *today* — the slot had not passed.
+
+    It went to the following week instead. The already-posted video was still
+    state='scheduled', so it was re-flowed too and took today's occurrence,
+    leaving the first genuinely pending video a week out. The symptom reads as
+    "re-flow skipped today"; the cause is that a sent item was re-dated at all.
+    """
+    import importlib
+    from datetime import datetime, timedelta, timezone
+
+    http, db, template_id = client
+    scheduler = importlib.import_module("yt_scheduler.services.scheduler")
+
+    async def noop(post_id, when):
+        return None
+
+    monkeypatch.setattr(scheduler, "schedule_social_post", noop)
+
+    # A slot two minutes out — unambiguously still ahead, and derived from that
+    # instant so it can't straddle midnight into a different weekday.
+    soon = datetime.now(timezone.utc) + timedelta(minutes=2)
+    created = await http.post(
+        "/api/projects/default/smart-queues",
+        json=_payload(
+            template_id,
+            timezone="UTC",
+            slots=[{"weekday": soon.weekday(), "time_of_day": soon.strftime("%H:%M")}],
+        ),
+    )
+    queue_id = created.json()["id"]
+
+    for video_id in ("sent", "next-up"):
+        await db.execute(
+            "INSERT INTO videos (id, project_id, title, item_type, "
+            "duration_seconds, privacy_status, width, height) "
+            "VALUES (?, 1, 'A clip', 'hook', 60, 'public', 1080, 1920)",
+            (video_id,),
+        )
+    for position, video_id in enumerate(("sent", "next-up")):
+        cursor = await db.execute(
+            "INSERT INTO smart_queue_items (queue_id, video_id, position, "
+            "scheduled_at, state) VALUES (?, ?, ?, '2020-01-06T09:00:00+00:00', "
+            "'scheduled')",
+            (queue_id, video_id, position),
+        )
+        await db.execute(
+            "INSERT INTO social_posts (video_id, platform, content, status, "
+            "smart_queue_item_id) VALUES (?, 'bluesky', 'x', ?, ?)",
+            (video_id, "posted" if video_id == "sent" else "approved",
+             int(cursor.lastrowid)),
+        )
+    await db.commit()
+
+    await http.post(f"/api/projects/default/smart-queues/{queue_id}/re-flow")
+
+    rows = {
+        r["video_id"]: r["scheduled_at"]
+        for r in await db.execute_fetchall(
+            "SELECT video_id, scheduled_at FROM smart_queue_items"
+        )
+    }
+    scheduled = datetime.fromisoformat(rows["next-up"])
+    assert scheduled.date() == soon.date() and scheduled.hour == soon.hour, (
+        f"next video went to {rows['next-up']}, but the {soon:%H:%M} slot today "
+        "had not passed yet"
+    )
+
+
+async def test_items_report_whether_they_have_gone_out(client):
+    """The Upcoming list on the config screen asks this endpoint what is still
+    coming. Filtering on `state` alone showed a video that had already posted
+    as upcoming, because sending never moves the item off 'scheduled'.
+    """
+    http, db, template_id = client
+    for video_id in ("sent", "pending"):
+        await db.execute(
+            "INSERT INTO videos (id, project_id, title, item_type, "
+            "duration_seconds, privacy_status, width, height) "
+            "VALUES (?, 1, 'A clip', 'hook', 60, 'public', 1080, 1920)",
+            (video_id,),
+        )
+    await db.commit()
+    created = await http.post(
+        "/api/projects/default/smart-queues", json=_payload(template_id)
+    )
+    queue_id = created.json()["id"]
+    for position, video_id in enumerate(("sent", "pending")):
+        cursor = await db.execute(
+            "INSERT INTO smart_queue_items (queue_id, video_id, position, "
+            "scheduled_at, state) VALUES (?, ?, ?, '2026-01-01T09:00:00+00:00', "
+            "'scheduled')",
+            (queue_id, video_id, position),
+        )
+        await db.execute(
+            "INSERT INTO social_posts (video_id, platform, content, status, "
+            "smart_queue_item_id) VALUES (?, 'bluesky', 'x', ?, ?)",
+            (video_id, "posted" if video_id == "sent" else "approved",
+             int(cursor.lastrowid)),
+        )
+    await db.commit()
+
+    items = (await http.get(
+        f"/api/projects/default/smart-queues/{queue_id}/items"
+    )).json()["items"]
+    by_video = {item["video_id"]: item for item in items}
+
+    assert by_video["sent"]["state"] == "scheduled", (
+        "precondition: sending does not move the item's state"
+    )
+    assert by_video["sent"]["has_posted"] == 1
+    assert by_video["pending"]["has_posted"] == 0

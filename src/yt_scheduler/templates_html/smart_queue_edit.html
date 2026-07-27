@@ -15,28 +15,35 @@
 </div>
 
 <div id="sq-error" class="error-banner" style="display:none;"></div>
+<p class="form-hint" id="sq-busy-note" style="display:none;"></p>
 
 <div class="section">
     <h2>Settings</h2>
-    <div class="form-row">
-        <label for="sq-name">Name</label>
-        <input type="text" id="sq-name" placeholder="Daily clips">
+    <div class="field-row">
+        <label class="field-label" for="sq-name">Name</label>
+        <div class="field-control">
+            <input type="text" id="sq-name" placeholder="Daily clips">
+        </div>
     </div>
-    <div class="form-row">
-        <label for="sq-template">Template</label>
-        <select id="sq-template"></select>
-        <p class="form-hint" id="sq-template-hint">
-            The template decides which video types this queue can post — the queue
-            can't widen it.
-        </p>
+    <div class="field-row">
+        <label class="field-label" for="sq-template">Template</label>
+        <div class="field-control">
+            <select id="sq-template"></select>
+            <p class="form-hint" id="sq-template-hint">
+                The template decides which video types this queue can post — the
+                queue can't widen it.
+            </p>
+        </div>
     </div>
-    <div class="form-row">
-        <label for="sq-timezone">Time zone</label>
-        <input type="text" id="sq-timezone" placeholder="America/Los_Angeles">
-        <p class="form-hint">
-            Posting times are wall-clock in this zone, so they stay put across
-            daylight-saving changes.
-        </p>
+    <div class="field-row">
+        <label class="field-label" for="sq-timezone">Time zone</label>
+        <div class="field-control">
+            <input type="text" id="sq-timezone" placeholder="America/Los_Angeles">
+            <p class="form-hint">
+                Posting times are wall-clock in this zone, so they stay put across
+                daylight-saving changes.
+            </p>
+        </div>
     </div>
 </div>
 
@@ -46,7 +53,7 @@
         One video goes out at each time. Any number per day, including none.
     </p>
     <div id="sq-slots"></div>
-    <div style="margin-top:0.5rem; display:flex; gap:0.5rem; align-items:center;">
+    <div class="field-control" style="margin-top:0.5rem;">
         <select id="sq-new-weekday">
             <option value="0">Monday</option>
             <option value="1">Tuesday</option>
@@ -63,42 +70,48 @@
 
 <div class="section">
     <h2>Which videos</h2>
-    <div class="form-row">
-        <label>Length</label>
-        <span>
-            between
-            <input type="number" id="sq-min-duration" min="0" step="1" value="0" style="width:6rem;"> and
-            <input type="number" id="sq-max-duration" min="1" step="1" value="180" style="width:6rem;"> seconds
-        </span>
+    <div class="field-row">
+        <span class="field-label">Length</span>
+        <div class="field-control">
+            <span>between</span>
+            <input type="number" id="sq-min-duration" min="0" step="1" value="0" style="width:6rem;">
+            <span>and</span>
+            <input type="number" id="sq-max-duration" min="1" step="1" value="180" style="width:6rem;">
+            <span>seconds</span>
+        </div>
     </div>
-    <div class="form-row">
-        <label>Orientation</label>
-        <span id="sq-orientations">
-            <label><input type="checkbox" value="portrait" checked> Portrait</label>
-            <label><input type="checkbox" value="square" checked> Square</label>
-            <label><input type="checkbox" value="landscape"> Landscape</label>
-        </span>
+    <div class="field-row">
+        <span class="field-label">Orientation</span>
+        <div class="field-control" id="sq-orientations">
+            <label class="field-check"><input type="checkbox" value="portrait" checked> Portrait</label>
+            <label class="field-check"><input type="checkbox" value="square" checked> Square</label>
+            <label class="field-check"><input type="checkbox" value="landscape"> Landscape</label>
+        </div>
     </div>
-    <div class="form-row">
-        <label>Already posted</label>
-        <label>
-            <input type="checkbox" id="sq-exclude-posted" checked>
-            Exclude videos already posted by this queue
-        </label>
-        <p class="form-hint">
-            Uncheck to re-post the back catalogue once this queue runs dry.
-        </p>
+    <div class="field-row">
+        <span class="field-label">Already posted</span>
+        <div class="field-control">
+            <label class="field-check">
+                <input type="checkbox" id="sq-exclude-posted" checked>
+                Exclude videos already posted by this queue
+            </label>
+            <p class="form-hint">
+                Uncheck to re-post the back catalogue once this queue runs dry.
+            </p>
+        </div>
     </div>
-    <div class="form-row">
-        <label>New videos</label>
-        <label>
-            <input type="checkbox" id="sq-auto-add" checked>
-            Automatically add eligible videos to this queue as they go live
-        </label>
+    <div class="field-row">
+        <span class="field-label">New videos</span>
+        <div class="field-control">
+            <label class="field-check">
+                <input type="checkbox" id="sq-auto-add" checked>
+                Automatically add eligible videos to this queue as they go live
+            </label>
+        </div>
     </div>
-    <div class="form-row">
-        <label for="sq-missed-policy">If a posting time is missed</label>
-        <span>
+    <div class="field-row">
+        <label class="field-label" for="sq-missed-policy">If a posting time is missed</label>
+        <div class="field-control">
             <select id="sq-missed-policy">
                 <option value="post_late">Post late, if within</option>
                 <option value="reschedule_end">Move to the end of the queue</option>
@@ -106,8 +119,18 @@
             </select>
             <input type="number" id="sq-missed-hours" min="1" value="24" style="width:5rem;">
             <span id="sq-missed-hours-label">hours</span>
-        </span>
+        </div>
     </div>
+</div>
+
+<!-- What the queue is actually holding. The Selection section below shows a
+     *forecast* for videos not yet accepted; this shows the committed schedule,
+     so reopening the page — or re-flowing onto new posting times — has
+     somewhere to show its result. -->
+<div class="section" id="sq-upcoming-section" style="display:none;">
+    <h2>Upcoming</h2>
+    <p class="form-hint" id="sq-upcoming-summary"></p>
+    <div id="sq-upcoming-list"></div>
 </div>
 
 <!-- Missed is derived from scheduled_at being in the past, computed on load.
@@ -131,7 +154,9 @@
         <span id="sq-summary" class="form-hint"></span>
     </div>
     <p class="form-hint">
-        Accept is optional — a queue can just collect new videos as they go live.
+        Accept and Re-render write post text, so they run while this page is open
+        and say so; Save and Re-flow apply immediately and you can leave straight
+        after. Accept is optional — a queue can just collect new videos as they go live.
         Post text is rendered when you Accept, so edit the template first, or use
         Re-render afterwards.
     </p>
@@ -358,15 +383,44 @@ function renderSelection(result) {
 // the schedule — so a double-click on a new one fired two creates, the second
 // of which failed the (project, name) uniqueness check and reported an error
 // for work that had actually succeeded.
-async function withBusyButton(id, busyLabel, work) {
+// Work that runs in the request, not in a background job: Accept and
+// Re-render both render post text, and a template with an AI block calls
+// Claude once per post. Leaving the page aborts the fetch mid-way, so the
+// answer to "can I go?" is no — and the user had no way to know that. Rather
+// than a warning nobody reads, say it while it is true and let the browser
+// enforce it. Both operations are idempotent, so an interrupted run is safe to
+// repeat; it is the silence that was the problem, not the risk.
+let mustStayCount = 0;
+
+window.addEventListener('beforeunload', (event) => {
+    if (!mustStayCount) return;
+    event.preventDefault();
+    event.returnValue = '';
+});
+
+function setBusyNote(text) {
+    const note = document.getElementById('sq-busy-note');
+    note.textContent = text;
+    note.style.display = text ? '' : 'none';
+}
+
+async function withBusyButton(id, busyLabel, work, {mustStay = false} = {}) {
     const button = document.getElementById(id);
     if (button.disabled) return;
     const label = button.textContent;
     button.disabled = true;
     button.textContent = busyLabel;
+    if (mustStay) {
+        mustStayCount += 1;
+        setBusyNote(`${busyLabel} Keep this page open until it finishes — leaving now stops it partway. (Safe to run again if it does.)`);
+    }
     try {
         return await work();
     } finally {
+        if (mustStay) {
+            mustStayCount -= 1;
+            if (!mustStayCount) setBusyNote('');
+        }
         button.disabled = false;
         button.textContent = label;
     }
@@ -435,6 +489,9 @@ document.getElementById('sq-accept-btn').addEventListener('click', async () => {
     lastSelection = [];
     button.disabled = true;
     button.textContent = 'Scheduling…';
+    // Accept renders every post it schedules — same Claude cost as Re-render.
+    mustStayCount += 1;
+    setBusyNote('Scheduling… Keep this page open until it finishes — leaving now stops it partway. (Safe to run again if it does.)');
     showError('');
     try {
         const result = await apiCall(
@@ -453,6 +510,7 @@ document.getElementById('sq-accept-btn').addEventListener('click', async () => {
         // Refresh BEFORE reporting: runSelection clears the banner and rewrites
         // the summary, so reporting first would erase both.
         await runSelection(false);
+        await loadUpcoming();
         document.getElementById('sq-summary').textContent =
             `Scheduled ${result.scheduled} video${result.scheduled === 1 ? '' : 's'}.${note}` +
             (failed.length
@@ -471,6 +529,8 @@ document.getElementById('sq-accept-btn').addEventListener('click', async () => {
     } catch (err) {
         showError(err.message);
     } finally {
+        mustStayCount -= 1;
+        if (!mustStayCount) setBusyNote('');
         button.disabled = false;
         button.textContent = 'Accept';
     }
@@ -501,7 +561,7 @@ document.getElementById('sq-rerender-btn').addEventListener('click', () =>
     } catch (err) {
         showError(err.message);
     }
-    }));
+    }, {mustStay: true}));
 
 // Save, creating the queue on first call. Returns true on success.
 // Extracted so Auto-select and Accept can save for you rather than refusing:
@@ -556,8 +616,12 @@ document.getElementById('sq-save-btn').addEventListener('click', () =>
     withBusyButton('sq-save-btn', 'Saving…', async () => {
         showError('');
         try {
+            const summary = document.getElementById('sq-summary');
+            const before = summary.textContent;
             await saveQueue();
-            document.getElementById('sq-summary').textContent = 'Saved.';
+            // saveQueue() writes its own summary when it re-flows; don't stomp it.
+            if (summary.textContent === before) summary.textContent = 'Saved.';
+            await loadUpcoming();
         } catch (err) {
             showError(err.message);
         }
@@ -574,6 +638,56 @@ document.getElementById('sq-delete-btn').addEventListener('click', async () => {
         showError(err.message);
     }
 });
+
+async function loadUpcoming() {
+    /** The queue's committed schedule, in posting order.
+     *
+     * Separate from renderSelection(), which forecasts times for candidates
+     * that have not been accepted yet. Only that forecast used to be on this
+     * page, so an existing schedule showed nothing at all until you pressed
+     * Auto-select, and a re-flow had no visible effect even though it had
+     * moved every date.
+     */
+    if (!queueId) return;
+    const section = document.getElementById('sq-upcoming-section');
+    try {
+        const data = await apiCall(
+            `/api/projects/${projectSlug}/smart-queues/${queueId}/items`
+        );
+        // queued = in the queue with no time yet (auto-added, awaiting Accept).
+        // has_posted is checked too: an item that has gone out keeps
+        // state='scheduled' forever, so state alone would list it as upcoming.
+        const pending = (data.items || []).filter(
+            item => !item.has_posted &&
+                (item.state === 'queued' || item.state === 'scheduled')
+        );
+        section.style.display = pending.length ? '' : 'none';
+        if (!pending.length) return;
+        const waiting = pending.filter(item => !item.scheduled_at).length;
+        document.getElementById('sq-upcoming-summary').textContent =
+            `${pending.length} video${pending.length === 1 ? '' : 's'} in the queue` +
+            (waiting ? ` — ${waiting} not scheduled yet; press Accept to give ${waiting === 1 ? 'it a time' : 'them times'}.` : '.');
+        document.getElementById('sq-upcoming-list').innerHTML = pending.map(item => {
+            const when = item.scheduled_at
+                ? new Date(item.scheduled_at).toLocaleString(undefined,
+                    {weekday:'short', month:'numeric', day:'numeric',
+                     hour:'numeric', minute:'2-digit'})
+                : 'not scheduled yet';
+            return `<div style="display:flex; gap:0.75rem; padding:0.2rem 0;">
+                <span style="min-width:11rem; color: var(--text-dim);">${escapeHtml(when)}</span>
+                <span style="min-width:5rem;">${escapeHtml(item.item_type || '')}</span>
+                <span>${escapeHtml(item.title || item.video_id)}</span>
+            </div>`;
+        }).join('');
+    } catch (err) {
+        // Surfaced, never silently blank: an empty list and a failed fetch
+        // look identical otherwise, and they mean opposite things.
+        section.style.display = '';
+        document.getElementById('sq-upcoming-summary').textContent = '';
+        document.getElementById('sq-upcoming-list').innerHTML =
+            `<span style="color: var(--danger);">Couldn't load the queue: ${escapeHtml(err.message)}</span>`;
+    }
+}
 
 async function loadMissed() {
     if (!queueId) return;
@@ -632,6 +746,7 @@ document.getElementById('sq-missed-list').addEventListener('click', async (event
             showError(`Still couldn't post: ${result.error}`);
         }
         await loadMissed();
+        await loadUpcoming();
     } catch (err) {
         showError(err.message);
     } finally {
@@ -643,6 +758,7 @@ document.getElementById('sq-missed-list').addEventListener('click', async (event
     try {
         await loadTemplates();
         await loadQueue();
+        await loadUpcoming();
         await loadMissed();
     } catch (err) {
         showError(err.message);
