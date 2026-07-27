@@ -143,8 +143,14 @@ distinguishable in history.
    presentation as the promo mass-schedule review.
 4. **Shuffle** reorders the *pending selection only*. It never touches
    items already scheduled by this queue.
-5. **Accept** schedules the selection. Accept is optional: a queue can be
-   created with auto-add enabled and no back-catalogue.
+5. **Accept** schedules the selection *and* everything auto-add has collected
+   since — waiting items first, since they have been in the queue longest.
+
+   Accept is the only thing that assigns a posting time. Auto-add collects;
+   Accept schedules. A queue running on auto-add alone therefore still needs
+   Accept pressed to give its videos times — the config screen shows "N videos
+   added automatically and waiting for a posting time" and Accept stays
+   available with nothing else selected.
 6. After Accept, a checkbox — *Automatically add eligible videos to this
    queue as they go live* (default **checked**) — then **Finish**.
 
@@ -192,7 +198,7 @@ removed item is eligible again automatically.
 Every transition of a video to live — a promo whose publish timer fired,
 an imported episode discovered already public, a manual publish — checks
 **all** smart queues, and for each with auto-add enabled, applies the same
-`is_eligible()` used by the config screen. Eligible → appended to the tail.
+`is_eligible()` used by the config screen. Eligible → appended to the tail **as `queued`, with no posting time**.
 
 **Liveness is `privacy_status == 'public'`, never `status == 'published'.**
 `status` drifts off `published` whenever privacy is flipped via the

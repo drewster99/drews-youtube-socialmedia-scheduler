@@ -210,7 +210,7 @@ async def test_one_broken_slot_does_not_abort_the_others(accept_env):
 async def test_accepting_nothing_is_a_no_op(accept_env):
     accept, _queue_service, db, queue_id, _scheduled = accept_env
     assert await accept.accept_selection(queue_id, []) == {
-        "scheduled": 0, "items": [], "skipped": []
+        "scheduled": 0, "items": [], "skipped": [], "errors": []
     }
     rows = await db.execute_fetchall("SELECT COUNT(*) n FROM smart_queue_items")
     assert rows[0]["n"] == 0
@@ -250,3 +250,170 @@ async def test_dst_boundary_holds_wall_clock_time(isolated_db, monkeypatch):
     assert local_hours == {9}
     # The UTC hour must differ across the boundary, or the zone was ignored.
     assert len({dt.hour for dt in instants}) == 2
+
+
+class TestQueuedItemsArePromoted:
+    """Auto-add appends a `queued` item with no time; Accept is what gives it
+    one. Before this existed, auto-add wrote `scheduled` — which candidates
+    excluded and Accept only ever INSERTed past — so an auto-added video sat in
+    the queue forever and never posted.
+    """
+
+    async def test_accept_promotes_a_waiting_item_in_place(self, accept_env):
+        accept, queue_service, db, queue_id, _scheduled = accept_env
+        await db.execute(
+            "INSERT INTO smart_queue_items (queue_id, video_id, position, state) "
+            "VALUES (?, 'v1', 0, ?)",
+            (queue_id, queue_service.ITEM_STATE_QUEUED),
+        )
+        await db.commit()
+
+        # No explicit ids: the waiting item alone must be picked up.
+        result = await accept.accept_selection(queue_id, [])
+
+        assert result["scheduled"] == 1
+        rows = await db.execute_fetchall(
+            "SELECT id, state, scheduled_at FROM smart_queue_items"
+        )
+        assert len(rows) == 1, "must promote the existing row, not add a second"
+        assert rows[0]["state"] == "scheduled"
+        assert rows[0]["scheduled_at"] is not None
+
+    async def test_waiting_items_go_before_a_new_selection(self, accept_env):
+        """They have been in the queue longest, so they post first."""
+        accept, queue_service, db, queue_id, _scheduled = accept_env
+        await db.execute(
+            "INSERT INTO smart_queue_items (queue_id, video_id, position, state) "
+            "VALUES (?, 'v2', 0, ?)",
+            (queue_id, queue_service.ITEM_STATE_QUEUED),
+        )
+        await db.commit()
+
+        await accept.accept_selection(queue_id, ["v1"])
+
+        rows = await db.execute_fetchall(
+            "SELECT video_id FROM smart_queue_items ORDER BY scheduled_at"
+        )
+        assert [r["video_id"] for r in rows] == ["v2", "v1"]
+
+    async def test_a_waiting_video_named_again_is_not_scheduled_twice(
+        self, accept_env
+    ):
+        accept, queue_service, db, queue_id, _scheduled = accept_env
+        await db.execute(
+            "INSERT INTO smart_queue_items (queue_id, video_id, position, state) "
+            "VALUES (?, 'v1', 0, ?)",
+            (queue_id, queue_service.ITEM_STATE_QUEUED),
+        )
+        await db.commit()
+
+        result = await accept.accept_selection(queue_id, ["v1"])
+
+        assert result["scheduled"] == 1
+        rows = await db.execute_fetchall("SELECT COUNT(*) n FROM smart_queue_items")
+        assert rows[0]["n"] == 1
+
+
+class TestAcceptCannotDoubleBook:
+    async def test_re_accepting_the_same_batch_schedules_once(self, accept_env):
+        """A failed Accept leaves the selection on screen untouched and
+        re-enables the button, so the obvious retry submits the same ids."""
+        accept, _queue_service, db, queue_id, _scheduled = accept_env
+
+        await accept.accept_selection(queue_id, ["v1", "v2"])
+        second = await accept.accept_selection(queue_id, ["v1", "v2"])
+
+        assert second["scheduled"] == 0
+        assert {s["reason"] for s in second["skipped"]} == {
+            "already scheduled by this queue"
+        }
+        rows = await db.execute_fetchall("SELECT COUNT(*) n FROM smart_queue_items")
+        assert rows[0]["n"] == 2
+
+    async def test_duplicate_ids_in_one_request_are_scheduled_once(self, accept_env):
+        accept, _queue_service, db, queue_id, _scheduled = accept_env
+
+        await accept.accept_selection(queue_id, ["v1", "v1", "v1"])
+
+        rows = await db.execute_fetchall("SELECT COUNT(*) n FROM smart_queue_items")
+        assert rows[0]["n"] == 1
+
+
+class TestAcceptWritesWholeVideosOnly:
+    async def test_every_approved_post_carries_its_scheduled_at(self, accept_env):
+        """A post with a NULL scheduled_at is invisible to restore_scheduled_posts
+        AND to missed_items, so a crash before the timer was registered used to
+        strand it permanently while its item still read as scheduled."""
+        accept, _queue_service, db, queue_id, _scheduled = accept_env
+
+        await accept.accept_selection(queue_id, ["v1", "v2"])
+
+        rows = await db.execute_fetchall(
+            "SELECT COUNT(*) n FROM social_posts "
+            "WHERE status = 'approved' AND scheduled_at IS NULL"
+        )
+        assert rows[0]["n"] == 0
+
+    async def test_a_transient_failure_leaves_the_video_untouched(
+        self, accept_env, monkeypatch
+    ):
+        """Not a template error — the API was down. Writing nothing keeps the
+        video a candidate so the retry is clean instead of half-scheduled."""
+        accept, queue_service, db, queue_id, _scheduled = accept_env
+        real_render = accept._render_slot
+
+        async def flaky(db_, video, slot, *, default_ai_system):
+            if video["id"] == "v2":
+                raise RuntimeError("Anthropic overloaded")
+            return await real_render(db_, video, slot,
+                                     default_ai_system=default_ai_system)
+
+        monkeypatch.setattr(accept, "_render_slot", flaky)
+
+        result = await accept.accept_selection(queue_id, ["v1", "v2"])
+
+        assert result["scheduled"] == 1
+        assert [e["video_id"] for e in result["errors"]] == ["v2"]
+        assert "RuntimeError" in result["errors"][0]["error"]
+        rows = await db.execute_fetchall(
+            "SELECT COUNT(*) n FROM smart_queue_items WHERE video_id = 'v2'"
+        )
+        assert rows[0]["n"] == 0, "nothing may be written for an abandoned video"
+        posts = await db.execute_fetchall(
+            "SELECT COUNT(*) n FROM social_posts WHERE video_id = 'v2'"
+        )
+        assert posts[0]["n"] == 0
+
+    async def test_a_missing_video_consumes_no_posting_time(self, accept_env):
+        """An abandoned instant is a posting time at which nothing goes out,
+        and nothing ever backfills it."""
+        accept, _queue_service, db, queue_id, _scheduled = accept_env
+
+        result = await accept.accept_selection(queue_id, ["ghost", "v1"])
+
+        assert [s["video_id"] for s in result["skipped"]] == ["ghost"]
+        rows = await db.execute_fetchall(
+            "SELECT position, scheduled_at FROM smart_queue_items"
+        )
+        assert len(rows) == 1
+        assert rows[0]["position"] == 0
+
+    async def test_a_video_from_another_project_is_refused(self, accept_env):
+        """It would post another channel's clip on this queue's accounts."""
+        accept, _queue_service, db, queue_id, _scheduled = accept_env
+        await db.execute(
+            "INSERT INTO projects (id, slug, name) VALUES (2, 'other', 'Other')"
+        )
+        await db.execute(
+            "INSERT INTO videos (id, project_id, title, item_type, "
+            "duration_seconds, privacy_status, width, height) "
+            "VALUES ('alien', 2, 'Not ours', 'hook', 60, 'public', 1080, 1920)"
+        )
+        await db.commit()
+
+        result = await accept.accept_selection(queue_id, ["alien"])
+
+        assert result["scheduled"] == 0
+        assert result["skipped"][0]["reason"] == "belongs to a different project"
+        rows = await db.execute_fetchall("SELECT COUNT(*) n FROM smart_queue_items")
+        assert rows[0]["n"] == 0

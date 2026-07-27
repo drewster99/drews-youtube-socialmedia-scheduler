@@ -105,6 +105,27 @@ def _close_leaked_db_connections() -> Iterator[None]:
             reset()
 
 
+@pytest.fixture(autouse=True)
+def _clear_mastodon_instance_limits_cache() -> Iterator[None]:
+    """Keep MastodonPoster's per-instance limits cache from crossing tests.
+
+    It is class-level with a 6-hour TTL, so an entry written by one test
+    outlives the whole run and is served to any later test asking the same
+    instance — including one that never patched httpx and believes it is
+    exercising the fallback path. Resolved through ``sys.modules`` rather than
+    imported: importing here would freeze ``config.DATA_DIR`` against the real
+    data dir for every test in the session.
+    """
+    def clear() -> None:
+        module = sys.modules.get("yt_scheduler.services.social")
+        if module is not None:
+            module.MastodonPoster._instance_limits_cache.clear()
+
+    clear()
+    yield
+    clear()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _block_production_database() -> Iterator[None]:
     real_sqlite_connect = sqlite3.connect

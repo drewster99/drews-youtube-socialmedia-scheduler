@@ -183,3 +183,116 @@ async def test_config_page_renders(client):
         response = await http.get(path)
         assert response.status_code == 200
         assert "Smart schedule" in response.text
+
+
+async def test_forecast_starts_after_the_existing_schedule(client):
+    """The forecast must predict what Accept will actually do.
+
+    It used to be computed from *now* while Accept scheduled after the last
+    stamped item, so every predicted date on the screen was wrong as soon as
+    the queue had anything pending — in exactly the case the screen is most
+    used, with the Accept button directly beneath it.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    http, db, template_id = client
+    for video_id, title in (("v1", "Booked clip"), ("v2", "Next clip")):
+        await db.execute(
+            "INSERT INTO videos (id, project_id, title, item_type, "
+            "duration_seconds, privacy_status, width, height) "
+            "VALUES (?, 1, ?, 'hook', 60, 'public', 1080, 1920)",
+            (video_id, title),
+        )
+    await db.commit()
+    created = await http.post(
+        "/api/projects/default/smart-queues", json=_payload(template_id)
+    )
+    queue_id = created.json()["id"]
+
+    booked = datetime.now(timezone.utc) + timedelta(weeks=5)
+    await db.execute(
+        "INSERT INTO smart_queue_items (queue_id, video_id, position, "
+        "scheduled_at, state) VALUES (?, 'v1', 0, ?, 'scheduled')",
+        (queue_id, booked.isoformat()),
+    )
+    await db.commit()
+
+    body = (await http.post(
+        f"/api/projects/default/smart-queues/{queue_id}/candidates", json={}
+    )).json()
+
+    assert [v["id"] for v in body["eligible"]] == ["v2"]
+    assert body["forecast"], "a queue with posting times must forecast candidates"
+    assert datetime.fromisoformat(body["forecast"][0]) > booked, (
+        f"forecast {body['forecast'][0]} lands before the already-booked "
+        f"{booked.isoformat()}; Accept would schedule it later than shown"
+    )
+
+
+async def test_accept_with_no_ids_schedules_the_waiting_items(client):
+    """A queue running on auto-add alone must be schedulable. The service
+    promoted waiting items all along, but the route rejected an empty list —
+    so nothing could reach it and the queue never posted."""
+    http, db, template_id = client
+    await db.execute(
+        "INSERT INTO template_slots (template_id, platform, body, media, max_chars) "
+        "VALUES (?, 'bluesky', 'Watch {{title}}', 'none', 300)",
+        (template_id,),
+    )
+    await db.execute(
+        "INSERT INTO videos (id, project_id, title, item_type, duration_seconds, "
+        "privacy_status, width, height) "
+        "VALUES ('v1', 1, 'Auto-added', 'hook', 60, 'public', 1080, 1920)"
+    )
+    await db.commit()
+    created = await http.post(
+        "/api/projects/default/smart-queues", json=_payload(template_id)
+    )
+    queue_id = created.json()["id"]
+    await db.execute(
+        "INSERT INTO smart_queue_items (queue_id, video_id, position, state) "
+        "VALUES (?, 'v1', 0, 'queued')",
+        (queue_id,),
+    )
+    await db.commit()
+
+    response = await http.post(
+        f"/api/projects/default/smart-queues/{queue_id}/accept", json={}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["scheduled"] == 1
+    rows = await db.execute_fetchall(
+        "SELECT state, scheduled_at FROM smart_queue_items"
+    )
+    assert rows[0]["state"] == "scheduled"
+    assert rows[0]["scheduled_at"] is not None
+
+
+async def test_candidates_reports_the_waiting_count(client):
+    """The screen can only offer to schedule waiting items if it knows they
+    exist — they are not candidates, because they are already in the queue."""
+    http, db, template_id = client
+    await db.execute(
+        "INSERT INTO videos (id, project_id, title, item_type, duration_seconds, "
+        "privacy_status, width, height) "
+        "VALUES ('v1', 1, 'Auto-added', 'hook', 60, 'public', 1080, 1920)"
+    )
+    await db.commit()
+    created = await http.post(
+        "/api/projects/default/smart-queues", json=_payload(template_id)
+    )
+    queue_id = created.json()["id"]
+    await db.execute(
+        "INSERT INTO smart_queue_items (queue_id, video_id, position, state) "
+        "VALUES (?, 'v1', 0, 'queued')",
+        (queue_id,),
+    )
+    await db.commit()
+
+    body = (await http.post(
+        f"/api/projects/default/smart-queues/{queue_id}/candidates", json={}
+    )).json()
+
+    assert body["waiting"] == 1
+    assert body["eligible"] == [], "a queued video is in the queue, not a candidate"

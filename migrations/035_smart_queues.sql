@@ -51,7 +51,14 @@ CREATE INDEX idx_smart_queues_project ON smart_queues(project_id);
 CREATE TABLE smart_queue_slots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     queue_id INTEGER NOT NULL REFERENCES smart_queues(id) ON DELETE CASCADE,
-    weekday INTEGER NOT NULL,        -- 0 = Monday, matching date.weekday()
+    -- 0 = Monday, matching date.weekday(). The CHECK is the backstop for the
+    -- read side: occurrences() walks forward a day at a time looking for a
+    -- matching weekday, so a value no date can ever equal (7, -1) marches the
+    -- calendar to the year 9999 and dies with OverflowError. Column affinity
+    -- runs BEFORE the CHECK, so 3.0 and '3' land as INTEGER 3 and pass here —
+    -- _parse_weekday is what refuses those and bools.
+    weekday INTEGER NOT NULL
+        CHECK (typeof(weekday) = 'integer' AND weekday BETWEEN 0 AND 6),
     time_of_day TEXT NOT NULL,       -- 'HH:MM', local to the queue's timezone
     UNIQUE (queue_id, weekday, time_of_day)
 );
@@ -68,9 +75,13 @@ CREATE TABLE smart_queue_items (
     video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
     -- UTC ISO, same convention as videos.publish_at and
-    -- social_posts.scheduled_at. NULL until the batch is accepted.
+    -- social_posts.scheduled_at. NULL while the item is still 'queued'.
     scheduled_at TEXT,
-    -- scheduled | posted | failed | skipped | removed
+    -- queued | scheduled | posted | failed | skipped | removed
+    --
+    -- 'queued' means in the queue with no posting time yet — what auto-add
+    -- appends when a video goes live. Accept is the only thing that promotes
+    -- it to 'scheduled', so a posting time is decided in one place.
     state TEXT NOT NULL DEFAULT 'scheduled',
     -- Why it was skipped or failed, in the user's words. NULL otherwise.
     reason TEXT,

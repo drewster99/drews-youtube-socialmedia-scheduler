@@ -16,8 +16,10 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 
 from yt_scheduler.database import get_db, write_transaction
+from yt_scheduler.services._keyed_locks import KeyedLocks
 from yt_scheduler.services import smart_queue as queue_service
 from yt_scheduler.services import social, templates as tmpl
 from yt_scheduler.services.render_context import (
@@ -25,10 +27,11 @@ from yt_scheduler.services.render_context import (
     build_render_context,
 )
 
-# Everything a single slot's render can legitimately fail with. Caught per
+# Render failures that repeat identically every time — a template problem,
+# not a service blip. Caught per
 # slot so one broken body doesn't abort the whole batch: the other
 # platforms still go out and the failure is visible with its real reason.
-_RENDER_FAILURES = (
+_DETERMINISTIC_RENDER_FAILURES = (
     RenderContextError,
     tmpl.MissingRequiredVariable,
     tmpl.UndefinedTemplateVariables,
@@ -41,6 +44,11 @@ _RENDER_FAILURES = (
 
 logger = logging.getLogger(__name__)
 
+# One Accept per queue at a time. The maxima that decide the next free time
+# and the next position are read before a render loop that can run for
+# minutes, so two overlapping Accepts would stamp the same instants.
+_accept_locks: KeyedLocks[int] = KeyedLocks()
+
 
 @dataclass(frozen=True)
 class SlotVerdict:
@@ -51,7 +59,7 @@ class SlotVerdict:
     reason: str | None = None
 
 
-async def slots_accepting(video: dict, slots: list[dict]) -> list[SlotVerdict]:
+def slots_accepting(video: dict, slots: list[dict]) -> list[SlotVerdict]:
     """Decide, per slot, whether this video can be posted there.
 
     Checked against the platform's published envelope *before* anything is
@@ -69,11 +77,10 @@ async def slots_accepting(video: dict, slots: list[dict]) -> list[SlotVerdict]:
             continue
         platform = slot["platform"]
 
-        poster_class = social._POSTERS.get(platform)
-        if poster_class is None:
+        if platform not in social.ALL_PLATFORMS:
             verdicts.append(SlotVerdict(slot, False, f"unknown platform {platform!r}"))
             continue
-        if not poster_class.accepts_media:
+        if not social.platform_accepts_attached_media(platform):
             verdicts.append(SlotVerdict(
                 slot, False,
                 f"{platform} can't take an attached video "
@@ -99,128 +106,341 @@ async def slots_accepting(video: dict, slots: list[dict]) -> list[SlotVerdict]:
     return verdicts
 
 
+@dataclass(frozen=True)
+class VideoPlan:
+    """Everything one video will write, decided before any lock is taken.
+
+    Rendering fires real Anthropic round-trips, so it finishes before the
+    transaction opens: ``write_transaction`` holds a process-wide lock and its
+    rules forbid awaiting network work inside it.
+
+    ``transient_error`` means nothing may be written for this video at all.
+    The failure was not the template's fault and will not repeat
+    deterministically, so leaving the video unqueued keeps it a candidate and
+    makes the retry clean rather than half-scheduled.
+    """
+
+    posts: list[tuple[dict, str, list[str]]]
+    skipped_slots: list[SlotVerdict]
+    transient_error: str | None = None
+
+
+async def _plan_video(
+    db, video: dict, slots: list[dict], *, default_ai_system: str | None
+) -> VideoPlan:
+    """Render every slot for one video and classify each outcome.
+
+    Two kinds of render failure, which must not be conflated. A template error
+    — undefined variable, malformed section, unknown image — fails identically
+    every time, so its slot is recorded as skipped with the reason and the
+    other platforms still go out. Anything else (Anthropic overloaded, no API
+    key, network down) is transient: it abandons the whole video so a later
+    Accept can take it cleanly.
+    """
+    posts: list[tuple[dict, str, list[str]]] = []
+    skipped_slots: list[SlotVerdict] = []
+    for verdict in slots_accepting(video, slots):
+        if not verdict.accepted:
+            skipped_slots.append(verdict)
+            continue
+        try:
+            rendered, media_paths = await _render_slot(
+                db, video, verdict.slot, default_ai_system=default_ai_system
+            )
+        except _DETERMINISTIC_RENDER_FAILURES as exc:
+            skipped_slots.append(SlotVerdict(verdict.slot, False, str(exc)))
+            continue
+        except Exception as exc:
+            # The type name is part of the message on purpose: "APIStatusError"
+            # reads as a service blip and "KeyError" reads as our bug, and the
+            # user should be able to tell which they are looking at. The full
+            # stack goes to the log either way.
+            logger.exception(
+                "Accept: unexpected failure rendering %s for video %s",
+                verdict.slot["platform"], video["id"],
+            )
+            return VideoPlan([], [], f"{type(exc).__name__}: {exc}")
+        posts.append((verdict.slot, rendered, media_paths))
+    return VideoPlan(posts, skipped_slots)
+
+
 async def accept_selection(
     queue_id: int, video_ids: list[str], *, default_ai_system: str | None = None
 ) -> dict:
-    """Schedule ``video_ids``, in the order given, onto the queue's recurrence.
+    """Give a posting time to everything waiting in this queue.
 
-    Order is the caller's: the config screen sends whatever the user is
-    looking at, shuffled or not. Times are computed by enumerating the queue's
-    recurrence in its own timezone, so each stamped instant is correct for its
-    own date across a DST boundary.
+    Two sources feed one plan, in this order:
 
-    Already-scheduled items are untouched; new times start after the last one
-    already on the books, so accepting a second batch appends rather than
-    colliding.
+    1. Items already in the queue with no time yet — what auto-add appends
+       when a video goes live. They keep their position, so they go out in the
+       order they arrived.
+    2. ``video_ids``, in the order the caller sends them (shuffled or not).
 
-    Returns ``{"scheduled": N, "items": [...], "skipped": [...]}``.
+    Accept is the ONLY thing that assigns a posting time. Auto-add deliberately
+    does not, so there is one place where "when does this go out" is decided
+    rather than two that could disagree.
+
+    Times are computed by enumerating the queue's recurrence in its own
+    timezone, so each stamped instant is right for its own date across a DST
+    boundary, and they continue after everything already scheduled so a second
+    Accept appends rather than double-booking.
+
+    Returns ``{"scheduled": N, "items": [...], "skipped": [...], "errors": [...]}``.
+    It does not raise once the loop has begun: a caller told nothing cannot
+    tell a half-landed batch from a normal one, so every outcome comes back in
+    the ledger.
     """
     from yt_scheduler.services.scheduler import schedule_social_post
 
-    if not video_ids:
-        return {"scheduled": 0, "items": [], "skipped": []}
-
     queue = await queue_service.get_queue(queue_id)
-    zone = queue_service.resolve_timezone(queue["timezone"])
     db = await get_db()
 
-    template = await _template_by_id(int(queue["template_id"]))
-    slots = template["slots"]
+    # One Accept per queue at a time. The render loop runs for minutes, and the
+    # "next free time" and "next position" maxima are read before it — two
+    # overlapping Accepts (a double-click is enough) would otherwise read the
+    # same maxima and stamp the same instants.
+    async with _accept_locks.get(queue_id):
+        template = await _template_by_id(int(queue["template_id"]))
+        slots = template["slots"]
 
-    # New times continue after everything already scheduled, so a second
-    # Accept appends to the plan instead of double-booking its slots.
-    last_rows = await db.execute_fetchall(
-        "SELECT MAX(scheduled_at) AS last FROM smart_queue_items "
-        "WHERE queue_id = ? AND state = 'scheduled'",
-        (queue_id,),
-    )
-    after = queue_service._parse_after(last_rows[0]["last"])
+        # A repeated id would otherwise be scheduled twice in one batch.
+        # dict.fromkeys de-dupes while preserving order, so "the order is the
+        # caller's" still holds.
+        video_ids = list(dict.fromkeys(video_ids))
 
-    instants = queue_service.occurrences(
-        queue["slots"], zone, len(video_ids), after=after
-    )
+        skipped: list[dict] = []
+        errors: list[dict] = []
 
-    position_rows = await db.execute_fetchall(
-        "SELECT COALESCE(MAX(position), -1) AS last FROM smart_queue_items "
-        "WHERE queue_id = ?",
-        (queue_id,),
-    )
-    next_position = int(position_rows[0]["last"]) + 1
-
-    created_items: list[dict] = []
-    skipped: list[dict] = []
-
-    for offset, video_id in enumerate(video_ids):
-        rows = await db.execute_fetchall(
-            "SELECT * FROM videos WHERE id = ?", (video_id,)
+        # Waiting items first, oldest position first: auto-add put them here and
+        # they have been waiting longest.
+        waiting = await db.execute_fetchall(
+            "SELECT id, video_id FROM smart_queue_items "
+            "WHERE queue_id = ? AND state = ? ORDER BY position",
+            (queue_id, queue_service.ITEM_STATE_QUEUED),
         )
-        if not rows:
-            skipped.append({"video_id": video_id, "reason": "video no longer exists"})
-            continue
-        video = dict(rows[0])
-        when = instants[offset]
+        pending: list[tuple[int | None, str]] = [
+            (int(row["id"]), row["video_id"]) for row in waiting
+        ]
+        waiting_ids = {row["video_id"] for row in waiting}
 
-        async with write_transaction() as write_db:
-            cursor = await write_db.execute(
-                "INSERT INTO smart_queue_items "
-                "(queue_id, video_id, position, scheduled_at, state) "
-                "VALUES (?,?,?,?,'scheduled')",
-                (queue_id, video_id, next_position + offset, when.isoformat()),
+        already = await queue_service.already_scheduled_video_ids(queue_id, video_ids)
+        for video_id in video_ids:
+            if video_id in waiting_ids:
+                # Already picked up above as a waiting item; scheduling it again
+                # here would give the same video two rows in one batch.
+                continue
+            if video_id in already:
+                # The screen's selection can be stale — a failed Accept leaves
+                # the list untouched, and re-submitting must not append a second
+                # copy of what already landed.
+                skipped.append({
+                    "video_id": video_id,
+                    "reason": "already scheduled by this queue",
+                })
+                continue
+            pending.append((None, video_id))
+
+        if not pending:
+            return {"scheduled": 0, "items": [], "skipped": skipped, "errors": errors}
+
+        # Resolve every video BEFORE any posting time is computed. An id that no
+        # longer names a video must consume neither an instant nor a position:
+        # an abandoned instant is a posting time at which nothing goes out, and
+        # nothing ever backfills it.
+        batch: list[tuple[int | None, dict]] = []
+        for item_id, video_id in pending:
+            rows = await db.execute_fetchall(
+                "SELECT * FROM videos WHERE id = ?", (video_id,)
             )
-            item_id = int(cursor.lastrowid)
+            if not rows:
+                skipped.append({
+                    "video_id": video_id, "reason": "video no longer exists",
+                })
+                continue
+            video = dict(rows[0])
+            if int(video.get("project_id") or 0) != int(queue["project_id"]):
+                # A video id from another project must never be scheduled here:
+                # it would post another channel's clip on this queue's accounts.
+                skipped.append({
+                    "video_id": video_id,
+                    "reason": "belongs to a different project",
+                })
+                continue
+            batch.append((item_id, video))
+        if not batch:
+            return {"scheduled": 0, "items": [], "skipped": skipped, "errors": errors}
 
-        verdicts = await slots_accepting(video, slots)
-        posted_any = False
-        for verdict in verdicts:
-            if not verdict.accepted:
-                await _record_skipped_slot(item_id, verdict)
+        instants = await queue_service.next_free_posting_times(queue, len(batch))
+        instant_index = 0
+
+        position_rows = await db.execute_fetchall(
+            "SELECT COALESCE(MAX(position), -1) AS last FROM smart_queue_items "
+            "WHERE queue_id = ?",
+            (queue_id,),
+        )
+        position = int(position_rows[0]["last"]) + 1
+
+        created_items: list[dict] = []
+
+        for item_id, video in batch:
+            video_id = video["id"]
+
+            # Everything that touches the network happens here, before any lock.
+            plan = await _plan_video(
+                db, video, slots, default_ai_system=default_ai_system
+            )
+            if plan.transient_error is not None:
+                errors.append({"video_id": video_id, "error": plan.transient_error})
+                continue
+
+            # An instant IS a posting time, and only a video that will actually
+            # post at it may consume one. A video no slot could carry is written
+            # with no time at all — stamping it would leave a slot in the plan
+            # where nothing goes out and nothing ever backfills it.
+            when = instants[instant_index] if plan.posts else None
+
+            try:
+                item_id, post_ids = await _write_video_plan(
+                    queue_id, video, plan,
+                    existing_item_id=item_id, item_position=position, when=when,
+                )
+            except Exception as exc:
+                # The transaction rolled back, so nothing partial survives and
+                # the video is still a candidate. Report it and keep going
+                # rather than discarding the ledger for what already landed.
+                logger.exception(
+                    "Accept: could not write the plan for video %s", video_id
+                )
+                errors.append({
+                    "video_id": video_id, "error": f"{type(exc).__name__}: {exc}",
+                })
+                continue
+            # Advanced only after the write lands. Consuming before it would
+            # leave a posting time nothing goes out at, which nothing backfills.
+            if plan.posts:
+                instant_index += 1
+            position += 1
+
+            # Outside the transaction: schedule_social_post writes and would
+            # otherwise join it, and a rollback cannot un-register an APScheduler
+            # job. scheduled_at is already committed, so a failure here is
+            # recoverable rather than invisible.
+            for post_id in post_ids:
+                try:
+                    await schedule_social_post(post_id, when)
+                except Exception as exc:
+                    logger.exception(
+                        "Accept: could not register the timer for post %s", post_id
+                    )
+                    errors.append({
+                        "video_id": video_id, "post_id": post_id,
+                        "error": (
+                            f"scheduled for {when.isoformat()}, but its timer "
+                            f"could not be registered ({type(exc).__name__}: "
+                            f"{exc}); it will be picked up on the next restart"
+                        ),
+                    })
+
+            for verdict in plan.skipped_slots:
                 skipped.append({
                     "video_id": video_id,
                     "platform": verdict.slot["platform"],
                     "reason": verdict.reason,
                 })
-                continue
-            try:
-                post_id = await _create_post_for_slot(
-                    db, video, verdict.slot, item_id,
-                    default_ai_system=default_ai_system,
-                )
-            except _RENDER_FAILURES as exc:
-                # A render failure is per-slot: the other platforms still go
-                # out, and this one is visible with the real reason rather
-                # than silently missing.
-                await _record_skipped_slot(
-                    item_id, SlotVerdict(verdict.slot, False, str(exc))
-                )
-                skipped.append({
-                    "video_id": video_id,
-                    "platform": verdict.slot["platform"],
-                    "reason": str(exc),
-                })
-                continue
-            await schedule_social_post(post_id, when)
-            posted_any = True
-
-        if not posted_any:
-            # Nothing can be sent for this video, so leaving it 'scheduled'
-            # would burn a posting slot on a no-op.
-            async with write_transaction() as write_db:
-                await write_db.execute(
-                    "UPDATE smart_queue_items SET state = 'skipped', reason = ? "
-                    "WHERE id = ?",
-                    ("no slot could carry this video", item_id),
-                )
-        created_items.append({
-            "id": item_id, "video_id": video_id,
-            "scheduled_at": when.isoformat(),
-            "posted_to_any": posted_any,
-        })
+            created_items.append({
+                "id": item_id, "video_id": video_id,
+                "scheduled_at": when.isoformat() if when is not None else None,
+                "posted_to_any": bool(plan.posts),
+            })
 
     return {
-        "scheduled": sum(1 for i in created_items if i["posted_to_any"]),
+        "scheduled": sum(1 for item in created_items if item["posted_to_any"]),
         "items": created_items,
         "skipped": skipped,
+        "errors": errors,
     }
+
+
+async def _write_video_plan(
+    queue_id: int, video: dict, plan: VideoPlan, *,
+    existing_item_id: int | None, item_position: int, when: datetime | None,
+) -> tuple[int, list[int]]:
+    """Commit one video's whole plan as a unit. Returns (item id, post ids).
+
+    Everything this video writes lands together or not at all: an item with
+    only some of its posts, or a post with no item, is a state nothing
+    downstream can reason about.
+
+    ``scheduled_at`` is written in the INSERT rather than left for
+    ``schedule_social_post``. A post row with a NULL ``scheduled_at`` is
+    invisible to both ``restore_scheduled_posts`` and ``missed_items``, so a
+    crash in that window used to strand it permanently while its item still
+    read as scheduled.
+
+    Nothing in here does I/O, so the process-wide write lock is held for a
+    handful of INSERTs and nothing else.
+    """
+    # An item no slot can carry would otherwise burn a posting time on a no-op,
+    # so it is written in its final state rather than corrected afterwards.
+    item_state = "scheduled" if plan.posts else "skipped"
+    item_reason = None if plan.posts else "no slot could carry this video"
+    # Derived from the same fact that decides the state, so the two cannot
+    # drift: an item that posts nothing holds no posting time either.
+    when_iso = when.isoformat() if plan.posts and when is not None else None
+
+    async with write_transaction() as db:
+        if existing_item_id is None:
+            cursor = await db.execute(
+                "INSERT INTO smart_queue_items "
+                "(queue_id, video_id, position, scheduled_at, state, reason) "
+                "VALUES (?,?,?,?,?,?)",
+                (queue_id, video["id"], item_position, when_iso,
+                 item_state, item_reason),
+            )
+            item_id = int(cursor.lastrowid)
+        else:
+            # A waiting item keeps its row and its position — it has been in
+            # the queue since it went live; all it was missing was a time.
+            item_id = existing_item_id
+            await db.execute(
+                "UPDATE smart_queue_items SET scheduled_at = ?, state = ?, "
+                "reason = ? WHERE id = ?",
+                (when_iso, item_state, item_reason, item_id),
+            )
+
+        post_ids: list[int] = []
+        for slot, rendered, media_paths in plan.posts:
+            cursor = await db.execute(
+                """
+                INSERT INTO social_posts
+                    (video_id, platform, content, media_paths, status,
+                     social_account_id, max_chars, slot_id,
+                     smart_queue_item_id, scheduled_at)
+                VALUES (?,?,?,?,'approved',?,?,?,?,?)
+                """,
+                (
+                    video["id"], slot["platform"], rendered,
+                    json.dumps(media_paths), slot.get("social_account_id"),
+                    slot.get("max_chars"), slot.get("id"), item_id,
+                    when_iso,
+                ),
+            )
+            post_ids.append(int(cursor.lastrowid))
+
+        # A row rather than nothing, so history can tell "never attempted" from
+        # "posted and later deleted".
+        for verdict in plan.skipped_slots:
+            await db.execute(
+                """
+                INSERT INTO social_posts
+                    (video_id, platform, content, status, error, slot_id,
+                     smart_queue_item_id)
+                VALUES (?,?,'','skipped',?,?,?)
+                """,
+                (video["id"], verdict.slot["platform"], verdict.reason,
+                 verdict.slot.get("id"), item_id),
+            )
+    return item_id, post_ids
 
 
 async def rerender_pending(queue_id: int, *, default_ai_system: str | None = None) -> dict:
@@ -267,7 +487,7 @@ async def rerender_pending(queue_id: int, *, default_ai_system: str | None = Non
             rendered, media_paths = await _render_slot(
                 db, dict(video_rows[0]), slot, default_ai_system=default_ai_system
             )
-        except _RENDER_FAILURES as exc:
+        except _DETERMINISTIC_RENDER_FAILURES as exc:
             errors.append({"post_id": int(row["post_id"]), "error": str(exc)})
             continue
         async with write_transaction() as write_db:
@@ -333,7 +553,7 @@ async def _template_by_id(template_id: int) -> dict:
     if not rows:
         raise queue_service.SmartQueueError(f"Template {template_id} not found")
     template = dict(rows[0])
-    template["slots"] = await tmpl._list_slots(template_id)
+    template["slots"] = await tmpl.list_slots(template_id)
     return template
 
 
@@ -359,46 +579,3 @@ async def _render_slot(
         cleaned_body, context["variables"], default_system_prompt=default_ai_system
     )
     return rendered.strip(), media_paths
-
-
-async def _create_post_for_slot(
-    db, video: dict, slot: dict, item_id: int, *, default_ai_system: str | None
-) -> int:
-    """Create one approved, scheduled ``social_posts`` row. Returns its id."""
-    rendered, media_paths = await _render_slot(
-        db, video, slot, default_ai_system=default_ai_system
-    )
-    async with write_transaction() as write_db:
-        cursor = await write_db.execute(
-            """
-            INSERT INTO social_posts
-                (video_id, platform, content, media_paths, status,
-                 social_account_id, max_chars, slot_id, smart_queue_item_id)
-            VALUES (?,?,?,?,'approved',?,?,?,?)
-            """,
-            (
-                video["id"], slot["platform"], rendered, json.dumps(media_paths),
-                slot.get("social_account_id"), slot.get("max_chars"),
-                slot.get("id"), item_id,
-            ),
-        )
-        return int(cursor.lastrowid)
-
-
-async def _record_skipped_slot(item_id: int, verdict: SlotVerdict) -> None:
-    """Record that a slot was deliberately not attempted, and why.
-
-    A row rather than nothing, so history can tell "never attempted" from
-    "posted and later deleted".
-    """
-    async with write_transaction() as db:
-        await db.execute(
-            """
-            INSERT INTO social_posts
-                (video_id, platform, content, status, error, slot_id,
-                 smart_queue_item_id)
-            SELECT i.video_id, ?, '', 'skipped', ?, ?, i.id
-              FROM smart_queue_items i WHERE i.id = ?
-            """,
-            (verdict.slot["platform"], verdict.reason, verdict.slot.get("id"), item_id),
-        )

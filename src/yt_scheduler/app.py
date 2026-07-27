@@ -204,12 +204,20 @@ async def lifespan(app: FastAPI):
         await backfill_channel_assets()
     except Exception:
         logger.exception("backfill_channel_assets failed at startup; continuing")
+    # Transcoded copies made at send time when a source broke a platform's
+    # limits. prepared_media deletes its own output, so anything still here
+    # belongs to a process that died mid-send. See services/social for the PID
+    # and age guards that keep this off a live instance's in-flight file.
     try:
-        from yt_scheduler.services.video_dimensions import backfill_video_dimensions
+        from yt_scheduler.services import social as _social
 
-        await backfill_video_dimensions()
+        swept = _social.cleanup_orphan_derived_media()
+        if swept:
+            logger.info(
+                "Swept %d orphan transcoded send copy(-ies) on startup", swept
+            )
     except Exception:
-        logger.exception("backfill_video_dimensions failed at startup; continuing")
+        logger.exception("Orphan derived-media sweep failed at startup; continuing")
 
     # Warm the ffmpeg encoder-capability cache once, off the loop. Without this
     # the first clip cut pays a synchronous `ffmpeg -encoders` spawn, and two

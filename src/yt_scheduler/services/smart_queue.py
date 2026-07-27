@@ -28,10 +28,23 @@ logger = logging.getLogger(__name__)
 ORIENTATIONS = ("portrait", "landscape", "square")
 MISSED_POLICIES = ("post_late", "reschedule_end", "remove")
 
-# States a queue item can be in. `scheduled` is the only pending one; the rest
-# are terminal for that occurrence, and a recycled video gets a NEW row rather
-# than a state reset (see the migration).
-ITEM_STATES = ("scheduled", "posted", "failed", "skipped", "removed")
+# In the queue, but with no posting time yet — what auto-add appends when a
+# video goes live. Accept is what turns it into `scheduled`, so there is one
+# place a posting time is decided rather than two that could disagree.
+ITEM_STATE_QUEUED = "queued"
+
+# States a queue item can be in. `queued` and `scheduled` are the pending ones;
+# the rest are terminal for that occurrence, and a recycled video gets a NEW
+# row rather than a state reset (see the migration).
+ITEM_STATES = (
+    ITEM_STATE_QUEUED, "scheduled", "posted", "failed", "skipped", "removed",
+)
+
+# States that mean "this video is already in this queue", so it must not be
+# offered again as a fresh candidate. `posted` is added on top of these when
+# the exclude-already-posted filter is on — that filter is what makes
+# recycling work, so it stays separate.
+PENDING_ITEM_STATES = (ITEM_STATE_QUEUED, "scheduled")
 
 DEFAULT_MAX_DURATION_SECONDS = 180.0
 DEFAULT_ORIENTATIONS = ["portrait", "square"]
@@ -52,6 +65,25 @@ class Eligibility:
 
     ok: bool
     reasons: tuple[str, ...] = ()
+
+
+#: Columns declared INTEGER that carry a yes/no. Listed because the PATCH route
+#: forwards whatever the body held, and both must be normalised.
+BOOLEAN_COLUMNS = ("exclude_already_posted", "auto_add_on_live")
+
+
+def require_boolean(field: str, value: object) -> bool:
+    """A JSON boolean, or a loud refusal.
+
+    Deliberately narrow rather than ``bool(value)``: the string 'false' is
+    truthy in Python, and SQLite would store it as TEXT, leaving a column that
+    reads as True everywhere. Guessing what the caller meant is worse than
+    refusing. ``bool`` subclasses ``int``, so the JSON true/false the UI sends
+    and the 0/1 the service API uses both pass.
+    """
+    if isinstance(value, bool) or (isinstance(value, int) and value in (0, 1)):
+        return bool(value)
+    raise SmartQueueError(f"{field} must be true or false, got {value!r}")
 
 
 def _parse_orientations(raw: str | list | None) -> list[str]:
@@ -157,7 +189,7 @@ async def candidate_videos(queue: dict) -> dict:
     # Already scheduled by THIS queue is always excluded; already posted by it
     # is excluded only when the filter is on (unchecking it is how recycling
     # works).
-    blocked_states = ["scheduled"]
+    blocked_states = list(PENDING_ITEM_STATES)
     if queue.get("exclude_already_posted"):
         blocked_states.append("posted")
     placeholders = ",".join("?" for _ in blocked_states)
@@ -220,14 +252,14 @@ def occurrences(
     by_weekday: dict[int, list[time]] = {}
     for slot in slots:
         parsed = _parse_time_of_day(slot["time_of_day"])
-        by_weekday.setdefault(int(slot["weekday"]), []).append(parsed)
+        by_weekday.setdefault(_parse_weekday(slot["weekday"]), []).append(parsed)
     for times in by_weekday.values():
         times.sort()
 
     out: list[datetime] = []
     day: date = start.date()
-    # A week of slots always yields at least one instant, so this cannot spin:
-    # every 7 days advanced produces >= 1 result.
+    # Every weekday is 0-6 (_parse_weekday, above), so each 7 days advanced
+    # matches at least one slot and produces >= 1 result: this cannot spin.
     while len(out) < count:
         for slot_time in by_weekday.get(day.weekday(), []):
             candidate = datetime.combine(day, slot_time, tzinfo=zone)
@@ -238,6 +270,56 @@ def occurrences(
                 break
         day += timedelta(days=1)
     return out
+
+
+async def next_free_posting_times(queue: dict, count: int) -> list[datetime]:
+    """The next ``count`` posting instants for ``queue``, after everything it
+    has already stamped.
+
+    Accept, the reschedule-to-end disposition, and the config screen's forecast
+    all have to answer "when is this queue next free?", and they have to answer
+    it identically — otherwise the forecast promises dates Accept won't use, or
+    a second Accept double-books times the first already took. One
+    implementation is what makes that impossible.
+
+    Reads ``id``, ``timezone`` and ``slots`` from the queue row.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT MAX(scheduled_at) AS last FROM smart_queue_items "
+        "WHERE queue_id = ? AND state = 'scheduled'",
+        (int(queue["id"]),),
+    )
+    zone = resolve_timezone(queue["timezone"])
+    return occurrences(
+        queue["slots"], zone, count, after=_parse_after(rows[0]["last"])
+    )
+
+
+async def already_scheduled_video_ids(
+    queue_id: int, video_ids: list[str]
+) -> set[str]:
+    """Which of ``video_ids`` this queue already has a pending item for.
+
+    The same rule :func:`candidate_videos` applies, asked of an explicit list,
+    so Accept enforces it at the write and not only at the preview. Without it,
+    re-submitting a selection the screen never refreshed appends a second item
+    and a second set of posts: the schema deliberately has no unique key on
+    (queue_id, video_id) because an item is an occurrence, so nothing else
+    would stop the double-booking.
+    """
+    if not video_ids:
+        return set()
+    placeholders = ",".join("?" for _ in video_ids)
+    state_placeholders = ",".join("?" for _ in PENDING_ITEM_STATES)
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        f"SELECT DISTINCT video_id FROM smart_queue_items "
+        f"WHERE queue_id = ? AND state IN ({state_placeholders}) "
+        f"AND video_id IN ({placeholders})",
+        (queue_id, *PENDING_ITEM_STATES, *video_ids),
+    )
+    return {row["video_id"] for row in rows}
 
 
 def _parse_after(value: str | None) -> datetime | None:
@@ -258,6 +340,32 @@ def _parse_after(value: str | None) -> datetime | None:
     return max(parsed, now)
 
 
+def _parse_weekday(value: object) -> int:
+    """Parse a slot's weekday: a whole number, 0 (Monday) - 6 (Sunday).
+
+    No coercion of floats or bools, unlike a bare ``int()``: ``int(3.7)`` is 3,
+    which would silently post on Thursday, and ``True`` is Tuesday. Out of
+    range is refused here rather than left to :func:`occurrences`, where a
+    weekday no date can ever match walks the calendar to the year 9999 and
+    dies with an ``OverflowError`` naming nothing.
+    """
+    if isinstance(value, (bool, float)):
+        raise SmartQueueError(
+            f"Weekday must be a whole number 0-6 (0 = Monday), got {value!r}"
+        )
+    try:
+        weekday = int(value)
+    except (TypeError, ValueError) as exc:
+        raise SmartQueueError(
+            f"Weekday must be a whole number 0-6 (0 = Monday), got {value!r}"
+        ) from exc
+    if not 0 <= weekday <= 6:
+        raise SmartQueueError(
+            f"Weekday must be a whole number 0-6 (0 = Monday), got {value!r}"
+        )
+    return weekday
+
+
 def _parse_time_of_day(value: str) -> time:
     """Parse 'HH:MM'. Rejects anything else rather than guessing."""
     try:
@@ -265,6 +373,33 @@ def _parse_time_of_day(value: str) -> time:
         return time(hour=int(hour), minute=int(minute))
     except (TypeError, ValueError) as exc:
         raise SmartQueueError(f"Invalid time of day {value!r}, expected HH:MM") from exc
+
+
+async def _slots_for_queues(queue_ids: list[int]) -> dict[int, list[dict]]:
+    """Posting times for each of ``queue_ids``, keyed by queue.
+
+    The single place slot rows are loaded and shaped, so the one-queue read and
+    the whole-project read cannot drift in ordering or in which columns reach
+    the caller. Every requested id gets a key, so a queue with no posting times
+    reads as ``[]`` rather than as missing.
+    """
+    if not queue_ids:
+        return {}
+    placeholders = ",".join("?" for _ in queue_ids)
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        f"SELECT queue_id, id, weekday, time_of_day FROM smart_queue_slots "
+        f"WHERE queue_id IN ({placeholders}) "
+        f"ORDER BY queue_id, weekday, time_of_day",
+        tuple(queue_ids),
+    )
+    by_queue: dict[int, list[dict]] = {queue_id: [] for queue_id in queue_ids}
+    for row in rows:
+        by_queue[row["queue_id"]].append({
+            "id": row["id"], "weekday": row["weekday"],
+            "time_of_day": row["time_of_day"],
+        })
+    return by_queue
 
 
 async def get_queue(queue_id: int) -> dict:
@@ -276,35 +411,84 @@ async def get_queue(queue_id: int) -> dict:
     if not rows:
         raise SmartQueueError(f"Smart queue {queue_id} not found")
     queue = dict(rows[0])
-    queue["slots"] = [
-        dict(r)
-        for r in await db.execute_fetchall(
-            "SELECT id, weekday, time_of_day FROM smart_queue_slots "
-            "WHERE queue_id = ? ORDER BY weekday, time_of_day",
-            (queue_id,),
-        )
-    ]
+    queue["slots"] = (await _slots_for_queues([queue_id]))[queue_id]
     return queue
 
 
 async def list_queues(project_id: int) -> list[dict]:
-    """Every queue in a project, each with its slots and a state summary."""
+    """Every queue in a project, each with its slots and a state summary.
+
+    Three statements regardless of how many queues there are. Per-queue reads
+    were each a separate hand-off to the one shared connection that every other
+    request and background job is also queued behind.
+    """
+    db = await get_db()
+    queues = [
+        dict(row)
+        for row in await db.execute_fetchall(
+            "SELECT * FROM smart_queues WHERE project_id = ? ORDER BY name",
+            (project_id,),
+        )
+    ]
+    queue_ids = [queue["id"] for queue in queues]
+    slots_by_queue = await _slots_for_queues(queue_ids)
+
+    counts_by_queue: dict[int, dict[str, int]] = {}
+    if queue_ids:
+        placeholders = ",".join("?" for _ in queue_ids)
+        for row in await db.execute_fetchall(
+            f"SELECT queue_id, state, COUNT(*) n FROM smart_queue_items "
+            f"WHERE queue_id IN ({placeholders}) "
+            f"GROUP BY queue_id, state ORDER BY queue_id, state",
+            tuple(queue_ids),
+        ):
+            counts_by_queue.setdefault(row["queue_id"], {})[row["state"]] = row["n"]
+
+    for queue in queues:
+        queue["slots"] = slots_by_queue[queue["id"]]
+        queue["counts"] = counts_by_queue.get(queue["id"], {})
+    return queues
+
+
+async def auto_add_queues(project_id: int) -> list[tuple[dict, list[str]]]:
+    """Every auto-add queue in a project, paired with its template's item types.
+
+    One statement, and one row shape, for the question the live-transition hook
+    actually asks. Going through :func:`list_queues` answered a much larger
+    question — slots and item-state counts the hook then discarded — and still
+    needed a :func:`template_applies_to` per queue on top.
+
+    A queue whose template is gone is logged and omitted: it cannot answer the
+    eligibility question, so it cannot take part in it. LEFT JOIN plus
+    ``template_row_id`` rather than an inner join so that case is *reported*
+    instead of vanishing — ``applies_to`` is NOT NULL, so testing it for NULL
+    would conflate "template gone" with "column empty".
+    """
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT id FROM smart_queues WHERE project_id = ? ORDER BY name",
+        """
+        SELECT q.*, t.id AS template_row_id, t.applies_to AS template_applies_to
+          FROM smart_queues q
+          LEFT JOIN templates t ON t.id = q.template_id
+         WHERE q.project_id = ? AND q.auto_add_on_live != 0
+         ORDER BY q.name
+        """,
         (project_id,),
     )
-    queues = []
+    pairs: list[tuple[dict, list[str]]] = []
     for row in rows:
-        queue = await get_queue(int(row["id"]))
-        counts = await db.execute_fetchall(
-            "SELECT state, COUNT(*) n FROM smart_queue_items "
-            "WHERE queue_id = ? GROUP BY state",
-            (queue["id"],),
-        )
-        queue["counts"] = {r["state"]: r["n"] for r in counts}
-        queues.append(queue)
-    return queues
+        queue = dict(row)
+        template_row_id = queue.pop("template_row_id")
+        raw_applies_to = queue.pop("template_applies_to")
+        if template_row_id is None:
+            logger.error(
+                "Smart queue %s (%r) references template %s, which is gone; "
+                "it cannot take part in auto-add",
+                queue["id"], queue["name"], queue["template_id"],
+            )
+            continue
+        pairs.append((queue, json.loads(raw_applies_to or "[]")))
+    return pairs
 
 
 async def create_queue(
@@ -357,7 +541,7 @@ async def create_queue(
             await db.execute(
                 "INSERT INTO smart_queue_slots (queue_id, weekday, time_of_day) "
                 "VALUES (?,?,?)",
-                (queue_id, int(slot["weekday"]), slot["time_of_day"]),
+                (queue_id, _parse_weekday(slot["weekday"]), slot["time_of_day"]),
             )
     return queue_id
 
@@ -388,6 +572,9 @@ async def update_queue(queue_id: int, changes: dict) -> None:
             "auto_add_on_live", "missed_policy", "missed_grace_hours",
         }
     }
+    for field in BOOLEAN_COLUMNS:
+        if field in columns:
+            columns[field] = 1 if require_boolean(field, columns[field]) else 0
     if "orientations" in changes:
         columns["orientations"] = json.dumps(
             _parse_orientations(changes["orientations"])
@@ -413,7 +600,7 @@ async def update_queue(queue_id: int, changes: dict) -> None:
                 await db.execute(
                     "INSERT INTO smart_queue_slots (queue_id, weekday, time_of_day) "
                     "VALUES (?,?,?)",
-                    (queue_id, int(slot["weekday"]), slot["time_of_day"]),
+                    (queue_id, _parse_weekday(slot["weekday"]), slot["time_of_day"]),
                 )
 
 
@@ -459,9 +646,7 @@ def _validate_queue_fields(
             "A smart queue needs at least one posting time, or it would never post."
         )
     for slot in slots:
-        weekday = int(slot["weekday"])
-        if not 0 <= weekday <= 6:
-            raise SmartQueueError(f"Weekday must be 0-6 (Mon-Sun), got {weekday}")
+        _parse_weekday(slot["weekday"])
         _parse_time_of_day(slot["time_of_day"])
     if min_duration_seconds < 0:
         raise SmartQueueError("Minimum duration can't be negative.")

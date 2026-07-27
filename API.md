@@ -2183,7 +2183,7 @@ Eligibility is decided by a single `smart_queue.is_eligible()` used by both the 
 
 ### `GET /api/projects/{slug}/smart-queues`
 
-**Response 200** — `{"queues": [{...queue, "slots": [...], "counts": {"scheduled": N, "posted": N, ...}}]}`. `counts` is per `smart_queue_items.state`.
+**Response 200** — `{"queues": [{...queue, "slots": [...], "counts": {"queued": N, "scheduled": N, "posted": N, ...}}]}`. `counts` is per `smart_queue_items.state`; `queued` and `scheduled` are both pending.
 
 ### `GET /api/projects/{slug}/smart-queues/{queue_id}`
 
@@ -2213,7 +2213,11 @@ Partial update. `slots`, when present, **replaces the whole set**. Switching `mi
 
 **Body** (all optional) — `min_duration_seconds`, `max_duration_seconds`, `orientations`, `exclude_already_posted` override the saved filters *for this preview only*, so the config screen can show the effect of a change before saving. `shuffle` (bool) reorders the proposed batch; it never touches items already scheduled by this queue.
 
-**Response 200** — `{"eligible": [...], "excluded": [{...video, "reasons": [...]}], "unknown_dimensions": N, "summary": {"total": N, "by_type": {...}}, "forecast": [ISO, ...], "ends_at": ISO|null, "warnings": [...]}`.
+**Response 200** — `{"waiting": N, "eligible": [...], "excluded": [{...video, "reasons": [...]}], "unknown_dimensions": N, "summary": {"total": N, "by_type": {...}}, "forecast": [ISO, ...], "ends_at": ISO|null, "warnings": [...]}`.
+
+`waiting` counts items auto-add already put in the queue with no posting time. They are **not** candidates — they are in the queue already — but Accept schedules them first, so the screen has to be able to say they exist.
+
+The forecast continues after everything the queue has already stamped, matching what Accept will actually do. Computing it from *now* made every predicted date wrong as soon as the queue had anything pending.
 
 `forecast[i]` is when `eligible[i]` would post. Occurrences are enumerated as **local** dates in the queue's timezone and converted individually, so an instant on the far side of a DST boundary still lands at its stated wall-clock time. Every excluded video carries its reasons, and `unknown_dimensions` counts those whose orientation can't be determined — a video the filters dropped is always accounted for rather than silently missing from the total. `warnings` carries e.g. "this queue has no posting times", so an empty forecast can't be mistaken for "nothing scheduled".
 
@@ -2221,9 +2225,15 @@ Partial update. `slots`, when present, **replaces the whole set**. Switching `mi
 
 **Purpose** — Schedule a batch of videos onto the queue's recurrence.
 
-**Body** — `video_ids`: the batch, **in the order the user is looking at** (shuffled or not). This endpoint does not re-sort it; ordering is a UI concern and Accept honours whatever it is sent.
+**Body** — `video_ids` (optional): the batch, **in the order the user is looking at** (shuffled or not). This endpoint does not re-sort it; ordering is a UI concern and Accept honours whatever it is sent. **Omit it, or send `[]`, to give posting times to the items auto-add has been collecting** without adding anything new.
 
-**Response 200** — `{"scheduled": N, "items": [{"id", "video_id", "scheduled_at", "posted_to_any"}], "skipped": [{"video_id", "platform", "reason"}]}`.
+Two sources feed one plan, in this order: items already in the queue in state `queued` (what auto-add appends when a video goes live — they keep their position, so they go out in the order they arrived), then `video_ids`. **Accept is the only thing that assigns a posting time**; auto-add deliberately does not, so "when does this go out" is decided in one place.
+
+**Response 200** — `{"scheduled": N, "items": [{"id", "video_id", "scheduled_at", "posted_to_any"}], "skipped": [{"video_id", "platform", "reason"}], "errors": [{"video_id", "post_id"?, "error"}]}`.
+
+It does not raise once the loop has begun — a caller told nothing cannot tell a half-landed batch from a normal one, so every outcome comes back in the ledger. `skipped` reasons include `already scheduled by this queue` (re-submitting a stale selection cannot double-book), `belongs to a different project`, and `video no longer exists`. Ids repeated within one request are scheduled once.
+
+Each video is written **whole or not at all**: its item row and all its posts commit in one transaction, and posts carry `scheduled_at` from the moment they exist, so a crash before the timer is registered is recovered at the next restart rather than stranding a post nothing can see. A **deterministic** render failure (undefined variable, malformed section) skips that slot; anything else — Anthropic overloaded, no API key, network down — abandons that **video**, writes nothing for it, and reports it in `errors`, so it stays a candidate and the retry is clean. A video that will post nothing consumes no posting time.
 
 **Side effects** — Per video: inserts a `smart_queue_items` row stamped with a concrete UTC instant, then per enabled template slot either creates an ordinary `social_posts` row (`status='approved'`, `slot_id`, `smart_queue_item_id`) and registers its `DateTrigger`, or records a `status='skipped'` row carrying the reason.
 
@@ -2281,7 +2291,9 @@ Posts already `posted` (or mid-`sending`) are left alone — they are history. R
 
 ### `GET /api/projects/{slug}/smart-queues/{queue_id}/items`
 
-**Query** — `state` (optional): `scheduled` | `posted` | `failed` | `skipped` | `removed`.
+**Query** — `state` (optional): `queued` | `scheduled` | `posted` | `failed` | `skipped` | `removed`.
+
+`queued` is in the queue with no posting time yet; `scheduled` has one.
 
 **Response 200** — `{"items": [{"id", "video_id", "position", "scheduled_at", "state", "reason", "added_at", "title", "item_type", "duration_seconds"}]}`, ordered by position.
 

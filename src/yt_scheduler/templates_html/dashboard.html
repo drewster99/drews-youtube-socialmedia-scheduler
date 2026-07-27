@@ -452,11 +452,18 @@ async function loadSmartQueues() {
             queues.length ? '' : 'none';
         document.getElementById('smart-queue-list').innerHTML = queues.map(queue => {
             const counts = queue.counts || {};
+            // `queued` is in the queue with no posting time yet (auto-added);
+            // `scheduled` has one. Both are pending, and counting only the
+            // latter would show 0 for a queue auto-add had been filling.
+            const waiting = counts.queued || 0;
             const pending = counts.scheduled || 0;
             const posted = counts.posted || 0;
             const failed = counts.failed || 0;
             const failedChip = failed
                 ? ` <span style="color: var(--danger);">${failed} failed</span>`
+                : '';
+            const waitingChip = waiting
+                ? ` · ${waiting} waiting to be scheduled`
                 : '';
             return `<div class="card" style="padding:0.6rem 0.8rem;">
                 <div style="display:flex; justify-content:space-between; align-items:center; gap:1rem;">
@@ -465,7 +472,7 @@ async function loadSmartQueues() {
                         <div class="form-hint">${_sqEscape(_cadenceSummary(queue))}</div>
                     </div>
                     <div style="display:flex; gap:1rem; align-items:center;">
-                        <span class="form-hint">${pending} queued · ${posted} posted${failedChip}</span>
+                        <span class="form-hint">${pending} scheduled${waitingChip} · ${posted} posted${failedChip}</span>
                         <a class="btn btn-sm" href="/projects/${projectSlug}/smart-queues/${queue.id}">Edit</a>
                     </div>
                 </div>

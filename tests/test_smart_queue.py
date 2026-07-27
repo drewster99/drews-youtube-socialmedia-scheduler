@@ -163,6 +163,20 @@ class TestOccurrences:
             module.resolve_timezone("UTC"), 0,
         ) == []
 
+    @pytest.mark.parametrize("weekday", [7, -1, "sunday", None, 3.5, True])
+    async def test_refuses_a_weekday_no_date_can_match(self, queue_module, weekday):
+        """occurrences() reads slots straight from the database, so a row
+        _validate_queue_fields never saw reaches it. 7 and -1 used to walk the
+        calendar to the year 9999 (~0.7s, then an OverflowError naming
+        nothing); 3.5 and True were silently coerced to Thursday and Tuesday."""
+        module, _ = queue_module
+        with pytest.raises(module.SmartQueueError, match="Weekday"):
+            module.occurrences(
+                [{"weekday": weekday, "time_of_day": "09:00"}],
+                module.resolve_timezone("UTC"), 3,
+                after=datetime(2026, 7, 27, tzinfo=timezone.utc),
+            )
+
     async def test_unknown_timezone_fails_loudly(self, queue_module):
         """No fallback to UTC: posting an 8am clip at 4pm because a zone name
         was mistyped is worse than a refused save."""
@@ -213,6 +227,35 @@ class TestValidation:
                 timezone_name="UTC",
                 slots=[{"weekday": 0, "time_of_day": "09:00"}],
                 min_duration_seconds=200, max_duration_seconds=100,
+            )
+
+    @pytest.mark.parametrize("weekday", [7, -1, "sunday", None, 3.5, True])
+    async def test_refuses_a_bad_weekday_on_save(self, queue_module, weekday):
+        module, db = queue_module
+        template_id = await self._template(db)
+        with pytest.raises(module.SmartQueueError, match="Weekday"):
+            await module.create_queue(
+                project_id=1, name="Nope", template_id=template_id,
+                timezone_name="UTC",
+                slots=[{"weekday": weekday, "time_of_day": "09:00"}],
+            )
+
+    async def test_the_schema_refuses_a_weekday_outside_0_6(self, queue_module):
+        """The service is not the only writer — a hand-edited database or a
+        restored bundle is one too."""
+        import sqlite3
+
+        module, db = queue_module
+        template_id = await self._template(db)
+        queue_id = await module.create_queue(
+            project_id=1, name="Q", template_id=template_id, timezone_name="UTC",
+            slots=[{"weekday": 0, "time_of_day": "09:00"}],
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            await db.execute(
+                "INSERT INTO smart_queue_slots (queue_id, weekday, time_of_day) "
+                "VALUES (?, 7, '09:00')",
+                (queue_id,),
             )
 
     async def test_rejects_unknown_orientation(self, queue_module):

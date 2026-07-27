@@ -99,9 +99,17 @@ async def ensure_dimensions(video_id: str) -> tuple[int, int] | None:
 async def backfill_video_dimensions() -> int:
     """Stamp dimensions on every row that has a local file but no dimensions.
 
-    Run once at startup. Returns the number of rows updated. Probing is
-    sequential on a worker thread: this is a one-time catch-up over a
-    few hundred rows at most, and ffprobe on a local file is milliseconds.
+    Runs periodically off the scheduler, never at startup: on the first boot
+    after migration 034 there are a few hundred rows to probe, and doing that
+    inline in the lifespan delays the server answering requests. Periodic
+    rather than once because no INSERT path writes dimensions, so new rows
+    keep appearing unstamped.
+
+    Returns the number of rows updated. Probing is sequential and commits per
+    row, both deliberate: sequential IS the concurrency limit (nothing waits on
+    this sweep, so spending threads from the shared executor would only take
+    them from request handlers), and per-row commits mean a process killed
+    mid-sweep keeps every row already stamped.
     """
     db = await get_db()
     rows = await db.execute_fetchall(

@@ -1951,6 +1951,8 @@ async def _apply_source_swap(
                     video_file_path = ?,
                     video_file_original_name = ?,
                     duration_seconds = ?,
+                    width = ?,
+                    height = ?,
                     source_file_origin = 'user_attached',
                     video_file_download_state = NULL,
                     transcript = NULL,
@@ -1961,7 +1963,8 @@ async def _apply_source_swap(
                     transcript_is_edited = 0,
                     updated_at = datetime('now')
                 WHERE id = ?""",
-                (str(incoming_path), new_original, new_duration, video_id),
+                (str(incoming_path), new_original, new_duration,
+                 new_width, new_height, video_id),
             )
         else:
             await db.execute(
@@ -1969,11 +1972,14 @@ async def _apply_source_swap(
                     video_file_path = ?,
                     video_file_original_name = ?,
                     duration_seconds = ?,
+                    width = ?,
+                    height = ?,
                     source_file_origin = 'user_attached',
                     video_file_download_state = NULL,
                     updated_at = datetime('now')
                 WHERE id = ?""",
-                (str(incoming_path), new_original, new_duration, video_id),
+                (str(incoming_path), new_original, new_duration,
+                 new_width, new_height, video_id),
             )
 
     await events.record_event(

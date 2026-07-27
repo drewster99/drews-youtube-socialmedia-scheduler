@@ -135,6 +135,7 @@
         Post text is rendered when you Accept, so edit the template first, or use
         Re-render afterwards.
     </p>
+    <div id="sq-waiting" class="form-hint" style="margin-top:0.5rem;"></div>
     <div id="sq-forecast" class="form-hint" style="margin-top:0.5rem;"></div>
     <div id="sq-candidates" style="margin-top:0.75rem;"></div>
     <details id="sq-excluded-wrap" style="margin-top:0.75rem; display:none;">
@@ -153,6 +154,9 @@ let lastSelection = [];
 // Snapshot of the posting times as last saved, so Save can tell whether
 // the recurrence actually changed and only then offer to re-flow.
 let savedSlotsSignature = '[]';
+// Items auto-add already put in the queue with no posting time. Accept
+// schedules them first, so it must stay usable when they're all there is.
+let waitingCount = 0;
 
 const DAY_NAMES = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
 
@@ -308,8 +312,15 @@ function renderSelection(result) {
 
     document.getElementById('sq-shuffle-btn').style.display =
         result.summary.total ? '' : 'none';
+    // Accept also promotes items auto-add already put in the queue, so it must
+    // stay available when the only thing pending is waiting items.
+    waitingCount = result.waiting || 0;
+    const waiting = waitingCount;
     document.getElementById('sq-accept-btn').style.display =
-        result.summary.total ? '' : 'none';
+        (result.summary.total || waiting) ? '' : 'none';
+    document.getElementById('sq-waiting').textContent = waiting
+        ? `${waiting} video${waiting === 1 ? '' : 's'} added automatically and waiting for a posting time — Accept will schedule ${waiting === 1 ? 'it' : 'them'} first.`
+        : '';
 
     document.getElementById('sq-candidates').innerHTML = lastSelection.map((video, index) => {
         const when = result.forecast[index]
@@ -383,11 +394,22 @@ document.getElementById('sq-select-btn').addEventListener('click', () => runSele
 document.getElementById('sq-shuffle-btn').addEventListener('click', () => runSelection(true));
 
 document.getElementById('sq-accept-btn').addEventListener('click', async () => {
-    if (!lastSelection.length) return;
+    if (!lastSelection.length && !waitingCount) return;
     const button = document.getElementById('sq-accept-btn');
     // The order on screen is the order that gets scheduled, shuffled or not.
     const videoIds = lastSelection.map(video => video.id);
-    if (!confirm(`Schedule ${videoIds.length} video${videoIds.length === 1 ? '' : 's'} in the order shown?`)) return;
+    const parts = [];
+    if (waitingCount) parts.push(`${waitingCount} waiting`);
+    if (videoIds.length) parts.push(`${videoIds.length} selected`);
+    if (!confirm(
+        `Schedule ${parts.join(' + ')} video${
+            waitingCount + videoIds.length === 1 ? '' : 's'}?` +
+        (waitingCount ? '\n\nWaiting videos go first — they have been in the queue longest.' : '')
+    )) return;
+    // These ids go stale the moment the request leaves: on a partial failure
+    // some are already scheduled. Drop them so a second click can't re-submit
+    // a batch the server has partly accepted; the refresh supplies fresh ones.
+    lastSelection = [];
     button.disabled = true;
     button.textContent = 'Scheduling…';
     showError('');
@@ -400,13 +422,29 @@ document.getElementById('sq-accept-btn').addEventListener('click', async () => {
         // Skipped slots are reported, not hidden — a platform that couldn't
         // take a clip should be visible now, not a surprise later.
         const skipped = result.skipped || [];
+        const failed = result.errors || [];
         const note = skipped.length
             ? ` ${skipped.length} slot${skipped.length === 1 ? '' : 's'} skipped: ` +
               skipped.slice(0, 5).map(s => `${s.platform || s.video_id} (${s.reason})`).join('; ')
             : '';
-        document.getElementById('sq-summary').textContent =
-            `Scheduled ${result.scheduled} video${result.scheduled === 1 ? '' : 's'}.${note}`;
+        // Refresh BEFORE reporting: runSelection clears the banner and rewrites
+        // the summary, so reporting first would erase both.
         await runSelection(false);
+        document.getElementById('sq-summary').textContent =
+            `Scheduled ${result.scheduled} video${result.scheduled === 1 ? '' : 's'}.${note}` +
+            (failed.length
+                ? ` ${failed.length} could not be scheduled — see below.`
+                : '');
+        // Never let a partial batch read as a clean one: a video that failed
+        // was left untouched and stays a candidate, so say so.
+        if (failed.length) {
+            showError(
+                `${failed.length} video${failed.length === 1 ? '' : 's'} could not be ` +
+                `scheduled and ${failed.length === 1 ? 'was' : 'were'} left untouched — ` +
+                `press Accept again to retry: ` +
+                failed.map(e => `${e.video_id} (${e.error})`).join(' · ')
+            );
+        }
     } catch (err) {
         showError(err.message);
     } finally {

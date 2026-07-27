@@ -11,7 +11,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from yt_scheduler.config import CAPTION_CHECK_INTERVAL_MINUTES, COMMENT_CHECK_INTERVAL_MINUTES
 from yt_scheduler.database import get_db, write_transaction
-from yt_scheduler.services import events, moderation, transcripts as transcript_service, youtube
+from yt_scheduler.services import (
+    events,
+    moderation,
+    transcripts as transcript_service,
+    video_dimensions,
+    youtube,
+)
 from yt_scheduler.services._keyed_locks import KeyedLocks
 from yt_scheduler.services.auth import set_active_project
 from yt_scheduler.services.projects import get_project_by_id
@@ -318,18 +324,14 @@ async def publish_video_job(video_id: str) -> dict:
                 )
             results["published"] = True
             results["youtube_skipped"] = True
-            # Single funnel for "this video became live" — see
-            # services/smart_queue_live. Best-effort: a queue problem must
-            # never make a successful publish look failed.
-            try:
-                from yt_scheduler.services.smart_queue_live import (
-                    on_video_became_live,
-                )
-                await on_video_became_live(video_id)
-            except Exception:
-                logger.exception(
-                    "Smart-queue auto-add failed for %s after publish", video_id
-                )
+            # Deliberately NOT calling on_video_became_live here. This branch
+            # never sets privacy_status — the item has no YouTube presence — so
+            # it stays 'unlisted', is_eligible reads that as "not live", and the
+            # funnel would record a permanent "no" for a video that is as live
+            # as it will ever get, so it could never be auto-added afterwards.
+            # Auto-add for non-YouTube items needs a decision about what "live"
+            # means for them; until then, leaving the marker unset keeps the
+            # question open rather than answering it wrongly and for good.
 
             await events.record_event(
                 video_id,
@@ -1683,6 +1685,28 @@ def start_scheduler(
     backfill_first_run = None
     if "pytest" not in sys.modules:
         backfill_first_run = datetime.now(timezone.utc) + timedelta(seconds=30)
+
+    # Dimensions feed the smart queue's orientation filter. A scheduler job
+    # rather than a lifespan step: on the first boot after migration 034 this is
+    # a few hundred ffprobe spawns, and for as long as the lifespan runs the
+    # menubar app shows a server that hasn't come up. Periodic because no INSERT
+    # path writes videos.width/height, so a video added after boot would read as
+    # "dimensions unknown" on the queue screen until the next restart. Probing
+    # stays sequential inside the job: asyncio.to_thread shares the loop's
+    # default executor with every other blocking call in the app, so finishing
+    # sooner would only take threads from request handlers.
+    dimensions_first_run = None
+    if "pytest" not in sys.modules:
+        dimensions_first_run = datetime.now(timezone.utc) + timedelta(seconds=15)
+    scheduler.add_job(
+        video_dimensions.backfill_video_dimensions,
+        "interval",
+        minutes=30,
+        id="backfill_video_dimensions",
+        replace_existing=True,
+        next_run_time=dimensions_first_run,
+    )
+
     scheduler.add_job(
         backfill_thumbnails_job,
         "interval",

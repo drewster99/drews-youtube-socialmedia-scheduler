@@ -84,6 +84,25 @@ LOG_DIR = _resolve_log_dir()
 DB_PATH = DATA_DIR / "publisher.db"
 TEMPLATES_DIR = DATA_DIR / "templates"
 UPLOAD_DIR = DATA_DIR / "uploads"
+
+
+def derived_media_dir() -> Path:
+    """The one directory under ``UPLOAD_DIR`` whose contents are all disposable.
+
+    It holds nothing but short-lived re-encodes made at send time when a source
+    breached a platform's limits. No DB row points at one, none is reachable
+    over ``/media`` (that route takes a bare filename and rejects a separator),
+    and the writer deletes its own output when the send finishes. A file that
+    outlives the process that wrote it is therefore garbage by definition —
+    which is what lets the startup sweep delete on sight, where the general
+    ``UPLOAD_DIR`` janitor in ROADMAP.md must identify every file first.
+    Nothing else may write here.
+
+    A function rather than a module constant because tests monkeypatch
+    ``UPLOAD_DIR``; a constant frozen at import would send their derived files
+    into the user's real uploads directory.
+    """
+    return UPLOAD_DIR / "derived"
 # Written by the server at startup and removed on clean shutdown. Checked by
 # import-all so it can refuse to overwrite a live data dir.
 PID_FILE = DATA_DIR / "server.pid"

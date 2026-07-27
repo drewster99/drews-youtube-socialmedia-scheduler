@@ -122,11 +122,11 @@ async def test_grace_window_boundaries(disposition_env):
     recent = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
     stale = (datetime.now(timezone.utc) - timedelta(hours=100)).isoformat()
 
-    assert await disposition.within_grace(queue, recent) is True
-    assert await disposition.within_grace(queue, stale) is False
+    assert disposition.within_grace(queue, recent) is True
+    assert disposition.within_grace(queue, stale) is False
 
     queue["missed_policy"] = "remove"
-    assert await disposition.within_grace(queue, recent) is False
+    assert disposition.within_grace(queue, recent) is False
 
 
 async def _qs_get(disposition, queue_id):

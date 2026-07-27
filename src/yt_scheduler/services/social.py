@@ -347,6 +347,107 @@ def _exception_detail(exc: BaseException) -> str:
     return f"{type(exc).__name__} (no further detail; see the server log)"
 
 
+# Every transcoded copy is named `social_<pid>_<platform>_<random>.mp4`. The
+# PID is in the name so the startup sweep can tell a file *it* leaked from one
+# another live instance is uploading right now. That case is real, not
+# theoretical: uvicorn runs the lifespan before it binds the port, so a stray
+# `yt-scheduler` against the same data dir executes every startup sweep and only
+# then dies on EADDRINUSE. It also covers our own process — the scheduler starts
+# before the sweeps, so a restored publish job can already be mid-send.
+_DERIVED_NAME_STEM = "social"
+
+# Backstop for PID reuse, where the number in a leaked file's name has since
+# been handed to an unrelated live process and the liveness check says "keep".
+# A derived file's whole life is one transcode (capped by media's 30-minute
+# ffmpeg timeout) plus one upload of a file small enough to satisfy a platform
+# byte cap, so this leaves hours of headroom.
+_DERIVED_MAX_AGE_SECONDS: float = 12 * 60 * 60
+
+
+def _owning_pid_of_derived_file(name: str) -> int | None:
+    """The PID embedded in a derived-media filename, or ``None`` when the name
+    is not one we wrote. An unrecognised name is never deleted."""
+    parts = name.split("_")
+    if len(parts) < 4 or parts[0] != _DERIVED_NAME_STEM:
+        return None
+    try:
+        pid = int(parts[1])
+    except ValueError:
+        return None
+    # A non-positive pid makes os.kill address a process *group*. A filename
+    # must never be able to steer that.
+    return pid if pid > 0 else None
+
+
+def _process_is_running(pid: int) -> bool:
+    """Whether ``pid`` names a live process.
+
+    Anything other than a definite "no such process" counts as running, so an
+    unexpected errno can never be the reason a file gets deleted.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        # PermissionError included: the process exists, we just don't own it.
+        return True
+    return True
+
+
+def cleanup_orphan_derived_media() -> int:
+    """Delete transcoded send copies whose writing process is gone.
+
+    :meth:`SocialPoster.prepared_media` removes its own output in a ``finally``,
+    which covers every in-process outcome including exceptions — but not
+    SIGKILL, a panic, or power loss mid-send. Each survivor is a full
+    transcoded video and nothing else would ever remove it.
+
+    Two guards keep it off a file still in use: the embedded PID must name no
+    live process, or the file must be older than any send could plausibly be.
+    Returns the number removed.
+    """
+    from yt_scheduler import config
+
+    derived_dir = config.derived_media_dir()
+    if not derived_dir.is_dir():
+        return 0
+    try:
+        entries = list(derived_dir.iterdir())
+    except OSError as exc:
+        logger.warning("Derived-media sweep could not read %s: %s", derived_dir, exc)
+        return 0
+
+    now = time.time()
+    removed = 0
+    for path in entries:
+        owning_pid = _owning_pid_of_derived_file(path.name)
+        if owning_pid is None:
+            # This module is the only writer here by contract, so an
+            # unrecognised entry means something changed. Report it; never
+            # widen the sweep to cover it.
+            logger.warning(
+                "Unrecognised entry in the derived-media directory; leaving it "
+                "in place: %s", path,
+            )
+            continue
+        try:
+            age_seconds = now - path.stat().st_mtime
+        except OSError as exc:
+            logger.debug("Could not stat derived media %s: %s", path, exc)
+            continue
+        if _process_is_running(owning_pid) and age_seconds < _DERIVED_MAX_AGE_SECONDS:
+            continue
+        try:
+            path.unlink()
+            removed += 1
+        except FileNotFoundError:
+            pass  # the owner's finally beat us to it
+        except OSError as exc:
+            logger.warning("Could not remove orphan derived media %s: %s", path, exc)
+    return removed
+
+
 class SocialPoster:
     """Base class for social media platform posters.
 
@@ -568,11 +669,11 @@ class SocialPoster:
                 # re-checks its attachments with _require_paths_managed, which
                 # rejects anything outside it. A system temp dir would fail
                 # that check on every transcoded post.
-                derived_dir = config.UPLOAD_DIR / "derived"
+                derived_dir = config.derived_media_dir()
                 derived_dir.mkdir(parents=True, exist_ok=True)
                 handle, destination_name = tempfile.mkstemp(
-                    prefix=f"social_{self.platform}_", suffix=".mp4",
-                    dir=str(derived_dir),
+                    prefix=f"{_DERIVED_NAME_STEM}_{os.getpid()}_{self.platform}_",
+                    suffix=".mp4", dir=str(derived_dir),
                 )
                 # mkstemp hands back an open descriptor we never write through
                 # — ffmpeg opens the path itself. Close it or every transcode
@@ -594,7 +695,12 @@ class SocialPoster:
             yield prepared
         finally:
             for temp in temporaries:
-                temp.unlink(missing_ok=True)
+                try:
+                    temp.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning(
+                        "Could not remove derived media %s: %s", temp, exc
+                    )
 
     async def is_configured(self) -> bool:
         """Check if this poster's credentials are complete."""
@@ -1349,6 +1455,16 @@ class MastodonPoster(SocialPoster):
     # Instance limits change only when an admin reconfigures the server, so a
     # long TTL is fine; the point of caching is to keep an HTTP round trip off
     # every single send, not to track a moving value.
+    #
+    # Class-level on purpose, and mutated in place on purpose. A poster is
+    # constructed per send, so an instance-level cache would never be read
+    # twice; `self._cache[k] = v` loads the class dict and mutates it rather
+    # than creating an instance attribute (only rebinding would shadow it).
+    # Keyed by instance, never by account: the limits belong to the server, so
+    # two accounts on one instance correctly share an entry and nothing
+    # account-scoped is stored. Growth needs no bound — the failure path
+    # returns before the write, so only a server that answered with usable
+    # numbers gets an entry. Tests clear it via an autouse conftest fixture.
     _INSTANCE_LIMITS_TTL_SECONDS = 6 * 60 * 60
     _instance_limits_cache: dict[str, tuple[float, media_service.PlatformMediaLimits]] = {}
 
@@ -1380,10 +1496,27 @@ class MastodonPoster(SocialPoster):
                 response.raise_for_status()
                 config = (response.json().get("configuration") or {})
                 attachments = config.get("media_attachments") or {}
+            defaults = PLATFORM_MEDIA_LIMITS["mastodon"]
+            reported = {
+                "max_bytes": attachments.get("video_size_limit"),
+                "max_pixels": attachments.get("video_matrix_limit"),
+                "max_frame_rate": attachments.get("video_frame_rate_limit"),
+            }
+            # A 200 carrying none of these is not an answer — most likely
+            # something other than Mastodon at this URL. Treated as a failed
+            # read so it takes the strict-defaults path and is not cached.
+            if not any(reported.values()):
+                raise ValueError(
+                    "no video limits in configuration.media_attachments"
+                )
+            # A field this server didn't report stays at Mastodon's built-in
+            # default rather than becoming None, which PlatformMediaLimits
+            # reads as "no limit" — that would skip a re-encode the server
+            # requires, and pin that wrong answer for the TTL.
             limits = media_service.PlatformMediaLimits(
-                max_bytes=attachments.get("video_size_limit"),
-                max_pixels=attachments.get("video_matrix_limit"),
-                max_frame_rate=attachments.get("video_frame_rate_limit"),
+                max_bytes=reported["max_bytes"] or defaults.max_bytes,
+                max_pixels=reported["max_pixels"] or defaults.max_pixels,
+                max_frame_rate=reported["max_frame_rate"] or defaults.max_frame_rate,
             )
         except Exception as exc:
             logger.warning(
@@ -1847,6 +1980,19 @@ _POSTERS: dict[str, type[SocialPoster]] = {
 }
 
 ALL_PLATFORMS = list(_POSTERS.keys())
+
+
+def platform_accepts_attached_media(platform: str) -> bool:
+    """Whether this platform's API can take a media upload from us at all.
+
+    A permanent property of the platform, not of any one file: no re-encode
+    makes an attachment postable to a platform that only fetches media from a
+    public URL. Lets callers decide up front instead of failing at send time.
+    """
+    poster_class = _POSTERS.get(platform)
+    if poster_class is None:
+        raise ValueError(f"Unknown platform: {platform}. Available: {ALL_PLATFORMS}")
+    return poster_class.accepts_media
 
 # Per-platform video envelopes. Same shape of idea as
 # DEFAULT_MAX_CHARS_BY_PLATFORM in services/templates.py, which already

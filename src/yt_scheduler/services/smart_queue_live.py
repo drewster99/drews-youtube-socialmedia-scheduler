@@ -51,11 +51,8 @@ async def on_video_became_live(video_id: str) -> dict:
         )
         return {"considered": False, "added_to": [], "reasons": {}}
 
-    queues = [
-        q for q in await queue_service.list_queues(int(project_id))
-        if q.get("auto_add_on_live")
-    ]
-    if not queues:
+    pairs = await queue_service.auto_add_queues(int(project_id))
+    if not pairs:
         # No queue wants it, so no decision was actually taken — leave the
         # marker unset so a queue created later still sees this video the
         # next time it genuinely goes live.
@@ -71,14 +68,7 @@ async def on_video_became_live(video_id: str) -> dict:
     added_to: list[int] = []
     reasons: dict[int, list[str]] = {}
     decidable = True
-    for queue in queues:
-        try:
-            applies_to = await queue_service.template_applies_to(queue["template_id"])
-        except queue_service.SmartQueueError as exc:
-            logger.error(
-                "Queue %s references a template that is gone: %s", queue["id"], exc
-            )
-            continue
+    for queue, applies_to in pairs:
         verdict = queue_service.is_eligible(video, queue, applies_to)
         if verdict.ok:
             if await _append_to_queue(int(queue["id"]), video_id):
@@ -130,18 +120,23 @@ async def _ensure_dimensions_best_effort(video: dict) -> None:
 
 
 async def _append_to_queue(queue_id: int, video_id: str) -> bool:
-    """Append to the tail as an unscheduled item. Returns False if it's
-    already pending there.
+    """Append to the tail as a queued item. Returns False if it's already
+    pending there.
 
-    No time is stamped: the item joins the queue, and Accept is what turns
-    queued items into a posting schedule. That keeps one path for "how does an
-    item get a time" rather than two.
+    No time is stamped, and the state is `queued` rather than `scheduled` —
+    the distinction is load-bearing. `scheduled` means "has a posting time";
+    writing it here produced an item Accept could never reach (candidates
+    exclude it, and Accept only ever inserted new rows), so an auto-added
+    video was queued forever and never posted. Accept promotes `queued` items
+    to `scheduled`, which keeps one path for "how does an item get a time".
     """
     db = await get_db()
+    placeholders = ",".join("?" for _ in queue_service.PENDING_ITEM_STATES)
     existing = await db.execute_fetchall(
-        "SELECT 1 FROM smart_queue_items "
-        "WHERE queue_id = ? AND video_id = ? AND state = 'scheduled'",
-        (queue_id, video_id),
+        f"SELECT 1 FROM smart_queue_items "
+        f"WHERE queue_id = ? AND video_id = ? "
+        f"AND state IN ({placeholders})",
+        (queue_id, video_id, *queue_service.PENDING_ITEM_STATES),
     )
     if existing:
         return False
@@ -149,9 +144,9 @@ async def _append_to_queue(queue_id: int, video_id: str) -> bool:
         await write_db.execute(
             """
             INSERT INTO smart_queue_items (queue_id, video_id, position, state)
-            SELECT ?, ?, COALESCE(MAX(position), -1) + 1, 'scheduled'
+            SELECT ?, ?, COALESCE(MAX(position), -1) + 1, ?
               FROM smart_queue_items WHERE queue_id = ?
             """,
-            (queue_id, video_id, queue_id),
+            (queue_id, video_id, queue_service.ITEM_STATE_QUEUED, queue_id),
         )
     return True

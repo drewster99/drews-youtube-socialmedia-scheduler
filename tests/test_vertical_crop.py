@@ -18,20 +18,33 @@ import pytest
 
 # --- videotoolbox bitrate buckets ---------------------------------------
 
-def test_videotoolbox_bitrate_buckets_match_resolution():
+def test_bitrate_ladder_buckets_match_resolution():
     """4K-class inputs get a higher bitrate so they don't get crushed at the
     1080p target. ≤720p sources stay modest."""
-    from yt_scheduler.services.media import _videotoolbox_bitrate_for_output
+    from yt_scheduler.services.media import _target_video_bitrate_bps
 
-    assert _videotoolbox_bitrate_for_output(3840, 2160) == "18M"   # 4K
-    assert _videotoolbox_bitrate_for_output(2560, 1440) == "10M"   # 1440p
-    assert _videotoolbox_bitrate_for_output(1920, 1080) == "6M"    # 1080p landscape
-    assert _videotoolbox_bitrate_for_output(1080, 1920) == "6M"    # 1080p vertical
-    assert _videotoolbox_bitrate_for_output(1280, 720) == "4M"     # 720p
-    assert _videotoolbox_bitrate_for_output(640, 360) == "2M"      # sub-720p
+    assert _target_video_bitrate_bps(3840, 2160) == 18_000_000   # 4K
+    assert _target_video_bitrate_bps(2560, 1440) == 10_000_000   # 1440p
+    assert _target_video_bitrate_bps(1920, 1080) == 6_000_000    # 1080p landscape
+    assert _target_video_bitrate_bps(1080, 1920) == 6_000_000    # 1080p vertical
+    assert _target_video_bitrate_bps(1280, 720) == 4_000_000     # 720p
+    assert _target_video_bitrate_bps(640, 360) == 2_000_000      # sub-720p
     # Unknown dims → conservative 1080p default so we don't underbit.
-    assert _videotoolbox_bitrate_for_output(None, None) == "6M"
-    assert _videotoolbox_bitrate_for_output(None, 1080) == "6M"
+    # Unknown dimensions are the probe adapter's job, not the ladder's — the
+    # ladder takes real ints so a None can't silently become a bucket.
+    from yt_scheduler.services import media
+
+    assert media._video_bitrate_bps_for_probe(None) == 6_000_000
+    assert media._video_bitrate_bps_for_probe(
+        media.VideoProbe(None, None, None, None, None)
+    ) == 6_000_000
+    # A measured zero is a measurement, not a missing value — bottom band.
+    assert media._video_bitrate_bps_for_probe(
+        media.VideoProbe(None, 0, 0, None, None)
+    ) == 2_000_000
+    assert media._video_bitrate_bps_for_probe(
+        media.VideoProbe(None, None, 1080, None, None)
+    ) == 6_000_000
 
 
 # --- hardware encoder detection -----------------------------------------
@@ -147,7 +160,7 @@ def test_extract_clip_auto_uses_hardware(
     assert "h264_videotoolbox" in cmd
     assert "libx264" not in cmd
     assert "-b:v" in cmd
-    assert "6M" in cmd  # 1080p band
+    assert cmd[cmd.index("-b:v") + 1] == "6000000"  # 1080p band
 
 
 def test_extract_clip_uses_hardware_decode_and_fast_seek(

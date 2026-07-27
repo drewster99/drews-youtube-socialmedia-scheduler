@@ -12,6 +12,12 @@ import importlib
 import pytest
 
 
+def queue_service_module():
+    """Resolved lazily: isolated_db purges yt_scheduler.* to re-freeze config,
+    so a module captured at import time would be a dead object."""
+    return importlib.import_module("yt_scheduler.services.smart_queue")
+
+
 @pytest.fixture
 async def live_env(isolated_db):
     queue_service = importlib.import_module("yt_scheduler.services.smart_queue")
@@ -57,9 +63,10 @@ async def test_eligible_video_is_appended(live_env):
         "SELECT video_id, position, state, scheduled_at FROM smart_queue_items"
     )
     assert rows[0]["video_id"] == "v1"
-    assert rows[0]["state"] == "scheduled"
-    # No time yet — Accept is the single path that turns queued items into a
-    # posting schedule.
+    # `queued`, not `scheduled`: scheduled means "has a posting time", and
+    # writing it here produced an item Accept could never reach — the video
+    # sat in the queue forever and never posted.
+    assert rows[0]["state"] == queue_service_module().ITEM_STATE_QUEUED
     assert rows[0]["scheduled_at"] is None
 
 
@@ -136,7 +143,7 @@ async def test_already_pending_is_not_duplicated(live_env):
     await _add_video(db)
     await db.execute(
         "INSERT INTO smart_queue_items (queue_id, video_id, position, state) "
-        "VALUES (?, 'v1', 0, 'scheduled')", (queue_id,),
+        "VALUES (?, 'v1', 0, 'queued')", (queue_id,),
     )
     await db.commit()
 

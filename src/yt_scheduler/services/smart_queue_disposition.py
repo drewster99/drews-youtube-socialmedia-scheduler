@@ -59,7 +59,7 @@ async def missed_items(queue_id: int) -> list[dict]:
     ]
 
 
-async def within_grace(queue: dict, scheduled_at: str | None) -> bool:
+def within_grace(queue: dict, scheduled_at: str | None) -> bool:
     """Whether a missed post is still inside the queue's post-late window.
 
     Only meaningful for the ``post_late`` policy; the other two never post
@@ -137,16 +137,8 @@ async def _reschedule_to_end(queue_id: int, item_id: int, post_id: int) -> dict:
     from yt_scheduler.services.scheduler import schedule_social_post
 
     queue = await queue_service.get_queue(queue_id)
-    zone = queue_service.resolve_timezone(queue["timezone"])
     db = await get_db()
-
-    last = await db.execute_fetchall(
-        "SELECT MAX(scheduled_at) AS last FROM smart_queue_items "
-        "WHERE queue_id = ? AND state = 'scheduled'",
-        (queue_id,),
-    )
-    after = queue_service._parse_after(last[0]["last"])
-    when = queue_service.occurrences(queue["slots"], zone, 1, after=after)[0]
+    when = (await queue_service.next_free_posting_times(queue, 1))[0]
 
     positions = await db.execute_fetchall(
         "SELECT COALESCE(MAX(position), -1) AS last FROM smart_queue_items "

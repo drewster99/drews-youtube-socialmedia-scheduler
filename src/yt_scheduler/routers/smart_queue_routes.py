@@ -81,10 +81,16 @@ async def create_smart_queue(slug: str, data: dict):
         )
     if data.get("orientations") is not None:
         optional["orientations"] = data["orientations"]
+    # Same coercion PATCH applies, so the two routes cannot disagree about what
+    # counts as a boolean.
     if "exclude_already_posted" in data:
-        optional["exclude_already_posted"] = bool(data["exclude_already_posted"])
+        optional["exclude_already_posted"] = smart_queue_service.require_boolean(
+            "exclude_already_posted", data["exclude_already_posted"]
+        )
     if "auto_add_on_live" in data:
-        optional["auto_add_on_live"] = bool(data["auto_add_on_live"])
+        optional["auto_add_on_live"] = smart_queue_service.require_boolean(
+            "auto_add_on_live", data["auto_add_on_live"]
+        )
     if data.get("missed_policy"):
         optional["missed_policy"] = data["missed_policy"]
     if data.get("missed_grace_hours") is not None:
@@ -121,7 +127,7 @@ async def update_smart_queue(slug: str, queue_id: int, data: dict):
         await smart_queue_service.update_queue(queue_id, data)
     except SmartQueueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    except (TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(400, f"Invalid smart queue payload: {exc}") from exc
     return await smart_queue_service.get_queue(queue_id)
 
@@ -167,9 +173,11 @@ async def preview_candidates(slug: str, queue_id: int, data: dict | None = None)
     forecast = []
     warnings = []
     try:
-        zone = smart_queue_service.resolve_timezone(queue["timezone"])
-        instants = smart_queue_service.occurrences(
-            queue["slots"], zone, len(eligible)
+        # The same helper Accept uses. Computing this from *now* instead made
+        # the forecast promise dates Accept would never use as soon as the
+        # queue had anything pending.
+        instants = await smart_queue_service.next_free_posting_times(
+            queue, len(eligible)
         )
         forecast = [dt.isoformat() for dt in instants]
     except SmartQueueError as exc:
@@ -182,7 +190,17 @@ async def preview_candidates(slug: str, queue_id: int, data: dict | None = None)
     for video in eligible:
         by_type[video["item_type"]] = by_type.get(video["item_type"], 0) + 1
 
+    # Items auto-add already put in the queue with no posting time. They are
+    # not candidates (they're in the queue already), but Accept schedules them
+    # first, so the screen has to be able to say they exist.
+    db = await get_db()
+    waiting_rows = await db.execute_fetchall(
+        "SELECT COUNT(*) AS n FROM smart_queue_items WHERE queue_id = ? AND state = ?",
+        (queue_id, smart_queue_service.ITEM_STATE_QUEUED),
+    )
+
     return {
+        "waiting": int(waiting_rows[0]["n"]),
         "eligible": eligible,
         "excluded": result["excluded"],
         "unknown_dimensions": result["unknown_dimensions"],
@@ -210,9 +228,11 @@ async def accept_selection(slug: str, queue_id: int, data: dict):
     after the last one on the books.
     """
     queue = await _queue_in_project_or_404(slug, queue_id)
-    video_ids = data.get("video_ids")
-    if not isinstance(video_ids, list) or not video_ids:
-        raise HTTPException(400, "video_ids must be a non-empty list.")
+    video_ids = data.get("video_ids") or []
+    if not isinstance(video_ids, list):
+        raise HTTPException(400, "video_ids must be a list.")
+    # An empty list is legitimate: it means "schedule whatever is already
+    # waiting in this queue", which is what auto-add fills.
 
     try:
         result = await smart_queue_accept.accept_selection(
@@ -282,7 +302,7 @@ async def list_missed(slug: str, queue_id: int):
     queue = await _queue_in_project_or_404(slug, queue_id)
     items = await smart_queue_disposition.missed_items(queue_id)
     for item in items:
-        item["within_grace"] = await smart_queue_disposition.within_grace(
+        item["within_grace"] = smart_queue_disposition.within_grace(
             queue, item["scheduled_at"]
         )
     return {

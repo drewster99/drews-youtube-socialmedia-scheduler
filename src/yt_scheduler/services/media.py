@@ -7,7 +7,7 @@ import logging
 import os
 import secrets
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -340,32 +340,56 @@ _VERTICAL_OUTPUT_HEIGHT: int = 1920
 # Hardware encoder bitrate target — videotoolbox needs an explicit
 # -b:v (no -crf support). 6 Mbps gives clean 1080p output for social
 # clips while keeping file sizes modest.
-_HARDWARE_BITRATE: str = "6M"
 
 
-def _videotoolbox_bitrate_for_output(width: int | None, height: int | None) -> str:
-    """Pick a sensible videotoolbox bitrate based on output resolution.
+def _target_video_bitrate_bps(width: int, height: int) -> int:
+    """Quality-appropriate video bitrate for an output of this size, in bps.
 
     Hand-tuned to match libx264 ``-crf 20`` perceived quality on typical
-    talking-head + camera content at each resolution. The bands are
-    intentionally coarse — videotoolbox quality plateaus past these
-    floors. When the dimensions are unknown we conservatively assume
-    1080p so we don't underbit a 4K output.
+    talking-head + camera content; the bands are deliberately coarse because
+    videotoolbox quality plateaus past these floors. A ladder exists at all
+    because videotoolbox has no ``-crf`` — an explicit ``-b:v`` is the only
+    quality control it accepts.
+
+    The single ladder for both encode paths: :func:`extract_clip` (clip cuts)
+    and :func:`transcode_for_platform` (social re-encode). In bps rather than
+    ffmpeg's ``"6M"`` shorthand so it can be compared against a probed source
+    bitrate and against a byte budget; ffmpeg reads a bare integer on ``-b:v``
+    as bits/sec, so ``str(6_000_000)`` selects the identical encode.
     """
-    if width is None or height is None:
-        return _HARDWARE_BITRATE
-    # Use the larger dimension so 1080x1920 vertical and 1920x1080
-    # landscape pick the same bucket.
+    # The larger dimension, so 1080x1920 vertical and 1920x1080 landscape land
+    # in the same band.
     big = max(int(width), int(height))
     if big >= 3000:   # 4K-class (3840x2160 or close)
-        return "18M"
+        return 18_000_000
     if big >= 2000:   # 1440p-class
-        return "10M"
+        return 10_000_000
     if big >= 1500:   # 1080p-class (1920x1080, 1080x1920)
-        return "6M"
+        return 6_000_000
     if big >= 1000:   # 720p-class
-        return "4M"
-    return "2M"       # sub-720p (640x360, 640x480, etc.)
+        return 4_000_000
+    return 2_000_000  # sub-720p (640x360, 640x480, etc.)
+
+
+# ffprobe can come back without dimensions — not installed, or a stream it
+# couldn't read. Assume 1080p rather than guessing low: underbitting a 4K
+# master is a visible, unrecoverable loss, while overbitting a 720p one only
+# costs disk. Named as dimensions, not a frozen bitrate, so it follows the
+# ladder if the ladder is ever retuned.
+_ASSUMED_DIMENSIONS_WHEN_UNKNOWN: tuple[int, int] = (1920, 1080)
+
+
+def _video_bitrate_bps_for_probe(probe: VideoProbe | None) -> int:
+    """Encode bitrate for a source we may or may not have a usable probe for."""
+    # `is None`, not truthiness: a probe reporting width=0 is a real (broken)
+    # measurement and belongs in the bottom band, not in the 1080p assumption.
+    if probe is None or probe.width is None or probe.height is None:
+        logger.info(
+            "Source dimensions unknown — encoding at the %dx%d bitrate.",
+            *_ASSUMED_DIMENSIONS_WHEN_UNKNOWN,
+        )
+        return _target_video_bitrate_bps(*_ASSUMED_DIMENSIONS_WHEN_UNKNOWN)
+    return _target_video_bitrate_bps(probe.width, probe.height)
 
 
 def _ffmpeg_timestamp_to_seconds(ts: str) -> float:
@@ -427,7 +451,7 @@ def extract_clip(
 
     * ``"auto"`` — videotoolbox when ffmpeg has it built in,
       libx264 otherwise. Bitrate is matched to the OUTPUT resolution
-      via :func:`_videotoolbox_bitrate_for_output` so 4K parents
+      via :func:`_video_bitrate_bps_for_probe` so 4K parents
       aren't crushed at the 1080p target.
     * ``"hardware"`` — force ``h264_videotoolbox``. Raises if the
       detection at module-import said it's not available.
@@ -549,12 +573,9 @@ def extract_clip(
 
     if use_hardware:
         # Bitrate matched to the OUTPUT (== source, no crop) resolution so a 4K
-        # parent isn't crushed at the 1080p target. The probe is present whenever
-        # use_hardware is set (needs_probe), but guard defensively.
-        bitrate = _videotoolbox_bitrate_for_output(
-            probe.width if probe else None,
-            probe.height if probe else None,
-        )
+        # parent isn't crushed at the 1080p target. ffmpeg reads a bare integer
+        # on -b:v as bits/sec — the same value the old "6M" spelling carried.
+        bitrate = str(_video_bitrate_bps_for_probe(probe))
         cmd.extend([
             "-c:v", "h264_videotoolbox",
             "-b:v", bitrate,
@@ -1035,6 +1056,13 @@ _AUDIO_BITRATE_BPS = 128_000
 # smeared, unwatchable clip nobody can read.
 _MIN_VIDEO_BITRATE_BPS = 400_000
 
+# Encoder rounding lands on the output's duration: AAC priming samples and a
+# final partial video frame both add a sliver. A compliant encode can measure a
+# few hundredths of a second longer than its source, so the post-encode
+# duration check gets a tolerance the pre-encode source check doesn't need.
+# Anything past this is a real overrun, not rounding.
+_DURATION_VERIFY_TOLERANCE_SECONDS = 0.5
+
 
 def fit_dimensions(
     width: int,
@@ -1070,25 +1098,6 @@ def fit_dimensions(
     out_h = max(2, int(height * scale) // 2 * 2)
     return out_w, out_h
 
-
-def _target_video_bitrate_bps(width: int, height: int) -> int:
-    """Quality-appropriate video bitrate for an output of this size, in bps.
-
-    Same bands as :func:`_videotoolbox_bitrate_for_output`, which was tuned
-    against libx264 ``-crf 20`` on talking-head and camera content, expressed
-    numerically so it can be compared against a byte budget and against the
-    source's own bitrate.
-    """
-    big = max(int(width), int(height))
-    if big >= 3000:
-        return 18_000_000
-    if big >= 2000:
-        return 10_000_000
-    if big >= 1500:
-        return 6_000_000
-    if big >= 1000:
-        return 4_000_000
-    return 2_000_000
 
 
 def violates_limits(probe: VideoProbe, limits: PlatformMediaLimits) -> list[str]:
@@ -1248,13 +1257,69 @@ def transcode_for_platform(
         output_path.unlink(missing_ok=True)
         raise
 
-    # Verify rather than trust: rate control is a target, not a guarantee.
-    if limits.max_bytes is not None:
-        actual = output_path.stat().st_size
-        if actual > limits.max_bytes:
-            output_path.unlink(missing_ok=True)
-            raise TranscodeVerificationError(
-                f"encoded to {actual / 1e6:.1f} MB, still over the "
-                f"{limits.max_bytes / 1e6:.0f} MB limit"
-            )
+    # Never leave a file we know a platform will reject where a caller could
+    # pick it up: one unlink site covers every way verification can fail.
+    try:
+        _verify_output_within_limits(output_path, limits)
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        raise
     return output_path
+
+
+def _verify_output_within_limits(
+    output_path: Path, limits: PlatformMediaLimits
+) -> None:
+    """Raise unless the finished file measurably satisfies ``limits``.
+
+    Measured, never computed: :func:`fit_dimensions` describes what we *asked*
+    ffmpeg for, and rate control is a target rather than a guarantee. The
+    caller deletes the output on any raise.
+    """
+    probe = probe_video_file(output_path)
+    if probe is None:
+        raise TranscodeVerificationError(
+            f"encoded {output_path.name} could not be probed, so we cannot "
+            "tell whether it fits the platform's limits"
+        )
+
+    # A limit whose probe field came back unknown is a check that silently
+    # vanishes — precisely the failure this function exists to prevent — so an
+    # output we cannot fully measure is refused rather than waved through.
+    unknown: list[str] = []
+    if probe.width is None or probe.height is None:
+        unknown.append("dimensions")
+    if limits.video_codecs and probe.codec_name is None:
+        unknown.append("video codec")
+    if limits.max_duration_seconds is not None and probe.duration_seconds is None:
+        unknown.append("duration")
+    if unknown:
+        raise TranscodeVerificationError(
+            f"encoded {output_path.name} could not be verified against the "
+            f"platform's limits — unknown: {', '.join(unknown)}"
+        )
+
+    # ffprobe's format.size is the one field we have a better source for: a
+    # container that omits it would void the byte check, which is the only part
+    # of this verification that has ever run.
+    measured = replace(probe, size_bytes=output_path.stat().st_size)
+
+    # Duration is adjudicated here rather than inside violates_limits so the
+    # rounding tolerance applies only to a measured *output*.
+    if (
+        limits.max_duration_seconds is not None
+        and measured.duration_seconds is not None
+        and measured.duration_seconds
+        > limits.max_duration_seconds + _DURATION_VERIFY_TOLERANCE_SECONDS
+    ):
+        raise MediaTooLongError(
+            f"encoded to {measured.duration_seconds:.1f}s, over the "
+            f"{limits.max_duration_seconds:.0f}s limit"
+        )
+
+    reasons = violates_limits(measured, replace(limits, max_duration_seconds=None))
+    if reasons:
+        raise TranscodeVerificationError(
+            f"encoded {output_path.name} still breaks the platform's limits: "
+            + "; ".join(reasons)
+        )
