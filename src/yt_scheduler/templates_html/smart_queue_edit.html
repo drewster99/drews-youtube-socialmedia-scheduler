@@ -353,12 +353,13 @@ function renderSelection(result) {
 }
 
 async function runSelection(shuffle) {
-    if (!queueId) {
-        showError('Save this smart schedule before selecting videos.');
-        return;
-    }
     showError('');
     try {
+        // Selecting needs a queue id, because the candidate list excludes
+        // videos this queue already holds. Save rather than refuse: the user
+        // filled the form out and pressed the obvious next button, and on an
+        // unsaved queue there is nothing scheduled to re-flow.
+        if (!queueId) await saveQueue({offerReflow: false});
         const result = await apiCall(
             `/api/projects/${projectSlug}/smart-queues/${queueId}/candidates`,
             {
@@ -455,7 +456,9 @@ document.getElementById('sq-accept-btn').addEventListener('click', async () => {
 
 document.getElementById('sq-rerender-btn').addEventListener('click', async () => {
     if (!queueId) {
-        showError('Save this smart schedule first.');
+        // Saving wouldn't help — a queue that has never been saved has no
+        // scheduled posts to re-render. Say what's actually true.
+        showError('Nothing to re-render yet — this schedule has no scheduled posts.');
         return;
     }
     showError('');
@@ -477,48 +480,60 @@ document.getElementById('sq-rerender-btn').addEventListener('click', async () =>
     }
 });
 
+// Save, creating the queue on first call. Returns true on success.
+// Extracted so Auto-select and Accept can save for you rather than refusing:
+// filling the form out and pressing the obvious next button should work, and
+// "save first" is bookkeeping the user shouldn't have to think about.
+// `offerReflow` is false for those implicit saves — nothing is scheduled yet
+// on a queue that has never been saved, so there is nothing to re-flow, and a
+// confirm() there would be a non-sequitur.
+async function saveQueue({offerReflow = true} = {}) {
+    const payload = queuePayload();
+    // Changing the posting times leaves already-scheduled items on the old
+    // ones. Ask rather than assume: re-flowing moves real, already-visible
+    // dates, and silently not re-flowing looks like the change did nothing.
+    const timesChanged = queueId && JSON.stringify(
+        [...slots].map(s => [s.weekday, s.time_of_day]).sort()
+    ) !== savedSlotsSignature;
+
+    const saved = queueId
+        ? await apiCall(`/api/projects/${projectSlug}/smart-queues/${queueId}`,
+            {method: 'PATCH', headers: {'Content-Type': 'application/json'},
+             body: JSON.stringify(payload)})
+        : await apiCall(`/api/projects/${projectSlug}/smart-queues`,
+            {method: 'POST', headers: {'Content-Type': 'application/json'},
+             body: JSON.stringify(payload)});
+
+    if (offerReflow && timesChanged) {
+        if (confirm('Posting times changed. Re-flow existing scheduled postings onto the new schedule?\n\nOK — move everything already scheduled.\nCancel — leave them where they are; the new times apply to videos added from now on.')) {
+            const flowed = await apiCall(
+                `/api/projects/${projectSlug}/smart-queues/${queueId}/re-flow`,
+                {method: 'POST'}
+            );
+            document.getElementById('sq-summary').textContent =
+                `Re-flowed ${flowed.reflowed} scheduled item${flowed.reflowed === 1 ? '' : 's'}.`;
+        }
+    }
+    savedSlotsSignature = JSON.stringify(
+        [...slots].map(s => [s.weekday, s.time_of_day]).sort()
+    );
+    if (!queueId) {
+        queueId = saved.id;
+        // Replace rather than push: going Back should return to the
+        // dashboard, not to a /new page that would create a second queue.
+        window.history.replaceState(
+            {}, '', `/projects/${projectSlug}/smart-queues/${queueId}`
+        );
+        document.getElementById('sq-delete-btn').style.display = '';
+    }
+    return true;
+}
+
 document.getElementById('sq-save-btn').addEventListener('click', async () => {
     showError('');
     try {
-        const payload = queuePayload();
-        // Changing the posting times leaves already-scheduled items on the old
-        // ones. Ask rather than assume: re-flowing moves real, already-visible
-        // dates, and silently not re-flowing looks like the change did nothing.
-        const timesChanged = queueId && JSON.stringify(
-            [...slots].map(s => [s.weekday, s.time_of_day]).sort()
-        ) !== savedSlotsSignature;
-
-        const saved = queueId
-            ? await apiCall(`/api/projects/${projectSlug}/smart-queues/${queueId}`,
-                {method: 'PATCH', headers: {'Content-Type': 'application/json'},
-                 body: JSON.stringify(payload)})
-            : await apiCall(`/api/projects/${projectSlug}/smart-queues`,
-                {method: 'POST', headers: {'Content-Type': 'application/json'},
-                 body: JSON.stringify(payload)});
-
-        if (timesChanged) {
-            if (confirm('Posting times changed. Re-flow existing scheduled postings onto the new schedule?\n\nOK — move everything already scheduled.\nCancel — leave them where they are; the new times apply to videos added from now on.')) {
-                const flowed = await apiCall(
-                    `/api/projects/${projectSlug}/smart-queues/${queueId}/re-flow`,
-                    {method: 'POST'}
-                );
-                document.getElementById('sq-summary').textContent =
-                    `Re-flowed ${flowed.reflowed} scheduled item${flowed.reflowed === 1 ? '' : 's'}.`;
-            }
-        }
-        savedSlotsSignature = JSON.stringify(
-            [...slots].map(s => [s.weekday, s.time_of_day]).sort()
-        );
-        if (!queueId) {
-            queueId = saved.id;
-            // Replace rather than push: going Back should return to the
-            // dashboard, not to a /new page that would create a second queue.
-            window.history.replaceState(
-                {}, '', `/projects/${projectSlug}/smart-queues/${queueId}`
-            );
-            document.getElementById('sq-delete-btn').style.display = '';
-        }
-        showError('');
+        await saveQueue();
+        document.getElementById('sq-summary').textContent = 'Saved.';
     } catch (err) {
         showError(err.message);
     }
