@@ -255,3 +255,91 @@ class TestRotatedSources:
             rotation_degrees={}.get("probe_rotation_degrees", 0),
         )
         assert (rebuilt.display_width, rebuilt.display_height) == (1920, 1080)
+
+
+class TestFrameRateMeasurement:
+    """`r_frame_rate` is the lowest rate that can express every timestamp — a
+    tick rate, which on a variable-frame-rate source reads as hundreds of fps.
+    Reading it as "the frame rate" makes an ordinary clip look like a breach.
+    """
+
+    @staticmethod
+    def _probe_from(monkeypatch, tmp_path, streams) -> media.VideoProbe:
+        import json
+        import subprocess
+
+        path = tmp_path / "clip.mp4"
+        path.write_bytes(b"\0")
+        payload = json.dumps({"streams": streams, "format": {"duration": "10"}})
+        monkeypatch.setattr(
+            media.subprocess, "run",
+            lambda *a, **k: subprocess.CompletedProcess(a, 0, payload, ""),
+        )
+        return media.probe_video_file(path)
+
+    def test_reads_the_average_not_the_tick_rate(self, monkeypatch, tmp_path):
+        probe = self._probe_from(monkeypatch, tmp_path, [{
+            "codec_type": "video", "width": 1080, "height": 1920,
+            "codec_name": "h264",
+            "r_frame_rate": "600/1",      # tick rate of a VFR screen capture
+            "avg_frame_rate": "30/1",     # what it actually plays at
+        }])
+        assert probe.frame_rate == 30.0
+
+    def test_an_uncounted_stream_stays_unknown(self, monkeypatch, tmp_path):
+        """ffprobe writes 0/0 when it has no frame count. Unknown must not be
+        mistaken for zero, which would compare as under every cap."""
+        probe = self._probe_from(monkeypatch, tmp_path, [{
+            "codec_type": "video", "width": 1080, "height": 1920,
+            "avg_frame_rate": "0/0",
+        }])
+        assert probe.frame_rate is None
+
+    def test_captures_the_audio_codec(self, monkeypatch, tmp_path):
+        probe = self._probe_from(monkeypatch, tmp_path, [
+            {"codec_type": "video", "width": 1080, "height": 1920},
+            {"codec_type": "audio", "codec_name": "OPUS"},
+        ])
+        assert probe.audio_codec_name == "opus"
+        assert probe.has_audio is True
+
+
+class TestFrameRateAndAudioLimits:
+    """Both caps existed on PlatformMediaLimits but nothing read them, so a
+    breach of either sailed through untouched and was rejected by the platform.
+    """
+
+    @staticmethod
+    def _clip(**overrides) -> media.VideoProbe:
+        fields = {
+            "duration_seconds": 30.0, "width": 1080, "height": 1920,
+            "bitrate_bps": 5_000_000, "size_bytes": 10_000_000,
+            "codec_name": "h264", "frame_rate": 30.0, "audio_codec_name": "aac",
+        }
+        fields.update(overrides)
+        return media.VideoProbe(**fields)
+
+    def test_a_frame_rate_breach_is_reported(self):
+        limits = media.PlatformMediaLimits(max_frame_rate=60)
+        assert media.violates_limits(self._clip(frame_rate=120.0), limits)
+
+    @pytest.mark.parametrize("fps", [23.976, 59.94, 60.0, 60.03])
+    def test_rates_at_or_near_the_cap_are_not_breaches(self, fps):
+        """avg_frame_rate is frames/duration, so a compliant 60fps encode can
+        measure a hair over. Without slack it fails its own verification and
+        the finished file is deleted."""
+        limits = media.PlatformMediaLimits(max_frame_rate=60)
+        assert media.violates_limits(self._clip(frame_rate=fps), limits) == []
+
+    def test_an_audio_codec_breach_is_reported(self):
+        limits = media.PlatformMediaLimits(audio_codecs=("aac",))
+        assert media.violates_limits(self._clip(audio_codec_name="opus"), limits)
+
+    def test_an_accepted_audio_codec_passes(self):
+        limits = media.PlatformMediaLimits(audio_codecs=("aac",))
+        assert media.violates_limits(self._clip(), limits) == []
+
+    def test_unknown_audio_is_not_a_breach(self):
+        limits = media.PlatformMediaLimits(audio_codecs=("aac",))
+        blind = self._clip(audio_codec_name=None)
+        assert media.violates_limits(blind, limits) == []

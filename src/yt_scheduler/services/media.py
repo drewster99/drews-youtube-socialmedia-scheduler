@@ -61,6 +61,7 @@ class VideoProbe:
     container: str | None = None
     has_audio: bool | None = None
     frame_rate: float | None = None
+    audio_codec_name: str | None = None
     #: Clockwise display rotation in degrees, from the stream's display matrix
     #: (or the legacy ``rotate`` tag). 0 when absent.
     rotation_degrees: int = 0
@@ -130,6 +131,7 @@ def probe_video_file(video_path: str | Path) -> VideoProbe | None:
     frame_rate: float | None = None
     rotation_degrees: int = 0
     has_audio: bool = False
+    audio_codec_name: str | None = None
     for stream in streams:
         codec_type = stream.get("codec_type")
         # Identify the video stream by codec_type, but also accept a stream that
@@ -167,17 +169,30 @@ def probe_video_file(video_path: str | Path) -> VideoProbe | None:
                 except (TypeError, ValueError):
                     rotation_degrees = 0
             # ffprobe reports frame rate as the rational "24/1" or "30000/1001".
-            raw_rate = stream.get("r_frame_rate")
+            #
+            # avg_frame_rate (frames / duration), NOT r_frame_rate. r_frame_rate
+            # is the lowest rate that can represent every timestamp exactly — a
+            # tick rate, which for a variable-frame-rate source (screen capture,
+            # phone video) reads as hundreds or thousands of fps. Comparing that
+            # against a platform cap would call an ordinary 30fps clip a breach
+            # and resample it for nothing. avg_frame_rate reads "0/0" when the
+            # stream carries no frame count; that stays None — unknown, which is
+            # never treated as a violation.
+            raw_rate = stream.get("avg_frame_rate")
             if isinstance(raw_rate, str) and "/" in raw_rate:
                 numerator, _, denominator = raw_rate.partition("/")
                 try:
                     denominator_value = float(denominator)
                     if denominator_value:
-                        frame_rate = float(numerator) / denominator_value
+                        frame_rate = float(numerator) / denominator_value or None
                 except (TypeError, ValueError):
                     pass
         elif codec_type == "audio":
             has_audio = True
+            if audio_codec_name is None:
+                raw_audio_codec = stream.get("codec_name")
+                if isinstance(raw_audio_codec, str) and raw_audio_codec:
+                    audio_codec_name = raw_audio_codec.lower()
 
     # ffprobe's format_name is a comma-separated list of compatible
     # container labels. We pick the first non-generic token. This is a
@@ -212,6 +227,7 @@ def probe_video_file(video_path: str | Path) -> VideoProbe | None:
         container=container,
         has_audio=has_audio,
         frame_rate=frame_rate,
+        audio_codec_name=audio_codec_name,
         rotation_degrees=rotation_degrees,
     )
 
@@ -1108,6 +1124,13 @@ _MIN_VIDEO_BITRATE_BPS = 400_000
 # Anything past this is a real overrun, not rounding.
 _DURATION_VERIFY_TOLERANCE_SECONDS = 0.5
 
+# avg_frame_rate is frames divided by duration, so a constant-rate 60fps clip
+# routinely measures a few hundredths over. Without slack a compliant encode
+# fails its own verification and gets deleted. 1fps is far below the gap to the
+# next real frame rate a source might use (60 -> 100/120), so a genuine breach
+# is still caught.
+_FRAME_RATE_TOLERANCE_FPS = 1.0
+
 
 def fit_dimensions(
     width: int,
@@ -1191,11 +1214,26 @@ def violates_limits(probe: VideoProbe, limits: PlatformMediaLimits) -> list[str]
                 f"{width}x{height} over the {limits.max_long_edge}px edge limit"
             )
     if (
+        limits.max_frame_rate is not None
+        and probe.frame_rate is not None
+        and probe.frame_rate > limits.max_frame_rate + _FRAME_RATE_TOLERANCE_FPS
+    ):
+        reasons.append(
+            f"{probe.frame_rate:.0f}fps over the {limits.max_frame_rate:.0f}fps limit"
+        )
+    if (
         limits.video_codecs
         and probe.codec_name is not None
         and probe.codec_name not in limits.video_codecs
     ):
         reasons.append(f"{probe.codec_name} is not an accepted video codec")
+    # Always fixable: every transcode re-encodes audio to AAC unconditionally.
+    if (
+        limits.audio_codecs
+        and probe.audio_codec_name is not None
+        and probe.audio_codec_name not in limits.audio_codecs
+    ):
+        reasons.append(f"{probe.audio_codec_name} is not an accepted audio codec")
     return reasons
 
 
