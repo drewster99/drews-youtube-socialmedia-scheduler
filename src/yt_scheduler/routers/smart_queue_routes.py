@@ -223,6 +223,24 @@ async def accept_selection(slug: str, queue_id: int, data: dict):
     return result
 
 
+@router.post("/{queue_id}/re-flow")
+async def reflow_pending(slug: str, queue_id: int):
+    """Re-stamp every pending item onto the queue's current posting times.
+
+    Call after changing the recurrence, when the user answers yes to "re-flow
+    existing scheduled postings?". Answering no means simply not calling this:
+    the new times then apply only to items added from now on.
+
+    Order and rendered text are preserved — only *when* each item goes out
+    moves.
+    """
+    await _queue_in_project_or_404(slug, queue_id)
+    try:
+        return await smart_queue_accept.reflow_pending(queue_id)
+    except SmartQueueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @router.post("/{queue_id}/re-render")
 async def rerender_pending(slug: str, queue_id: int):
     """Re-render every still-pending post this queue owns from the current
@@ -246,6 +264,41 @@ async def _default_ai_system(project_id: int) -> str:
         "ai_block_default_system_prompt", project_id=project_id
     )
     return resolved["system"]
+
+
+@router.get("/{queue_id}/activity")
+async def queue_activity(slug: str, queue_id: int, limit: int = 10):
+    """What this queue is about to post and what it recently posted.
+
+    Drives the expandable panel on the project dashboard. ``upcoming`` is the
+    real posting state — per-platform rows from ``social_posts`` — rather than
+    the queue item alone, so a video whose Mastodon slot failed while Bluesky
+    succeeded reads correctly instead of as one ambiguous line.
+    """
+    await _queue_in_project_or_404(slug, queue_id)
+    db = await get_db()
+    base = """
+        SELECT p.id, p.platform, p.status, p.scheduled_at, p.posted_at,
+               p.post_url, p.error, v.title, v.id AS video_id
+          FROM social_posts p
+          JOIN smart_queue_items i ON i.id = p.smart_queue_item_id
+          JOIN videos v ON v.id = i.video_id
+         WHERE i.queue_id = ?
+    """
+    upcoming = await db.execute_fetchall(
+        base + " AND p.status NOT IN ('posted','skipped')"
+        " ORDER BY p.scheduled_at IS NULL, p.scheduled_at LIMIT ?",
+        (queue_id, limit),
+    )
+    recent = await db.execute_fetchall(
+        base + " AND p.status IN ('posted','failed','skipped')"
+        " ORDER BY COALESCE(p.posted_at, p.scheduled_at) DESC LIMIT ?",
+        (queue_id, limit),
+    )
+    return {
+        "upcoming": [dict(r) for r in upcoming],
+        "recent": [dict(r) for r in recent],
+    }
 
 
 @router.get("/{queue_id}/items")

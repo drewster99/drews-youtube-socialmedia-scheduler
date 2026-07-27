@@ -265,6 +265,18 @@ async def publish_video_job(video_id: str) -> dict:
                         (video_id,),
                     )
                 results["published"] = True
+                # Single funnel for "this video became live" — see
+                # services/smart_queue_live. Best-effort: a queue problem must
+                # never make a successful publish look failed.
+                try:
+                    from yt_scheduler.services.smart_queue_live import (
+                        on_video_became_live,
+                    )
+                    await on_video_became_live(video_id)
+                except Exception:
+                    logger.exception(
+                        "Smart-queue auto-add failed for %s after publish", video_id
+                    )
                 await events.record_event(
                     video_id,
                     "published",
@@ -306,6 +318,19 @@ async def publish_video_job(video_id: str) -> dict:
                 )
             results["published"] = True
             results["youtube_skipped"] = True
+            # Single funnel for "this video became live" — see
+            # services/smart_queue_live. Best-effort: a queue problem must
+            # never make a successful publish look failed.
+            try:
+                from yt_scheduler.services.smart_queue_live import (
+                    on_video_became_live,
+                )
+                await on_video_became_live(video_id)
+            except Exception:
+                logger.exception(
+                    "Smart-queue auto-add failed for %s after publish", video_id
+                )
+
             await events.record_event(
                 video_id,
                 "published",

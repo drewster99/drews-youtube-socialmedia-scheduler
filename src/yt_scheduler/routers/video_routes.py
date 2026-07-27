@@ -878,6 +878,20 @@ async def update_video(video_id: str, data: dict):
                 f"UPDATE videos SET {', '.join(updates)} WHERE id = ?", params
             )
 
+    # Manual privacy flip to public is one of the ways a video becomes live.
+    # Keyed on the transition (was not public, now is) rather than on the new
+    # value alone, so re-saving an already-public video isn't a fresh event.
+    # Best-effort: a queue problem must not make a successful save look failed.
+    if new_privacy == "public" and (before.get("privacy_status") or "") != "public":
+        try:
+            from yt_scheduler.services.smart_queue_live import on_video_became_live
+
+            await on_video_became_live(video_id)
+        except Exception:
+            logger.exception(
+                "Smart-queue auto-add failed for %s after a manual publish", video_id
+            )
+
     # publish_at changes route through apply_user_reschedule so the
     # APScheduler job actually re-registers, publish_at_manual flips
     # to 1, and the cascade (children-of-parent or same-tier-siblings)

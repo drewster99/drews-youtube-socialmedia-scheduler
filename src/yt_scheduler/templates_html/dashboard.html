@@ -458,15 +458,21 @@ async function loadSmartQueues() {
             const failedChip = failed
                 ? ` <span style="color: var(--danger);">${failed} failed</span>`
                 : '';
-            return `<div class="card" style="display:flex; justify-content:space-between; align-items:center; gap:1rem; padding:0.6rem 0.8rem;">
-                <div>
-                    <strong>${_sqEscape(queue.name)}</strong>
-                    <div class="form-hint">${_sqEscape(_cadenceSummary(queue))}</div>
+            return `<div class="card" style="padding:0.6rem 0.8rem;">
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:1rem;">
+                    <div>
+                        <strong>${_sqEscape(queue.name)}</strong>
+                        <div class="form-hint">${_sqEscape(_cadenceSummary(queue))}</div>
+                    </div>
+                    <div style="display:flex; gap:1rem; align-items:center;">
+                        <span class="form-hint">${pending} queued · ${posted} posted${failedChip}</span>
+                        <a class="btn btn-sm" href="/projects/${projectSlug}/smart-queues/${queue.id}">Edit</a>
+                    </div>
                 </div>
-                <div style="display:flex; gap:1rem; align-items:center;">
-                    <span class="form-hint">${pending} queued · ${posted} posted${failedChip}</span>
-                    <a class="btn btn-sm" href="/projects/${projectSlug}/smart-queues/${queue.id}">Edit</a>
-                </div>
+                <details class="sq-activity" data-queue-id="${queue.id}" style="margin-top:0.4rem;">
+                    <summary class="form-hint">Upcoming and recent</summary>
+                    <div class="sq-activity-body form-hint">Loading…</div>
+                </details>
             </div>`;
         }).join('');
     } catch (err) {
@@ -475,6 +481,49 @@ async function loadSmartQueues() {
         console.error('Could not load smart schedules', err);
     }
 }
+
+// Loaded on expand rather than with the card: most dashboard visits don't
+// need it, and it's two more queries per queue.
+function _sqActivityLine(row) {
+    const when = row.posted_at || row.scheduled_at;
+    const stamp = when ? fmtScheduledWhen(when) : 'unscheduled';
+    const failed = row.status === 'failed' || row.status === 'skipped';
+    const detail = failed && row.error
+        ? ` — <span style="color: var(--danger);">${_sqEscape(row.error)}</span>`
+        : '';
+    const link = row.post_url
+        ? ` <a href="${_sqEscape(row.post_url)}" target="_blank" rel="noopener">↗</a>`
+        : '';
+    return `<div style="padding:0.1rem 0;">
+        <span style="color: var(--text-dim); min-width:9rem; display:inline-block;">${_sqEscape(stamp)}</span>
+        <span style="min-width:5rem; display:inline-block;">${_sqEscape(row.platform)}</span>
+        <span>${_sqEscape(row.title)}</span>${link}${detail}
+    </div>`;
+}
+
+document.addEventListener('toggle', async (event) => {
+    const details = event.target.closest?.('.sq-activity');
+    if (!details || !details.open || details.dataset.loaded) return;
+    details.dataset.loaded = '1';
+    const body = details.querySelector('.sq-activity-body');
+    try {
+        const resp = await fetch(
+            `/api/projects/${projectSlug}/smart-queues/${details.dataset.queueId}/activity`
+        );
+        if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
+        const data = await resp.json();
+        const upcoming = (data.upcoming || []).map(_sqActivityLine).join('')
+            || '<div>Nothing scheduled.</div>';
+        const recent = (data.recent || []).map(_sqActivityLine).join('')
+            || '<div>Nothing posted yet.</div>';
+        body.innerHTML =
+            `<div style="margin-top:0.3rem;"><strong>Upcoming</strong>${upcoming}</div>` +
+            `<div style="margin-top:0.5rem;"><strong>Recent</strong>${recent}</div>`;
+    } catch (err) {
+        body.innerHTML = `<span style="color: var(--danger);">Could not load activity: ${_sqEscape(err.message)}</span>`;
+        details.dataset.loaded = '';
+    }
+}, true);
 
 loadSmartQueues();
 </script>

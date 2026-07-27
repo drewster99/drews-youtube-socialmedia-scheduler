@@ -2235,6 +2235,22 @@ A slot is **skipped** rather than failed when nothing could make it work: the cl
 
 A render failure is scoped to its own slot: the other platforms still schedule. A video for which **no** slot could carry it has its queue item marked `skipped` too, so it doesn't burn a posting slot on a no-op. A disabled slot produces no row at all — it was never in play.
 
+### `POST /api/projects/{slug}/smart-queues/{queue_id}/re-flow`
+
+**Purpose** — Re-stamp every pending item onto the queue's current posting times, after the recurrence changed.
+
+**Response 200** — `{"reflowed": N}`.
+
+Order and rendered text are preserved; only *when* each item goes out moves. The UI calls this when the user answers yes to "re-flow existing scheduled postings?" — answering no simply doesn't call it, so the new times apply to items added from then on and what is already on the books stays put. Posted and in-flight posts are never re-stamped.
+
+### `GET /api/projects/{slug}/smart-queues/{queue_id}/activity`
+
+**Query** — `limit` (default 10) per list.
+
+**Response 200** — `{"upcoming": [...], "recent": [...]}`, each a list of `{"id", "platform", "status", "scheduled_at", "posted_at", "post_url", "error", "title", "video_id"}`.
+
+Rows are per-platform `social_posts`, not per queue item: a video whose Mastodon slot failed while Bluesky succeeded has to read as two different outcomes rather than one ambiguous line. Drives the expandable panel on the project dashboard, which is the only place queue activity rolls up across videos.
+
 ### `POST /api/projects/{slug}/smart-queues/{queue_id}/re-render`
 
 **Purpose** — Re-render every still-pending post this queue owns from the current template, after editing it.

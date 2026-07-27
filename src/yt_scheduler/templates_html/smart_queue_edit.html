@@ -139,6 +139,9 @@ const isNew = queueIdParam === 'new';
 let queueId = isNew ? null : parseInt(queueIdParam, 10);
 let slots = [];
 let lastSelection = [];
+// Snapshot of the posting times as last saved, so Save can tell whether
+// the recurrence actually changed and only then offer to re-flow.
+let savedSlotsSignature = '[]';
 
 const DAY_NAMES = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
 
@@ -257,6 +260,9 @@ async function loadQueue() {
         input.checked = wanted.includes(input.value);
     });
     slots = queue.slots || [];
+    savedSlotsSignature = JSON.stringify(
+        [...slots].map(s => [s.weekday, s.time_of_day]).sort()
+    );
     renderSlots();
     document.getElementById('sq-delete-btn').style.display = '';
     syncMissedPolicyFields();
@@ -426,6 +432,13 @@ document.getElementById('sq-save-btn').addEventListener('click', async () => {
     showError('');
     try {
         const payload = queuePayload();
+        // Changing the posting times leaves already-scheduled items on the old
+        // ones. Ask rather than assume: re-flowing moves real, already-visible
+        // dates, and silently not re-flowing looks like the change did nothing.
+        const timesChanged = queueId && JSON.stringify(
+            [...slots].map(s => [s.weekday, s.time_of_day]).sort()
+        ) !== savedSlotsSignature;
+
         const saved = queueId
             ? await apiCall(`/api/projects/${projectSlug}/smart-queues/${queueId}`,
                 {method: 'PATCH', headers: {'Content-Type': 'application/json'},
@@ -433,6 +446,20 @@ document.getElementById('sq-save-btn').addEventListener('click', async () => {
             : await apiCall(`/api/projects/${projectSlug}/smart-queues`,
                 {method: 'POST', headers: {'Content-Type': 'application/json'},
                  body: JSON.stringify(payload)});
+
+        if (timesChanged) {
+            if (confirm('Posting times changed. Re-flow existing scheduled postings onto the new schedule?\n\nOK — move everything already scheduled.\nCancel — leave them where they are; the new times apply to videos added from now on.')) {
+                const flowed = await apiCall(
+                    `/api/projects/${projectSlug}/smart-queues/${queueId}/re-flow`,
+                    {method: 'POST'}
+                );
+                document.getElementById('sq-summary').textContent =
+                    `Re-flowed ${flowed.reflowed} scheduled item${flowed.reflowed === 1 ? '' : 's'}.`;
+            }
+        }
+        savedSlotsSignature = JSON.stringify(
+            [...slots].map(s => [s.weekday, s.time_of_day]).sort()
+        );
         if (!queueId) {
             queueId = saved.id;
             // Replace rather than push: going Back should return to the

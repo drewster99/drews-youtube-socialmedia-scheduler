@@ -279,6 +279,47 @@ async def rerender_pending(queue_id: int, *, default_ai_system: str | None = Non
     return {"updated": updated, "errors": errors}
 
 
+async def reflow_pending(queue_id: int) -> dict:
+    """Re-stamp every pending item onto the queue's current recurrence.
+
+    Used after the posting times change. Existing items keep their order and
+    their rendered text — only *when* they go out moves, which is the whole
+    point of saying yes to "re-flow existing scheduled postings?".
+
+    Answering no simply doesn't call this: the new times then apply to items
+    added from now on, and what is already on the books stays put.
+    """
+    from yt_scheduler.services.scheduler import schedule_social_post
+
+    queue = await queue_service.get_queue(queue_id)
+    zone = queue_service.resolve_timezone(queue["timezone"])
+    db = await get_db()
+
+    items = await db.execute_fetchall(
+        "SELECT id FROM smart_queue_items "
+        "WHERE queue_id = ? AND state = 'scheduled' ORDER BY position",
+        (queue_id,),
+    )
+    if not items:
+        return {"reflowed": 0}
+
+    instants = queue_service.occurrences(queue["slots"], zone, len(items))
+    for item, when in zip(items, instants):
+        async with write_transaction() as write_db:
+            await write_db.execute(
+                "UPDATE smart_queue_items SET scheduled_at = ? WHERE id = ?",
+                (when.isoformat(), int(item["id"])),
+            )
+        posts = await db.execute_fetchall(
+            "SELECT id FROM social_posts "
+            "WHERE smart_queue_item_id = ? AND status NOT IN ('posted', 'sending')",
+            (int(item["id"]),),
+        )
+        for post in posts:
+            await schedule_social_post(int(post["id"]), when)
+    return {"reflowed": len(items)}
+
+
 async def _template_by_id(template_id: int) -> dict:
     """Load a template with its slots, by id.
 

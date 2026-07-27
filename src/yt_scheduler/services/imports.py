@@ -252,6 +252,19 @@ async def import_video(
             ),
         )
 
+    # Importing something already public is one of the ways a video first
+    # becomes live to us. Best-effort: a queue problem must not fail an import
+    # that otherwise succeeded.
+    if privacy == "public":
+        try:
+            from yt_scheduler.services.smart_queue_live import on_video_became_live
+
+            await on_video_became_live(video_id)
+        except Exception:
+            logger.exception(
+                "Smart-queue auto-add failed for imported video %s", video_id
+            )
+
     await events.record_event(
         video_id, "imported",
         {
