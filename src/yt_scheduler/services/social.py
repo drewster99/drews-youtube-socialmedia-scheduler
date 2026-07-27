@@ -6,11 +6,19 @@ import asyncio
 import json
 import logging
 import mimetypes
+import os
 import re
+import tempfile
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
+
+# Aliased: MastodonPoster binds a local `media` to a Mastodon attachment dict,
+# which would shadow a bare module import inside that method. Matches how the
+# routers already refer to this module.
+from yt_scheduler.services import media as media_service
 
 from yt_scheduler.services.keychain import (
     store_secret_async,
@@ -354,6 +362,11 @@ class SocialPoster:
 
     required_keys: list[str] = []
 
+    # False when the platform's API cannot take an attachment from us at all,
+    # so :meth:`post` skips media preparation entirely rather than transcoding
+    # a file the poster is about to refuse.
+    accepts_media: bool = True
+
     def __init__(self, bundle: dict | None = None) -> None:
         self._bundle: dict | None = bundle
 
@@ -413,7 +426,40 @@ class SocialPoster:
 
         Subclasses that only use the first item should call
         :meth:`_resolve_media_inputs` to normalise inputs to a list.
+
+        This is a template method: it normalises the media inputs, brings any
+        attachment inside the platform's limits (see :meth:`prepared_media`),
+        and hands the result to :meth:`_post_prepared`, which subclasses
+        implement. Doing it here rather than in each poster means a video is
+        checked against the destination's envelope on *every* send path —
+        smart queue, publish fan-out, and manual Send alike — instead of
+        depending on five implementations staying in agreement.
         """
+        paths, alts = self._resolve_media_inputs(media_path, media_paths, alt_texts)
+        if not self.accepts_media:
+            # Nothing to prepare, and preparing would burn a transcode on an
+            # attachment the poster is about to reject anyway. Its own check
+            # produces the platform-specific explanation.
+            return await self._post_prepared(
+                text, media_paths=paths, alt_texts=alts
+            )
+        # Checked before probing so a missing attachment reports as missing
+        # rather than as an unreadable file.
+        self._require_paths_exist(paths, self.platform)
+        async with self.prepared_media(paths) as prepared:
+            return await self._post_prepared(
+                text, media_paths=prepared, alt_texts=alts
+            )
+
+    async def _post_prepared(
+        self,
+        text: str,
+        media_path: str | None = None,
+        *,
+        media_paths: list[str] | None = None,
+        alt_texts: list[str] | None = None,
+    ) -> dict:
+        """Platform-specific send. ``media_paths`` are already upload-ready."""
         raise NotImplementedError
 
     @staticmethod
@@ -475,6 +521,81 @@ class SocialPoster:
                 "Nothing was posted."
             )
 
+    async def media_limits(self) -> "media_service.PlatformMediaLimits":
+        """What this platform accepts for a video attachment.
+
+        Static for every platform whose limits are published globally.
+        Mastodon overrides this: its caps are per-instance and the only
+        authority is the instance itself.
+        """
+        return PLATFORM_MEDIA_LIMITS[self.platform]
+
+    @asynccontextmanager
+    async def prepared_media(self, paths: list[str]):
+        """Yield upload-ready paths, transcoding any video this platform
+        would reject, and deleting whatever we produced on the way out.
+
+        A source already inside the platform's envelope is yielded untouched
+        — no re-encode, no quality loss, no time spent. Only what actually
+        violates a limit gets re-encoded, and only as far as needed.
+
+        Raises :class:`media_service.MediaTooLongError` when the clip is longer than
+        the platform allows. That is unfixable by encoding, so the caller
+        skips this platform rather than failing it.
+        """
+        from yt_scheduler import config
+
+        limits = await self.media_limits()
+        prepared: list[str] = []
+        temporaries: list[Path] = []
+        try:
+            for path in paths:
+                mime = mimetypes.guess_type(Path(path).name)[0] or ""
+                if not mime.startswith("video/"):
+                    prepared.append(path)
+                    continue
+                probe = await asyncio.to_thread(media_service.probe_video_file, path)
+                if probe is None:
+                    raise MediaUploadError(
+                        f"Can't post to {self.platform}: {Path(path).name} could "
+                        "not be probed, so we can't tell whether it fits the "
+                        "platform's limits. Nothing was posted."
+                    )
+                if not media_service.violates_limits(probe, limits):
+                    prepared.append(path)
+                    continue
+                # Derived files must live inside UPLOAD_DIR: every poster
+                # re-checks its attachments with _require_paths_managed, which
+                # rejects anything outside it. A system temp dir would fail
+                # that check on every transcoded post.
+                derived_dir = config.UPLOAD_DIR / "derived"
+                derived_dir.mkdir(parents=True, exist_ok=True)
+                handle, destination_name = tempfile.mkstemp(
+                    prefix=f"social_{self.platform}_", suffix=".mp4",
+                    dir=str(derived_dir),
+                )
+                # mkstemp hands back an open descriptor we never write through
+                # — ffmpeg opens the path itself. Close it or every transcode
+                # leaks one for the life of the process.
+                os.close(handle)
+                destination = Path(destination_name)
+                temporaries.append(destination)
+                await asyncio.to_thread(
+                    media_service.transcode_for_platform,
+                    path, destination, limits, probe=probe,
+                )
+                logger.info(
+                    "Transcoded %s for %s: %dx%d %.1f MB -> %.1f MB",
+                    Path(path).name, self.platform, probe.width or 0,
+                    probe.height or 0, (probe.size_bytes or 0) / 1e6,
+                    destination.stat().st_size / 1e6,
+                )
+                prepared.append(str(destination))
+            yield prepared
+        finally:
+            for temp in temporaries:
+                temp.unlink(missing_ok=True)
+
     async def is_configured(self) -> bool:
         """Check if this poster's credentials are complete."""
         creds = await self._get_creds()
@@ -535,7 +656,7 @@ class TwitterPoster(SocialPoster):
             await clear_needs_reauth(uuid)
             return True
 
-    async def post(
+    async def _post_prepared(
         self,
         text: str,
         media_path: str | None = None,
@@ -809,7 +930,7 @@ class BlueskyPoster(SocialPoster):
         "redirect_uri",
     ]
 
-    async def post(
+    async def _post_prepared(
         self,
         text: str,
         media_path: str | None = None,
@@ -867,6 +988,18 @@ class BlueskyPoster(SocialPoster):
                 "video": blob,
                 "alt": first_alt or "",
             }
+            # Without aspectRatio, clients guess the shape and lay the post
+            # out wrong — a 9:16 clip renders letterboxed into a 16:9 box.
+            # The lexicon rejects any dimension below 1, so a probe that
+            # comes back without usable numbers is simply omitted.
+            probe = await asyncio.to_thread(
+                media_service.probe_video_file, str(first_path)
+            )
+            if probe and probe.width and probe.height:
+                embed["aspectRatio"] = {
+                    "width": int(probe.width),
+                    "height": int(probe.height),
+                }
         elif embed_kind == "images":
             images_payload: list[dict] = []
             for path_obj, alt in existing[:4]:
@@ -1213,7 +1346,56 @@ class MastodonPoster(SocialPoster):
     platform = "mastodon"
     required_keys = ["access_token", "instance_url"]
 
-    async def post(
+    # Instance limits change only when an admin reconfigures the server, so a
+    # long TTL is fine; the point of caching is to keep an HTTP round trip off
+    # every single send, not to track a moving value.
+    _INSTANCE_LIMITS_TTL_SECONDS = 6 * 60 * 60
+    _instance_limits_cache: dict[str, tuple[float, media_service.PlatformMediaLimits]] = {}
+
+    async def media_limits(self) -> media_service.PlatformMediaLimits:
+        """Read this instance's real caps from ``/api/v2/instance``.
+
+        Mastodon's limits are per-instance and vary enormously —
+        mastodon.social allows a 99 MiB / 8.29 Mpx video where the built-in
+        defaults are 40 MB / 2.3 Mpx. Hardcoding the defaults would reject
+        files the instance would happily accept, so the instance is the only
+        authority worth asking.
+
+        A fetch failure falls back to Mastodon's built-in defaults, which are
+        the *most restrictive* case — so the fallback can only cause a
+        needless re-encode, never an upload the instance rejects.
+        """
+        creds = await self._get_creds()
+        base = (creds.get("instance_url") or "").rstrip("/")
+        if not base:
+            return PLATFORM_MEDIA_LIMITS["mastodon"]
+
+        cached = self._instance_limits_cache.get(base)
+        if cached and (time.time() - cached[0]) < self._INSTANCE_LIMITS_TTL_SECONDS:
+            return cached[1]
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.get(f"{base}/api/v2/instance")
+                response.raise_for_status()
+                config = (response.json().get("configuration") or {})
+                attachments = config.get("media_attachments") or {}
+            limits = media_service.PlatformMediaLimits(
+                max_bytes=attachments.get("video_size_limit"),
+                max_pixels=attachments.get("video_matrix_limit"),
+                max_frame_rate=attachments.get("video_frame_rate_limit"),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not read media limits from %s (%s); using Mastodon's "
+                "built-in defaults, which are stricter", base, exc,
+            )
+            return PLATFORM_MEDIA_LIMITS["mastodon"]
+
+        self._instance_limits_cache[base] = (time.time(), limits)
+        return limits
+
+    async def _post_prepared(
         self,
         text: str,
         media_path: str | None = None,
@@ -1303,7 +1485,7 @@ class LinkedInPoster(SocialPoster):
     platform = "linkedin"
     required_keys = ["access_token", "person_urn"]
 
-    async def post(
+    async def _post_prepared(
         self,
         text: str,
         media_path: str | None = None,
@@ -1512,10 +1694,14 @@ class LinkedInPoster(SocialPoster):
 
 
 class ThreadsPoster(SocialPoster):
+    # Threads fetches media from a public URL rather than accepting an upload;
+    # nothing this app serves is publicly reachable. See ROADMAP.
+    accepts_media = False
+
     platform = "threads"
     required_keys = ["access_token", "user_id"]
 
-    async def post(
+    async def _post_prepared(
         self,
         text: str,
         media_path: str | None = None,
@@ -1523,11 +1709,15 @@ class ThreadsPoster(SocialPoster):
         media_paths: list[str] | None = None,
         alt_texts: list[str] | None = None,
     ) -> dict:
-        # Threads' API posts text only — it can't attach media. Generation
-        # drops a Threads slot's media (and warns there), so a freshly
-        # generated post never reaches this. A post created by older code may
-        # still carry media_paths — refuse to post it silently text-only;
-        # surface it so the user removes the attachment and retries.
+        # We can't attach media to Threads. Not a platform limitation — the
+        # Threads API does take video, but only as a `video_url` it fetches
+        # itself ("we will cURL your video ... it must be on a public
+        # server"). This app serves on 127.0.0.1 with no public hosting, so
+        # there is no URL to hand Meta. See ROADMAP "Public media hosting".
+        # Generation drops a Threads slot's media (and warns there), so a
+        # freshly generated post never reaches this. A post created by older
+        # code may still carry media_paths — refuse to post it silently
+        # text-only; surface it so the user removes the attachment and retries.
         text = (text or "").strip()
         creds = await self._get_creds()
         if self._resolve_media_inputs(media_path, media_paths, alt_texts)[0]:
@@ -1657,6 +1847,55 @@ _POSTERS: dict[str, type[SocialPoster]] = {
 }
 
 ALL_PLATFORMS = list(_POSTERS.keys())
+
+# Per-platform video envelopes. Same shape of idea as
+# DEFAULT_MAX_CHARS_BY_PLATFORM in services/templates.py, which already
+# encodes a per-platform text limit — this is the media equivalent.
+#
+# Numbers are the published caps as of 2026-07. Where a platform does not
+# publish one (Bluesky's resolution), the field stays None rather than being
+# guessed. Mastodon's entry is a floor only: its real caps are per-instance
+# and MastodonPoster.media_limits() reads them from the instance.
+PLATFORM_MEDIA_LIMITS: dict[str, media_service.PlatformMediaLimits] = {
+    # Bluesky publishes no numbers in its docs; these are the constants the
+    # first-party client enforces (VIDEO_MAX_SIZE_MB / VIDEO_MAX_DURATION_MS).
+    "bluesky": media_service.PlatformMediaLimits(
+        max_bytes=300 * 1000 * 1000,
+        max_duration_seconds=180,
+        video_codecs=("h264", "hevc", "vp8", "vp9"),
+    ),
+    # 140s and 1920x1200 apply to standard accounts. Premium raises both, but
+    # assuming the higher tier would produce uploads that fail for most users.
+    "twitter": media_service.PlatformMediaLimits(
+        max_bytes=512 * 1000 * 1000,
+        max_duration_seconds=140,
+        max_pixels=1920 * 1200,
+        video_codecs=("h264",),
+        audio_codecs=("aac",),
+    ),
+    # Overridden per-instance; see MastodonPoster.media_limits(). These are
+    # Mastodon's own built-in defaults, used only if the instance can't be
+    # reached — they are the most restrictive case, so a file that passes
+    # them passes anywhere.
+    "mastodon": media_service.PlatformMediaLimits(
+        max_bytes=40 * 1024 * 1024,
+        max_pixels=2_304_000,
+        max_frame_rate=60,
+    ),
+    "linkedin": media_service.PlatformMediaLimits(
+        max_bytes=5 * 1000 * 1000 * 1000,
+        max_duration_seconds=15 * 60,
+        max_pixels=4096 * 2304,
+        video_codecs=("h264",),
+    ),
+    "threads": media_service.PlatformMediaLimits(
+        max_bytes=1000 * 1000 * 1000,
+        max_duration_seconds=300,
+        max_long_edge=1920,
+        max_frame_rate=60,
+        video_codecs=("h264", "hevc"),
+    ),
+}
 
 # Per-platform field definitions for the settings UI
 PLATFORM_FIELDS: dict[str, list[dict]] = {

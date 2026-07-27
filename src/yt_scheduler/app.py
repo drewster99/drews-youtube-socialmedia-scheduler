@@ -203,6 +203,12 @@ async def lifespan(app: FastAPI):
         await backfill_channel_assets()
     except Exception:
         logger.exception("backfill_channel_assets failed at startup; continuing")
+    try:
+        from yt_scheduler.services.video_dimensions import backfill_video_dimensions
+
+        await backfill_video_dimensions()
+    except Exception:
+        logger.exception("backfill_video_dimensions failed at startup; continuing")
 
     # Warm the ffmpeg encoder-capability cache once, off the loop. Without this
     # the first clip cut pays a synchronous `ffmpeg -encoders` spawn, and two

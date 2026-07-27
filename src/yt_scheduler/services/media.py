@@ -54,6 +54,7 @@ class VideoProbe:
     codec_name: str | None = None
     container: str | None = None
     has_audio: bool | None = None
+    frame_rate: float | None = None
 
 
 def probe_video_file(video_path: str | Path) -> VideoProbe | None:
@@ -99,6 +100,7 @@ def probe_video_file(video_path: str | Path) -> VideoProbe | None:
     fmt = data.get("format") or {}
     width = height = None
     codec_name: str | None = None
+    frame_rate: float | None = None
     has_audio: bool = False
     for stream in streams:
         codec_type = stream.get("codec_type")
@@ -120,6 +122,16 @@ def probe_video_file(video_path: str | Path) -> VideoProbe | None:
             raw_codec = stream.get("codec_name")
             if isinstance(raw_codec, str) and raw_codec:
                 codec_name = raw_codec.lower()
+            # ffprobe reports frame rate as the rational "24/1" or "30000/1001".
+            raw_rate = stream.get("r_frame_rate")
+            if isinstance(raw_rate, str) and "/" in raw_rate:
+                numerator, _, denominator = raw_rate.partition("/")
+                try:
+                    denominator_value = float(denominator)
+                    if denominator_value:
+                        frame_rate = float(numerator) / denominator_value
+                except (TypeError, ValueError):
+                    pass
         elif codec_type == "audio":
             has_audio = True
 
@@ -155,6 +167,7 @@ def probe_video_file(video_path: str | Path) -> VideoProbe | None:
         codec_name=codec_name,
         container=container,
         has_audio=has_audio,
+        frame_rate=frame_rate,
     )
 
 
@@ -957,3 +970,291 @@ def generate_thumbnail(
         raise
 
     return output
+
+
+# ---------------------------------------------------------------------------
+# Social-platform media normalisation
+#
+# Every platform publishes a different envelope (bytes, duration, pixel
+# matrix, codecs). Rather than encode once for the strictest, we work out
+# what a given source actually violates for a given platform and encode the
+# minimum that fixes it — so a file already inside the envelope uploads
+# untouched, losslessly, at zero cost.
+# ---------------------------------------------------------------------------
+
+
+class MediaTooLongError(Exception):
+    """The source exceeds a platform's duration cap.
+
+    Unfixable by re-encoding: the caller must skip that platform rather than
+    burn CPU on an encode that cannot succeed.
+    """
+
+
+class TranscodeVerificationError(Exception):
+    """The encode finished but still violates the platform's limits.
+
+    Raised instead of uploading, because a file we already know will be
+    rejected must never be handed to a platform.
+    """
+
+
+@dataclass(frozen=True)
+class PlatformMediaLimits:
+    """What one platform will accept for a video attachment.
+
+    ``None`` on any field means "no published limit" — not "zero". Fields
+    describe the *encoded frame*, matching :class:`VideoProbe`.
+    """
+
+    max_bytes: int | None = None
+    max_duration_seconds: float | None = None
+    # Pixel-matrix cap (width * height), e.g. Mastodon's video_matrix_limit.
+    max_pixels: int | None = None
+    # Single-dimension cap applied to the longer edge, e.g. Threads' 1920
+    # horizontal ceiling.
+    max_long_edge: int | None = None
+    max_frame_rate: float | None = None
+    video_codecs: tuple[str, ...] = ()
+    audio_codecs: tuple[str, ...] = ()
+
+
+# Universal ceiling applied to every transcode we produce. Chosen so one
+# encode satisfies every platform we post to; aspect ratio is always
+# preserved, so a portrait source lands at 1080x1920 and a landscape one at
+# 1920x1080 from the same rule.
+_SOCIAL_MAX_LONG_EDGE = 1920
+_SOCIAL_MAX_SHORT_EDGE = 1080
+
+# Headroom under a hard byte ceiling. Container overhead and rate-control
+# overshoot both land on top of the requested bitrate, so aiming at exactly
+# the limit reliably lands just over it.
+_BYTE_TARGET_SAFETY = 0.92
+_AUDIO_BITRATE_BPS = 128_000
+# Below this the result is not worth posting; better a loud failure than a
+# smeared, unwatchable clip nobody can read.
+_MIN_VIDEO_BITRATE_BPS = 400_000
+
+
+def fit_dimensions(
+    width: int,
+    height: int,
+    *,
+    max_long_edge: int | None = _SOCIAL_MAX_LONG_EDGE,
+    max_short_edge: int | None = _SOCIAL_MAX_SHORT_EDGE,
+    max_pixels: int | None = None,
+) -> tuple[int, int]:
+    """Largest even-dimension box that preserves aspect ratio within all caps.
+
+    Never upscales: a source already inside every cap comes back unchanged
+    (rounded down to even, which h264's yuv420p requires). Orientation is
+    preserved by construction — the caps apply to the long and short edges,
+    not to width and height, so portrait stays portrait and square stays
+    square.
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError(f"invalid source dimensions {width}x{height}")
+
+    scale = 1.0
+    long_edge, short_edge = max(width, height), min(width, height)
+    if max_long_edge is not None and long_edge > max_long_edge:
+        scale = min(scale, max_long_edge / long_edge)
+    if max_short_edge is not None and short_edge > max_short_edge:
+        scale = min(scale, max_short_edge / short_edge)
+    if max_pixels is not None and width * height > max_pixels:
+        scale = min(scale, (max_pixels / (width * height)) ** 0.5)
+
+    # Round each edge DOWN to even. Rounding up could re-breach the very cap
+    # we just applied.
+    out_w = max(2, int(width * scale) // 2 * 2)
+    out_h = max(2, int(height * scale) // 2 * 2)
+    return out_w, out_h
+
+
+def _target_video_bitrate_bps(width: int, height: int) -> int:
+    """Quality-appropriate video bitrate for an output of this size, in bps.
+
+    Same bands as :func:`_videotoolbox_bitrate_for_output`, which was tuned
+    against libx264 ``-crf 20`` on talking-head and camera content, expressed
+    numerically so it can be compared against a byte budget and against the
+    source's own bitrate.
+    """
+    big = max(int(width), int(height))
+    if big >= 3000:
+        return 18_000_000
+    if big >= 2000:
+        return 10_000_000
+    if big >= 1500:
+        return 6_000_000
+    if big >= 1000:
+        return 4_000_000
+    return 2_000_000
+
+
+def violates_limits(probe: VideoProbe, limits: PlatformMediaLimits) -> list[str]:
+    """Which of ``limits`` this file breaks, as human-readable reasons.
+
+    Empty list means the file can be uploaded exactly as it is. Duration is
+    reported like any other violation here; deciding that it is the one
+    unfixable kind is :func:`transcode_for_platform`'s job.
+
+    A field the probe couldn't determine is not treated as a violation —
+    we don't re-encode on a guess.
+    """
+    reasons: list[str] = []
+    if (
+        limits.max_bytes is not None
+        and probe.size_bytes is not None
+        and probe.size_bytes > limits.max_bytes
+    ):
+        reasons.append(
+            f"{probe.size_bytes / 1e6:.1f} MB over the "
+            f"{limits.max_bytes / 1e6:.0f} MB limit"
+        )
+    if (
+        limits.max_duration_seconds is not None
+        and probe.duration_seconds is not None
+        and probe.duration_seconds > limits.max_duration_seconds
+    ):
+        reasons.append(
+            f"{probe.duration_seconds:.0f}s over the "
+            f"{limits.max_duration_seconds:.0f}s limit"
+        )
+    if probe.width and probe.height:
+        if limits.max_pixels is not None and probe.width * probe.height > limits.max_pixels:
+            reasons.append(
+                f"{probe.width}x{probe.height} over the "
+                f"{limits.max_pixels:,}px matrix limit"
+            )
+        if (
+            limits.max_long_edge is not None
+            and max(probe.width, probe.height) > limits.max_long_edge
+        ):
+            reasons.append(
+                f"{probe.width}x{probe.height} over the "
+                f"{limits.max_long_edge}px edge limit"
+            )
+    if (
+        limits.video_codecs
+        and probe.codec_name is not None
+        and probe.codec_name not in limits.video_codecs
+    ):
+        reasons.append(f"{probe.codec_name} is not an accepted video codec")
+    return reasons
+
+
+def transcode_for_platform(
+    source: str | Path,
+    output: str | Path,
+    limits: PlatformMediaLimits,
+    *,
+    probe: VideoProbe,
+) -> Path:
+    """Re-encode ``source`` so it satisfies ``limits``, preserving aspect ratio.
+
+    Raises :class:`MediaTooLongError` when the source is longer than the
+    platform allows (no encode can fix duration) and
+    :class:`TranscodeVerificationError` when the finished file still breaches
+    a limit — never returns a file we know will be rejected.
+
+    ``libx264`` is used whenever a byte ceiling applies: videotoolbox honours
+    an exact bitrate target poorly, and overshooting the cap is the one
+    failure this function exists to prevent.
+    """
+    source_path, output_path = Path(source), Path(output)
+    duration = probe.duration_seconds
+    if (
+        limits.max_duration_seconds is not None
+        and duration is not None
+        and duration > limits.max_duration_seconds
+    ):
+        raise MediaTooLongError(
+            f"{duration:.0f}s exceeds the {limits.max_duration_seconds:.0f}s limit"
+        )
+    if probe.width is None or probe.height is None:
+        raise ValueError(f"cannot transcode {source_path.name}: dimensions unknown")
+
+    out_w, out_h = fit_dimensions(
+        probe.width, probe.height, max_pixels=limits.max_pixels,
+        max_long_edge=min(
+            _SOCIAL_MAX_LONG_EDGE, limits.max_long_edge or _SOCIAL_MAX_LONG_EDGE
+        ),
+    )
+
+    # Quality-appropriate bitrate for the OUTPUT size, never above what the
+    # source itself carries: a downscale must never inflate the file. Without
+    # the source clamp, a generous platform cap (X allows 512 MB) would be
+    # read as licence to spend it — a 92 MB source re-encoded to 457 MB.
+    target_bps = _target_video_bitrate_bps(out_w, out_h)
+    if probe.bitrate_bps:
+        target_bps = min(target_bps, probe.bitrate_bps)
+
+    # A byte ceiling can only ever lower the target, never raise it.
+    byte_ceiling_binds = False
+    if limits.max_bytes is not None and duration:
+        budget_bps = int(
+            limits.max_bytes * _BYTE_TARGET_SAFETY * 8 / duration
+        ) - _AUDIO_BITRATE_BPS
+        if budget_bps < _MIN_VIDEO_BITRATE_BPS:
+            raise TranscodeVerificationError(
+                f"cannot fit {duration:.0f}s under {limits.max_bytes / 1e6:.0f} MB "
+                f"without dropping below {_MIN_VIDEO_BITRATE_BPS / 1e6:.1f} Mb/s"
+            )
+        if budget_bps < target_bps:
+            target_bps = budget_bps
+            byte_ceiling_binds = True
+
+    cmd: list[str] = [
+        "ffmpeg", "-y", "-i", str(source_path),
+        "-vf", f"scale={out_w}:{out_h}",
+        "-pix_fmt", "yuv420p",
+        # Threads requires the moov atom at the front; harmless everywhere else.
+        "-movflags", "+faststart",
+        "-c:a", "aac", "-b:a", str(_AUDIO_BITRATE_BPS), "-ar", "48000", "-ac", "2",
+    ]
+
+    # libx264 whenever an exact size has to be hit — videotoolbox honours a
+    # bitrate target too loosely to trust against a hard cap.
+    if byte_ceiling_binds or not hardware_encoder_available("h264"):
+        cmd += [
+            "-c:v", "libx264", "-profile:v", "high", "-preset", "medium",
+            "-b:v", str(target_bps),
+            "-maxrate", str(int(target_bps * 1.2)),
+            "-bufsize", str(target_bps * 2),
+        ]
+    else:
+        cmd += [
+            "-c:v", "h264_videotoolbox", "-profile:v", "high",
+            "-b:v", str(target_bps),
+        ]
+
+    # A frame-rate limit is a CEILING. Only resample when the source actually
+    # exceeds it — passing it unconditionally would upsample 24fps content to
+    # the cap, inflating both encode time and file size for no gain.
+    if (
+        limits.max_frame_rate is not None
+        and probe.frame_rate is not None
+        and probe.frame_rate > limits.max_frame_rate
+    ):
+        cmd += ["-r", str(int(limits.max_frame_rate))]
+
+    cmd.append(str(output_path))
+
+    try:
+        subprocess.run(
+            cmd, check=True, capture_output=True, timeout=_FFMPEG_TIMEOUT_SECONDS
+        )
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        output_path.unlink(missing_ok=True)
+        raise
+
+    # Verify rather than trust: rate control is a target, not a guarantee.
+    if limits.max_bytes is not None:
+        actual = output_path.stat().st_size
+        if actual > limits.max_bytes:
+            output_path.unlink(missing_ok=True)
+            raise TranscodeVerificationError(
+                f"encoded to {actual / 1e6:.1f} MB, still over the "
+                f"{limits.max_bytes / 1e6:.0f} MB limit"
+            )
+    return output_path

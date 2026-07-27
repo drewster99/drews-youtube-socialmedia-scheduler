@@ -120,6 +120,35 @@ before clicking Generate.
 - Defer until the feature has been used enough to know whether users care.
   If they don't notice spend, this is wasted scope.
 
+## Public media hosting (unblocks native video on Threads)
+
+Threads is the one connected platform we cannot attach a video to. Not a
+platform limitation: its API *does* take video, but only as a `video_url`
+that Meta fetches itself — "we will cURL your video using the URL provided
+so it must be on a public server". This app serves on `127.0.0.1`, so
+there is no URL to hand it, and `ThreadsPoster.accepts_media` is `False`.
+
+Every other platform takes a direct binary upload, so this affects Threads
+alone today.
+
+**Acceptance:**
+
+- A way to publish one media file at a short-lived public URL — Cloudflare
+  (we already host the Threads OAuth bounce page there, see `cloudflare/`)
+  or Firebase Storage or similar.
+- The URL must expire or be revoked after the post is created; a clip
+  should not stay world-readable indefinitely because it was posted once.
+- `ThreadsPoster` flips to `accepts_media = True` and uploads via the
+  container flow (create with `video_url` → poll status → publish).
+
+**Notes:**
+
+- Interacts with the smart queue: a Threads slot in a queue template
+  currently records a `skipped` row for every video item.
+- Whatever hosts the file must receive the *transcoded* output, not the
+  master — see `PLATFORM_MEDIA_LIMITS["threads"]` (1 GB, 5 min, 1920
+  horizontal max).
+
 ## Source-file backup cleanup
 
 The "Replace source" flow (migration 026, `POST /api/videos/{id}/source-file`)
