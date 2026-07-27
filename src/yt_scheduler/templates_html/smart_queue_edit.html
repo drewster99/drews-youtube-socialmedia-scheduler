@@ -352,6 +352,26 @@ function renderSelection(result) {
     ).join('');
 }
 
+// Buttons that issue a request are disabled while it is in flight, and say so.
+// Two reasons, and the second is the one that bites: a button that looks idle
+// during a slow request invites a second click, and Auto-select now CREATES
+// the schedule — so a double-click on a new one fired two creates, the second
+// of which failed the (project, name) uniqueness check and reported an error
+// for work that had actually succeeded.
+async function withBusyButton(id, busyLabel, work) {
+    const button = document.getElementById(id);
+    if (button.disabled) return;
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = busyLabel;
+    try {
+        return await work();
+    } finally {
+        button.disabled = false;
+        button.textContent = label;
+    }
+}
+
 async function runSelection(shuffle) {
     showError('');
     try {
@@ -391,8 +411,10 @@ document.getElementById('sq-slots').addEventListener('click', (event) => {
 });
 
 document.getElementById('sq-missed-policy').addEventListener('change', syncMissedPolicyFields);
-document.getElementById('sq-select-btn').addEventListener('click', () => runSelection(false));
-document.getElementById('sq-shuffle-btn').addEventListener('click', () => runSelection(true));
+document.getElementById('sq-select-btn').addEventListener('click', () =>
+    withBusyButton('sq-select-btn', 'Selecting…', () => runSelection(false)));
+document.getElementById('sq-shuffle-btn').addEventListener('click', () =>
+    withBusyButton('sq-shuffle-btn', 'Shuffling…', () => runSelection(true)));
 
 document.getElementById('sq-accept-btn').addEventListener('click', async () => {
     if (!lastSelection.length && !waitingCount) return;
@@ -454,7 +476,8 @@ document.getElementById('sq-accept-btn').addEventListener('click', async () => {
     }
 });
 
-document.getElementById('sq-rerender-btn').addEventListener('click', async () => {
+document.getElementById('sq-rerender-btn').addEventListener('click', () =>
+    withBusyButton('sq-rerender-btn', 'Re-rendering…', async () => {
     if (!queueId) {
         // Saving wouldn't help — a queue that has never been saved has no
         // scheduled posts to re-render. Say what's actually true.
@@ -478,7 +501,7 @@ document.getElementById('sq-rerender-btn').addEventListener('click', async () =>
     } catch (err) {
         showError(err.message);
     }
-});
+    }));
 
 // Save, creating the queue on first call. Returns true on success.
 // Extracted so Auto-select and Accept can save for you rather than refusing:
@@ -529,15 +552,16 @@ async function saveQueue({offerReflow = true} = {}) {
     return true;
 }
 
-document.getElementById('sq-save-btn').addEventListener('click', async () => {
-    showError('');
-    try {
-        await saveQueue();
-        document.getElementById('sq-summary').textContent = 'Saved.';
-    } catch (err) {
-        showError(err.message);
-    }
-});
+document.getElementById('sq-save-btn').addEventListener('click', () =>
+    withBusyButton('sq-save-btn', 'Saving…', async () => {
+        showError('');
+        try {
+            await saveQueue();
+            document.getElementById('sq-summary').textContent = 'Saved.';
+        } catch (err) {
+            showError(err.message);
+        }
+    }));
 
 document.getElementById('sq-delete-btn').addEventListener('click', async () => {
     if (!queueId) return;
