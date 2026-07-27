@@ -1793,8 +1793,8 @@ async def video_file_info(video_id: str) -> dict:
     probe: media_service.VideoProbe | None = None
     if exists and resolved is not None:
         probe = await asyncio.to_thread(media_service.probe_video_file, resolved)
-    width = probe.width if probe else None
-    height = probe.height if probe else None
+    width = probe.display_width if probe else None
+    height = probe.display_height if probe else None
     codec_name = probe.codec_name if probe else None
     container = probe.container if probe else None
     return {
@@ -1932,16 +1932,20 @@ async def _apply_source_swap(
     # trust the user's upload as best-effort), so incoming_probe can
     # legitimately be None here. Fall back to existing-row duration
     # when we can't probe.
+    # Display dimensions, matching what stamp_dimensions writes into these same
+    # columns. They feed the smart queue's orientation filter, so the two
+    # writers have to agree: a rotated source stored as coded would be filed
+    # landscape here while the sweep files it portrait.
     if incoming_probe is None or incoming_probe.duration_seconds is None:
         new_duration = row.get("duration_seconds")
-        new_width = incoming_probe.width if incoming_probe else None
-        new_height = incoming_probe.height if incoming_probe else None
+        new_width = incoming_probe.display_width if incoming_probe else None
+        new_height = incoming_probe.display_height if incoming_probe else None
         new_bitrate = incoming_probe.bitrate_bps if incoming_probe else None
         new_size = incoming_probe.size_bytes if incoming_probe else None
     else:
         new_duration = incoming_probe.duration_seconds
-        new_width = incoming_probe.width
-        new_height = incoming_probe.height
+        new_width = incoming_probe.display_width
+        new_height = incoming_probe.display_height
         new_bitrate = incoming_probe.bitrate_bps
         new_size = incoming_probe.size_bytes
     async with write_transaction() as db:
@@ -2061,17 +2065,28 @@ def _evaluate_replacement(
     current_origin = row.get("source_file_origin")
     if (
         current is not None
-        and current.width is not None
-        and current.height is not None
-        and incoming.width is not None
-        and incoming.height is not None
+        and current.display_width is not None
+        and current.display_height is not None
+        and incoming.display_width is not None
+        and incoming.display_height is not None
         and current_origin not in ("youtube_download", "generated_clip")
     ):
-        if incoming.width < current.width and incoming.height < current.height:
+        # Display dimensions on both sides: across a rotation boundary the
+        # coded axes don't correspond, so a coded comparison would measure
+        # width against height and call a same-size replacement a downgrade
+        # (or miss a real one).
+        if (
+            incoming.display_width < current.display_width
+            and incoming.display_height < current.display_height
+        ):
             issues.append({
                 "code": "resolution_downgrade",
-                "current": _format_resolution(current.width, current.height),
-                "incoming": _format_resolution(incoming.width, incoming.height),
+                "current": _format_resolution(
+                    current.display_width, current.display_height
+                ),
+                "incoming": _format_resolution(
+                    incoming.display_width, incoming.display_height
+                ),
             })
 
     return issues
@@ -2269,6 +2284,9 @@ async def replace_video_source_file(
                 "video_id": video_id,
                 "path": str(incoming_path),
                 "original_name": new_original,
+                "probe_rotation_degrees": (
+                    incoming_probe.rotation_degrees if incoming_probe else 0
+                ),
                 "probe_width": incoming_probe.width if incoming_probe else None,
                 "probe_height": incoming_probe.height if incoming_probe else None,
                 "probe_duration_seconds": (
@@ -2408,6 +2426,9 @@ async def finalize_pending_source_file(
         size_bytes=entry["probe_size_bytes"],
         codec_name=entry["probe_codec_name"],
         container=entry["probe_container"],
+        # Back-compat: entries written before rotation was captured have no
+        # such key. 0 reproduces exactly what those entries meant at the time.
+        rotation_degrees=entry.get("probe_rotation_degrees", 0),
     )
 
     async with _source_file_lock(video_id):

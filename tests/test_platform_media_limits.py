@@ -228,3 +228,30 @@ class TestRotatedSources:
             f"scaled to {scale}; a rotated vertical source must not be "
             "squashed into the shape it happens to be stored as"
         )
+
+    def test_a_probe_round_trips_its_rotation(self):
+        """The Replace-source pending snapshot stores a probe's fields and
+        rebuilds it later. Dropping rotation there would rebuild a probe that
+        claims coded == display, quietly undoing the fix for that path."""
+        original = self._rotated(90)
+        snapshot = {
+            "probe_width": original.width,
+            "probe_height": original.height,
+            "probe_rotation_degrees": original.rotation_degrees,
+        }
+        rebuilt = media.VideoProbe(
+            duration_seconds=None, width=snapshot["probe_width"],
+            height=snapshot["probe_height"], bitrate_bps=None, size_bytes=None,
+            rotation_degrees=snapshot["probe_rotation_degrees"],
+        )
+        assert (rebuilt.display_width, rebuilt.display_height) == (1080, 1920)
+
+    def test_a_pre_rotation_snapshot_still_rebuilds(self):
+        """Entries written before rotation was captured have no such key; 0
+        reproduces exactly what they meant at the time."""
+        rebuilt = media.VideoProbe(
+            duration_seconds=None, width=1920, height=1080,
+            bitrate_bps=None, size_bytes=None,
+            rotation_degrees={}.get("probe_rotation_degrees", 0),
+        )
+        assert (rebuilt.display_width, rebuilt.display_height) == (1920, 1080)

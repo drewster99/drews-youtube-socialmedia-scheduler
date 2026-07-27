@@ -687,8 +687,8 @@ class SocialPoster:
                 )
                 logger.info(
                     "Transcoded %s for %s: %dx%d %.1f MB -> %.1f MB",
-                    Path(path).name, self.platform, probe.width or 0,
-                    probe.height or 0, (probe.size_bytes or 0) / 1e6,
+                    Path(path).name, self.platform, probe.display_width or 0,
+                    probe.display_height or 0, (probe.size_bytes or 0) / 1e6,
                     destination.stat().st_size / 1e6,
                 )
                 prepared.append(str(destination))

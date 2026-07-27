@@ -595,8 +595,8 @@ async def generate_preview(
         media_service.probe_video_file, parent_path,
     )
     warnings = media_service.source_quality_warnings(
-        width=parent_probe.width if parent_probe else None,
-        height=parent_probe.height if parent_probe else None,
+        width=parent_probe.display_width if parent_probe else None,
+        height=parent_probe.display_height if parent_probe else None,
         source_origin=parent.get("source_file_origin"),
     )
 

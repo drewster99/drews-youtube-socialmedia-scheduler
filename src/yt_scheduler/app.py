@@ -539,8 +539,8 @@ async def project_generate_from_source_page(
                 probe.container if probe else None,
             )
             parent_meta["warnings"] = media_service.source_quality_warnings(
-                width=probe.width if probe else None,
-                height=probe.height if probe else None,
+                width=probe.display_width if probe else None,
+                height=probe.display_height if probe else None,
                 source_origin=current_video.get("source_file_origin"),
             )
         # 11-char id is the YouTube convention used elsewhere in the app.
