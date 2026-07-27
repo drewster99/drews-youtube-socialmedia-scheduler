@@ -383,10 +383,17 @@ async def list_queue_items(slug: str, queue_id: int, state: str | None = None):
             )
         clause = " AND i.state = ?"
         params.append(state)
+    # has_posted is derived, not read from i.state: sending updates
+    # social_posts and never the item, so state alone would present a video
+    # that has already gone out as still upcoming.
     rows = await db.execute_fetchall(
         f"""
         SELECT i.id, i.video_id, i.position, i.scheduled_at, i.state,
-               i.reason, i.added_at, v.title, v.item_type, v.duration_seconds
+               i.reason, i.added_at, v.title, v.item_type, v.duration_seconds,
+               EXISTS (
+                   SELECT 1 FROM social_posts p
+                    WHERE p.smart_queue_item_id = i.id AND p.status = 'posted'
+               ) AS has_posted
           FROM smart_queue_items i
           JOIN videos v ON v.id = i.video_id
          WHERE i.queue_id = ?{clause}

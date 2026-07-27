@@ -515,9 +515,22 @@ async def reflow_pending(queue_id: int) -> dict:
     zone = queue_service.resolve_timezone(queue["timezone"])
     db = await get_db()
 
+    # An item whose posts have gone out is finished, whatever its state column
+    # says — sending updates social_posts and never touches the item, so a
+    # posted video sits at state='scheduled' forever. Including it here handed
+    # it a fresh future occurrence and pushed every remaining video back a
+    # week, once per re-flow. A partially-sent item is excluded too: some of it
+    # is already public, so moving the rest is not a re-flow, it is a split.
     items = await db.execute_fetchall(
-        "SELECT id FROM smart_queue_items "
-        "WHERE queue_id = ? AND state = 'scheduled' ORDER BY position",
+        """
+        SELECT i.id FROM smart_queue_items i
+         WHERE i.queue_id = ? AND i.state = 'scheduled'
+           AND NOT EXISTS (
+               SELECT 1 FROM social_posts p
+                WHERE p.smart_queue_item_id = i.id AND p.status = 'posted'
+           )
+         ORDER BY i.position
+        """,
         (queue_id,),
     )
     if not items:

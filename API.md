@@ -2183,7 +2183,7 @@ Eligibility is decided by a single `smart_queue.is_eligible()` used by both the 
 
 ### `GET /api/projects/{slug}/smart-queues`
 
-**Response 200** — `{"queues": [{...queue, "slots": [...], "counts": {"queued": N, "scheduled": N, "posted": N, ...}}]}`. `counts` is per `smart_queue_items.state`; `queued` and `scheduled` are both pending.
+**Response 200** — `{"queues": [{...queue, "slots": [...], "counts": {"queued": N, "scheduled": N, "posted": N, ...}}]}`. `counts` buckets the queue's items. `queued` and `scheduled` are both pending. **`posted` and `failed` are derived from the item's `social_posts` rows, not from `smart_queue_items.state`** — sending updates the post and never the item, so an item stays `scheduled` for life and counting the column reported "0 posted" forever.
 
 ### `GET /api/projects/{slug}/smart-queues/{queue_id}`
 
@@ -2293,9 +2293,11 @@ Posts already `posted` (or mid-`sending`) are left alone — they are history. R
 
 **Query** — `state` (optional): `queued` | `scheduled` | `posted` | `failed` | `skipped` | `removed`.
 
-`queued` is in the queue with no posting time yet; `scheduled` has one.
+`queued` is in the queue with no posting time yet; `scheduled` has one. Note that only `queued`, `scheduled` and `removed` are ever *written* to `smart_queue_items.state` — filtering on the other three matches nothing. Use `has_posted` (below) to tell a sent item from a pending one.
 
-**Response 200** — `{"items": [{"id", "video_id", "position", "scheduled_at", "state", "reason", "added_at", "title", "item_type", "duration_seconds"}]}`, ordered by position.
+**Response 200** — `{"items": [{"id", "video_id", "position", "scheduled_at", "state", "reason", "added_at", "title", "item_type", "duration_seconds", "has_posted"}]}`, ordered by position.
+
+`has_posted` (0/1) is derived from the item's `social_posts` rows, because sending updates the post and never the item — an item that has already gone out still reads `state = 'scheduled'`. Any caller asking "what is still coming up?" must check `has_posted`, not `state` alone.
 
 An item is an **occurrence, not a membership**: one row per time a video was added, with no uniqueness constraint on (queue, video). Recycling a previously-posted clip appends a new row and the history keeps both.
 
