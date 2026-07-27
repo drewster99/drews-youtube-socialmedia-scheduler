@@ -2173,6 +2173,59 @@ Terminal jobs (`done` / `failed`) are evicted from the in-memory job dict 30 min
 **Side effects** — For each scheduled video: writes `videos.publish_at`, sets `videos.status='scheduled'`, registers the APScheduler `publish_video_job` (which also re-stages per-post social jobs), and stamps `publish_at_manual = 0` so future cascade routines may sweep these rows.
 
 
+## Smart queues (`/api/projects/{slug}/smart-queues`)
+
+Source: `src/yt_scheduler/routers/smart_queue_routes.py`
+
+Project-wide social posting of promo clips: an ordered list of videos plus a weekly recurrence, posting one video to every enabled slot of its template at each recurrence time. See `SMART_QUEUE.md` for the design.
+
+Eligibility is decided by a single `smart_queue.is_eligible()` used by both the Auto-select preview here and the live-transition hook, so the two cannot drift into disagreeing about which videos belong in a queue.
+
+### `GET /api/projects/{slug}/smart-queues`
+
+**Response 200** — `{"queues": [{...queue, "slots": [...], "counts": {"scheduled": N, "posted": N, ...}}]}`. `counts` is per `smart_queue_items.state`.
+
+### `GET /api/projects/{slug}/smart-queues/{queue_id}`
+
+**Response 200** — the queue row plus `slots`. **404** when the queue doesn't exist *or* belongs to another project — reported as not-found rather than forbidden so an id in another project isn't confirmed to exist by the error.
+
+### `POST /api/projects/{slug}/smart-queues`
+
+**Body** — `name`, `template_id`, `timezone` (IANA name, e.g. `America/Los_Angeles`), `slots` (`[{"weekday": 0-6 where 0=Monday, "time_of_day": "HH:MM"}]`). Optional: `min_duration_seconds` (default 0), `max_duration_seconds` (default 180), `orientations` (default `["portrait","square"]`), `exclude_already_posted` (default true), `auto_add_on_live` (default true), `missed_policy` (`post_late` | `reschedule_end` | `remove`, default `post_late`), `missed_grace_hours` (default 24, applies only to `post_late` and is stored NULL otherwise).
+
+Keys the body omits are left to the documented creation defaults — the route forwards only what was actually sent, so an absent key can't override a default and then fail its own validation.
+
+**Response 200** — the created queue. **400** with the specific reason for: no posting times, an inverted duration range, an unknown orientation or timezone, `post_late` without a positive grace window, or a duplicate name within the project.
+
+`item_type` is deliberately **not** a queue field: the template's `applies_to` is the single source of truth for which types a queue can touch.
+
+### `PATCH /api/projects/{slug}/smart-queues/{queue_id}`
+
+Partial update. `slots`, when present, **replaces the whole set**. Switching `missed_policy` away from `post_late` clears `missed_grace_hours` rather than leaving a stale number that does nothing.
+
+### `DELETE /api/projects/{slug}/smart-queues/{queue_id}`
+
+**Response 200** — `{"deleted": true, "cancelled_posts": N}`. Cancels every pending per-post job the queue owns. Posting history is **kept**: `social_posts.smart_queue_item_id` is `ON DELETE SET NULL`, so posts a deleted queue sent remain readable on each video.
+
+### `POST /api/projects/{slug}/smart-queues/{queue_id}/candidates`
+
+**Purpose** — Preview which videos the queue would take, what it excluded and why, and when they would go out. **Writes nothing.**
+
+**Body** (all optional) — `min_duration_seconds`, `max_duration_seconds`, `orientations`, `exclude_already_posted` override the saved filters *for this preview only*, so the config screen can show the effect of a change before saving. `shuffle` (bool) reorders the proposed batch; it never touches items already scheduled by this queue.
+
+**Response 200** — `{"eligible": [...], "excluded": [{...video, "reasons": [...]}], "unknown_dimensions": N, "summary": {"total": N, "by_type": {...}}, "forecast": [ISO, ...], "ends_at": ISO|null, "warnings": [...]}`.
+
+`forecast[i]` is when `eligible[i]` would post. Occurrences are enumerated as **local** dates in the queue's timezone and converted individually, so an instant on the far side of a DST boundary still lands at its stated wall-clock time. Every excluded video carries its reasons, and `unknown_dimensions` counts those whose orientation can't be determined — a video the filters dropped is always accounted for rather than silently missing from the total. `warnings` carries e.g. "this queue has no posting times", so an empty forecast can't be mistaken for "nothing scheduled".
+
+### `GET /api/projects/{slug}/smart-queues/{queue_id}/items`
+
+**Query** — `state` (optional): `scheduled` | `posted` | `failed` | `skipped` | `removed`.
+
+**Response 200** — `{"items": [{"id", "video_id", "position", "scheduled_at", "state", "reason", "added_at", "title", "item_type", "duration_seconds"}]}`, ordered by position.
+
+An item is an **occurrence, not a membership**: one row per time a video was added, with no uniqueness constraint on (queue, video). Recycling a previously-posted clip appends a new row and the history keeps both.
+
+
 ## Chunked uploads (`/api/uploads`)
 
 All large-file domain endpoints (`POST /api/videos/upload`, `POST /api/videos/items`, `POST /api/videos/{id}/source-file`) consume an `upload_id` produced by this chunked-upload protocol rather than accepting a multipart body. The protocol exists because:

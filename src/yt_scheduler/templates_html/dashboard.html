@@ -14,8 +14,15 @@
     </h1>
     <div style="display:flex; gap:0.5rem;">
         <button class="btn" id="compose-standalone-btn">Compose standalone post</button>
+        <a class="btn" href="/projects/{{ current_project.slug }}/smart-queues/new">Create smart schedule</a>
         <button class="btn btn-primary" id="upload-btn">Upload new video</button>
     </div>
+</div>
+
+<!-- Above the videos: a queue is a project-wide thing, not a per-video one. -->
+<div class="section" id="smart-queue-section" style="display:none;">
+    <h2>Smart schedules</h2>
+    <div id="smart-queue-list"></div>
 </div>
 
 <div class="section">
@@ -410,5 +417,65 @@ _dashPollTimer = setInterval(_dashPollTick, 30_000);
 document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') _dashPollTick();
 });
+
+// Smart schedules. The section stays hidden until at least one exists, so a
+// project that doesn't use them isn't given an empty box to wonder about.
+const DAY_ABBREV = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+
+// A queue name is user-supplied and interpolated into innerHTML below.
+function _sqEscape(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function _cadenceSummary(queue) {
+    if (!queue.slots || !queue.slots.length) return 'no posting times';
+    const byDay = new Map();
+    queue.slots.forEach(slot => {
+        if (!byDay.has(slot.weekday)) byDay.set(slot.weekday, []);
+        byDay.get(slot.weekday).push(slot.time_of_day);
+    });
+    return [...byDay.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([day, times]) => `${DAY_ABBREV[day]} ${times.sort().join(', ')}`)
+        .join(' · ');
+}
+
+async function loadSmartQueues() {
+    try {
+        const resp = await fetch(`/api/projects/${projectSlug}/smart-queues`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const queues = data.queues || [];
+        document.getElementById('smart-queue-section').style.display =
+            queues.length ? '' : 'none';
+        document.getElementById('smart-queue-list').innerHTML = queues.map(queue => {
+            const counts = queue.counts || {};
+            const pending = counts.scheduled || 0;
+            const posted = counts.posted || 0;
+            const failed = counts.failed || 0;
+            const failedChip = failed
+                ? ` <span style="color: var(--danger);">${failed} failed</span>`
+                : '';
+            return `<div class="card" style="display:flex; justify-content:space-between; align-items:center; gap:1rem; padding:0.6rem 0.8rem;">
+                <div>
+                    <strong>${_sqEscape(queue.name)}</strong>
+                    <div class="form-hint">${_sqEscape(_cadenceSummary(queue))}</div>
+                </div>
+                <div style="display:flex; gap:1rem; align-items:center;">
+                    <span class="form-hint">${pending} queued · ${posted} posted${failedChip}</span>
+                    <a class="btn btn-sm" href="/projects/${projectSlug}/smart-queues/${queue.id}">Edit</a>
+                </div>
+            </div>`;
+        }).join('');
+    } catch (err) {
+        // A dashboard that can't reach the queue endpoint should still show
+        // videos; the queue section simply stays hidden.
+        console.error('Could not load smart schedules', err);
+    }
+}
+
+loadSmartQueues();
 </script>
 {% endblock %}

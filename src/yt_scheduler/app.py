@@ -33,6 +33,7 @@ from yt_scheduler.routers import (
     project_variable_routes,
     promo_routes,
     settings_routes,
+    smart_queue_routes,
     social_credentials_routes,
     social_routes,
     template_routes,
@@ -388,6 +389,7 @@ app.include_router(item_variable_routes.router)
 app.include_router(item_image_routes.router)
 app.include_router(media_routes.router)
 app.include_router(uploads_routes.router)
+app.include_router(smart_queue_routes.router)
 
 
 # --- HTML pages -------------------------------------------------------------
@@ -546,6 +548,19 @@ async def project_generate_from_source_page(
             "current_video": current_video,
             "parent_meta": parent_meta,
         },
+    )
+
+
+@app.get("/projects/{slug}/smart-queues/{queue_id}", response_class=HTMLResponse)
+async def project_smart_queue_page(request: Request, slug: str, queue_id: str):
+    """Create or edit a smart queue. ``queue_id`` is ``new`` for a fresh one,
+    so the create and edit flows are the same screen rather than two that
+    have to be kept looking alike."""
+    project = await _project_context(slug)
+    return html_templates.TemplateResponse(
+        request,
+        "smart_queue_edit.html",
+        context={"current_project": project, "queue_id": queue_id},
     )
 
 

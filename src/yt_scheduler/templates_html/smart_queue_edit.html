@@ -1,0 +1,406 @@
+{% extends "base.html" %}
+{% block title %}{{ current_project.name }} / Smart schedule — Drew's Video + Socials Scheduler{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1 class="page-breadcrumb">
+        <a href="/projects/{{ current_project.slug }}" class="crumb crumb-project">{{ current_project.name }}</a>
+        <span class="crumb-sep">/</span>
+        <a href="/projects/{{ current_project.slug }}" class="crumb crumb-page">Smart schedule</a>
+    </h1>
+    <div style="display:flex; gap:0.5rem;">
+        <button class="btn" id="sq-delete-btn" style="display:none;">Delete</button>
+        <button class="btn btn-primary" id="sq-save-btn">Save</button>
+    </div>
+</div>
+
+<div id="sq-error" class="error-banner" style="display:none;"></div>
+
+<div class="section">
+    <h2>Settings</h2>
+    <div class="form-row">
+        <label for="sq-name">Name</label>
+        <input type="text" id="sq-name" placeholder="Daily clips">
+    </div>
+    <div class="form-row">
+        <label for="sq-template">Template</label>
+        <select id="sq-template"></select>
+        <p class="form-hint" id="sq-template-hint">
+            The template decides which video types this queue can post — the queue
+            can't widen it.
+        </p>
+    </div>
+    <div class="form-row">
+        <label for="sq-timezone">Time zone</label>
+        <input type="text" id="sq-timezone" placeholder="America/Los_Angeles">
+        <p class="form-hint">
+            Posting times are wall-clock in this zone, so they stay put across
+            daylight-saving changes.
+        </p>
+    </div>
+</div>
+
+<div class="section">
+    <h2>Posting times</h2>
+    <p class="form-hint">
+        One video goes out at each time. Any number per day, including none.
+    </p>
+    <div id="sq-slots"></div>
+    <div style="margin-top:0.5rem; display:flex; gap:0.5rem; align-items:center;">
+        <select id="sq-new-weekday">
+            <option value="0">Monday</option>
+            <option value="1">Tuesday</option>
+            <option value="2">Wednesday</option>
+            <option value="3">Thursday</option>
+            <option value="4">Friday</option>
+            <option value="5">Saturday</option>
+            <option value="6">Sunday</option>
+        </select>
+        <input type="time" id="sq-new-time" value="09:00">
+        <button class="btn btn-sm" id="sq-add-slot">Add time</button>
+    </div>
+</div>
+
+<div class="section">
+    <h2>Which videos</h2>
+    <div class="form-row">
+        <label>Length</label>
+        <span>
+            between
+            <input type="number" id="sq-min-duration" min="0" step="1" value="0" style="width:6rem;"> and
+            <input type="number" id="sq-max-duration" min="1" step="1" value="180" style="width:6rem;"> seconds
+        </span>
+    </div>
+    <div class="form-row">
+        <label>Orientation</label>
+        <span id="sq-orientations">
+            <label><input type="checkbox" value="portrait" checked> Portrait</label>
+            <label><input type="checkbox" value="square" checked> Square</label>
+            <label><input type="checkbox" value="landscape"> Landscape</label>
+        </span>
+    </div>
+    <div class="form-row">
+        <label>Already posted</label>
+        <label>
+            <input type="checkbox" id="sq-exclude-posted" checked>
+            Exclude videos already posted by this queue
+        </label>
+        <p class="form-hint">
+            Uncheck to re-post the back catalogue once this queue runs dry.
+        </p>
+    </div>
+    <div class="form-row">
+        <label>New videos</label>
+        <label>
+            <input type="checkbox" id="sq-auto-add" checked>
+            Automatically add eligible videos to this queue as they go live
+        </label>
+    </div>
+    <div class="form-row">
+        <label for="sq-missed-policy">If a posting time is missed</label>
+        <span>
+            <select id="sq-missed-policy">
+                <option value="post_late">Post late, if within</option>
+                <option value="reschedule_end">Move to the end of the queue</option>
+                <option value="remove">Remove from the queue</option>
+            </select>
+            <input type="number" id="sq-missed-hours" min="1" value="24" style="width:5rem;">
+            <span id="sq-missed-hours-label">hours</span>
+        </span>
+    </div>
+</div>
+
+<div class="section">
+    <h2>Selection</h2>
+    <div style="display:flex; gap:0.5rem; align-items:center;">
+        <button class="btn" id="sq-select-btn">Auto-select videos</button>
+        <button class="btn" id="sq-shuffle-btn" style="display:none;">Shuffle</button>
+        <span id="sq-summary" class="form-hint"></span>
+    </div>
+    <div id="sq-forecast" class="form-hint" style="margin-top:0.5rem;"></div>
+    <div id="sq-candidates" style="margin-top:0.75rem;"></div>
+    <details id="sq-excluded-wrap" style="margin-top:0.75rem; display:none;">
+        <summary id="sq-excluded-summary"></summary>
+        <div id="sq-excluded"></div>
+    </details>
+</div>
+
+<script>
+const projectSlug = {{ current_project.slug | tojson }};
+const queueIdParam = {{ queue_id | tojson }};
+const isNew = queueIdParam === 'new';
+let queueId = isNew ? null : parseInt(queueIdParam, 10);
+let slots = [];
+let lastSelection = [];
+
+const DAY_NAMES = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function showError(message) {
+    const banner = document.getElementById('sq-error');
+    banner.textContent = message;
+    banner.style.display = message ? 'block' : 'none';
+    if (message) window.scrollTo({top: 0, behavior: 'smooth'});
+}
+
+// Surface the server's own message rather than a generic one — the server
+// explains exactly which filter or field was rejected.
+async function apiCall(url, options) {
+    const response = await fetch(url, options);
+    if (!response.ok) {
+        let detail = `${response.status} ${response.statusText}`;
+        try {
+            const body = await response.json();
+            if (body.detail) detail = body.detail;
+        } catch (err) { /* non-JSON error body; keep the status line */ }
+        throw new Error(detail);
+    }
+    return response.json();
+}
+
+function renderSlots() {
+    const host = document.getElementById('sq-slots');
+    if (!slots.length) {
+        host.innerHTML = '<p class="form-hint">No posting times yet — this queue would never post.</p>';
+        return;
+    }
+    const ordered = [...slots].sort(
+        (a, b) => a.weekday - b.weekday || a.time_of_day.localeCompare(b.time_of_day)
+    );
+    host.innerHTML = ordered.map((slot, index) =>
+        `<div class="slot-row" style="display:flex; gap:0.5rem; align-items:center; padding:0.15rem 0;">
+            <span>${escapeHtml(DAY_NAMES[slot.weekday])} at ${escapeHtml(slot.time_of_day)}</span>
+            <button class="btn btn-sm sq-remove-slot" data-index="${index}">Remove</button>
+        </div>`
+    ).join('');
+    slots = ordered;
+}
+
+function selectedOrientations() {
+    return Array.from(
+        document.querySelectorAll('#sq-orientations input:checked')
+    ).map(input => input.value);
+}
+
+function currentFilters() {
+    return {
+        min_duration_seconds: parseFloat(document.getElementById('sq-min-duration').value) || 0,
+        max_duration_seconds: parseFloat(document.getElementById('sq-max-duration').value) || null,
+        orientations: selectedOrientations(),
+        exclude_already_posted: document.getElementById('sq-exclude-posted').checked,
+    };
+}
+
+function queuePayload() {
+    const policy = document.getElementById('sq-missed-policy').value;
+    return {
+        name: document.getElementById('sq-name').value,
+        template_id: parseInt(document.getElementById('sq-template').value, 10),
+        timezone: document.getElementById('sq-timezone').value.trim(),
+        slots: slots,
+        auto_add_on_live: document.getElementById('sq-auto-add').checked,
+        missed_policy: policy,
+        missed_grace_hours: policy === 'post_late'
+            ? parseInt(document.getElementById('sq-missed-hours').value, 10)
+            : null,
+        ...currentFilters(),
+    };
+}
+
+async function loadTemplates() {
+    // Templates are project-scoped by query parameter, not by path segment.
+    const data = await apiCall(
+        `/api/templates?project_slug=${encodeURIComponent(projectSlug)}`
+    );
+    const select = document.getElementById('sq-template');
+    const list = Array.isArray(data) ? data : (data.templates || []);
+    select.innerHTML = list.map(
+        tpl => `<option value="${tpl.id}">${escapeHtml(tpl.name)}</option>`
+    ).join('');
+}
+
+async function loadQueue() {
+    if (isNew) {
+        // Default to the browser's zone: it's what the user means by "9am",
+        // and it's editable right there if they mean something else.
+        document.getElementById('sq-timezone').value =
+            Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+        renderSlots();
+        return;
+    }
+    const queue = await apiCall(`/api/projects/${projectSlug}/smart-queues/${queueId}`);
+    document.getElementById('sq-name').value = queue.name;
+    document.getElementById('sq-template').value = queue.template_id;
+    document.getElementById('sq-timezone').value = queue.timezone;
+    document.getElementById('sq-min-duration').value = queue.min_duration_seconds;
+    document.getElementById('sq-max-duration').value = queue.max_duration_seconds ?? '';
+    document.getElementById('sq-exclude-posted').checked = !!queue.exclude_already_posted;
+    document.getElementById('sq-auto-add').checked = !!queue.auto_add_on_live;
+    document.getElementById('sq-missed-policy').value = queue.missed_policy;
+    if (queue.missed_grace_hours) {
+        document.getElementById('sq-missed-hours').value = queue.missed_grace_hours;
+    }
+    const wanted = JSON.parse(queue.orientations || '[]');
+    document.querySelectorAll('#sq-orientations input').forEach(input => {
+        input.checked = wanted.includes(input.value);
+    });
+    slots = queue.slots || [];
+    renderSlots();
+    document.getElementById('sq-delete-btn').style.display = '';
+    syncMissedPolicyFields();
+}
+
+function syncMissedPolicyFields() {
+    const isPostLate = document.getElementById('sq-missed-policy').value === 'post_late';
+    document.getElementById('sq-missed-hours').style.display = isPostLate ? '' : 'none';
+    document.getElementById('sq-missed-hours-label').style.display = isPostLate ? '' : 'none';
+}
+
+function renderSelection(result) {
+    lastSelection = result.eligible || [];
+    const byType = Object.entries(result.summary.by_type || {})
+        .map(([type, count]) => `${count} ${type}${count === 1 ? '' : 's'}`)
+        .join(', ');
+    document.getElementById('sq-summary').textContent =
+        result.summary.total
+            ? `${byType} = ${result.summary.total} videos`
+            : 'No videos match these filters.';
+
+    const forecast = document.getElementById('sq-forecast');
+    if (result.warnings && result.warnings.length) {
+        forecast.innerHTML = `<span style="color: var(--danger);">${escapeHtml(result.warnings.join(' '))}</span>`;
+    } else if (result.ends_at) {
+        const end = new Date(result.ends_at);
+        forecast.textContent = `Runs through ${end.toLocaleDateString(undefined,
+            {weekday:'short', year:'numeric', month:'long', day:'numeric'})}.`;
+    } else {
+        forecast.textContent = '';
+    }
+
+    document.getElementById('sq-shuffle-btn').style.display =
+        result.summary.total ? '' : 'none';
+
+    document.getElementById('sq-candidates').innerHTML = lastSelection.map((video, index) => {
+        const when = result.forecast[index]
+            ? new Date(result.forecast[index]).toLocaleString(undefined,
+                {weekday:'short', month:'numeric', day:'numeric', hour:'numeric', minute:'2-digit'})
+            : '—';
+        return `<div style="display:flex; gap:0.75rem; padding:0.2rem 0;">
+            <span style="min-width:11rem; color: var(--text-dim);">${escapeHtml(when)}</span>
+            <span style="min-width:5rem;">${escapeHtml(video.item_type)}</span>
+            <span>${escapeHtml(video.title)}</span>
+        </div>`;
+    }).join('');
+
+    // Everything excluded is accounted for, with the reason — a bare count
+    // with no explanation is what makes a filter feel broken.
+    const excluded = result.excluded || [];
+    const wrap = document.getElementById('sq-excluded-wrap');
+    wrap.style.display = excluded.length ? '' : 'none';
+    const unknownNote = result.unknown_dimensions
+        ? ` — ${result.unknown_dimensions} with unknown dimensions`
+        : '';
+    document.getElementById('sq-excluded-summary').textContent =
+        `${excluded.length} video${excluded.length === 1 ? '' : 's'} excluded${unknownNote}`;
+    document.getElementById('sq-excluded').innerHTML = excluded.map(video =>
+        `<div style="padding:0.2rem 0;">
+            <span>${escapeHtml(video.title)}</span>
+            <span class="form-hint"> — ${escapeHtml((video.reasons || []).join('; '))}</span>
+        </div>`
+    ).join('');
+}
+
+async function runSelection(shuffle) {
+    if (!queueId) {
+        showError('Save this smart schedule before selecting videos.');
+        return;
+    }
+    showError('');
+    try {
+        const result = await apiCall(
+            `/api/projects/${projectSlug}/smart-queues/${queueId}/candidates`,
+            {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({...currentFilters(), shuffle: !!shuffle}),
+            }
+        );
+        renderSelection(result);
+    } catch (err) {
+        showError(err.message);
+    }
+}
+
+document.getElementById('sq-add-slot').addEventListener('click', () => {
+    const weekday = parseInt(document.getElementById('sq-new-weekday').value, 10);
+    const time = document.getElementById('sq-new-time').value;
+    if (!time) return;
+    if (slots.some(s => s.weekday === weekday && s.time_of_day === time)) return;
+    slots.push({weekday, time_of_day: time});
+    renderSlots();
+});
+
+document.getElementById('sq-slots').addEventListener('click', (event) => {
+    const button = event.target.closest('.sq-remove-slot');
+    if (!button) return;
+    slots.splice(parseInt(button.dataset.index, 10), 1);
+    renderSlots();
+});
+
+document.getElementById('sq-missed-policy').addEventListener('change', syncMissedPolicyFields);
+document.getElementById('sq-select-btn').addEventListener('click', () => runSelection(false));
+document.getElementById('sq-shuffle-btn').addEventListener('click', () => runSelection(true));
+
+document.getElementById('sq-save-btn').addEventListener('click', async () => {
+    showError('');
+    try {
+        const payload = queuePayload();
+        const saved = queueId
+            ? await apiCall(`/api/projects/${projectSlug}/smart-queues/${queueId}`,
+                {method: 'PATCH', headers: {'Content-Type': 'application/json'},
+                 body: JSON.stringify(payload)})
+            : await apiCall(`/api/projects/${projectSlug}/smart-queues`,
+                {method: 'POST', headers: {'Content-Type': 'application/json'},
+                 body: JSON.stringify(payload)});
+        if (!queueId) {
+            queueId = saved.id;
+            // Replace rather than push: going Back should return to the
+            // dashboard, not to a /new page that would create a second queue.
+            window.history.replaceState(
+                {}, '', `/projects/${projectSlug}/smart-queues/${queueId}`
+            );
+            document.getElementById('sq-delete-btn').style.display = '';
+        }
+        showError('');
+    } catch (err) {
+        showError(err.message);
+    }
+});
+
+document.getElementById('sq-delete-btn').addEventListener('click', async () => {
+    if (!queueId) return;
+    if (!confirm('Delete this smart schedule? Anything still scheduled is cancelled. Posting history is kept.')) return;
+    try {
+        await apiCall(`/api/projects/${projectSlug}/smart-queues/${queueId}`,
+            {method: 'DELETE'});
+        window.location.href = `/projects/${projectSlug}`;
+    } catch (err) {
+        showError(err.message);
+    }
+});
+
+(async function init() {
+    try {
+        await loadTemplates();
+        await loadQueue();
+    } catch (err) {
+        showError(err.message);
+    }
+})();
+</script>
+{% endblock %}
