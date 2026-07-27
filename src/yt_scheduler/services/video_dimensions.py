@@ -4,8 +4,13 @@ Orientation is a *filter* for the smart queue, which selects across every
 video in a project — so it has to be answerable in SQL rather than by
 shelling out to ffprobe per row.
 
-Only width and height are stored. Orientation is derived on read, so there
-is no second column that can disagree with the dimensions it came from.
+Only width and height are stored, and they are the **display** dimensions —
+what a viewer actually sees, with rotation applied. A phone clip shot
+vertically is commonly stored as a 1920x1080 landscape frame plus a
+90-degree display matrix; recording the coded frame would file it as
+landscape, so "portrait only" would miss it and "landscape" would wrongly
+catch it. Orientation is derived on read, so there is no second column that
+can disagree with the dimensions it came from.
 
 ``videos.youtube_kind`` is not an orientation signal despite the name: it is
 a duration-derived guess (``<=60s -> 'short'``) written only on the import
@@ -62,18 +67,21 @@ async def stamp_dimensions(video_id: str, video_file_path: str | None) -> tuple[
     if not video_file_path or not Path(video_file_path).exists():
         return None
     probe = await asyncio.to_thread(media_service.probe_video_file, video_file_path)
-    if probe is None or not probe.width or not probe.height:
+    if probe is None or not probe.display_width or not probe.display_height:
         logger.warning(
             "Could not determine dimensions for video %s (%s)",
             video_id, Path(video_file_path).name,
         )
         return None
+    # Display, not coded: the orientation filter answers "what shape does this
+    # look like", and a rotated source is a different shape than it is stored.
+    width, height = int(probe.display_width), int(probe.display_height)
     async with write_transaction() as db:
         await db.execute(
             "UPDATE videos SET width = ?, height = ? WHERE id = ?",
-            (int(probe.width), int(probe.height), video_id),
+            (width, height, video_id),
         )
-    return int(probe.width), int(probe.height)
+    return width, height
 
 
 async def ensure_dimensions(video_id: str) -> tuple[int, int] | None:

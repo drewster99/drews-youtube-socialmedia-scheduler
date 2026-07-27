@@ -51,6 +51,14 @@ attach time, with a one-time backfill for rows that have a local file.
 Orientation is *derived*, never stored: `height > width` → portrait,
 `width > height` → landscape, equal → square.
 
+The stored dimensions are the **display** ones, with rotation applied. A
+phone clip shot vertically is commonly stored as a 1920×1080 landscape frame
+plus a 90° display matrix, and every player shows it as 1080×1920 portrait.
+Recording the coded frame would file it as landscape, so "portrait only"
+would miss exactly the videos the filter exists for. The same display
+dimensions drive the platform limit checks and the transcode's scale filter —
+ffmpeg autorotates, so the frame it scales is already the rotated one.
+
 Rows with no dimensions (nothing local to probe) are **excluded and
 counted**, never silently dropped: the config screen shows "N videos
 skipped — dimensions unknown" so the number is always accounted for.

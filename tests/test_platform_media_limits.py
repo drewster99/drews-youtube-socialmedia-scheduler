@@ -13,6 +13,8 @@ invariant worth protecting is: a transcode never inflates.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from yt_scheduler.services import media
@@ -140,3 +142,89 @@ class TestPlatformRegistry:
         entry = PLATFORM_MEDIA_LIMITS["mastodon"]
         assert entry.max_bytes == 40 * 1024 * 1024
         assert entry.max_pixels == 2_304_000
+
+
+class TestRotatedSources:
+    """A phone clip shot vertically is stored as a landscape frame plus a
+    90-degree display matrix. Every player, and ffmpeg's own decoder, shows it
+    portrait — so measuring the coded frame files it as landscape, and an
+    orientation filter set to portrait misses the very videos it exists for.
+    """
+
+    @staticmethod
+    def _rotated(degrees: int) -> media.VideoProbe:
+        """Coded landscape 1920x1080, displayed per ``degrees``."""
+        return media.VideoProbe(
+            duration_seconds=30.0, width=1920, height=1080,
+            bitrate_bps=8_000_000, size_bytes=30_000_000,
+            codec_name="h264", rotation_degrees=degrees,
+        )
+
+    @pytest.mark.parametrize("degrees", [90, -90, 270, -270])
+    def test_a_quarter_turn_swaps_the_display_shape(self, degrees):
+        probe = self._rotated(degrees)
+        assert (probe.display_width, probe.display_height) == (1080, 1920)
+
+    @pytest.mark.parametrize("degrees", [0, 180, -180, 360])
+    def test_a_half_turn_leaves_the_shape_alone(self, degrees):
+        probe = self._rotated(degrees)
+        assert (probe.display_width, probe.display_height) == (1920, 1080)
+
+    def test_orientation_follows_what_a_viewer_sees(self):
+        from yt_scheduler.services.video_dimensions import orientation_of
+
+        rotated = self._rotated(90)
+        assert orientation_of(rotated.width, rotated.height) == "landscape"
+        assert orientation_of(
+            rotated.display_width, rotated.display_height
+        ) == "portrait", "selecting portrait must find a phone-shot vertical clip"
+
+    def test_limits_are_measured_against_the_displayed_frame(self):
+        """A platform's pixel and edge caps apply to the frame it renders."""
+        # 1920 long edge either way, so the edge cap must fire for both.
+        limits = media.PlatformMediaLimits(max_long_edge=1280)
+        assert media.violates_limits(self._rotated(90), limits)
+        assert media.violates_limits(self._rotated(0), limits)
+
+    def test_unknown_dimensions_stay_unknown_through_rotation(self):
+        blind = media.VideoProbe(
+            duration_seconds=1.0, width=None, height=None,
+            bitrate_bps=None, size_bytes=None, rotation_degrees=90,
+        )
+        assert blind.display_width is None
+        assert blind.display_height is None
+
+    def test_transcode_targets_the_displayed_shape(self, monkeypatch, tmp_path):
+        """ffmpeg autorotates, so the frame reaching the scale filter is the
+        rotated one. Scaling to the coded shape would squash a vertical clip
+        into a landscape box."""
+        import subprocess
+
+        captured: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            captured.append(cmd)
+            Path(cmd[-1]).write_bytes(b"\0" * 1000)
+            return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+        monkeypatch.setattr(media.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            media, "hardware_encoder_available", lambda codec="h264": False
+        )
+        monkeypatch.setattr(
+            media, "probe_video_file",
+            lambda path: media.VideoProbe(
+                duration_seconds=30.0, width=1080, height=1920,
+                bitrate_bps=1, size_bytes=1000, codec_name="h264",
+            ),
+        )
+        media.transcode_for_platform(
+            tmp_path / "in.mp4", tmp_path / "out.mp4",
+            media.PlatformMediaLimits(max_pixels=2_304_000),
+            probe=self._rotated(90),
+        )
+        scale = captured[0][captured[0].index("-vf") + 1]
+        assert scale == "scale=1080:1920", (
+            f"scaled to {scale}; a rotated vertical source must not be "
+            "squashed into the shape it happens to be stored as"
+        )

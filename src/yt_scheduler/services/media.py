@@ -33,10 +33,16 @@ class VideoProbe:
 
     Fields are ``None`` when ffprobe didn't return that piece — the caller
     must treat a missing field as "unknown" rather than 0. ``width`` and
-    ``height`` come from the first video stream; rotation metadata is not
-    applied so they describe the encoded frame, not the display frame
-    (irrelevant for fidelity comparisons since both files being compared
-    use the same convention).
+    ``height`` come from the first video stream and describe the **encoded**
+    frame.
+
+    For "what shape is this video", use :attr:`display_width` /
+    :attr:`display_height` instead. A phone clip shot vertically is commonly
+    stored as a 1920x1080 landscape frame plus a 90-degree display matrix;
+    every player, and ffmpeg's own decoder, shows it as 1080x1920 portrait.
+    Reading the coded frame would call that video landscape, so an
+    orientation filter set to portrait would miss it and a landscape filter
+    would wrongly catch it.
 
     ``codec_name`` is the ffprobe codec_name string for the first video
     stream (e.g. ``h264``, ``hevc``, ``vp9``, ``av1``, ``prores``).
@@ -55,6 +61,27 @@ class VideoProbe:
     container: str | None = None
     has_audio: bool | None = None
     frame_rate: float | None = None
+    #: Clockwise display rotation in degrees, from the stream's display matrix
+    #: (or the legacy ``rotate`` tag). 0 when absent.
+    rotation_degrees: int = 0
+
+    @property
+    def _is_quarter_turned(self) -> bool:
+        return abs(int(self.rotation_degrees)) % 180 == 90
+
+    @property
+    def display_width(self) -> int | None:
+        """Frame width as a viewer sees it, with rotation applied."""
+        if self.width is None or self.height is None:
+            return self.width
+        return self.height if self._is_quarter_turned else self.width
+
+    @property
+    def display_height(self) -> int | None:
+        """Frame height as a viewer sees it, with rotation applied."""
+        if self.width is None or self.height is None:
+            return self.height
+        return self.width if self._is_quarter_turned else self.height
 
 
 def probe_video_file(video_path: str | Path) -> VideoProbe | None:
@@ -101,6 +128,7 @@ def probe_video_file(video_path: str | Path) -> VideoProbe | None:
     width = height = None
     codec_name: str | None = None
     frame_rate: float | None = None
+    rotation_degrees: int = 0
     has_audio: bool = False
     for stream in streams:
         codec_type = stream.get("codec_type")
@@ -122,6 +150,22 @@ def probe_video_file(video_path: str | Path) -> VideoProbe | None:
             raw_codec = stream.get("codec_name")
             if isinstance(raw_codec, str) and raw_codec:
                 codec_name = raw_codec.lower()
+            # Rotation lives in the Display Matrix side data on modern ffmpeg
+            # and in a `rotate` tag on older files. Both are read: a phone clip
+            # is otherwise measured as the landscape frame it is stored as,
+            # rather than the portrait one everybody sees.
+            for side_data in stream.get("side_data_list") or []:
+                if "rotation" in side_data:
+                    try:
+                        rotation_degrees = int(float(side_data["rotation"]))
+                    except (TypeError, ValueError):
+                        pass
+            if not rotation_degrees:
+                raw_rotate = (stream.get("tags") or {}).get("rotate")
+                try:
+                    rotation_degrees = int(float(raw_rotate)) if raw_rotate else 0
+                except (TypeError, ValueError):
+                    rotation_degrees = 0
             # ffprobe reports frame rate as the rational "24/1" or "30000/1001".
             raw_rate = stream.get("r_frame_rate")
             if isinstance(raw_rate, str) and "/" in raw_rate:
@@ -168,6 +212,7 @@ def probe_video_file(video_path: str | Path) -> VideoProbe | None:
         container=container,
         has_audio=has_audio,
         frame_rate=frame_rate,
+        rotation_degrees=rotation_degrees,
     )
 
 
@@ -383,13 +428,13 @@ def _video_bitrate_bps_for_probe(probe: VideoProbe | None) -> int:
     """Encode bitrate for a source we may or may not have a usable probe for."""
     # `is None`, not truthiness: a probe reporting width=0 is a real (broken)
     # measurement and belongs in the bottom band, not in the 1080p assumption.
-    if probe is None or probe.width is None or probe.height is None:
+    if probe is None or probe.display_width is None or probe.display_height is None:
         logger.info(
             "Source dimensions unknown — encoding at the %dx%d bitrate.",
             *_ASSUMED_DIMENSIONS_WHEN_UNKNOWN,
         )
         return _target_video_bitrate_bps(*_ASSUMED_DIMENSIONS_WHEN_UNKNOWN)
-    return _target_video_bitrate_bps(probe.width, probe.height)
+    return _target_video_bitrate_bps(probe.display_width, probe.display_height)
 
 
 def _ffmpeg_timestamp_to_seconds(ts: str) -> float:
@@ -1129,19 +1174,21 @@ def violates_limits(probe: VideoProbe, limits: PlatformMediaLimits) -> list[str]
             f"{probe.duration_seconds:.0f}s over the "
             f"{limits.max_duration_seconds:.0f}s limit"
         )
-    if probe.width and probe.height:
-        if limits.max_pixels is not None and probe.width * probe.height > limits.max_pixels:
+    # Display dimensions throughout: a platform's pixel and edge caps apply to
+    # the frame it will show, and a rotated source is a different shape than it
+    # is stored as.
+    width, height = probe.display_width, probe.display_height
+    if width and height:
+        if limits.max_pixels is not None and width * height > limits.max_pixels:
             reasons.append(
-                f"{probe.width}x{probe.height} over the "
-                f"{limits.max_pixels:,}px matrix limit"
+                f"{width}x{height} over the {limits.max_pixels:,}px matrix limit"
             )
         if (
             limits.max_long_edge is not None
-            and max(probe.width, probe.height) > limits.max_long_edge
+            and max(width, height) > limits.max_long_edge
         ):
             reasons.append(
-                f"{probe.width}x{probe.height} over the "
-                f"{limits.max_long_edge}px edge limit"
+                f"{width}x{height} over the {limits.max_long_edge}px edge limit"
             )
     if (
         limits.video_codecs
@@ -1180,11 +1227,14 @@ def transcode_for_platform(
         raise MediaTooLongError(
             f"{duration:.0f}s exceeds the {limits.max_duration_seconds:.0f}s limit"
         )
-    if probe.width is None or probe.height is None:
+    if probe.display_width is None or probe.display_height is None:
         raise ValueError(f"cannot transcode {source_path.name}: dimensions unknown")
 
+    # Display dimensions, because ffmpeg autorotates: the frame reaching the
+    # scale filter is already the rotated one. Scaling to the coded shape would
+    # squash a phone-shot vertical clip into a landscape box.
     out_w, out_h = fit_dimensions(
-        probe.width, probe.height, max_pixels=limits.max_pixels,
+        probe.display_width, probe.display_height, max_pixels=limits.max_pixels,
         max_long_edge=min(
             _SOCIAL_MAX_LONG_EDGE, limits.max_long_edge or _SOCIAL_MAX_LONG_EDGE
         ),
@@ -1287,7 +1337,7 @@ def _verify_output_within_limits(
     # vanishes — precisely the failure this function exists to prevent — so an
     # output we cannot fully measure is refused rather than waved through.
     unknown: list[str] = []
-    if probe.width is None or probe.height is None:
+    if probe.display_width is None or probe.display_height is None:
         unknown.append("dimensions")
     if limits.video_codecs and probe.codec_name is None:
         unknown.append("video codec")

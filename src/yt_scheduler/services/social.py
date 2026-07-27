@@ -1101,10 +1101,13 @@ class BlueskyPoster(SocialPoster):
             probe = await asyncio.to_thread(
                 media_service.probe_video_file, str(first_path)
             )
-            if probe and probe.width and probe.height:
+            if probe and probe.display_width and probe.display_height:
+                # Display, not coded: the ratio has to describe the frame
+                # Bluesky will actually render, or a rotated clip lays out
+                # sideways.
                 embed["aspectRatio"] = {
-                    "width": int(probe.width),
-                    "height": int(probe.height),
+                    "width": int(probe.display_width),
+                    "height": int(probe.display_height),
                 }
         elif embed_kind == "images":
             images_payload: list[dict] = []
