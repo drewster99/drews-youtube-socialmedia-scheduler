@@ -670,13 +670,26 @@ async function fetchTemplate() {
     return resp.ok ? await resp.json() : null;
 }
 
-async function loadTemplate() {
+async function loadTemplate({ populateEditableFields = false } = {}) {
+    /** Re-reads the template and refreshes everything derived from it: the
+     * slot list, credentials, known variables.
+     *
+     * The description, applies-to boxes and test variables are only filled in
+     * when `populateEditableFields` is set — that is, on first load. Those
+     * inputs are edited by hand and committed by their own Save button (or, for
+     * test variables, a debounced autosave), so overwriting them here threw
+     * away whatever had been typed but not yet saved. Add slot and Delete slot
+     * both call this to refresh the list, which is how typing a description and
+     * then touching a slot silently reverted the description.
+     *
+     * The default is false so a caller added later cannot reintroduce that by
+     * omission: repopulating the form is the exceptional request, not the norm.
+     */
     let appliesTo = ['hook', 'short', 'segment', 'video'];
     try {
         template = await fetchTemplate();
         if (template) {
             slots = template.slots || [];
-            document.getElementById('template-desc').value = template.description || '';
             if (Array.isArray(template.applies_to) && template.applies_to.length) {
                 appliesTo = template.applies_to;
             }
@@ -685,7 +698,10 @@ async function loadTemplate() {
                 deleteBtn.disabled = true;
                 deleteBtn.title = 'Built-in templates cannot be deleted';
             }
-            hydrateTestVariables(template.test_variables || {});
+            if (populateEditableFields) {
+                document.getElementById('template-desc').value = template.description || '';
+                hydrateTestVariables(template.test_variables || {});
+            }
         } else {
             slots = [];
             showToast(`Couldn't load template "${templateName}".`, 'error');
@@ -694,9 +710,11 @@ async function loadTemplate() {
         slots = [];
         showToast(`Couldn't load template "${templateName}": ${e.message}`, 'error');
     }
-    document.querySelectorAll('input[name="applies_to"]').forEach(box => {
-        box.checked = appliesTo.includes(box.value);
-    });
+    if (populateEditableFields) {
+        document.querySelectorAll('input[name="applies_to"]').forEach(box => {
+            box.checked = appliesTo.includes(box.value);
+        });
+    }
     await loadCredentialsForVisiblePlatforms();
     await loadKnownCustomVars();
     renderSlots();
@@ -811,6 +829,6 @@ function initTestVarsAutosave() {
     });
 }
 
-loadTemplate();
+loadTemplate({ populateEditableFields: true });
 </script>
 {% endblock %}

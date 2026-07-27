@@ -205,3 +205,25 @@ async def test_save_template_only_touches_builtin_slots(app_db) -> None:
     )
     assert extra_after is not None
     assert extra_after["body"] == "extra variant"
+
+
+def test_slot_edits_do_not_repopulate_the_meta_form():
+    """Typing a description, then adding or deleting a slot, used to revert it.
+
+    Add slot and Delete slot both call loadTemplate() to refresh the slot list,
+    and loadTemplate() also refilled the description, applies-to boxes and test
+    variables from the server — throwing away anything typed but not yet saved.
+
+    The guarantee is the *default*: repopulating those inputs must be something
+    a caller opts into, so a call site added later cannot reintroduce the bug by
+    simply not thinking about it.
+    """
+    from pathlib import Path
+
+    page = Path(
+        "src/yt_scheduler/templates_html/template_edit.html"
+    ).read_text()
+
+    assert "async function loadTemplate({ populateEditableFields = false } = {})" in page
+    # Exactly one caller opts in: the initial page load.
+    assert page.count("populateEditableFields: true") == 1
