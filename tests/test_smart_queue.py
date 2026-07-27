@@ -56,6 +56,26 @@ class TestEligibility:
         assert not verdict.ok
         assert "template applies to" in verdict.reasons[0]
 
+    async def test_a_video_template_covers_an_episode(self, queue_module):
+        """`applies_to` speaks tiers (hook/short/segment/video) while videos
+        carry an item_type (episode/hook/short/segment/standalone). Only the
+        full-length value is spelled differently, so a template applying to
+        "Video" silently matched nothing at all."""
+        module, _ = queue_module
+        verdict = module.is_eligible(
+            _video(item_type="episode"), _queue(), ["video"]
+        )
+        assert verdict.ok, verdict.reasons
+
+    async def test_the_mapping_is_not_symmetric(self, queue_module):
+        """Only video->episode is renamed; every other tier must keep matching
+        its own name and nothing else."""
+        module, _ = queue_module
+        matches = module.tier_matches_item_type
+        assert matches("hook", "hook") and not matches("hook", "episode")
+        assert not matches("video", "video"), "no video has item_type 'video'"
+        assert not matches("segment", "short")
+
     @pytest.mark.parametrize("privacy", ["unlisted", "private", ""])
     async def test_requires_privacy_public_not_status(self, queue_module, privacy):
         """privacy_status is the authority on liveness — `status` drifts off

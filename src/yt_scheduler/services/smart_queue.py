@@ -112,11 +112,33 @@ def resolve_timezone(name: str) -> ZoneInfo:
         raise SmartQueueError(f"Unknown timezone {name!r}") from exc
 
 
+#: ``templates.applies_to`` is a TIER list — hook | short | segment | video —
+#: while ``videos.item_type`` is a kind: episode | hook | short | segment |
+#: standalone. They line up on three of four values; only the full-length one
+#: is spelled differently, so a template applying to "Video" matched no episode
+#: at all.
+#:
+#: Matched against item_type rather than tier on purpose. Tier is derived from
+#: duration, so it cannot tell a full episode from a promo clip — on the live
+#: data 7 episodes tier as hook/short/segment, and matching by tier would sweep
+#: them into a promo queue. The kind is the question here; length already has
+#: its own filter. (The template-picker UIs in socials_compose and
+#: project_settings do match on tier — that divergence is noted in
+#: SMART_QUEUE.md.)
+_ITEM_TYPE_FOR_TIER = {"video": "episode"}
+
+
+def tier_matches_item_type(tier: str, item_type: str) -> bool:
+    """Whether an ``applies_to`` entry covers a video of this ``item_type``."""
+    return _ITEM_TYPE_FOR_TIER.get(tier, tier) == item_type
+
+
 def is_eligible(video: dict, queue: dict, applies_to: list[str]) -> Eligibility:
     """Whether ``video`` may be added to ``queue``.
 
-    ``applies_to`` is the queue template's item-type list — passed in rather
-    than re-read here so a caller checking many videos loads it once.
+    ``applies_to`` is the queue template's tier list — passed in rather than
+    re-read here so a caller checking many videos loads it once. See
+    :func:`tier_matches_item_type` for how it maps onto ``item_type``.
 
     Every condition ANDs. Unknown dimensions are their own outcome, never
     treated as a passing or failing orientation: a video we know nothing about
@@ -125,7 +147,7 @@ def is_eligible(video: dict, queue: dict, applies_to: list[str]) -> Eligibility:
     reasons: list[str] = []
 
     item_type = (video.get("item_type") or "").strip()
-    if item_type not in applies_to:
+    if not any(tier_matches_item_type(t, item_type) for t in applies_to):
         reasons.append(
             f"type '{item_type or 'unset'}' is not one the template applies to"
         )
@@ -436,13 +458,32 @@ async def list_queues(project_id: int) -> list[dict]:
     counts_by_queue: dict[int, dict[str, int]] = {}
     if queue_ids:
         placeholders = ",".join("?" for _ in queue_ids)
+        # Whether an item has posted is derived from its social_posts rows, not
+        # read from item.state. Only 'queued', 'scheduled' and 'removed' are
+        # ever written to that column — sending updates social_posts.status and
+        # leaves the item alone — so counting states here reported "0 posted"
+        # forever, next to a Recent list showing the post that had gone out.
+        # Same principle as missed items: the posting rows are the truth, and a
+        # second copy of it in item.state could only ever drift.
         for row in await db.execute_fetchall(
-            f"SELECT queue_id, state, COUNT(*) n FROM smart_queue_items "
-            f"WHERE queue_id IN ({placeholders}) "
-            f"GROUP BY queue_id, state ORDER BY queue_id, state",
+            f"""
+            SELECT queue_id, bucket, COUNT(*) n FROM (
+                SELECT i.queue_id AS queue_id,
+                       CASE
+                         WHEN i.state IN ('removed', 'queued') THEN i.state
+                         WHEN SUM(p.status = 'posted') > 0 THEN 'posted'
+                         WHEN SUM(p.status = 'failed') > 0 THEN 'failed'
+                         ELSE i.state
+                       END AS bucket
+                  FROM smart_queue_items i
+                  LEFT JOIN social_posts p ON p.smart_queue_item_id = i.id
+                 WHERE i.queue_id IN ({placeholders})
+                 GROUP BY i.id
+            ) GROUP BY queue_id, bucket ORDER BY queue_id, bucket
+            """,
             tuple(queue_ids),
         ):
-            counts_by_queue.setdefault(row["queue_id"], {})[row["state"]] = row["n"]
+            counts_by_queue.setdefault(row["queue_id"], {})[row["bucket"]] = row["n"]
 
     for queue in queues:
         queue["slots"] = slots_by_queue[queue["id"]]

@@ -16,7 +16,8 @@ file itself. This doc captures the full design.
 * **Queue item** — an *occurrence*, not a membership: one row per time a
   video is added to a queue. A video can legitimately appear more than
   once over the queue's life (see *Recycling*).
-* **Eligibility** — the AND of: template `applies_to` ∩ `item_type`,
+* **Eligibility** — the AND of: template `applies_to` ∩ `item_type`
+  (see *Two vocabularies* below),
   duration within [min, max], orientation in the selected set, video is
   live, and not archived.
 
@@ -37,6 +38,30 @@ and not currently scheduled by this queue.
 The template's `applies_to` is the source of truth for which item types a
 queue can touch. A template limited to hook/short/segment yields a queue
 that can never pick up an episode.
+
+#### Two vocabularies
+
+`templates.applies_to` is a **tier** list — `hook | short | segment |
+video` — while `videos.item_type` is a **kind**: `episode | hook | short |
+segment | standalone`. Three of the four values coincide; only the
+full-length one is spelled differently, so
+`smart_queue.tier_matches_item_type()` maps `video → episode`. Without it
+a template applying to "Video" matched nothing at all.
+
+`standalone` has no counterpart in `applies_to`, so a standalone video can
+never enter a queue. That is a gap in the tier vocabulary, not something
+this mapping should paper over.
+
+Matching is against `item_type`, not `tier`, on purpose: tier is derived
+from duration, so it cannot tell a full episode from a promo clip — on the
+live data 7 episodes tier as hook/short/segment, and matching by tier would
+sweep them into a promo queue. The question here is *what kind of thing is
+this*; length already has its own filter.
+
+That diverges from the two template-picker UIs (`socials_compose.html`,
+`project_settings.html`), which filter `applies_to` against `tier`. They are
+answering a different question — "which templates could I use for the video
+I am looking at" — where duration is the relevant axis.
 
 ### Orientation needs new data
 
@@ -287,6 +312,21 @@ or **Remove from queue**.
 
 No governor, no sweeper, no new spacing machinery, no automatic retry.
 Recovery is manual and user-initiated.
+
+### Posting outcome is derived too
+
+`smart_queue_items.state` only ever holds `queued`, `scheduled` or `removed`.
+Sending writes `social_posts.status` and never touches the item, so "has this
+item posted?" is answered by its posts, never by the column. Two bugs came
+from reading the column instead:
+
+* the dashboard counted `state = 'posted'` and so always showed 0 posted;
+* re-flow selected `state = 'scheduled'` and so re-dated an item that had
+  already gone out, handing it a fresh occurrence and pushing every remaining
+  video back one slot — visible as "re-flow skipped today".
+
+Both now ask the posts. A partially-sent item is treated as sent: part of it
+is already public, so moving the rest is a split, not a re-flow.
 
 "Missed" is a **derived** state — `scheduled_at` in the past and not
 posted — computed when the screen loads. No background job, no stored
