@@ -2217,6 +2217,32 @@ Partial update. `slots`, when present, **replaces the whole set**. Switching `mi
 
 `forecast[i]` is when `eligible[i]` would post. Occurrences are enumerated as **local** dates in the queue's timezone and converted individually, so an instant on the far side of a DST boundary still lands at its stated wall-clock time. Every excluded video carries its reasons, and `unknown_dimensions` counts those whose orientation can't be determined — a video the filters dropped is always accounted for rather than silently missing from the total. `warnings` carries e.g. "this queue has no posting times", so an empty forecast can't be mistaken for "nothing scheduled".
 
+### `POST /api/projects/{slug}/smart-queues/{queue_id}/accept`
+
+**Purpose** — Schedule a batch of videos onto the queue's recurrence.
+
+**Body** — `video_ids`: the batch, **in the order the user is looking at** (shuffled or not). This endpoint does not re-sort it; ordering is a UI concern and Accept honours whatever it is sent.
+
+**Response 200** — `{"scheduled": N, "items": [{"id", "video_id", "scheduled_at", "posted_to_any"}], "skipped": [{"video_id", "platform", "reason"}]}`.
+
+**Side effects** — Per video: inserts a `smart_queue_items` row stamped with a concrete UTC instant, then per enabled template slot either creates an ordinary `social_posts` row (`status='approved'`, `slot_id`, `smart_queue_item_id`) and registers its `DateTrigger`, or records a `status='skipped'` row carrying the reason.
+
+Times continue after the last item already scheduled by this queue, so a second Accept appends rather than double-booking. Occurrences are enumerated as local dates in the queue's timezone and converted individually, so an instant past a DST boundary still lands at its stated wall-clock time.
+
+**Text is rendered now, not at fire time**, matching the rest of the app. A later template edit does not reach posts already scheduled — use [`/re-render`](#post-apiprojectsslugsmart-queuesqueue_idre-render).
+
+A slot is **skipped** rather than failed when nothing could make it work: the clip is longer than the platform's cap (no encode shortens a clip), the platform can't take an attachment at all (Threads), or the slot's body fails to render. Skipped means "known in advance, not attempted"; `failed` means "attempted and broke", and history has to tell them apart. Size, resolution, and codec are deliberately **not** grounds for skipping — `prepared_media` fixes those at send time.
+
+A render failure is scoped to its own slot: the other platforms still schedule. A video for which **no** slot could carry it has its queue item marked `skipped` too, so it doesn't burn a posting slot on a no-op. A disabled slot produces no row at all — it was never in play.
+
+### `POST /api/projects/{slug}/smart-queues/{queue_id}/re-render`
+
+**Purpose** — Re-render every still-pending post this queue owns from the current template, after editing it.
+
+**Response 200** — `{"updated": N, "errors": [{"post_id", "error"}]}`. Errors are per post so one bad render doesn't hide the rest.
+
+Posts already `posted` (or mid-`sending`) are left alone — they are history. Rendering uses the project's editable `ai_block_default_system_prompt`, same as the generate path.
+
 ### `GET /api/projects/{slug}/smart-queues/{queue_id}/items`
 
 **Query** — `state` (optional): `scheduled` | `posted` | `failed` | `skipped` | `removed`.

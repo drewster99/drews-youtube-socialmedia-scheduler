@@ -115,8 +115,15 @@
     <div style="display:flex; gap:0.5rem; align-items:center;">
         <button class="btn" id="sq-select-btn">Auto-select videos</button>
         <button class="btn" id="sq-shuffle-btn" style="display:none;">Shuffle</button>
+        <button class="btn btn-primary" id="sq-accept-btn" style="display:none;">Accept</button>
+        <button class="btn" id="sq-rerender-btn">Re-render pending posts</button>
         <span id="sq-summary" class="form-hint"></span>
     </div>
+    <p class="form-hint">
+        Accept is optional — a queue can just collect new videos as they go live.
+        Post text is rendered when you Accept, so edit the template first, or use
+        Re-render afterwards.
+    </p>
     <div id="sq-forecast" class="form-hint" style="margin-top:0.5rem;"></div>
     <div id="sq-candidates" style="margin-top:0.75rem;"></div>
     <details id="sq-excluded-wrap" style="margin-top:0.75rem; display:none;">
@@ -284,6 +291,8 @@ function renderSelection(result) {
 
     document.getElementById('sq-shuffle-btn').style.display =
         result.summary.total ? '' : 'none';
+    document.getElementById('sq-accept-btn').style.display =
+        result.summary.total ? '' : 'none';
 
     document.getElementById('sq-candidates').innerHTML = lastSelection.map((video, index) => {
         const when = result.forecast[index]
@@ -355,6 +364,63 @@ document.getElementById('sq-slots').addEventListener('click', (event) => {
 document.getElementById('sq-missed-policy').addEventListener('change', syncMissedPolicyFields);
 document.getElementById('sq-select-btn').addEventListener('click', () => runSelection(false));
 document.getElementById('sq-shuffle-btn').addEventListener('click', () => runSelection(true));
+
+document.getElementById('sq-accept-btn').addEventListener('click', async () => {
+    if (!lastSelection.length) return;
+    const button = document.getElementById('sq-accept-btn');
+    // The order on screen is the order that gets scheduled, shuffled or not.
+    const videoIds = lastSelection.map(video => video.id);
+    if (!confirm(`Schedule ${videoIds.length} video${videoIds.length === 1 ? '' : 's'} in the order shown?`)) return;
+    button.disabled = true;
+    button.textContent = 'Scheduling…';
+    showError('');
+    try {
+        const result = await apiCall(
+            `/api/projects/${projectSlug}/smart-queues/${queueId}/accept`,
+            {method: 'POST', headers: {'Content-Type': 'application/json'},
+             body: JSON.stringify({video_ids: videoIds})}
+        );
+        // Skipped slots are reported, not hidden — a platform that couldn't
+        // take a clip should be visible now, not a surprise later.
+        const skipped = result.skipped || [];
+        const note = skipped.length
+            ? ` ${skipped.length} slot${skipped.length === 1 ? '' : 's'} skipped: ` +
+              skipped.slice(0, 5).map(s => `${s.platform || s.video_id} (${s.reason})`).join('; ')
+            : '';
+        document.getElementById('sq-summary').textContent =
+            `Scheduled ${result.scheduled} video${result.scheduled === 1 ? '' : 's'}.${note}`;
+        await runSelection(false);
+    } catch (err) {
+        showError(err.message);
+    } finally {
+        button.disabled = false;
+        button.textContent = 'Accept';
+    }
+});
+
+document.getElementById('sq-rerender-btn').addEventListener('click', async () => {
+    if (!queueId) {
+        showError('Save this smart schedule first.');
+        return;
+    }
+    showError('');
+    try {
+        const result = await apiCall(
+            `/api/projects/${projectSlug}/smart-queues/${queueId}/re-render`,
+            {method: 'POST'}
+        );
+        const failures = (result.errors || []).length;
+        document.getElementById('sq-summary').textContent =
+            `Re-rendered ${result.updated} pending post${result.updated === 1 ? '' : 's'}.` +
+            (failures ? ` ${failures} could not be re-rendered — see below.` : '');
+        if (failures) {
+            showError((result.errors || [])
+                .map(e => `post ${e.post_id}: ${e.error}`).join(' · '));
+        }
+    } catch (err) {
+        showError(err.message);
+    }
+});
 
 document.getElementById('sq-save-btn').addEventListener('click', async () => {
     showError('');

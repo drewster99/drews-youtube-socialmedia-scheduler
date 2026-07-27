@@ -1,7 +1,8 @@
-"""Smart queue CRUD and candidate preview.
+"""Smart queue CRUD, candidate preview, and scheduling.
 
-Scheduling itself (Accept) lands in a later phase; everything here is safe to
-call without committing anything to a posting schedule.
+Everything except ``/accept`` and ``/re-render`` is read-only with respect to
+the posting schedule — the preview in particular writes nothing, so the config
+screen can explore filter changes freely.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from fastapi import APIRouter, HTTPException
 from yt_scheduler.database import get_db
 from yt_scheduler.services import projects as project_service
 from yt_scheduler.services import smart_queue as smart_queue_service
+from yt_scheduler.services import smart_queue_accept
 from yt_scheduler.services.smart_queue import SmartQueueError
 
 logger = logging.getLogger(__name__)
@@ -188,6 +190,62 @@ async def preview_candidates(slug: str, queue_id: int, data: dict | None = None)
         "ends_at": forecast[-1] if forecast else None,
         "warnings": warnings,
     }
+
+
+@router.post("/{queue_id}/accept")
+async def accept_selection(slug: str, queue_id: int, data: dict):
+    """Schedule the given videos, in the order given, onto this queue.
+
+    **Body** — ``video_ids``: the batch to schedule, in the order the user is
+    looking at (shuffled or not). The order is the caller's; this endpoint
+    does not re-sort it.
+
+    Renders each template slot now and writes ordinary ``social_posts`` rows,
+    so a later template edit does not reach them — use ``/re-render`` for
+    that. Slots that cannot carry a video record a ``skipped`` row with the
+    reason rather than being silently absent.
+
+    Items already scheduled by this queue are untouched; new times continue
+    after the last one on the books.
+    """
+    queue = await _queue_in_project_or_404(slug, queue_id)
+    video_ids = data.get("video_ids")
+    if not isinstance(video_ids, list) or not video_ids:
+        raise HTTPException(400, "video_ids must be a non-empty list.")
+
+    try:
+        result = await smart_queue_accept.accept_selection(
+            queue_id, [str(v) for v in video_ids],
+            default_ai_system=await _default_ai_system(queue["project_id"]),
+        )
+    except SmartQueueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return result
+
+
+@router.post("/{queue_id}/re-render")
+async def rerender_pending(slug: str, queue_id: int):
+    """Re-render every still-pending post this queue owns from the current
+    template. Posted rows are history and are left alone.
+
+    **Response 200** — ``{"updated": N, "errors": [{"post_id", "error"}]}``.
+    Errors are per post so one bad render doesn't hide the rest.
+    """
+    queue = await _queue_in_project_or_404(slug, queue_id)
+    return await smart_queue_accept.rerender_pending(
+        queue_id, default_ai_system=await _default_ai_system(queue["project_id"])
+    )
+
+
+async def _default_ai_system(project_id: int) -> str:
+    """The project's editable default system prompt for ``{{ai: …}}`` blocks,
+    so a queue render honours the same setting the generate path does."""
+    from yt_scheduler.services import prompts as prompt_service
+
+    resolved = await prompt_service.get_prompt_with_fallback(
+        "ai_block_default_system_prompt", project_id=project_id
+    )
+    return resolved["system"]
 
 
 @router.get("/{queue_id}/items")

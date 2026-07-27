@@ -240,6 +240,24 @@ def occurrences(
     return out
 
 
+def _parse_after(value: str | None) -> datetime | None:
+    """Interpret a stored ``scheduled_at`` as the point to schedule after.
+
+    ``None`` (nothing scheduled yet) means "from now", which
+    :func:`occurrences` handles. A stored value is always UTC ISO; a naive
+    string is read as UTC to match how it was written.
+    """
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    # A backlog whose last slot is already in the past must not push new items
+    # into the past too.
+    return max(parsed, now)
+
+
 def _parse_time_of_day(value: str) -> time:
     """Parse 'HH:MM'. Rejects anything else rather than guessing."""
     try:
