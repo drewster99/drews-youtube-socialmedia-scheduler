@@ -52,6 +52,27 @@ LINKEDIN_SCOPES = "openid profile w_member_social"
 THREADS_REDIRECT_PATH = "/api/oauth/threads/callback"
 THREADS_SCOPES = "threads_basic,threads_content_publish"
 
+# Meta issues 60-day Threads tokens. Used only when a token response omits
+# expires_in, so the refresh sweep still has a date to work from rather than
+# treating "unknown" as "fine" — that assumption is what let a token die.
+_THREADS_DEFAULT_TTL_SECONDS = 60 * 24 * 3600
+
+
+def _stamp_threads_expiry(bundle: dict, token_data: dict | None) -> None:
+    """Record when this Threads token dies, so the sweep can renew it in time.
+
+    Threads has no separate refresh token: renewal uses the access token
+    itself, and only works while it is still valid. Knowing the expiry is
+    therefore the difference between renewing forever and needing a manual
+    reconnect every 60 days.
+    """
+    expires_in = (token_data or {}).get("expires_in")
+    try:
+        seconds = int(expires_in) if expires_in is not None else _THREADS_DEFAULT_TTL_SECONDS
+    except (TypeError, ValueError):
+        seconds = _THREADS_DEFAULT_TTL_SECONDS
+    bundle["expires_at"] = int(time.time()) + seconds
+
 TWITTER_REDIRECT_PATH = "/api/oauth/twitter/callback"
 # media.write covers v2 simple + chunked media upload (images, GIFs, videos).
 TWITTER_SCOPES = "tweet.read tweet.write users.read offline.access media.write"
@@ -384,6 +405,10 @@ async def threads_callback(code: str | None = None, state: str | None = None, er
         "client_id": pending["client_id"],
         "client_secret": pending["client_secret"],
     }
+    # Recorded so the refresh sweep knows when to renew. Without it a Threads
+    # token silently aged out at 60 days and every post failed with an opaque
+    # HTTP 500 until someone reconnected by hand.
+    _stamp_threads_expiry(bundle, long_data)
     if username:
         bundle["username"] = username
 
@@ -480,6 +505,7 @@ async def threads_exchange(data: dict):
         "user_id": str(user_id),
         "client_secret": app_secret,
     }
+    _stamp_threads_expiry(bundle, long_data)
     if username:
         bundle["username"] = username
 

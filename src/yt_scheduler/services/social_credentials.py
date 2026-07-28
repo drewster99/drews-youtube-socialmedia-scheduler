@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 import logging
 import uuid as uuidlib
 
@@ -182,6 +183,20 @@ async def save_bundle(platform: str, uuid: str, bundle: dict) -> None:
     )
 
 
+def _expiry_iso(expires_at) -> str | None:
+    """Bundle ``expires_at`` (unix seconds) as an ISO timestamp, or None.
+
+    None on anything unparseable rather than a guessed date: a wrong expiry
+    would either nag about a healthy token or stay silent about a dead one.
+    """
+    if not expires_at:
+        return None
+    try:
+        return datetime.fromtimestamp(int(expires_at), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError):
+        return None
+
+
 async def upsert_credential(
     platform: str,
     provider_account_id: str,
@@ -202,6 +217,10 @@ async def upsert_credential(
     # Captured for X accounts; COALESCE keeps a previously-known value when a
     # re-auth couldn't fetch it (e.g. the /users/me lookup hiccuped).
     verified_type = bundle.get("verified_type")
+    # Mirrored out of the bundle so the Settings list can show "expires in N
+    # days" without a Keychain read per row. Not a secret; NULL means the
+    # issuer didn't say, which is different from "never expires".
+    token_expires_at = _expiry_iso(bundle.get("expires_at"))
     cursor = await db.execute(
         "SELECT id, uuid FROM social_accounts "
         "WHERE platform = ? AND provider_account_id = ?",
@@ -227,9 +246,11 @@ async def upsert_credential(
                 "UPDATE social_accounts "
                 "SET username = ?, display_name = ?, is_nickname = ?, "
                 "    deleted_at = NULL, needs_reauth = 0, "
-                "    verified_type = COALESCE(?, verified_type) "
+                "    verified_type = COALESCE(?, verified_type), "
+                "    token_expires_at = COALESCE(?, token_expires_at) "
                 "WHERE id = ?",
-                (username, display_name, 1 if is_nickname else 0, verified_type, existing_id),
+                (username, display_name, 1 if is_nickname else 0, verified_type,
+                 token_expires_at, existing_id),
             )
         return await get_credential_by_id(existing_id)  # type: ignore[return-value]
 
@@ -265,6 +286,22 @@ async def mark_needs_reauth(uuid: str) -> None:
     async with write_transaction() as db:
         await db.execute(
             "UPDATE social_accounts SET needs_reauth = 1 WHERE uuid = ?", (uuid,)
+        )
+
+
+async def set_token_expiry(uuid: str, expires_at) -> None:
+    """Mirror a refreshed token's new expiry onto the credential row.
+
+    Called after a successful refresh so the Settings list reflects the renewal
+    rather than continuing to show the old, now-wrong date.
+    """
+    iso = _expiry_iso(expires_at)
+    if iso is None:
+        return
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE social_accounts SET token_expires_at = ? WHERE uuid = ?",
+            (iso, uuid),
         )
 
 

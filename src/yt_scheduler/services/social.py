@@ -474,6 +474,14 @@ class SocialPoster:
     # this is a dependency we can satisfy or fail to.
     requires_hosted_media: bool = False
 
+    # Whether this platform HAS a token-refresh flow at all. Separate from
+    # :meth:`refresh_if_stale` returning False, which means "nothing due right
+    # now" — the two were indistinguishable, and Threads spent 60 days
+    # inheriting the no-op default while its token quietly aged out. A platform
+    # that sets this False is asserting its credentials don't expire; one that
+    # sets it True must override refresh_if_stale.
+    supports_token_refresh: bool = False
+
     def __init__(self, bundle: dict | None = None) -> None:
         self._bundle: dict | None = bundle
 
@@ -717,15 +725,23 @@ class SocialPoster:
         """Proactively refresh this credential's access token if it expires
         within ``window_secs``. Returns ``True`` if a refresh happened.
 
-        Default: no-op (``False``) — the platform has no refresh flow (tokens
-        are long-lived or never expire). Subclasses with refresh tokens
-        override this. A terminal failure raises :class:`CredentialAuthError`
-        so the caller can mark the credential ``needs_reauth``.
+        Default: no-op (``False``). Only correct for a platform whose
+        credentials genuinely don't expire — say so by leaving
+        ``supports_token_refresh`` False. Do not inherit this because a refresh
+        flow hasn't been written yet: the sweep would report success having
+        done nothing, and the token would die on schedule with no warning.
+        That is exactly what happened to Threads.
+
+        A terminal failure raises :class:`CredentialAuthError` so the caller
+        can mark the credential ``needs_reauth``.
         """
         return False
 
 
 class TwitterPoster(SocialPoster):
+    # Declares what refresh_if_stale below already does, so the two can't
+    # drift apart silently.
+    supports_token_refresh = True
     platform = "twitter"
     # OAuth 2.0 user-context with media.write scope is the only supported
     # path. Tweets go through v2 ``POST /2/tweets``; image/GIF/video uploads
@@ -1025,6 +1041,9 @@ def _build_bluesky_facets(text: str) -> list[dict]:
 
 
 class BlueskyPoster(SocialPoster):
+    # Declares what refresh_if_stale below already does, so the two can't
+    # drift apart silently.
+    supports_token_refresh = True
     platform = "bluesky"
     # OAuth-only: a Bluesky bundle must contain the per-credential ES256
     # key, the access/refresh tokens, the resolved PDS, and the AS's token
@@ -1845,6 +1864,17 @@ class ThreadsPoster(SocialPoster):
     platform = "threads"
     required_keys = ["access_token", "user_id"]
 
+    # Threads has no separate refresh token: it renews using the access token
+    # itself via the th_refresh_token grant. That is why this didn't follow the
+    # Twitter/Bluesky shape and ended up unimplemented.
+    supports_token_refresh = True
+
+    # Meta issues 60-day tokens and will renew one that is at least 24 hours
+    # old and not yet expired. Past expiry there is no way back but a fresh
+    # OAuth, so the sweep has to act well before then.
+    _TOKEN_MIN_AGE_SECONDS = 24 * 3600
+    _TOKEN_TTL_FALLBACK_SECONDS = 60 * 24 * 3600
+
     # Threads' image ceiling. PLATFORM_MEDIA_LIMITS covers video only (and
     # prepared_media probes only video), so an oversized image would otherwise
     # upload fine and be rejected by Meta with no useful explanation.
@@ -1934,6 +1964,106 @@ class ThreadsPoster(SocialPoster):
             raise
         except Exception as e:
             raise RuntimeError(f"Threads post failed: {_exception_detail(e)}") from e
+
+    async def refresh_if_stale(self, *, window_secs: int = 0) -> bool:
+        """Renew the long-lived token before it lapses.
+
+        Meta's ``th_refresh_token`` grant takes the current access token and
+        returns a new 60-day one, so a token refreshed on schedule never needs
+        another OAuth. Once it *has* expired there is no recovery here — that
+        raises :class:`CredentialAuthError` so the credential is flagged
+        ``needs_reauth`` instead of failing every post with an opaque 500,
+        which is what happened before this existed.
+        """
+        creds = await self._get_creds()
+        uuid = creds.get("uuid")
+        if not (uuid and creds.get("access_token")):
+            return False
+        if not self._token_is_due(creds, window_secs):
+            return False
+
+        from yt_scheduler.services.social_credentials import (
+            clear_needs_reauth,
+            get_credential_lock,
+            load_bundle,
+            save_bundle,
+            set_token_expiry,
+        )
+
+        async with get_credential_lock(uuid):
+            # Re-read inside the lock: another sweep or a send-path refresh may
+            # have renewed it while we waited, and reusing the stale token
+            # would spend a second refresh for nothing.
+            current = await load_bundle("threads", uuid) or creds
+            if not self._token_is_due(current, window_secs):
+                return False
+            token = current.get("access_token")
+            if not token:
+                return False
+
+            import httpx
+
+            try:
+                async with httpx.AsyncClient(timeout=20) as client:
+                    resp = await client.get(
+                        "https://graph.threads.net/refresh_access_token",
+                        params={
+                            "grant_type": "th_refresh_token",
+                            "access_token": token,
+                        },
+                    )
+            except httpx.HTTPError as exc:
+                # Network trouble is not a credential problem; the next sweep
+                # retries rather than flagging a working token as dead.
+                logger.warning("Threads token refresh could not reach Meta: %s", exc)
+                return False
+
+            if resp.status_code != 200:
+                detail = _http_error_detail(resp)
+                # Meta refuses a token younger than 24h. That is a "come back
+                # later", not a dead credential — flagging needs_reauth here
+                # would send the user through OAuth for no reason.
+                if "24 hours" in detail or "too early" in detail.lower():
+                    logger.info("Threads token too new to refresh yet: %s", detail)
+                    return False
+                raise CredentialAuthError(
+                    uuid,
+                    f"Threads token could not be refreshed ({detail}). Reconnect "
+                    "Threads in Settings — an expired token can only be replaced, "
+                    "not renewed.",
+                )
+
+            data = resp.json()
+            new_token = data.get("access_token")
+            if not new_token:
+                raise CredentialAuthError(
+                    uuid,
+                    "Threads refresh returned no access_token. Reconnect Threads "
+                    "in Settings.",
+                )
+            expires_in = int(data.get("expires_in") or self._TOKEN_TTL_FALLBACK_SECONDS)
+            updated = dict(current)
+            updated["access_token"] = new_token
+            updated["expires_at"] = int(time.time()) + expires_in
+            await save_bundle("threads", uuid, updated)
+            await set_token_expiry(uuid, updated["expires_at"])
+            await clear_needs_reauth(uuid)
+            logger.info("Threads token refreshed; valid for %.0f more days",
+                        expires_in / 86400)
+            return True
+
+    def _token_is_due(self, creds: dict, window_secs: int) -> bool:
+        """Whether this token is close enough to expiry to be worth renewing.
+
+        An absent ``expires_at`` means the bundle predates expiry tracking, so
+        it is treated as due: refreshing once backfills the field and every
+        later sweep can reason properly. Not knowing is not the same as being
+        fine — that assumption is what let this token die.
+        """
+        expires_at = int(creds.get("expires_at") or 0)
+        if not expires_at:
+            return True
+        return expires_at - window_secs <= int(time.time())
 
     async def _media_container_params(self, paths: list[str]) -> dict[str, str]:
         """Build the container's media fields, hosting the attachment if any.

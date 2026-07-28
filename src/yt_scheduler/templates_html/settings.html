@@ -698,7 +698,11 @@ function renderCredentialRow(cred) {
     const reauthBadge = cred.needs_reauth
         ? ' <span class="badge badge-draft" style="margin-left:0.4rem;">Needs re-auth</span>'
         : '';
-    const reconnectBtn = cred.needs_reauth
+    // Expiry is shown whenever we know it, and the credential is treated as
+    // needing attention once it has lapsed -- a dead token that still looks
+    // "Connected" is what let a Threads account fail silently for weeks.
+    const expiry = tokenExpiryNote(cred);
+    const reconnectBtn = (cred.needs_reauth || expiry.expired)
         ? `<button class="btn btn-sm btn-warning" title="Re-authenticate this account"
                    data-cred-action="reconnect"
                    data-platform="${escapeHtml(cred.platform)}"
@@ -717,7 +721,7 @@ function renderCredentialRow(cred) {
             <div>
                 <div style="font-weight:600;">${escapeHtml(cred.label)}${reauthBadge}${premiumBadge}</div>
                 <div style="font-size:0.8rem; color:var(--text-muted);">
-                    ${cred.is_nickname ? '<em>nickname</em> · ' : ''}Connected ${escapeHtml(created)}
+                    ${cred.is_nickname ? '<em>nickname</em> · ' : ''}Connected ${escapeHtml(created)}${expiry.html}
                     ${cred.platform === 'twitter' && !xPremium
                         ? (cred.verified_type === 'none'
                             ? ' · free tier (280-char posts)'
@@ -735,6 +739,33 @@ function renderCredentialRow(cred) {
                         data-label="${escapeHtml(cred.label)}">×</button>
             </div>
         </div>`;
+}
+
+/**
+ * How this credential's token is doing, if the provider told us.
+ *
+ * Unknown is rendered as unknown rather than as healthy: a credential stored
+ * before expiry tracking existed says nothing about whether it still works,
+ * and claiming otherwise is how a dead token keeps looking connected.
+ */
+function tokenExpiryNote(cred) {
+    if (!cred.token_expires_at) return {html: '', expired: false};
+    const when = new Date(cred.token_expires_at);
+    if (isNaN(when.getTime())) return {html: '', expired: false};
+    const days = Math.round((when.getTime() - Date.now()) / 86400000);
+    if (days < 0) {
+        return {
+            expired: true,
+            html: ` · <span style="color: var(--danger); font-weight:600;">token expired ${-days} day${days === -1 ? '' : 's'} ago — reconnect</span>`,
+        };
+    }
+    if (days <= 7) {
+        return {
+            expired: false,
+            html: ` · <span style="color: var(--warning, #ffa940);">token expires in ${days} day${days === 1 ? '' : 's'}</span>`,
+        };
+    }
+    return {expired: false, html: ` · token valid ${days} more days`};
 }
 
 function renderAddAccountButton(name) {
