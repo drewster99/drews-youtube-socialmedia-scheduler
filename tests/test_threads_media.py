@@ -8,13 +8,30 @@ rather than degrading to a text-only post the user never composed.
 
 from __future__ import annotations
 
+import importlib
+
 import httpx
 import pytest
 
-from yt_scheduler.services import media_hosting, social
-
 CREDS = {"access_token": "tok", "user_id": "42", "username": "drew", "uuid": "u-1"}
 HOSTED_URL = "https://acct.r2.cloudflarestorage.com/bucket/abc.mp4?X-Amz-Signature=xyz"
+
+
+@pytest.fixture
+def media_hosting():
+    """Resolve the live module, never a module-scope reference.
+
+    Other tests purge ``sys.modules`` to re-freeze config, which orphans any
+    reference captured at import time: we would patch a dead object while the
+    code under test talks to a fresh one, and its exception classes would no
+    longer compare equal either.
+    """
+    return importlib.import_module("yt_scheduler.services.media_hosting")
+
+
+@pytest.fixture
+def social():
+    return importlib.import_module("yt_scheduler.services.social")
 
 
 @pytest.fixture
@@ -41,7 +58,7 @@ def graph(monkeypatch):
 
 
 @pytest.fixture
-def hosted(monkeypatch):
+def hosted(monkeypatch, media_hosting):
     """Stand in for the R2 upload; records what it was asked to host."""
     asked: list[str] = []
 
@@ -58,8 +75,9 @@ def _params(request: httpx.Request) -> dict[str, str]:
     return dict(request.url.params)
 
 
-async def test_video_builds_a_video_container_with_the_signed_url(graph, hosted,
-                                                                  tmp_path):
+async def test_video_builds_a_video_container_with_the_signed_url(
+    graph, hosted, tmp_path, social
+):
     path = tmp_path / "clip.mp4"
     path.write_bytes(b"v" * 64)
     poster = social.ThreadsPoster(bundle=CREDS)
@@ -75,7 +93,7 @@ async def test_video_builds_a_video_container_with_the_signed_url(graph, hosted,
     assert result["id"] == "post-9"
 
 
-async def test_image_builds_an_image_container(graph, hosted, tmp_path):
+async def test_image_builds_an_image_container(graph, hosted, tmp_path, social):
     """Images have the identical requirement — the only difference is which
     field the URL goes in."""
     path = tmp_path / "frame.jpg"
@@ -90,7 +108,7 @@ async def test_image_builds_an_image_container(graph, hosted, tmp_path):
     assert "video_url" not in create
 
 
-async def test_text_only_post_hosts_nothing(graph, hosted):
+async def test_text_only_post_hosts_nothing(graph, hosted, social):
     poster = social.ThreadsPoster(bundle=CREDS)
 
     await poster._post_prepared("just words")
@@ -99,7 +117,7 @@ async def test_text_only_post_hosts_nothing(graph, hosted):
     assert hosted == [], "a text post must not touch media hosting"
 
 
-async def test_publish_uses_the_container_id(graph, hosted, tmp_path):
+async def test_publish_uses_the_container_id(graph, hosted, tmp_path, social):
     path = tmp_path / "clip.mp4"
     path.write_bytes(b"v" * 64)
 
@@ -110,7 +128,7 @@ async def test_publish_uses_the_container_id(graph, hosted, tmp_path):
 
 
 async def test_unconfigured_hosting_raises_instead_of_posting_text_only(
-    graph, monkeypatch, tmp_path
+    graph, monkeypatch, tmp_path, media_hosting, social
 ):
     """The failure that matters most: silently dropping the attachment would
     publish something the user did not write."""
@@ -128,7 +146,9 @@ async def test_unconfigured_hosting_raises_instead_of_posting_text_only(
     assert graph == [], "nothing may be posted when hosting is unavailable"
 
 
-async def test_hosting_failure_is_surfaced_not_swallowed(graph, monkeypatch, tmp_path):
+async def test_hosting_failure_is_surfaced_not_swallowed(
+    graph, monkeypatch, tmp_path, media_hosting, social
+):
     async def _boom(path, **_kw):
         raise media_hosting.MediaHostingError("HTTP 403 SignatureDoesNotMatch")
 
@@ -142,7 +162,7 @@ async def test_hosting_failure_is_surfaced_not_swallowed(graph, monkeypatch, tmp
     assert graph == []
 
 
-async def test_oversized_image_is_refused_before_upload(graph, hosted, tmp_path):
+async def test_oversized_image_is_refused_before_upload(graph, hosted, tmp_path, social):
     """PLATFORM_MEDIA_LIMITS covers video only, so the image cap is checked
     here rather than letting Meta reject it opaquely."""
     path = tmp_path / "huge.png"
@@ -156,7 +176,7 @@ async def test_oversized_image_is_refused_before_upload(graph, hosted, tmp_path)
 
 
 async def test_multiple_attachments_are_refused_rather_than_truncated(
-    graph, hosted, tmp_path
+    graph, hosted, tmp_path, social
 ):
     """Threads needs a CAROUSEL container for more than one, which we don't
     build. Posting only the first would drop content silently."""
@@ -172,7 +192,7 @@ async def test_multiple_attachments_are_refused_rather_than_truncated(
     assert hosted == [] and graph == []
 
 
-async def test_unknown_media_kind_is_refused(graph, hosted, tmp_path):
+async def test_unknown_media_kind_is_refused(graph, hosted, tmp_path, social):
     path = tmp_path / "notes.txt"
     path.write_bytes(b"hello")
 
@@ -183,7 +203,7 @@ async def test_unknown_media_kind_is_refused(graph, hosted, tmp_path):
     assert hosted == [] and graph == []
 
 
-async def test_media_containers_get_a_longer_poll_budget_than_text():
+async def test_media_containers_get_a_longer_poll_budget_than_text(social):
     """Meta downloads the file during the container window and asks for ~30s;
     the text budget would time out before a video ever finished."""
     assert (social.ThreadsPoster._MEDIA_CONTAINER_POLL_ATTEMPTS
@@ -192,7 +212,7 @@ async def test_media_containers_get_a_longer_poll_budget_than_text():
             * social.ThreadsPoster._CONTAINER_POLL_DELAY_SECONDS) >= 120
 
 
-async def test_platform_capability_flags_are_the_single_source_of_truth():
+async def test_platform_capability_flags_are_the_single_source_of_truth(social):
     assert social.platform_accepts_attached_media("threads") is True
     assert social.platform_requires_hosted_media("threads") is True
     # Everyone else takes a direct upload and must not gain a hosting dependency.
