@@ -338,20 +338,60 @@ async function generatePreviews() {
         </div>`;
     try {
         const slotIds = selectedSlotIds();
-        const resp = await fetch(`/api/social/generate-posts/${videoId}`, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-                template_name: templateName,
-                platforms: platforms,
-                slot_ids: slotIds,  // G1 — exact-slot routing
-                user_message: userMessage,
-                unresolved_ack: true,
-            }),
+        const body = JSON.stringify({
+            template_name: templateName,
+            platforms: platforms,
+            slot_ids: slotIds,  // G1 — exact-slot routing
+            user_message: userMessage,
+            unresolved_ack: true,
         });
-        if (!resp.ok) {
-            showToast('Generation failed.', 'error');
-            previewArea.innerHTML = '<p class="empty-state">Generation failed — try again.</p>';
+
+        // A 409 carrying scheduled_overwrite is the server asking a question,
+        // not reporting a failure: regenerating would cancel posts that are
+        // already on the schedule. Treating it as an error (which this screen
+        // did) surfaced the raw JSON body as "Generation failed" and left the
+        // user with no way to say yes. The detail page has always handled it;
+        // this one hadn't.
+        let resp = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const confirmed = attempt > 0;
+            resp = await fetch(
+                `/api/social/generate-posts/${videoId}`
+                    + (confirmed ? '?confirm_overwrite_scheduled=true' : ''),
+                {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body,
+                    _silent: true,
+                });
+            if (resp.status !== 409 || confirmed) break;
+
+            const detail = ((await resp.json().catch(() => ({}))) || {}).detail || {};
+            if (!detail.scheduled_overwrite || !Array.isArray(detail.scheduled)) break;
+
+            const lines = detail.scheduled
+                .map(sp => `• ${sp.platform}${sp.scheduled_at ? ` — ${new Date(sp.scheduled_at).toLocaleString()}` : ''}`)
+                .join('\n');
+            const ok = confirm(
+                `Regenerating will cancel ${detail.scheduled.length} scheduled post`
+                + `${detail.scheduled.length === 1 ? '' : 's'}:\n\n${lines}\n\n`
+                + `Cancel ${detail.scheduled.length === 1 ? 'it' : 'them'} and regenerate?`
+            );
+            if (!ok) {
+                showToast('Kept the scheduled posts — nothing regenerated.', 'info');
+                previewArea.innerHTML = '<p class="empty-state">Cancelled — existing scheduled posts kept.</p>';
+                return;
+            }
+        }
+
+        if (!resp || !resp.ok) {
+            // Say what the server said. "Generation failed" alone sent the user
+            // looking for a bug when the answer was in the response body.
+            const detail = ((await resp?.json().catch(() => ({}))) || {}).detail;
+            const why = typeof detail === 'string' ? detail : '';
+            showToast(why ? `Generation failed: ${why}` : 'Generation failed.', 'error');
+            previewArea.innerHTML =
+                `<p class="empty-state">Generation failed${why ? ` — ${escapeHtmlBasic(why)}` : ' — try again'}.</p>`;
             return;
         }
         let warnings = [];
