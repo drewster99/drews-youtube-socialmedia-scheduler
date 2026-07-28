@@ -1910,7 +1910,7 @@ class ThreadsPoster(SocialPoster):
             access_token = creds["access_token"]
             user_id = creds["user_id"]
 
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=self._HTTP_TIMEOUT_SECONDS) as client:
                 create_resp = await client.post(
                     f"https://graph.threads.net/v1.0/{user_id}/threads",
                     params={
@@ -2121,6 +2121,12 @@ class ThreadsPoster(SocialPoster):
             ) from exc
 
         return {"media_type": media_type, url_field: hosted.url}
+
+    # httpx's default per-request timeout is 5 seconds, which container
+    # create regularly exceeds: Meta fetches and validates the hosted media
+    # during that call. A real image post died on ReadTimeout the first day
+    # a working token met this path.
+    _HTTP_TIMEOUT_SECONDS = 60
 
     _TEXT_CONTAINER_POLL_ATTEMPTS = 10
 

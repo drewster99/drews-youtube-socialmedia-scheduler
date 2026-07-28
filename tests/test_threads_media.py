@@ -212,6 +212,40 @@ async def test_media_containers_get_a_longer_poll_budget_than_text(social):
             * social.ThreadsPoster._CONTAINER_POLL_DELAY_SECONDS) >= 120
 
 
+async def test_post_flow_client_sets_an_explicit_timeout(monkeypatch, social):
+    """Regression: the post-flow client once relied on httpx's 5-second
+    default, which container create exceeds whenever Meta fetches the hosted
+    media during the call — a real image post died on ReadTimeout the first
+    day a working token met this path."""
+    timeouts_passed: list[object] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/threads"):
+            return httpx.Response(200, json={"id": "container-1"})
+        if path.endswith("/threads_publish"):
+            return httpx.Response(200, json={"id": "post-9"})
+        return httpx.Response(200, json={"status": "FINISHED"})
+
+    original = httpx.AsyncClient.__init__
+
+    def patched(self, *a, **kw):
+        timeouts_passed.append(kw.get("timeout"))
+        original(self, *a, **{**kw, "transport": httpx.MockTransport(handler)})
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", patched)
+
+    await social.ThreadsPoster(bundle=CREDS)._post_prepared("just words")
+
+    assert timeouts_passed, "expected the post flow to construct an httpx client"
+    assert all(t is not None for t in timeouts_passed), (
+        "the post-flow client must set an explicit timeout, not httpx's default"
+    )
+    # The budget has to comfortably cover Meta fetching and validating the
+    # hosted media inside the container-create call.
+    assert all(t >= 30 for t in timeouts_passed)
+
+
 async def test_platform_capability_flags_are_the_single_source_of_truth(social):
     assert social.platform_accepts_attached_media("threads") is True
     assert social.platform_requires_hosted_media("threads") is True
