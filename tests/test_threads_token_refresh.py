@@ -196,8 +196,10 @@ async def test_expiry_reaches_the_api_so_the_ui_can_show_it(isolated_db):
     creds_mod = importlib.import_module("yt_scheduler.services.social_credentials")
     await isolated_db.execute(
         "INSERT INTO social_accounts "
-        "(id, uuid, platform, provider_account_id, username, token_expires_at) "
-        "VALUES (1,'u1','threads','pid-1','someone','2026-09-01T00:00:00+00:00')"
+        "(id, uuid, platform, provider_account_id, username, credentials_ref, "
+        " token_expires_at) "
+        "VALUES (1,'u1','threads','pid-1','someone','cred.u1',"
+        "'2026-09-01T00:00:00+00:00')"
     )
     await isolated_db.commit()
 
