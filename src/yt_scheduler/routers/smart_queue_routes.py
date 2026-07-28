@@ -492,9 +492,9 @@ async def list_queue_items(slug: str, queue_id: int, state: str | None = None):
             )
         clause = " AND i.state = ?"
         params.append(state)
-    # has_posted is derived, not read from i.state: sending updates
-    # social_posts and never the item, so state alone would present a video
-    # that has already gone out as still upcoming.
+    # has_posted and has_pending are both derived, not read from i.state:
+    # sending updates social_posts and never the item, so state alone would
+    # present a video that has already gone out as still upcoming.
     rows = await db.execute_fetchall(
         f"""
         SELECT i.id, i.video_id, i.position, i.scheduled_at, i.state,
@@ -502,7 +502,17 @@ async def list_queue_items(slug: str, queue_id: int, state: str | None = None):
                (i.state = 'posted' OR EXISTS (
                    SELECT 1 FROM social_posts p
                     WHERE p.smart_queue_item_id = i.id AND p.status = 'posted'
-               )) AS has_posted
+               )) AS has_posted,
+               -- "Is anything still due?" is a different question from "has
+               -- anything gone out?", and only the first one decides whether an
+               -- item is upcoming. They agree until a send lands partially --
+               -- one platform posts, another fails and is retried -- and then
+               -- has_posted alone hides an item that still holds live timers.
+               EXISTS (
+                   SELECT 1 FROM social_posts p
+                    WHERE p.smart_queue_item_id = i.id
+                      AND p.status NOT IN ('posted', 'skipped')
+               ) AS has_pending
           FROM smart_queue_items i
           JOIN videos v ON v.id = i.video_id
          WHERE i.queue_id = ?{clause}

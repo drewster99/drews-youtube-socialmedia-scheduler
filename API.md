@@ -2401,7 +2401,9 @@ Reconciliation now runs automatically on template change, so a gap here means it
 
 `queued` is in the queue with no posting time yet; `scheduled` has one. Note that only `queued`, `scheduled` and `removed` are ever *written* to `smart_queue_items.state` — filtering on the other three matches nothing. Use `has_posted` (below) to tell a sent item from a pending one.
 
-**Response 200** — `{"items": [{"id", "video_id", "position", "scheduled_at", "state", "reason", "added_at", "title", "item_type", "duration_seconds", "has_posted"}]}`, ordered by position.
+**Response 200** — `{"items": [{"id", "video_id", "position", "scheduled_at", "state", "reason", "added_at", "title", "item_type", "duration_seconds", "has_posted", "has_pending"}]}`, ordered by position.
+
+`has_posted` = at least one post has gone out. `has_pending` = at least one post is still unsent (excludes `posted` and `skipped`). They are different questions and only `has_pending` decides whether an item is upcoming — they agree until a send lands partially, after which `!has_posted` would hide an item that still holds live timers.
 
 `has_posted` (0/1) is derived from the item's `social_posts` rows, because sending updates the post and never the item — an item that has already gone out still reads `state = 'scheduled'`. Any caller asking "what is still coming up?" must check `has_posted`, not `state` alone.
 

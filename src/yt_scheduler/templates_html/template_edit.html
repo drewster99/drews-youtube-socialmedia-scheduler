@@ -249,8 +249,11 @@ function syncHostingWarn(slotId) {
     const platform = (warn.getAttribute('data-platform') || '').trim().toLowerCase();
     const mediaSel = document.querySelector(`[data-slot-media="${slotId}"]`);
     const body = document.querySelector(`[data-slot-body="${slotId}"]`);
-    const wantsMedia = (mediaSel && mediaSel.value && mediaSel.value !== 'none')
-        || (body && /\{\{\s*(video|thumbnail|image:)/i.test(body.value));
+    // bodyHasMediaDirective is the page's own definition of "this body
+    // embeds media" — a second regex here would be a second answer that can
+    // disagree with syncMediaField's.
+    const wantsMedia = (body && bodyHasMediaDirective(body.value))
+        || (mediaSel && !mediaSel.disabled && mediaSel.value && mediaSel.value !== 'none');
 
     const show = hostingState.needsHosting.has(platform)
         && wantsMedia && !hostingState.configured;

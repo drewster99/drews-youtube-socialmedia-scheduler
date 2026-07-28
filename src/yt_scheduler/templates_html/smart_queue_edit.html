@@ -716,11 +716,14 @@ async function loadUpcoming() {
             `/api/projects/${projectSlug}/smart-queues/${queueId}/items`
         );
         // queued = in the queue with no time yet (auto-added, awaiting Accept).
-        // has_posted is checked too: an item that has gone out keeps
-        // state='scheduled' forever, so state alone would list it as upcoming.
+        // Filtered on has_pending, not !has_posted: those agree until a send
+        // lands partially, and then !has_posted drops an item that still has
+        // unsent posts with live timers. "Upcoming" has to mean "something is
+        // still due", which is what has_pending says. A queued item has no
+        // posts at all yet, so it is upcoming by virtue of its state.
         const pending = (data.items || []).filter(
-            item => !item.has_posted &&
-                (item.state === 'queued' || item.state === 'scheduled')
+            item => (item.state === 'queued' && !item.has_posted)
+                || (item.state === 'scheduled' && item.has_pending)
         );
         section.style.display = pending.length ? '' : 'none';
         if (!pending.length) return;
