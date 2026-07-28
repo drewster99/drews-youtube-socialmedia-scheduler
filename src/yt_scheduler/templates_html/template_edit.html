@@ -216,14 +216,12 @@ function syncMediaField(slotId) {
     }
 }
 
-// --- Threads video-directive guard (Threads can't attach media — slot is skipped on generate) ---
-const VIDEO_DIRECTIVE_RE = /\{\{\s*video\s*\}\}/i;
-function syncThreadsWarn(slotId, platform) {
-    const warn = document.querySelector(`[data-slot-threads-warn="${slotId}"]`);
-    if (!warn) return;
-    const ta = document.querySelector(`[data-slot-body="${slotId}"]`);
-    warn.style.display = (platform === 'threads' && ta && VIDEO_DIRECTIVE_RE.test(ta.value)) ? '' : 'none';
-}
+// The Threads video-directive warning lived here. It is gone because it is no
+// longer true: Threads carries images and video via media_hosting, and every
+// connected platform now accepts an attachment. Whether a platform can take
+// media is decided server-side by social.platform_accepts_attached_media() and
+// warned about at generation time — a hardcoded platform name in the editor
+// was always going to outlive the fact it encoded.
 
 // Per-platform default character limits, mirrored from
 // services/templates.DEFAULT_MAX_CHARS_BY_PLATFORM. Used by addSlot()
@@ -355,7 +353,6 @@ function renderSlotCard(slot) {
                     <div class="code-hl-backdrop" data-slot-hl="${slot.id}" aria-hidden="true"></div>
                     <textarea data-slot-body="${slot.id}" rows="6" class="code-editor" spellcheck="false">${escapeHtml(slot.body)}</textarea>
                 </div>
-                <div data-slot-threads-warn="${slot.id}" class="form-hint slot-threads-warn" style="display: none;">⚠ This slot uses a video directive — Threads can't attach media, so this slot is skipped when you generate posts.</div>
             </div>
             <div class="form-row">
                 <div class="form-group">
@@ -400,13 +397,11 @@ function attachSlotHandlers(slot) {
     if (bodyArea) {
         bodyArea.addEventListener('input', () => {
             syncMediaField(slot.id);
-            syncThreadsWarn(slot.id, slot.platform);
             renderSlotHighlight(slot.id);
         });
         bodyArea.addEventListener('scroll', () => syncHighlightScroll(slot.id));
     }
     syncMediaField(slot.id);
-    syncThreadsWarn(slot.id, slot.platform);
     renderSlotHighlight(slot.id);
 }
 

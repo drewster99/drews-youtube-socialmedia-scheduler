@@ -962,7 +962,6 @@ body {
 .tag-section { color: var(--accent); font-weight: 600; }
 .tag-unknown { color: var(--warning); }
 .tag-unresolved { color: var(--danger); font-weight: 600; }
-.slot-threads-warn { color: var(--danger); }
 
 /* Over-limit / leftover-tag flags on generated social-post cards */
 .social-post-over-limit { border-color: var(--danger); }
