@@ -216,12 +216,51 @@ function syncMediaField(slotId) {
     }
 }
 
-// The Threads video-directive warning lived here. It is gone because it is no
-// longer true: Threads carries images and video via media_hosting, and every
-// connected platform now accepts an attachment. Whether a platform can take
-// media is decided server-side by social.platform_accepts_attached_media() and
-// warned about at generation time — a hardcoded platform name in the editor
-// was always going to outlive the fact it encoded.
+// The old warning here said Threads can't attach media. That stopped being
+// true when media_hosting landed. What IS still true is that Threads fetches
+// media from a URL, so it needs hosting configured — and unlike the platform's
+// capability, that is a real thing the user can get wrong. Driven by the
+// server's own answer rather than a hardcoded platform name, so adding another
+// fetch-based platform doesn't need an edit here.
+let hostingState = null;   // null = not checked yet; never guessed
+
+async function loadHostingState() {
+    try {
+        const [hosting, caps] = await Promise.all([
+            fetch('/api/settings/media-hosting').then(r => r.ok ? r.json() : null),
+            fetch('/api/platform-capabilities').then(r => r.ok ? r.json() : null),
+        ]);
+        if (!hosting || !caps) return;
+        hostingState = {
+            configured: !!hosting.configured,
+            needsHosting: new Set(caps.requires_hosted_media || []),
+        };
+        document.querySelectorAll('[data-slot-hosting-warn]').forEach(el =>
+            syncHostingWarn(el.getAttribute('data-slot-hosting-warn')));
+    } catch (err) {
+        // Unknown is not the same as fine: say nothing rather than imply it's
+        // configured when we couldn't find out.
+    }
+}
+
+function syncHostingWarn(slotId) {
+    const warn = document.querySelector(`[data-slot-hosting-warn="${slotId}"]`);
+    if (!warn || !hostingState) return;
+    const platform = (warn.getAttribute('data-platform') || '').trim().toLowerCase();
+    const mediaSel = document.querySelector(`[data-slot-media="${slotId}"]`);
+    const body = document.querySelector(`[data-slot-body="${slotId}"]`);
+    const wantsMedia = (mediaSel && mediaSel.value && mediaSel.value !== 'none')
+        || (body && /\{\{\s*(video|thumbnail|image:)/i.test(body.value));
+
+    const show = hostingState.needsHosting.has(platform)
+        && wantsMedia && !hostingState.configured;
+    warn.textContent = show
+        ? `\u26a0 ${platform} fetches media from a URL, and media hosting isn't configured `
+          + `\u2014 this slot will be skipped rather than posted without its media. `
+          + `Set it up under General settings \u2192 Media hosting.`
+        : '';
+    warn.style.display = show ? '' : 'none';
+}
 
 // Per-platform default character limits, mirrored from
 // services/templates.DEFAULT_MAX_CHARS_BY_PLATFORM. Used by addSlot()
@@ -353,6 +392,7 @@ function renderSlotCard(slot) {
                     <div class="code-hl-backdrop" data-slot-hl="${slot.id}" aria-hidden="true"></div>
                     <textarea data-slot-body="${slot.id}" rows="6" class="code-editor" spellcheck="false">${escapeHtml(slot.body)}</textarea>
                 </div>
+                <div data-slot-hosting-warn="${slot.id}" data-platform="${escapeHtml(slot.platform || '')}" class="form-hint slot-hosting-warn" style="display: none;"></div>
             </div>
             <div class="form-row">
                 <div class="form-group">
@@ -403,6 +443,12 @@ function attachSlotHandlers(slot) {
     }
     syncMediaField(slot.id);
     renderSlotHighlight(slot.id);
+    syncHostingWarn(slot.id);
+    // Media choice and body both feed the warning, so both retrigger it.
+    document.querySelector(`[data-slot-media="${slot.id}"]`)
+        ?.addEventListener('change', () => syncHostingWarn(slot.id));
+    document.querySelector(`[data-slot-body="${slot.id}"]`)
+        ?.addEventListener('input', () => syncHostingWarn(slot.id));
 }
 
 async function saveSlot(slotId) {
@@ -828,5 +874,7 @@ function initTestVarsAutosave() {
 }
 
 loadTemplate({ populateEditableFields: true });
+// Fetched once; every slot's warning reads the same answer.
+loadHostingState();
 </script>
 {% endblock %}

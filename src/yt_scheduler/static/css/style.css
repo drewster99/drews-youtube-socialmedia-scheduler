@@ -1892,10 +1892,14 @@ dialog.modal-xwide {
    because the work it reports rewrites schedules from wherever you happen to
    be standing. */
 .reconcile-banner {
+    /* Sticky inside .content so it occupies flow space (never covering the
+       page) and stays put while scrolling. Negative margins cancel .content's
+       padding so it reads as a bar rather than a floating card. */
     position: sticky;
     top: 0;
     z-index: 50;
-    padding: 0.6rem 1rem;
+    margin: -2rem -2rem 1.5rem;
+    padding: 0.7rem 2rem;
     background: var(--bg-input, #2a2a2a);
     border-bottom: 2px solid var(--accent, #4a9eff);
     font-size: 0.85rem;
@@ -1928,3 +1932,5 @@ dialog.modal-xwide {
 @media (prefers-reduced-motion: reduce) {
     .reconcile-banner__spinner { animation: none; }
 }
+
+.slot-hosting-warn { color: var(--danger); margin-top: 0.35rem; }

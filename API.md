@@ -2346,6 +2346,12 @@ Implemented as a `slot_body_changed` job covering every enabled slot — the who
 
 Posts already `posted` (or mid-`sending`) are left alone — they are history. Rendering uses the project's editable `ai_block_default_system_prompt`, same as the generate path.
 
+### `GET /api/platform-capabilities`
+
+**Purpose** — Which platforms accept an attachment, and which need media hosting configured to do it. Exists so the UI never hardcodes a platform name for this; every client-side attempt to answer it ("Threads is text-only") outlived the fact it encoded.
+
+**Response 200** — `{"accepts_media": ["twitter", "bluesky", "mastodon", "linkedin", "threads"], "requires_hosted_media": ["threads"]}`.
+
 ### `GET /api/reconcile-status`
 
 **Purpose** — Progress of smart-queue template reconciliation, for the banner every page shows. Deliberately not scoped to a project: the work rewrites real schedules, so it has to be visible wherever the user is.

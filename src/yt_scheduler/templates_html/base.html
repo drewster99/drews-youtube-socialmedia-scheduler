@@ -35,12 +35,14 @@
         </div>
     </nav>
 
-    <!-- Template reconciliation runs in the background and rewrites real
-         schedules, so it has to be visible from wherever the user is, not only
-         from the screen that started it. -->
-    <div id="reconcile-banner" class="reconcile-banner" style="display:none;"></div>
-
     <main class="content">
+        <!-- Reconciliation runs in the background and rewrites real schedules,
+             so it has to be visible from wherever the user is, not only from
+             the screen that started it. Inside .content, not a sibling of it:
+             body is display:flex with a fixed sidebar, so a sibling becomes a
+             flex item and gets squeezed into the leftover column. -->
+        <div id="reconcile-banner" class="reconcile-banner" style="display:none;"></div>
+
         {% block content %}{% endblock %}
     </main>
 

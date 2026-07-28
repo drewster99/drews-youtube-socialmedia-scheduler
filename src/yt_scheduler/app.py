@@ -394,6 +394,28 @@ async def api_build():
     return build_info.as_dict()
 
 
+@app.get("/api/platform-capabilities")
+async def api_platform_capabilities():
+    """Which platforms accept an attachment, and which need hosting to do it.
+
+    Exists so the UI never hardcodes a platform name for this. Every previous
+    attempt to answer it client-side ("Threads is text-only") outlived the fact
+    it encoded and had to be hunted down.
+    """
+    from yt_scheduler.services import social
+
+    return {
+        "accepts_media": [
+            p for p in social.ALL_PLATFORMS
+            if social.platform_accepts_attached_media(p)
+        ],
+        "requires_hosted_media": [
+            p for p in social.ALL_PLATFORMS
+            if social.platform_requires_hosted_media(p)
+        ],
+    }
+
+
 @app.get("/api/reconcile-status")
 async def api_reconcile_status():
     """Template-reconciliation progress, for the banner every page shows.
