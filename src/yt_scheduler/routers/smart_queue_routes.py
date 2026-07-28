@@ -290,20 +290,43 @@ async def reflow_pending(slug: str, queue_id: int):
         raise HTTPException(400, str(exc)) from exc
 
 
+async def _enabled_slot_ids(queue: dict) -> list[int]:
+    """Every enabled slot on this queue's template.
+
+    Manual re-render and backfill are the whole-template cases of the same two
+    jobs a template edit queues, so they reuse those handlers rather than
+    keeping a second implementation that can drift.
+    """
+    from yt_scheduler.services.smart_queue_accept import _template_by_id
+
+    template = await _template_by_id(int(queue["template_id"]))
+    return [
+        int(slot["id"]) for slot in template["slots"]
+        if slot.get("id") and not slot.get("is_disabled")
+    ]
+
+
 @router.post("/{queue_id}/re-render")
 async def rerender_pending(slug: str, queue_id: int):
-    """Re-render every still-pending post this queue owns from the current
-    template. Posted rows are history and are left alone.
+    """Queue a re-render of every still-pending post this queue owns.
 
-    **Response 200** — ``{"updated": N, "errors": [{"post_id", "error"}]}``.
-    Errors are per post so one bad render doesn't hide the rest.
+    Returns as soon as the job is queued — one AI round-trip per post is
+    minutes of work that must not hold the request open or die with the
+    browser tab. Watch it in the app-wide banner; progress is at
+    ``GET /api/reconcile-status``. Posted rows are history and are left alone.
+
+    **Response 200** — ``{"queued": true, "jobs": N}``.
     """
     queue = await _queue_in_project_or_404(slug, queue_id)
     await _require_not_reconciling(queue_id)
-    await _require_not_reconciling(queue_id)
-    return await smart_queue_accept.rerender_pending(
-        queue_id, default_ai_system=await _default_ai_system(queue["project_id"])
-    )
+    slot_ids = await _enabled_slot_ids(queue)
+    if not slot_ids:
+        return {"queued": False, "jobs": 0}
+    ids = await smart_queue_reconcile.enqueue_jobs(queue_id, [{
+        "kind": smart_queue_reconcile.KIND_SLOT_BODY_CHANGED,
+        "payload": {"slot_ids": slot_ids},
+    }])
+    return {"queued": True, "jobs": len(ids)}
 
 
 @router.post("/{queue_id}/reconcile-jobs/{job_id}/dismiss")
@@ -341,13 +364,22 @@ async def backfill_pending_slots(slug: str, queue_id: int):
     a backfilled post inherits its item's time, so nothing on the calendar
     moves.
 
-    **Response 200** — ``{"created": N, "skipped": N, "errors": [...]}``.
+    Queued rather than run inline, for the same reason as re-render: it renders
+    N posts with an AI round-trip apiece. Watch it in the app-wide banner.
+
+    **Response 200** — ``{"queued": true, "jobs": N}``. The ``slots_added``
+    handler skips any slot an item already has, so this is safe to repeat.
     """
     queue = await _queue_in_project_or_404(slug, queue_id)
     await _require_not_reconciling(queue_id)
-    return await smart_queue_accept.backfill_pending_slots(
-        queue_id, default_ai_system=await _default_ai_system(queue["project_id"])
-    )
+    slot_ids = await _enabled_slot_ids(queue)
+    if not slot_ids:
+        return {"queued": False, "jobs": 0}
+    ids = await smart_queue_reconcile.enqueue_jobs(queue_id, [{
+        "kind": smart_queue_reconcile.KIND_SLOTS_ADDED,
+        "payload": {"slot_ids": slot_ids},
+    }])
+    return {"queued": True, "jobs": len(ids)}
 
 
 async def _default_ai_system(project_id: int) -> str:

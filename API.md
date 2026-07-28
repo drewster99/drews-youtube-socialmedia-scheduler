@@ -2336,9 +2336,13 @@ Rows are per-platform `social_posts`, not per queue item: a video whose Mastodon
 
 ### `POST /api/projects/{slug}/smart-queues/{queue_id}/re-render`
 
-**Purpose** — Re-render every still-pending post this queue owns from the current template, after editing it.
+**Purpose** — Queue a re-render of every still-pending post this queue owns, after editing the template.
 
-**Response 200** — `{"updated": N, "errors": [{"post_id", "error"}]}`. Errors are per post so one bad render doesn't hide the rest.
+**Response 200** — `{"queued": true, "jobs": N}`. Returns immediately: one AI round-trip per post is minutes of work, so it runs on the reconcile worker rather than holding the request open. Progress is at `GET /api/reconcile-status` and in the app-wide banner; closing the page no longer stops it.
+
+Implemented as a `slot_body_changed` job covering every enabled slot — the whole-template case of what a template edit queues, rather than a second implementation.
+
+**Errors** — `409` while reconciliation already owns this queue.
 
 Posts already `posted` (or mid-`sending`) are left alone — they are history. Rendering uses the project's editable `ai_block_default_system_prompt`, same as the generate path.
 
@@ -2359,7 +2363,9 @@ Posts already `posted` (or mid-`sending`) are left alone — they are history. R
 }
 ```
 
-`kind` is one of `slots_added`, `slots_removed`, `slot_body_changed`, `applies_to_removed`. A queue in `locked_queue_ids` refuses `PATCH` until its jobs finish.
+`kind` is one of `slots_added`, `slots_removed`, `slot_body_changed`, `applies_to_removed`, plus `enqueue_failed` (only ever recorded already-failed, when a saved template edit could not be turned into jobs).
+
+A queue in `locked_queue_ids` returns `409` from every schedule mutation — `PATCH`, `DELETE`, `/accept`, `/re-flow`, `/re-render`, `/backfill-slots` — until its jobs finish. Reading stays allowed.
 
 ### `POST /api/projects/{slug}/smart-queues/{queue_id}/reconcile-jobs/{job_id}/dismiss`
 
@@ -2379,7 +2385,9 @@ Reconciliation now runs automatically on template change, so a gap here means it
 
 **Purpose** — Create the posts pending items would have had, had the slots existed. Counterpart to `re-render`: that rewrites rows that exist, this adds rows that never did. Every `scheduled_at` is left alone — a backfilled post inherits its item's time, so nothing on the calendar moves.
 
-**Response 200** — `{"created": N, "skipped": N, "errors": [{"item_id", "platform", "error"}]}`. A slot that cannot carry the video records a `skipped` row with its reason rather than a post that would fail at send time.
+**Response 200** — `{"queued": true, "jobs": N}`. Queued on the reconcile worker for the same reason as re-render, and reported in the same banner. Implemented as a `slots_added` job covering every enabled slot; that handler skips any slot an item already has, so repeating it is safe. A slot that cannot carry the video records a `skipped` row with its reason rather than a post that would fail at send time.
+
+**Errors** — `409` while reconciliation already owns this queue.
 
 ### `GET /api/projects/{slug}/smart-queues/{queue_id}/items`
 
