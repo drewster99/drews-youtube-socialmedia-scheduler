@@ -2020,9 +2020,17 @@ class ThreadsPoster(SocialPoster):
 
             if resp.status_code != 200:
                 detail = _http_error_detail(resp)
-                # Meta refuses a token younger than 24h. That is a "come back
-                # later", not a dead credential — flagging needs_reauth here
-                # would send the user through OAuth for no reason.
+                # 5xx is Meta having a bad day, not a verdict on the token.
+                # Flagging needs_reauth here would march the user through OAuth
+                # for a perfectly good credential; the next sweep retries.
+                if resp.status_code >= 500:
+                    logger.warning(
+                        "Threads token refresh got %s from Meta; will retry: %s",
+                        resp.status_code, detail,
+                    )
+                    return False
+                # Meta refuses a token younger than 24h. Also "come back
+                # later" rather than a dead credential.
                 if "24 hours" in detail or "too early" in detail.lower():
                     logger.info("Threads token too new to refresh yet: %s", detail)
                     return False

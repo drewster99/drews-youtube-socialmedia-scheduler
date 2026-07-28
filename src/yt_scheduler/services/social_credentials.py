@@ -88,6 +88,14 @@ def _row_to_dict(row) -> dict:
         # For X accounts: 'none' | 'blue' | 'business' | 'government' — anything
         # but 'none'/NULL means X Premium (25,000-char posts). NULL elsewhere.
         "verified_type": (row["verified_type"] if "verified_type" in row.keys() else None),
+        # When this token dies, ISO-8601, or None when the issuer never told
+        # us. None must render as "unknown", never as "doesn't expire" —
+        # assuming the latter is how a lapsed Threads token kept looking
+        # connected for weeks. Guarded by a key check because rows read before
+        # migration 039 don't carry the column.
+        "token_expires_at": (
+            row["token_expires_at"] if "token_expires_at" in row.keys() else None
+        ),
         "label": format_account_label(row["platform"], row["username"]),
     }
 

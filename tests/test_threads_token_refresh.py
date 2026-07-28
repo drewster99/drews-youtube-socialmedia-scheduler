@@ -178,6 +178,33 @@ async def test_a_network_error_is_retried_not_treated_as_expiry(
     assert "bundle" not in stored
 
 
+async def test_a_meta_outage_is_not_a_verdict_on_the_token(social, meta, stored):
+    """A 5xx from the refresh endpoint says Meta is unwell, not that the
+    credential is dead. Flagging needs_reauth would send the user through OAuth
+    for a working token."""
+    calls, state = meta
+    state["status"] = 503
+    state["payload"] = {"message": "Service temporarily unavailable"}
+
+    assert await social.ThreadsPoster(bundle=dict(CREDS)).refresh_if_stale() is False
+    assert "bundle" not in stored
+
+
+async def test_expiry_reaches_the_api_so_the_ui_can_show_it(isolated_db):
+    """The column is useless if the row mapper drops it -- which it did, since
+    _row_to_dict whitelists fields rather than passing the row through."""
+    creds_mod = importlib.import_module("yt_scheduler.services.social_credentials")
+    await isolated_db.execute(
+        "INSERT INTO social_accounts "
+        "(id, uuid, platform, provider_account_id, username, token_expires_at) "
+        "VALUES (1,'u1','threads','pid-1','someone','2026-09-01T00:00:00+00:00')"
+    )
+    await isolated_db.commit()
+
+    rows = await creds_mod.list_credentials()
+    assert rows[0]["token_expires_at"] == "2026-09-01T00:00:00+00:00"
+
+
 async def test_refresh_needs_a_token_to_refresh(social, meta, stored):
     calls, _ = meta
     assert await social.ThreadsPoster(bundle={"uuid": "u"}).refresh_if_stale() is False
