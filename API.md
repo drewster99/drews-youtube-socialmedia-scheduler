@@ -1572,6 +1572,54 @@ Source: `src/yt_scheduler/routers/settings_routes.py`
 
 **Response 200** — `{"status": "ok"}`.
 
+### `GET /api/settings/media-hosting`
+
+**Purpose** — Cloudflare R2 media-hosting status. Threads fetches video from a URL rather than accepting an upload, so a clip must be briefly reachable over HTTPS; see `services/media_hosting.py`.
+
+**Response 200**:
+
+```json
+{
+  "configured": true,
+  "account_id": "64102e7e...",
+  "bucket": "my-threads-videos",
+  "masked_access_key_id": "a1b2c3…7f8e",
+  "secret_set": true,
+  "download_url_ttl_seconds": 7200,
+  "storage": "keychain"
+}
+```
+
+`configured` is true only when all four values are present — a partial config cannot produce a working URL. The secret access key is never returned, only `secret_set`.
+
+### `PUT /api/settings/media-hosting`
+
+**Purpose** — Save any subset of the four media-hosting values.
+
+**Request body** — `{"account_id": "...", "bucket": "...", "access_key_id": "...", "secret_access_key": "..."}`. Every field is optional; blank fields are left untouched so the form can be re-saved without re-entering the secret.
+
+**Response 200** — `{"status": "ok", "storage": "..."}`.
+
+**Errors** — `400` (all four fields blank).
+
+**Side effects** — Both keys go to Keychain under the `media_hosting` namespace; `media_hosting_account_id` and `media_hosting_bucket` persist in the `settings` table.
+
+### `DELETE /api/settings/media-hosting`
+
+**Purpose** — Remove the R2 credentials and the bucket/account settings.
+
+**Response 200** — `{"status": "ok"}`.
+
+### `POST /api/settings/media-hosting/test`
+
+**Purpose** — Upload a few bytes and read them back through a presigned URL, so a wrong account ID, an under-scoped token or a truncated secret surfaces with its real error instead of failing opaquely at send time.
+
+**Response 200** — `{"status": "ok", "detail": {"bucket": "...", "account_id": "...", "key": "connection-test/...", "bytes": 62, "content_type_served": "text/plain", "download_url_ttl_seconds": 7200}}`.
+
+**Errors** — `400` (not configured), `502` (upload or read-back failed; the message carries the provider's response).
+
+**Note** — Deliberately does not delete the test object: the bucket enforces Object Lock with a 24-hour minimum retention, so an early delete is impossible. The bucket's 7-day lifecycle rule removes it.
+
 ### `GET /api/settings/oauth-clients`
 
 **Purpose** — Return configured social OAuth clients (X / LinkedIn / Threads). Used by the Settings UI.

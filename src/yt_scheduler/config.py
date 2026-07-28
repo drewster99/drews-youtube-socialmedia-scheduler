@@ -219,6 +219,14 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 ANTHROPIC_NAMESPACE = "anthropic"
 ANTHROPIC_API_KEY_FIELD = "api_key"
 
+# Cloudflare R2 credentials for temporary media hosting (see
+# services/media_hosting.py). Both halves live in the Keychain: the access key
+# id is not itself a secret — it rides in every presigned URL — but splitting a
+# credential across two stores invites half of it landing in .env later.
+MEDIA_HOSTING_NAMESPACE = "media_hosting"
+MEDIA_HOSTING_ACCESS_KEY_ID_FIELD = "access_key_id"
+MEDIA_HOSTING_SECRET_ACCESS_KEY_FIELD = "secret_access_key"
+
 
 def get_anthropic_api_key() -> str:
     """Load the Anthropic API key from secure storage (Keychain / encrypted fallback)."""

@@ -59,6 +59,48 @@
     </div>
 </div>
 
+<!-- Media hosting — Threads fetches video from a URL rather than accepting an
+     upload, so a clip needs to be briefly reachable over HTTPS. -->
+<div class="card">
+    <h2>Media hosting (Cloudflare R2)</h2>
+    <p class="form-hint">
+        Threads doesn't accept a media upload — <strong>images and video alike</strong>,
+        its API fetches them from a URL Meta cURLs itself, and this app serves on
+        <code>127.0.0.1</code>. Attachments are put in a <strong>private</strong> R2
+        bucket and handed to Meta as a signed URL that expires, so the bucket is
+        never publicly readable. Keys are stored in
+        <span id="media-hosting-storage-type">Keychain</span>; the bucket and
+        account ID are not secret and live in the database.
+    </p>
+    <div id="media-hosting-status" style="margin-bottom: 0.75rem;">
+        <p class="loading">Checking…</p>
+    </div>
+    <div class="form-group">
+        <label>Account ID</label>
+        <input type="text" id="media-hosting-account-id" placeholder="64102e7e…" autocomplete="off">
+        <small style="color: var(--text-muted);">The subdomain of your R2 endpoint: <code>https://&lt;account-id&gt;.r2.cloudflarestorage.com</code></small>
+    </div>
+    <div class="form-group">
+        <label>Bucket</label>
+        <input type="text" id="media-hosting-bucket" placeholder="my-threads-videos" autocomplete="off">
+    </div>
+    <div class="form-group">
+        <label>Access Key ID</label>
+        <input type="password" id="media-hosting-access-key-id" placeholder="R2 S3 Access Key ID" autocomplete="off">
+        <small style="color: var(--text-muted);">From R2 → API Tokens → Create, with <strong>Object Read &amp; Write</strong> scoped to this bucket. Not the Cloudflare API token.</small>
+    </div>
+    <div class="form-group">
+        <label>Secret Access Key</label>
+        <input type="password" id="media-hosting-secret-access-key" placeholder="R2 S3 Secret Access Key" autocomplete="off">
+        <small style="color: var(--text-muted);">Cloudflare shows this once. Losing it means creating a new token.</small>
+    </div>
+    <div class="form-actions">
+        <button class="btn btn-primary" id="btn-save-media-hosting" onclick="saveMediaHosting()">Save</button>
+        <button class="btn btn-secondary" id="btn-test-media-hosting" onclick="testMediaHosting()">Test connection</button>
+        <button class="btn btn-danger" id="btn-remove-media-hosting" onclick="removeMediaHosting()" style="display:none;">Remove</button>
+    </div>
+</div>
+
 <!-- Threads OAuth redirect — Meta only redirects to HTTPS, so the popup flow
      needs DYS_THREADS_REDIRECT_URL pointing at a public bounce page. -->
 <div class="card">
@@ -305,6 +347,128 @@ async function removeAnthropicKey() {
     if (resp.ok) {
         showToast('API key removed', 'success');
         loadAnthropicStatus();
+    }
+}
+
+// --- Media hosting (Cloudflare R2) ---
+
+const MEDIA_HOSTING_FIELDS = {
+    account_id: 'media-hosting-account-id',
+    bucket: 'media-hosting-bucket',
+    access_key_id: 'media-hosting-access-key-id',
+    secret_access_key: 'media-hosting-secret-access-key',
+};
+
+async function loadMediaHostingStatus() {
+    const el = document.getElementById('media-hosting-status');
+    const resp = await fetch('/api/settings/media-hosting');
+    if (!resp.ok) {
+        // Never leave "Checking…" up forever — a stuck spinner reads as
+        // "still working" when the request actually failed.
+        el.innerHTML = `<span class="badge badge-draft">Status unavailable</span>
+            <span style="color: var(--text-muted); font-size: 0.8rem; margin-left: 0.5rem;">
+                Couldn't read media hosting settings (HTTP ${resp.status}).</span>`;
+        return;
+    }
+    const data = await resp.json();
+    const removeBtn = document.getElementById('btn-remove-media-hosting');
+    document.getElementById('media-hosting-storage-type').textContent = 'macOS Keychain';
+
+    // Non-secret values are echoed back so the form shows what's in effect.
+    // The secret never is — only whether one is set.
+    document.getElementById(MEDIA_HOSTING_FIELDS.account_id).value = data.account_id || '';
+    document.getElementById(MEDIA_HOSTING_FIELDS.bucket).value = data.bucket || '';
+
+    const secretInput = document.getElementById(MEDIA_HOSTING_FIELDS.secret_access_key);
+    const keyIdInput = document.getElementById(MEDIA_HOSTING_FIELDS.access_key_id);
+    secretInput.value = '';
+    keyIdInput.value = '';
+    secretInput.placeholder = data.secret_set ? 'Stored — enter a new value to replace' : 'R2 S3 Secret Access Key';
+    keyIdInput.placeholder = data.masked_access_key_id
+        ? `Stored (${data.masked_access_key_id}) — enter a new value to replace`
+        : 'R2 S3 Access Key ID';
+
+    if (data.configured) {
+        const hours = Math.round((data.download_url_ttl_seconds || 0) / 3600);
+        el.innerHTML = `<span class="badge badge-published">Configured</span>
+            <span style="color: var(--text-muted); font-size: 0.8rem; margin-left: 0.5rem;">
+                ${escapeHtml(data.bucket)} — signed links valid ${hours}h</span>`;
+    } else {
+        // Name what's missing rather than just "not configured" — a half-filled
+        // form is the likeliest state to get stuck in, and all four are needed.
+        const missing = [
+            !data.account_id && 'account ID',
+            !data.bucket && 'bucket',
+            !data.masked_access_key_id && 'access key ID',
+            !data.secret_set && 'secret access key',
+        ].filter(Boolean);
+        el.innerHTML = `<span class="badge badge-draft">Not configured</span>
+            <span style="color: var(--text-muted); font-size: 0.8rem; margin-left: 0.5rem;">
+                Missing ${escapeHtml(missing.join(', '))}. Threads posts can't include images or video until this is set.</span>`;
+    }
+    // Offered whenever anything is stored, not only when all four are — a
+    // partial config still has values the user may want to clear.
+    const anyStored = !!(data.account_id || data.bucket || data.masked_access_key_id || data.secret_set);
+    removeBtn.style.display = anyStored ? 'inline-flex' : 'none';
+}
+
+async function saveMediaHosting() {
+    const body = {};
+    for (const [field, id] of Object.entries(MEDIA_HOSTING_FIELDS)) {
+        body[field] = document.getElementById(id).value.trim();
+    }
+    if (!Object.values(body).some(v => v)) {
+        showToast('Enter at least one value', 'error');
+        return;
+    }
+    if (body.account_id && body.account_id.includes('.')) {
+        // Easy to paste the whole endpoint URL here; the signature covers the
+        // host, so a wrong account id fails as an opaque 403 much later.
+        showToast('Account ID is just the subdomain, not the full endpoint URL', 'error');
+        return;
+    }
+    const resp = await fetch('/api/settings/media-hosting', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+    });
+    if (resp.ok) {
+        showToast('Saved (keys in Keychain, bucket in DB)', 'success');
+        loadMediaHostingStatus();
+    } else {
+        const err = await resp.json().catch(() => ({}));
+        showToast(err.detail || 'Could not save media hosting settings', 'error');
+    }
+}
+
+async function testMediaHosting() {
+    const btn = document.getElementById('btn-test-media-hosting');
+    const original = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Testing…';
+    try {
+        const resp = await fetch('/api/settings/media-hosting/test', {method: 'POST'});
+        const result = await resp.json().catch(() => ({}));
+        if (resp.ok) {
+            const d = result.detail || {};
+            showToast(`Round-trip OK — uploaded and read back ${d.bytes} bytes from ${d.bucket}`, 'success');
+        } else {
+            // The real reason, not a generic failure: a wrong account id, an
+            // under-scoped token and a truncated secret all look different here.
+            showToast(result.detail || 'Media hosting test failed', 'error');
+        }
+    } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+    }
+}
+
+async function removeMediaHosting() {
+    if (!confirm('Remove the R2 credentials? Threads posts with video will stop working.')) return;
+    const resp = await fetch('/api/settings/media-hosting', {method: 'DELETE'});
+    if (resp.ok) {
+        showToast('Media hosting credentials removed', 'success');
+        loadMediaHostingStatus();
     }
 }
 
@@ -756,6 +920,7 @@ async function loadSettings() {
 // Load everything
 loadAuthStatus();
 loadAnthropicStatus();
+loadMediaHostingStatus();
 loadThreadsOAuthStatus();
 loadOAuthClients();
 loadSocialPlatforms();

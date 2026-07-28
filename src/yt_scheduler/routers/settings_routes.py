@@ -9,6 +9,9 @@ from fastapi import APIRouter, HTTPException
 from yt_scheduler.config import (
     ANTHROPIC_API_KEY_FIELD,
     ANTHROPIC_NAMESPACE,
+    MEDIA_HOSTING_ACCESS_KEY_ID_FIELD,
+    MEDIA_HOSTING_NAMESPACE,
+    MEDIA_HOSTING_SECRET_ACCESS_KEY_FIELD,
     get_anthropic_api_key,
 )
 from yt_scheduler.database import get_db, write_transaction
@@ -17,6 +20,7 @@ from yt_scheduler.services import oauth_clients
 from yt_scheduler.services.keychain import (
     delete_secret_async,
     get_storage_type,
+    load_secret_async,
     store_secret_async,
 )
 from yt_scheduler.services.social import (
@@ -156,6 +160,119 @@ async def delete_anthropic_key():
     """Remove Anthropic API key from Keychain/secrets."""
     await delete_secret_async(ANTHROPIC_NAMESPACE, ANTHROPIC_API_KEY_FIELD)
     return {"status": "ok"}
+
+
+# --- Media hosting (Cloudflare R2) ---
+
+
+def _mask(value: str) -> str:
+    """Show enough of an identifier to recognise it, never enough to use it."""
+    return f"{value[:6]}…{value[-4:]}" if len(value) > 12 else "***"
+
+
+@router.get("/media-hosting")
+async def get_media_hosting_status():
+    """Report whether media hosting is set up. Secrets are never returned."""
+    from yt_scheduler.services.media_hosting import (
+        DOWNLOAD_URL_TTL_SECONDS,
+        SETTING_ACCOUNT_ID,
+        SETTING_BUCKET,
+        is_configured,
+    )
+
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT key, value FROM settings WHERE key IN (?, ?)",
+        (SETTING_ACCOUNT_ID, SETTING_BUCKET),
+    )
+    values = {row["key"]: (row["value"] or "") for row in rows}
+    access_key_id = await load_secret_async(
+        MEDIA_HOSTING_NAMESPACE, MEDIA_HOSTING_ACCESS_KEY_ID_FIELD
+    ) or ""
+    secret_set = bool(await load_secret_async(
+        MEDIA_HOSTING_NAMESPACE, MEDIA_HOSTING_SECRET_ACCESS_KEY_FIELD
+    ))
+
+    return {
+        "configured": await is_configured(),
+        "account_id": values.get(SETTING_ACCOUNT_ID, ""),
+        "bucket": values.get(SETTING_BUCKET, ""),
+        "masked_access_key_id": _mask(access_key_id) if access_key_id else "",
+        "secret_set": secret_set,
+        "download_url_ttl_seconds": DOWNLOAD_URL_TTL_SECONDS,
+        "storage": get_storage_type(),
+    }
+
+
+@router.put("/media-hosting")
+async def update_media_hosting(data: dict):
+    """Save any subset of the four values. Blank fields are left untouched so
+    the form can be re-saved without re-entering the secret."""
+    from yt_scheduler.services.media_hosting import SETTING_ACCOUNT_ID, SETTING_BUCKET
+
+    account_id = (data.get("account_id") or "").strip()
+    bucket = (data.get("bucket") or "").strip()
+    access_key_id = (data.get("access_key_id") or "").strip()
+    secret_access_key = (data.get("secret_access_key") or "").strip()
+
+    if not any((account_id, bucket, access_key_id, secret_access_key)):
+        raise HTTPException(400, "Nothing to save — every field was blank")
+
+    non_secret = [(SETTING_ACCOUNT_ID, account_id), (SETTING_BUCKET, bucket)]
+    to_write = [(key, value) for key, value in non_secret if value]
+    if to_write:
+        async with write_transaction() as db:
+            for key, value in to_write:
+                await db.execute(
+                    "INSERT INTO settings (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, value),
+                )
+    if access_key_id:
+        await store_secret_async(
+            MEDIA_HOSTING_NAMESPACE, MEDIA_HOSTING_ACCESS_KEY_ID_FIELD, access_key_id
+        )
+    if secret_access_key:
+        await store_secret_async(
+            MEDIA_HOSTING_NAMESPACE, MEDIA_HOSTING_SECRET_ACCESS_KEY_FIELD,
+            secret_access_key,
+        )
+    return {"status": "ok", "storage": get_storage_type()}
+
+
+@router.delete("/media-hosting")
+async def delete_media_hosting():
+    """Remove the R2 credentials and settings."""
+    from yt_scheduler.services.media_hosting import SETTING_ACCOUNT_ID, SETTING_BUCKET
+
+    await delete_secret_async(MEDIA_HOSTING_NAMESPACE, MEDIA_HOSTING_ACCESS_KEY_ID_FIELD)
+    await delete_secret_async(
+        MEDIA_HOSTING_NAMESPACE, MEDIA_HOSTING_SECRET_ACCESS_KEY_FIELD
+    )
+    async with write_transaction() as db:
+        await db.execute(
+            "DELETE FROM settings WHERE key IN (?, ?)",
+            (SETTING_ACCOUNT_ID, SETTING_BUCKET),
+        )
+    return {"status": "ok"}
+
+
+@router.post("/media-hosting/test")
+async def test_media_hosting():
+    """Upload a few bytes and read them back, so a bad credential fails here
+    with its real error instead of opaquely at send time."""
+    from yt_scheduler.services.media_hosting import (
+        MediaHostingError,
+        MediaHostingNotConfigured,
+        verify_round_trip,
+    )
+
+    try:
+        return {"status": "ok", "detail": await verify_round_trip()}
+    except MediaHostingNotConfigured as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except MediaHostingError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 # --- OAuth client credentials (Twitter / LinkedIn / Threads) ---
