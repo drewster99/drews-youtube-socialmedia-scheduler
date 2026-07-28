@@ -23,11 +23,28 @@ from yt_scheduler.services.social_credentials import (
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 
+#: Upper bound on one page of the activity feed. Generous — the point is to
+#: refuse a request that would read the whole table, not to shape the UI.
+_MAX_RECENT_EVENTS_PER_PAGE = 200
+
+
 @router.get("/__recent-events", include_in_schema=False)
 @router.get("/recent-events")
-async def recent_events(limit: int = 7) -> list[dict]:
-    """Newest activity log entries across all projects, for the Home page feed."""
-    return await events_service.list_recent_events(limit=limit)
+async def recent_events(limit: int = 7, offset: int = 0) -> list[dict]:
+    """Newest activity log entries across all projects, for the Home page feed.
+
+    Bad paging values are refused rather than clamped: a silently corrected
+    limit returns a page the caller did not ask for, and looks like the feed
+    simply ended.
+    """
+    if limit < 1 or limit > _MAX_RECENT_EVENTS_PER_PAGE:
+        raise HTTPException(
+            400,
+            f"limit must be between 1 and {_MAX_RECENT_EVENTS_PER_PAGE}, got {limit}",
+        )
+    if offset < 0:
+        raise HTTPException(400, f"offset cannot be negative, got {offset}")
+    return await events_service.list_recent_events(limit=limit, offset=offset)
 
 
 @router.get("/upcoming")

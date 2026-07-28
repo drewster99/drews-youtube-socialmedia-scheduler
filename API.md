@@ -119,7 +119,12 @@ Aliases: `GET /api/projects/__recent-events` (excluded from OpenAPI schema).
 
 | Name | Type | Required | Description |
 |---|---|---|---|
-| `limit` | int | optional | Max rows. Default `7`. |
+| `limit` | int | optional | Max rows. Default `7`, max `200`. |
+| `offset` | int | optional | Rows to skip, for paging further back. Default `0`. |
+
+Both are **refused with `400`, never clamped** — a silently corrected limit returns a page the caller did not ask for, which reads as the feed having ended.
+
+Ordering is `(created_at DESC, id DESC)`. The tiebreak is load-bearing: a batch operation writes many events with an identical `created_at`, and a `created_at`-only sort is not a total order, so rows would swap between pages and paging would repeat some events and skip others. A page shorter than `limit` is how a caller knows it has reached the end.
 
 **Response 200** — Array of `video_events` rows joined to `videos` and `projects`:
 

@@ -33,6 +33,10 @@
         <div id="recent-list" class="event-list">
             <p class="loading">Loading...</p>
         </div>
+        <div id="recent-more-wrap" style="display:none; margin-top:0.75rem;">
+            <button class="btn btn-sm" id="recent-more-btn">Show older</button>
+            <span class="form-hint" id="recent-more-note"></span>
+        </div>
     </section>
 </div>
 
@@ -381,16 +385,32 @@ function eventDetails(item) {
     }
 }
 
-async function loadRecent() {
+// The feed used to fetch one page and stop, with nothing to say it had —
+// a run that scheduled 48 posts filled it entirely and buried everything
+// older, with no way to reach any of it.
+const RECENT_PAGE_SIZE = 30;
+let recentLoaded = 0;
+
+async function loadRecent({append = false} = {}) {
     const container = document.getElementById('recent-list');
+    const wrap = document.getElementById('recent-more-wrap');
     try {
-        const resp = await fetch('/api/projects/recent-events?limit=30');
+        const offset = append ? recentLoaded : 0;
+        const resp = await fetch(
+            `/api/projects/recent-events?limit=${RECENT_PAGE_SIZE}&offset=${offset}`);
         const items = resp.ok ? await resp.json() : [];
-        if (!items.length) {
+        if (!append && !items.length) {
             container.innerHTML = '<p class="empty-state">No recent activity yet.</p>';
+            wrap.style.display = 'none';
             return;
         }
-        container.innerHTML = items.map(i => {
+        recentLoaded = offset + items.length;
+        // A short page means the end; a full one only means there may be more.
+        const maybeMore = items.length === RECENT_PAGE_SIZE;
+        wrap.style.display = maybeMore ? '' : 'none';
+        document.getElementById('recent-more-note').textContent =
+            `${recentLoaded} shown`;
+        const html = items.map(i => {
             const tier = eventTier(i.type);
             // Inline border-left so columns line up across all rows even
             // when the running .app shell is serving a stale bundled CSS
@@ -405,10 +425,35 @@ async function loadRecent() {
                 <span class="event-project">${escapeHtml(i.project_name)}</span>
             </div>`;
         }).join('');
+        if (append) {
+            container.insertAdjacentHTML('beforeend', html);
+        } else {
+            container.innerHTML = html;
+        }
     } catch (e) {
-        container.innerHTML = '<p class="empty-state">Could not load activity.</p>';
+        // Only blank the list on a first load; wiping what is already on screen
+        // because page 3 failed would lose the entries the user was reading.
+        if (!append) {
+            container.innerHTML = '<p class="empty-state">Could not load activity.</p>';
+        } else {
+            document.getElementById('recent-more-note').textContent =
+                'Could not load older activity.';
+        }
     }
 }
+
+document.getElementById('recent-more-btn').addEventListener('click', async () => {
+    const button = document.getElementById('recent-more-btn');
+    if (button.disabled) return;
+    button.disabled = true;
+    button.textContent = 'Loading…';
+    try {
+        await loadRecent({append: true});
+    } finally {
+        button.disabled = false;
+        button.textContent = 'Show older';
+    }
+});
 
 const dialog = document.getElementById('add-project-dialog');
 

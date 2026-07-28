@@ -50,8 +50,14 @@ async def list_events_for_video(video_id: str, limit: int = 200) -> list[dict]:
     return [_row_to_dict(row) for row in rows]
 
 
-async def list_recent_events(limit: int = 7) -> list[dict]:
-    """Newest-first events across all videos/projects, joined with the project."""
+async def list_recent_events(limit: int = 7, offset: int = 0) -> list[dict]:
+    """Newest-first events across all videos/projects, joined with the project.
+
+    ``offset`` pages further back. The ordering is (created_at, id) descending
+    rather than created_at alone, so it is total even when a batch of events
+    shares a timestamp — a plain created_at sort would let rows swap between
+    pages and the feed would drop or repeat entries as you paged.
+    """
     db = await get_db()
     rows = await db.execute_fetchall(
         """
@@ -62,9 +68,9 @@ async def list_recent_events(limit: int = 7) -> list[dict]:
         JOIN videos v ON v.id = e.video_id
         JOIN projects p ON p.id = v.project_id
         ORDER BY e.created_at DESC, e.id DESC
-        LIMIT ?
+        LIMIT ? OFFSET ?
         """,
-        (limit,),
+        (limit, offset),
     )
     return [_row_to_dict(row) for row in rows]
 
