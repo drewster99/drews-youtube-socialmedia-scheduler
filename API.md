@@ -2354,6 +2354,8 @@ Posts already `posted` (or mid-`sending`) are left alone — they are history. R
 
 `ok: false` with `"unreachable": true` means we couldn't get an answer — a network failure *or* a 5xx from the provider. Neither is a verdict on the token, and both are kept distinct from a 4xx rejection so a bad day at the provider isn't read as an expired credential.
 
+**Side effect** — the verdict is mirrored into the credential's `needs_reauth` flag: a rejection sets it (Settings then shows the badge and Reconnect button), a pass clears a stale flag, and unreachable leaves it untouched in both directions.
+
 **Errors** — `404` (unknown credential, or no stored bundle), `501` (platform has no live check implemented).
 
 ### `GET /api/platform-capabilities`

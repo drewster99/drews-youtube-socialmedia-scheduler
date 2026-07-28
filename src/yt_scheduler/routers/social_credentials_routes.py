@@ -116,8 +116,16 @@ async def verify_credential(uuid: str):
     **Response 200** — ``{"ok": bool, "detail": "...", "username": "..."}``.
     ``ok: false`` with ``unreachable: true`` means we could not reach the
     provider, which says nothing about the token.
+
+    The verdict is mirrored into ``needs_reauth``: a rejection sets it (so
+    Settings flags the row and offers Reconnect), a pass clears a stale flag.
+    Unreachable leaves the flag untouched in both directions.
     """
-    from yt_scheduler.services.social_credentials import load_bundle
+    from yt_scheduler.services.social_credentials import (
+        clear_needs_reauth,
+        load_bundle,
+        mark_needs_reauth,
+    )
 
     cred = await get_credential_by_uuid(uuid)
     if cred is None:
@@ -128,6 +136,15 @@ async def verify_credential(uuid: str):
         raise HTTPException(404, "No stored credentials for this account")
 
     try:
-        return await verify_live(cred["platform"], bundle)
+        result = await verify_live(cred["platform"], bundle)
     except CredentialCheckUnsupported as exc:
         raise HTTPException(501, str(exc)) from exc
+
+    # Without this, Verify could tell the user their token is dead while the
+    # row still showed no Reconnect button — a verdict with no way to act on
+    # it. The live check is authoritative, so its answer drives the flag.
+    if result["ok"]:
+        await clear_needs_reauth(uuid)
+    elif not result.get("unreachable"):
+        await mark_needs_reauth(uuid)
+    return result

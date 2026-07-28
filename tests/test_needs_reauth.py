@@ -11,6 +11,7 @@ import importlib
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
 from tests.conftest import install_in_memory_keychain
@@ -156,3 +157,93 @@ async def test_send_post_precheck_returns_401_for_flagged_credential(
         resp = c.post(f"/api/social/posts/{post_id}/send")
         assert resp.status_code == 401
         assert "needs re-authentication" in resp.json()["detail"]
+
+
+# --- Verify mirrors its verdict into needs_reauth --------------------------
+#
+# Without this, Verify could tell the user their token was dead while the row
+# still showed no Reconnect button — a verdict with no way to act on it.
+
+
+def _respond_to_threads_with(monkeypatch: pytest.MonkeyPatch, handler) -> None:
+    real_async_client = httpx.AsyncClient
+
+    def patched(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched)
+
+
+async def _seed_threads_credential(creds):
+    return await creds.upsert_credential(
+        "threads", "th:1", "drew", {"access_token": "tok", "user_id": "42"}
+    )
+
+
+async def test_verify_rejection_marks_needs_reauth(app_db, monkeypatch) -> None:
+    creds, _db = app_db
+    cred = await _seed_threads_credential(creds)
+
+    def rejected(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": {"message": "token expired"}})
+
+    _respond_to_threads_with(monkeypatch, rejected)
+    routes = importlib.import_module(
+        "yt_scheduler.routers.social_credentials_routes"
+    )
+
+    result = await routes.verify_credential(cred["uuid"])
+
+    assert result["ok"] is False
+    after = await creds.get_credential_by_uuid(cred["uuid"])
+    assert after["needs_reauth"] is True
+
+
+async def test_verify_success_clears_a_stale_needs_reauth(app_db, monkeypatch) -> None:
+    """After re-auth via paste-token or OAuth, a passing Verify is definitive
+    proof the credential works — leaving the flag set would keep blocking
+    sends via the pre-check."""
+    creds, _db = app_db
+    cred = await _seed_threads_credential(creds)
+    await creds.mark_needs_reauth(cred["uuid"])
+
+    def valid(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "42", "username": "drew"})
+
+    _respond_to_threads_with(monkeypatch, valid)
+    routes = importlib.import_module(
+        "yt_scheduler.routers.social_credentials_routes"
+    )
+
+    result = await routes.verify_credential(cred["uuid"])
+
+    assert result["ok"] is True
+    after = await creds.get_credential_by_uuid(cred["uuid"])
+    assert after["needs_reauth"] is False
+
+
+async def test_verify_unreachable_leaves_the_flag_alone(app_db, monkeypatch) -> None:
+    """Not reaching the provider says nothing about the token — the flag must
+    survive in both directions."""
+    creds, _db = app_db
+    cred = await _seed_threads_credential(creds)
+
+    def unreachable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to host")
+
+    _respond_to_threads_with(monkeypatch, unreachable)
+    routes = importlib.import_module(
+        "yt_scheduler.routers.social_credentials_routes"
+    )
+
+    result = await routes.verify_credential(cred["uuid"])
+    assert result["ok"] is False
+    assert result["unreachable"] is True
+    after = await creds.get_credential_by_uuid(cred["uuid"])
+    assert after["needs_reauth"] is False
+
+    await creds.mark_needs_reauth(cred["uuid"])
+    await routes.verify_credential(cred["uuid"])
+    after = await creds.get_credential_by_uuid(cred["uuid"])
+    assert after["needs_reauth"] is True
