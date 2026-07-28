@@ -731,7 +731,9 @@ function renderCredentialRow(cred) {
             </div>
             <div style="display:flex; gap:0.25rem; align-items:center;">
                 ${reconnectBtn}
-                <button class="btn-icon" title="Refresh username from provider"
+                <button class="btn btn-sm" title="Ask the provider whether this token still works"
+                        data-cred-action="verify">Verify</button>
+                <button class="btn-icon" title="Re-read the cached username (does not contact the provider)"
                         data-cred-action="refresh-username">↻</button>
                 <button class="btn-icon" title="Remove"
                         style="color: var(--danger);"
@@ -817,6 +819,43 @@ async function pasteThreadsToken() {
 }
 
 
+/**
+ * Ask the provider whether this credential still works.
+ *
+ * The ↻ button next to this one only re-reads a cached username and never
+ * contacts anyone — which is why a Threads token that had been dead for weeks
+ * still looked connected. This is the one that actually finds out.
+ */
+async function verifyCredential(uuid, button) {
+    const original = button.textContent;
+    button.disabled = true;
+    button.textContent = 'Checking…';
+    try {
+        const resp = await fetch(`/api/social-credentials/${uuid}/verify`, {method: 'POST'});
+        const result = await resp.json().catch(() => ({}));
+        if (resp.status === 501) {
+            showToast(result.detail || 'No live check for this platform yet.', 'info');
+            return;
+        }
+        if (!resp.ok) {
+            showToast(result.detail || `Check failed (HTTP ${resp.status})`, 'error');
+            return;
+        }
+        if (result.ok) {
+            showToast(`Token is valid${result.username ? ` — @${result.username}` : ''}`, 'success');
+        } else if (result.unreachable) {
+            // Not the same as a dead token, and must not be reported as one.
+            showToast(result.detail || 'Could not reach the provider.', 'info');
+        } else {
+            showToast(result.detail || 'The provider rejected this token.', 'error');
+        }
+        loadSocialPlatforms();
+    } finally {
+        button.disabled = false;
+        button.textContent = original;
+    }
+}
+
 async function refreshCredentialUsername(uuid) {
     const resp = await fetch(`/api/social-credentials/${uuid}/refresh-username`, {method: 'POST'});
     if (resp.ok) {
@@ -878,6 +917,9 @@ document.getElementById('social-platforms').addEventListener('click', (e) => {
     switch (btn.dataset.credAction) {
         case 'reconnect':
             reconnectCredential(btn.dataset.platform, btn.dataset.username || '');
+            break;
+        case 'verify':
+            if (uuid) verifyCredential(uuid, btn);
             break;
         case 'refresh-username':
             if (uuid) refreshCredentialUsername(uuid);

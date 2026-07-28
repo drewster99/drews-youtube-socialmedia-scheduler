@@ -2346,6 +2346,16 @@ Implemented as a `slot_body_changed` job covering every enabled slot — the who
 
 Posts already `posted` (or mid-`sending`) are left alone — they are history. Rendering uses the project's editable `ai_block_default_system_prompt`, same as the generate path.
 
+### `POST /api/social-credentials/{uuid}/verify`
+
+**Purpose** — Ask the *provider* whether this credential still works. Distinct from `/refresh-username`, which reads the cached username out of the stored bundle and so reports a healthy account for a token that died weeks ago. This one makes a real call (Threads: `GET graph.threads.net/v1.0/me`).
+
+**Response 200** — `{"ok": true, "detail": "Token is valid.", "username": "..."}`, or `{"ok": false, "detail": "Threads rejected the token (HTTP 400): ..."}`.
+
+`ok: false` with `"unreachable": true` means the provider couldn't be reached, which says nothing about the token — reported separately so a network blip isn't read as an expired credential.
+
+**Errors** — `404` (unknown credential, or no stored bundle), `501` (platform has no live check implemented).
+
 ### `GET /api/platform-capabilities`
 
 **Purpose** — Which platforms accept an attachment, and which need media hosting configured to do it. Exists so the UI never hardcodes a platform name for this; every client-side attempt to answer it ("Threads is text-only") outlived the fact it encoded.

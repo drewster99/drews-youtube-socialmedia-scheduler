@@ -158,3 +158,65 @@ async def upsert_social_account(platform: str, *, project_id: int) -> int | None
             (project_id, account_id),
         )
     return account_id
+
+
+class CredentialCheckUnsupported(RuntimeError):
+    """This platform has no cheap identity endpoint to probe."""
+
+
+async def verify_live(platform: str, bundle: dict) -> dict:
+    """Ask the *provider* whether these credentials still work.
+
+    ``resolve_username`` deliberately does not do this — it reads the cached
+    username out of the bundle, which is why the Settings ↻ button reported a
+    healthy account for a Threads token that had been dead for weeks. This is
+    the opposite: a real round-trip whose only purpose is to find out.
+
+    Returns ``{"ok": bool, "detail": str, "username": str|None}``. A network
+    failure is reported as such rather than as a dead credential — not
+    reaching the provider says nothing about the token.
+    """
+    import httpx
+
+    if platform != "threads":
+        raise CredentialCheckUnsupported(
+            f"No live credential check implemented for {platform}."
+        )
+
+    token = bundle.get("access_token")
+    if not token:
+        return {"ok": False, "detail": "No access token stored.", "username": None}
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                "https://graph.threads.net/v1.0/me",
+                params={"fields": "id,username", "access_token": token},
+            )
+    except httpx.HTTPError as exc:
+        return {
+            "ok": False,
+            "unreachable": True,
+            "detail": f"Could not reach Threads: {exc}",
+            "username": None,
+        }
+
+    if resp.status_code == 200:
+        data = resp.json()
+        return {
+            "ok": True,
+            "detail": "Token is valid.",
+            "username": data.get("username"),
+        }
+
+    body = ""
+    try:
+        error = (resp.json() or {}).get("error") or {}
+        body = error.get("message") or resp.text[:200]
+    except ValueError:
+        body = resp.text[:200]
+    return {
+        "ok": False,
+        "detail": f"Threads rejected the token (HTTP {resp.status_code}): {body}",
+        "username": None,
+    }

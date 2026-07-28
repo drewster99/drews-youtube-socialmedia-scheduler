@@ -17,7 +17,11 @@ from yt_scheduler.services.social_credentials import (
     list_credentials,
     soft_delete_credential,
 )
-from yt_scheduler.services.social_identity import resolve_username
+from yt_scheduler.services.social_identity import (
+    CredentialCheckUnsupported,
+    resolve_username,
+    verify_live,
+)
 
 router = APIRouter(prefix="/api/social-credentials", tags=["social-credentials"])
 
@@ -99,3 +103,31 @@ async def refresh_credential_username(uuid: str):
         if cursor.rowcount == 0:
             raise HTTPException(404, "Credential not found")
     return {"changed": True, "username": new_username}
+
+
+@router.post("/{uuid}/verify")
+async def verify_credential(uuid: str):
+    """Ask the provider whether this credential still works.
+
+    Distinct from ``/refresh-username``, which reads the cached username out of
+    the stored bundle and therefore reports a healthy account for a token that
+    died weeks ago. This one makes a real call.
+
+    **Response 200** — ``{"ok": bool, "detail": "...", "username": "..."}``.
+    ``ok: false`` with ``unreachable: true`` means we could not reach the
+    provider, which says nothing about the token.
+    """
+    from yt_scheduler.services.social_credentials import load_bundle
+
+    cred = await get_credential_by_uuid(uuid)
+    if cred is None:
+        raise HTTPException(404, "Credential not found")
+
+    bundle = await load_bundle(cred["platform"], uuid)
+    if bundle is None:
+        raise HTTPException(404, "No stored credentials for this account")
+
+    try:
+        return await verify_live(cred["platform"], bundle)
+    except CredentialCheckUnsupported as exc:
+        raise HTTPException(501, str(exc)) from exc
