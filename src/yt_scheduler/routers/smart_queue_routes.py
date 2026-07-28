@@ -55,10 +55,13 @@ async def _require_not_reconciling(queue_id: int) -> None:
     invisible.
     """
     if await smart_queue_reconcile.queue_is_locked(queue_id):
+        # Deliberately doesn't say "a template change": the same jobs are
+        # queued by Re-render and Add missing slots, and blaming a template
+        # edit the user didn't make sends them looking for the wrong thing.
         raise HTTPException(
             409,
-            "This schedule is being updated to match a template change. "
-            "Wait for that to finish, then try again.",
+            "This schedule's posts are still being updated in the background. "
+            "Watch the banner at the top of the page, then try again.",
         )
 
 
