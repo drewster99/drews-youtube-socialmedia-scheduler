@@ -1112,6 +1112,12 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 
 **Renderer** — Each slot's `body` is rendered through the same engine as [`POST /api/expand_text`](#post-apiexpand_text) (`services/templates.render`). All variables, `{{var!}}` / `{{var??default}}` / `{{ai: ...}}` / `{{ai[system]: ...}}` syntax, and recursive AI-block evaluation behave identically.
 
+### `GET /api/social/failed-posts`
+
+**Purpose** — All social posts whose most recent send attempt failed, newest first. Powers the app-wide failed-sends banner (`static/js/failed-sends-banner.js`, loaded by `base.html` on every page), which stays up until each post is retried successfully or deleted — `social_posts.status` is the single source of truth, with no separate acknowledged/dismissed state.
+
+**Response 200** — Array of `{"id": int, "video_id": str, "platform": str, "error": str, "social_account_id": int|null, "video_title": str, "page_url": str}`. `page_url` is the ready link to the owning project's video-detail page — the server vends it because the detail route 404s unless the slug actually owns the video.
+
 ### `GET /api/social/posts/{video_id}`
 
 **Purpose** — All social posts for a video.

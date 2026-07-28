@@ -41,7 +41,15 @@
              the screen that started it. Inside .content, not a sibling of it:
              body is display:flex with a fixed sidebar, so a sibling becomes a
              flex item and gets squeezed into the leftover column. -->
-        <div id="reconcile-banner" class="reconcile-banner" style="display:none;"></div>
+        <!-- One sticky group, not two: each banner used to pin itself to
+             top:0 with its own negative top margin, so with a reconcile job
+             running AND a failed send outstanding they landed on the same
+             spot and overlapped. The wrapper owns the stickiness; the banners
+             just stack inside it. -->
+        <div class="app-banners">
+            <div id="reconcile-banner" class="reconcile-banner" style="display:none;"></div>
+            <div id="failed-sends-banner" class="failed-sends-banner" style="display:none;"></div>
+        </div>
 
         {% block content %}{% endblock %}
     </main>
@@ -49,6 +57,7 @@
     <div id="toast-container"></div>
 
     <script src="/static/js/reconcile-banner.js"></script>
+    <script src="/static/js/failed-sends-banner.js"></script>
     <script src="/static/js/app.js"></script>
     <script src="/static/js/uploads.js"></script>
     <script src="/static/js/oauth-connectors.js"></script>

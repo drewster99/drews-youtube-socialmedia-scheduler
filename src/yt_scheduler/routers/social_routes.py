@@ -598,6 +598,39 @@ async def get_post_trace(post_id: int):
     }
 
 
+@router.get("/failed-posts")
+async def list_failed_posts():
+    """Social posts whose most recent send attempt failed, newest first.
+
+    Powers the app-wide failed-sends banner (``static/js/failed-sends-banner.js``,
+    loaded by ``base.html`` on every page): a failed send must stay visible from
+    wherever the user is standing until it is retried successfully or deleted,
+    not flash once in a toast. The ``social_posts`` table is the single source
+    of truth — there is no separate acknowledged/dismissed state.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        """SELECT sp.id, sp.video_id, sp.platform, sp.error,
+                  sp.social_account_id, v.title AS video_title,
+                  p.slug AS project_slug
+           FROM social_posts sp
+           JOIN videos v ON v.id = sp.video_id
+           JOIN projects p ON p.id = v.project_id
+           WHERE sp.status = 'failed'
+           ORDER BY sp.id DESC""",
+    )
+    posts = []
+    for row in rows:
+        post = dict(row)
+        # The server vends the ready page URL: the video-detail route 404s
+        # unless the slug actually owns the video, so the banner must not
+        # guess a slug (the /videos/{id} redirect assumes the default project).
+        slug = post.pop("project_slug")
+        post["page_url"] = f"/projects/{slug}/videos/{post['video_id']}"
+        posts.append(post)
+    return posts
+
+
 @router.get("/posts/{video_id}")
 async def get_posts(video_id: str):
     """Get all social posts for a video."""

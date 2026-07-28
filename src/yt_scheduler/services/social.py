@@ -18,6 +18,7 @@ import httpx
 # Aliased: MastodonPoster binds a local `media` to a Mastodon attachment dict,
 # which would shadow a bare module import inside that method. Matches how the
 # routers already refer to this module.
+from yt_scheduler import config
 from yt_scheduler.services import media as media_service
 
 from yt_scheduler.services.keychain import (
@@ -69,7 +70,9 @@ async def _twitter_refresh_bearer(creds: dict[str, str]) -> str | None:
     auth = None
     if creds.get("client_secret"):
         auth = (client_id, creds["client_secret"])
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(
+        timeout=config.TWITTER_BEARER_REFRESH_TIMEOUT_SECONDS
+    ) as client:
         resp = await client.post(_TWITTER_TOKEN_URL, data=body, auth=auth)
     if resp.status_code != 200:
         raise RuntimeError(
@@ -115,7 +118,6 @@ async def _twitter_refresh_bearer(creds: dict[str, str]) -> str | None:
 _TWITTER_V2_MEDIA = "https://api.x.com/2/media/upload"
 _TWITTER_V2_MEDIA_INIT = "https://api.x.com/2/media/upload/initialize"
 _TWITTER_SIMPLE_LIMIT = 5 * 1024 * 1024  # 5 MB; images only
-_TWITTER_VIDEO_CHUNK = 4 * 1024 * 1024
 
 
 class _TwitterBearerExpired(RuntimeError):
@@ -141,7 +143,9 @@ async def _twitter_v2_simple_upload(
     with media_path.open("rb") as f:
         files = {"media": (media_path.name, f, mime)}
         data = {"media_category": _twitter_media_category(mime)}
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(
+            timeout=config.TWITTER_SIMPLE_UPLOAD_TIMEOUT_SECONDS
+        ) as client:
             resp = await client.post(
                 _TWITTER_V2_MEDIA,
                 headers={"Authorization": f"Bearer {bearer_token}"},
@@ -167,7 +171,9 @@ async def _twitter_v2_chunked_upload(
     headers = {"Authorization": f"Bearer {bearer_token}"}
     total_bytes = media_path.stat().st_size
 
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(
+        timeout=config.TWITTER_CHUNKED_UPLOAD_TIMEOUT_SECONDS
+    ) as client:
         # initialize — JSON body; returns the media id used by every later step.
         init = await client.post(
             _TWITTER_V2_MEDIA_INIT,
@@ -191,7 +197,7 @@ async def _twitter_v2_chunked_upload(
         with media_path.open("rb") as f:
             segment = 0
             while True:
-                chunk = f.read(_TWITTER_VIDEO_CHUNK)
+                chunk = f.read(config.TWITTER_VIDEO_UPLOAD_CHUNK_BYTES)
                 if not chunk:
                     break
                 append = await client.post(
@@ -1183,7 +1189,7 @@ class BlueskyPoster(SocialPoster):
                     "collection": "app.bsky.feed.post",
                     "record": record,
                 },
-                timeout=60,
+                timeout=config.BLUESKY_POST_TIMEOUT_SECONDS,
             )
 
         resp = await _do()
@@ -1438,7 +1444,7 @@ class BlueskyPoster(SocialPoster):
                     "Content-Type": mime,
                 },
                 content=data,
-                timeout=120,
+                timeout=config.BLUESKY_BLOB_UPLOAD_TIMEOUT_SECONDS,
             )
 
         resp = await _do()
@@ -1518,8 +1524,14 @@ class MastodonPoster(SocialPoster):
         if cached and (time.time() - cached[0]) < self._INSTANCE_LIMITS_TTL_SECONDS:
             return cached[1]
 
+        # Direct from-import: this method's local ``config`` (the instance's
+        # configuration JSON below) shadows the module-level config import.
+        from yt_scheduler.config import MASTODON_INSTANCE_PROBE_TIMEOUT_SECONDS
+
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with httpx.AsyncClient(
+                timeout=MASTODON_INSTANCE_PROBE_TIMEOUT_SECONDS
+            ) as client:
                 response = await client.get(f"{base}/api/v2/instance")
                 response.raise_for_status()
                 config = (response.json().get("configuration") or {})
@@ -1699,7 +1711,9 @@ class LinkedInPoster(SocialPoster):
                 ][:9]
             )
             try:
-                async with httpx.AsyncClient(timeout=120) as client:
+                async with httpx.AsyncClient(
+                    timeout=config.LINKEDIN_MEDIA_UPLOAD_TIMEOUT_SECONDS
+                ) as client:
                     for path_obj, alt in uploadable:
                         asset_urn = await self._linkedin_upload_asset(
                             client, token, owner_urn, path_obj, is_video,
@@ -1744,7 +1758,9 @@ class LinkedInPoster(SocialPoster):
         }
 
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
+            async with httpx.AsyncClient(
+                timeout=config.LINKEDIN_POST_TIMEOUT_SECONDS
+            ) as client:
                 resp = await client.post(
                     "https://api.linkedin.com/v2/ugcPosts", headers=headers, json=body,
                 )
@@ -1910,7 +1926,9 @@ class ThreadsPoster(SocialPoster):
             access_token = creds["access_token"]
             user_id = creds["user_id"]
 
-            async with httpx.AsyncClient(timeout=self._HTTP_TIMEOUT_SECONDS) as client:
+            async with httpx.AsyncClient(
+                timeout=config.THREADS_POST_TIMEOUT_SECONDS
+            ) as client:
                 create_resp = await client.post(
                     f"https://graph.threads.net/v1.0/{user_id}/threads",
                     params={
@@ -2004,7 +2022,9 @@ class ThreadsPoster(SocialPoster):
             import httpx
 
             try:
-                async with httpx.AsyncClient(timeout=20) as client:
+                async with httpx.AsyncClient(
+                    timeout=config.THREADS_TOKEN_REFRESH_TIMEOUT_SECONDS
+                ) as client:
                     resp = await client.get(
                         "https://graph.threads.net/refresh_access_token",
                         params={
@@ -2121,12 +2141,6 @@ class ThreadsPoster(SocialPoster):
             ) from exc
 
         return {"media_type": media_type, url_field: hosted.url}
-
-    # httpx's default per-request timeout is 5 seconds, which container
-    # create regularly exceeds: Meta fetches and validates the hosted media
-    # during that call. A real image post died on ReadTimeout the first day
-    # a working token met this path.
-    _HTTP_TIMEOUT_SECONDS = 60
 
     _TEXT_CONTAINER_POLL_ATTEMPTS = 10
 

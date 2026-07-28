@@ -336,6 +336,71 @@ CAPTION_CHECK_INTERVAL_MINUTES = _parse_int_env(
     "DYS_CAPTION_CHECK_MINUTES", "YTP_CAPTION_CHECK_MINUTES", 15
 )
 
+# ---------------------------------------------------------------------------
+# Outbound HTTP call budgets
+#
+# Every outbound API call names its timeout here — never a hardcoded number at
+# the call site, and never httpx's implicit 5-second default, which cut off a
+# real Threads publish mid-call the first day a working token met a media
+# post. These are stall detectors, not speed limits: httpx applies the value
+# per socket operation (connect / read / write), so a slow-but-flowing
+# transfer never trips them — only a dead connection or a provider that stops
+# answering does.
+
+DEFAULT_API_CALL_TIMEOUT_SECONDS = 120
+
+TWITTER_BEARER_REFRESH_TIMEOUT_SECONDS = DEFAULT_API_CALL_TIMEOUT_SECONDS
+TWITTER_SIMPLE_UPLOAD_TIMEOUT_SECONDS = DEFAULT_API_CALL_TIMEOUT_SECONDS
+BLUESKY_POST_TIMEOUT_SECONDS = DEFAULT_API_CALL_TIMEOUT_SECONDS
+BLUESKY_BLOB_UPLOAD_TIMEOUT_SECONDS = DEFAULT_API_CALL_TIMEOUT_SECONDS
+MASTODON_INSTANCE_PROBE_TIMEOUT_SECONDS = DEFAULT_API_CALL_TIMEOUT_SECONDS
+LINKEDIN_MEDIA_UPLOAD_TIMEOUT_SECONDS = DEFAULT_API_CALL_TIMEOUT_SECONDS
+LINKEDIN_POST_TIMEOUT_SECONDS = DEFAULT_API_CALL_TIMEOUT_SECONDS
+THREADS_POST_TIMEOUT_SECONDS = DEFAULT_API_CALL_TIMEOUT_SECONDS
+THREADS_TOKEN_REFRESH_TIMEOUT_SECONDS = DEFAULT_API_CALL_TIMEOUT_SECONDS
+THREADS_VERIFY_TIMEOUT_SECONDS = DEFAULT_API_CALL_TIMEOUT_SECONDS
+THREADS_USERINFO_TIMEOUT_SECONDS = DEFAULT_API_CALL_TIMEOUT_SECONDS
+MEDIA_HOSTING_CONNECTION_TEST_TIMEOUT_SECONDS = DEFAULT_API_CALL_TIMEOUT_SECONDS
+# Token exchanges and userinfo fetches inside the OAuth callback flows
+# (Twitter, LinkedIn, Mastodon, Threads).
+OAUTH_EXCHANGE_TIMEOUT_SECONDS = DEFAULT_API_CALL_TIMEOUT_SECONDS
+# The resolve_username identity fetches behind Settings' ↻ button.
+USERNAME_RESOLVE_TIMEOUT_SECONDS = DEFAULT_API_CALL_TIMEOUT_SECONDS
+
+# Per-call values in force before consolidation onto the default (2026-07-28),
+# kept for reference and easy rollback:
+# TWITTER_BEARER_REFRESH_TIMEOUT_SECONDS = 20
+# TWITTER_SIMPLE_UPLOAD_TIMEOUT_SECONDS = 60
+# BLUESKY_POST_TIMEOUT_SECONDS = 60
+# BLUESKY_BLOB_UPLOAD_TIMEOUT_SECONDS = 120
+# MASTODON_INSTANCE_PROBE_TIMEOUT_SECONDS = 10
+# LINKEDIN_MEDIA_UPLOAD_TIMEOUT_SECONDS = 120
+# LINKEDIN_POST_TIMEOUT_SECONDS = 60
+# THREADS_POST_TIMEOUT_SECONDS = 60  (httpx's 5-second default before that)
+# THREADS_TOKEN_REFRESH_TIMEOUT_SECONDS = 20
+# THREADS_VERIFY_TIMEOUT_SECONDS = 20
+# THREADS_USERINFO_TIMEOUT_SECONDS = 20
+# MEDIA_HOSTING_CONNECTION_TEST_TIMEOUT_SECONDS = 60
+# OAUTH_EXCHANGE_TIMEOUT_SECONDS = 20  (two userinfo fetches used 15)
+# USERNAME_RESOLVE_TIMEOUT_SECONDS = 15
+
+# Bulk-transfer budgets and chunk sizes keep their own values — a 512 MB video
+# on a slow link is not "one API call", so the default deliberately does not
+# apply to these.
+
+# Twitter chunked upload (video / large files): one multipart request per
+# segment, each request getting its own budget.
+TWITTER_CHUNKED_UPLOAD_TIMEOUT_SECONDS = 120
+TWITTER_VIDEO_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024
+
+# Threads media goes to R2 as a single streamed PUT (no protocol-level
+# chunking); the chunk size is the per-read buffer of that stream — it bounds
+# peak memory (one chunk resident at a time regardless of file size), is the
+# socket-write unit the write timeout meters, and does not affect
+# Content-Length or split the request.
+MEDIA_HOSTING_UPLOAD_TIMEOUT_SECONDS = 30 * 60
+MEDIA_HOSTING_UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024
+
 
 def ensure_dirs() -> None:
     """Create required directories if they don't exist."""

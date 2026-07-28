@@ -19,6 +19,11 @@ from typing import Callable
 
 import httpx
 
+from yt_scheduler.config import (
+    THREADS_VERIFY_TIMEOUT_SECONDS,
+    USERNAME_RESOLVE_TIMEOUT_SECONDS,
+)
+
 from yt_scheduler.services.keychain import load_all_secrets_async
 
 logger = logging.getLogger(__name__)
@@ -32,7 +37,7 @@ async def resolve_twitter() -> str | None:
     if not bearer:
         return None
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=USERNAME_RESOLVE_TIMEOUT_SECONDS) as client:
             resp = await client.get(
                 "https://api.twitter.com/2/users/me",
                 headers={"Authorization": f"Bearer {bearer}"},
@@ -53,7 +58,7 @@ async def resolve_mastodon() -> str | None:
         return None
     instance = instance.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=USERNAME_RESOLVE_TIMEOUT_SECONDS) as client:
             resp = await client.get(
                 f"{instance}/api/v1/accounts/verify_credentials",
                 headers={"Authorization": f"Bearer {token}"},
@@ -80,7 +85,7 @@ async def resolve_linkedin() -> str | None:
     if not token:
         return None
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=USERNAME_RESOLVE_TIMEOUT_SECONDS) as client:
             resp = await client.get(
                 "https://api.linkedin.com/v2/userinfo",
                 headers={"Authorization": f"Bearer {token}"},
@@ -194,7 +199,7 @@ async def verify_live(platform: str, bundle: dict) -> dict:
         return {"ok": False, "detail": "No access token stored.", "username": None}
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=THREADS_VERIFY_TIMEOUT_SECONDS) as client:
             resp = await client.get(
                 "https://graph.threads.net/v1.0/me",
                 params={"fields": "id,username", "access_token": token},

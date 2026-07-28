@@ -24,6 +24,8 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 
 from yt_scheduler.config import (
+    OAUTH_EXCHANGE_TIMEOUT_SECONDS,
+    THREADS_USERINFO_TIMEOUT_SECONDS,
     THREADS_REDIRECT_URL,
     YOUTUBE_SCOPES,
     resolve_oauth_origin,
@@ -167,7 +169,7 @@ async def linkedin_callback(code: str | None = None, state: str | None = None, e
 
     # Exchange code for access token
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=OAUTH_EXCHANGE_TIMEOUT_SECONDS) as client:
             token_resp = await client.post(
                 "https://www.linkedin.com/oauth/v2/accessToken",
                 data={
@@ -199,7 +201,7 @@ async def linkedin_callback(code: str | None = None, state: str | None = None, e
 
     # Look up Person URN via userinfo
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=OAUTH_EXCHANGE_TIMEOUT_SECONDS) as client:
             ui = await client.get(
                 "https://api.linkedin.com/v2/userinfo",
                 headers={"Authorization": f"Bearer {access_token}"},
@@ -308,7 +310,7 @@ async def threads_callback(code: str | None = None, state: str | None = None, er
         return _result_page(False, "Unknown or expired OAuth state. Click Connect with Threads again.", platform="threads")
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=OAUTH_EXCHANGE_TIMEOUT_SECONDS) as client:
             short_resp = await client.post(
                 "https://graph.threads.net/oauth/access_token",
                 data={
@@ -339,7 +341,7 @@ async def threads_callback(code: str | None = None, state: str | None = None, er
 
     # Exchange short-lived (~1h) for long-lived (~60d)
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=OAUTH_EXCHANGE_TIMEOUT_SECONDS) as client:
             long_resp = await client.get(
                 "https://graph.threads.net/access_token",
                 params={
@@ -379,7 +381,7 @@ async def threads_callback(code: str | None = None, state: str | None = None, er
     username = ""
     me_error: str | None = None
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=THREADS_USERINFO_TIMEOUT_SECONDS) as client:
             me = await client.get(
                 "https://graph.threads.net/v1.0/me",
                 params={"fields": "id,username", "access_token": access_token},
@@ -457,7 +459,7 @@ async def threads_exchange(data: dict):
         )
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=OAUTH_EXCHANGE_TIMEOUT_SECONDS) as client:
             long_resp = await client.get(
                 "https://graph.threads.net/access_token",
                 params={
@@ -483,7 +485,7 @@ async def threads_exchange(data: dict):
         raise HTTPException(502, "Token exchange response had no access_token. See server log.")
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=THREADS_USERINFO_TIMEOUT_SECONDS) as client:
             me = await client.get(
                 "https://graph.threads.net/v1.0/me",
                 params={"fields": "id,username", "access_token": access_token},
@@ -543,7 +545,7 @@ async def threads_paste_token(data: dict):
         raise HTTPException(400, "access_token is required")
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=THREADS_USERINFO_TIMEOUT_SECONDS) as client:
             me = await client.get(
                 "https://graph.threads.net/v1.0/me",
                 params={"fields": "id,username", "access_token": access_token},
@@ -682,7 +684,7 @@ async def twitter_callback(
         auth = (pending["client_id"], pending["client_secret"])
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=OAUTH_EXCHANGE_TIMEOUT_SECONDS) as client:
             token_resp = await client.post(
                 "https://api.twitter.com/2/oauth2/token",
                 data=body,
@@ -714,7 +716,7 @@ async def twitter_callback(
     verified_type = ""
     me_error: str | None = None
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=OAUTH_EXCHANGE_TIMEOUT_SECONDS) as client:
             me = await client.get(
                 "https://api.twitter.com/2/users/me",
                 headers={"Authorization": f"Bearer {access_token}"},
@@ -801,7 +803,7 @@ async def mastodon_start(data: dict):
     code_verifier, code_challenge = _pkce_pair()
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=OAUTH_EXCHANGE_TIMEOUT_SECONDS) as client:
             register = await client.post(
                 f"{instance}/api/v1/apps",
                 data={
@@ -878,7 +880,7 @@ async def mastodon_callback(
     if pending.get("code_verifier"):
         token_body["code_verifier"] = pending["code_verifier"]
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=OAUTH_EXCHANGE_TIMEOUT_SECONDS) as client:
             token_resp = await client.post(
                 f"{instance}/oauth/token",
                 data=token_body,
@@ -901,7 +903,7 @@ async def mastodon_callback(
     account_id = ""
     verify_error: str | None = None
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=OAUTH_EXCHANGE_TIMEOUT_SECONDS) as client:
             verify = await client.get(
                 f"{instance}/api/v1/accounts/verify_credentials",
                 headers={"Authorization": f"Bearer {access_token}"},

@@ -85,7 +85,7 @@ async def test_upload_body_is_the_whole_file_intact(captured, video, media_hosti
 
 async def test_file_larger_than_one_chunk_still_arrives_whole(captured, tmp_path, monkeypatch, media_hosting, config):
     """Force several chunks so a boundary bug can't hide behind a big default."""
-    monkeypatch.setattr(media_hosting, "_UPLOAD_CHUNK_BYTES", 1024)
+    monkeypatch.setattr(media_hosting, "MEDIA_HOSTING_UPLOAD_CHUNK_BYTES", 1024)
     path = tmp_path / "big.mp4"
     payload = bytes(i % 256 for i in range(10_000))
     path.write_bytes(payload)

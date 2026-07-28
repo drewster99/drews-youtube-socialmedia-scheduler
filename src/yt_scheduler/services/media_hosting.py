@@ -29,8 +29,11 @@ from pathlib import Path
 
 from yt_scheduler.config import (
     MEDIA_HOSTING_ACCESS_KEY_ID_FIELD,
+    MEDIA_HOSTING_CONNECTION_TEST_TIMEOUT_SECONDS,
     MEDIA_HOSTING_NAMESPACE,
     MEDIA_HOSTING_SECRET_ACCESS_KEY_FIELD,
+    MEDIA_HOSTING_UPLOAD_CHUNK_BYTES,
+    MEDIA_HOSTING_UPLOAD_TIMEOUT_SECONDS,
 )
 from yt_scheduler.services import sigv4
 
@@ -51,13 +54,6 @@ UPLOAD_URL_TTL_SECONDS = 60 * 60
 
 SETTING_ACCOUNT_ID = "media_hosting_account_id"
 SETTING_BUCKET = "media_hosting_bucket"
-
-_UPLOAD_TIMEOUT_SECONDS = 30 * 60
-# Read size per iteration of _stream_file, which is also the size of each body
-# chunk handed to httpx. It bounds peak memory during an upload — one chunk is
-# resident at a time regardless of how large the file is — and does not affect
-# Content-Length or split the request: it is still a single PUT.
-_UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024
 
 
 class MediaHostingNotConfigured(RuntimeError):
@@ -153,13 +149,17 @@ def _presign(config: MediaHostingConfig, *, method: str, key: str,
     )
 
 
-async def _stream_file(path: Path, chunk_size: int = _UPLOAD_CHUNK_BYTES):
+async def _stream_file(path: Path, chunk_size: int):
     """Yield a file in chunks so a multi-gigabyte upload never lands in memory.
 
     Must be an *async* iterable: ``httpx.AsyncClient`` refuses a plain file
     handle outright ("Attempted to send an sync request with an AsyncClient
     instance"). Reads go through a worker thread so disk I/O doesn't stall the
     event loop while the rest of the app is serving.
+
+    ``chunk_size`` is required rather than defaulted: a default argument binds
+    at import time, which is how a test that patched the module constant
+    silently exercised nothing.
     """
     with path.open("rb") as handle:
         while True:
@@ -193,10 +193,10 @@ async def host_file(local_path: str | Path, *,
     upload_url = _presign(config, method="PUT", key=key,
                           expires_seconds=UPLOAD_URL_TTL_SECONDS)
     try:
-        async with httpx.AsyncClient(timeout=_UPLOAD_TIMEOUT_SECONDS) as client:
+        async with httpx.AsyncClient(timeout=MEDIA_HOSTING_UPLOAD_TIMEOUT_SECONDS) as client:
             response = await client.put(
                 upload_url,
-                content=_stream_file(path),
+                content=_stream_file(path, chunk_size=MEDIA_HOSTING_UPLOAD_CHUNK_BYTES),
                 # Content-Length is mandatory, not merely nice: without it httpx
                 # sends the generator as Transfer-Encoding: chunked, which an S3
                 # PUT rejects. Content-Type matters because R2 stores it and
@@ -243,7 +243,9 @@ async def verify_round_trip() -> dict:
     key = f"connection-test/{uuid.uuid4().hex}.txt"
     payload = f"drews-video-social-scheduler connection test {uuid.uuid4().hex}".encode()
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(
+        timeout=MEDIA_HOSTING_CONNECTION_TEST_TIMEOUT_SECONDS
+    ) as client:
         try:
             put = await client.put(
                 _presign(config, method="PUT", key=key,

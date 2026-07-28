@@ -1895,10 +1895,7 @@ dialog.modal-xwide {
     /* Sticky inside .content so it occupies flow space (never covering the
        page) and stays put while scrolling. Negative margins cancel .content's
        padding so it reads as a bar rather than a floating card. */
-    position: sticky;
-    top: 0;
-    z-index: 50;
-    margin: -2rem -2rem 1.5rem;
+    margin: 0 -2rem;
     padding: 0.7rem 2rem;
     background: var(--bg-input, #2a2a2a);
     border-bottom: 2px solid var(--accent, #4a9eff);
@@ -1933,4 +1930,42 @@ dialog.modal-xwide {
     .reconcile-banner__spinner { animation: none; }
 }
 
+.failed-sends-banner {
+    /* Same in-flow sticky bar as .reconcile-banner, but bordered in the
+       danger color: this one only ever carries bad news. */
+    margin: 0 -2rem;
+    padding: 0.7rem 2rem;
+    background: var(--bg-input, #2a2a2a);
+    border-bottom: 2px solid var(--danger, #ff6b6b);
+    font-size: 0.85rem;
+    line-height: 1.5;
+}
+
+.failed-sends-banner strong {
+    color: var(--danger, #ff6b6b);
+}
+
+.failed-sends-banner a {
+    color: var(--accent, #4a9eff);
+}
+
+.failed-sends-banner__more {
+    color: var(--text-muted, #999);
+}
+
 .slot-hosting-warn { color: var(--danger); margin-top: 0.35rem; }
+
+
+/* Sticky group for the app-wide banners. Owning position/stickiness here
+   rather than on each banner is what keeps two visible banners stacked
+   instead of pinned to the same coordinate. No negative top margin: an empty
+   wrapper carrying one would cancel .content's top padding on every page
+   where nothing is wrong, which is most of them. */
+.app-banners {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+}
+.app-banners > div:not([style*="display:none"]):not([style*="display: none"]) {
+    margin-bottom: 1.5rem;
+}
