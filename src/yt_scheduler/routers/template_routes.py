@@ -8,12 +8,17 @@ working.
 
 from __future__ import annotations
 
+import logging
 import re
+from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, HTTPException
 
 from yt_scheduler.services import projects as project_service
+from yt_scheduler.services import smart_queue_reconcile as reconcile
 from yt_scheduler.services import templates as tmpl
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/templates", tags=["templates"])
 
@@ -75,6 +80,47 @@ async def create_template(data: dict, project_slug: str | None = None):
     return {"status": "ok"}
 
 
+async def _add_slot_or_400(template_id: int, platform: str, **kwargs):
+    """``tmpl.add_slot`` with its ValueError mapped to a 400.
+
+    Separated so the call can sit inside ``_reconciling`` without a try/except
+    nested in an async-with obscuring what the endpoint actually does.
+    """
+    try:
+        return await tmpl.add_slot(template_id, platform, **kwargs)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@asynccontextmanager
+async def _reconciling(name: str, project_id: int):
+    """Snapshot a template around a mutation and queue schedule reconciliation.
+
+    Every template mutation goes through here rather than each endpoint
+    remembering to do it: a slot added by a route that forgot would be
+    invisible to every schedule already built from this template, which is the
+    exact failure this exists to end.
+
+    Reconciliation is queued, never awaited — it re-renders posts with an AI
+    round-trip apiece, which must not hold the save request open.
+    """
+    before = reconcile.snapshot_template(
+        await tmpl.get_template(name, project_id=project_id) or {}
+    )
+    yield
+    after_template = await tmpl.get_template(name, project_id=project_id)
+    if after_template is None:
+        return
+    result = await reconcile.enqueue_for_template(
+        int(after_template["id"]),
+        before,
+        reconcile.snapshot_template(after_template),
+    )
+    if result["jobs"]:
+        logger.info("template %r change queued %s reconcile job(s) across %s queue(s)",
+                    name, result["jobs"], result["queues"])
+
+
 @router.put("/{name}")
 async def update_template(name: str, data: dict, project_slug: str | None = None):
     """Update an existing template."""
@@ -83,16 +129,17 @@ async def update_template(name: str, data: dict, project_slug: str | None = None
     if not existing:
         raise HTTPException(404, f"Template '{name}' not found")
 
-    try:
-        await tmpl.save_template(
-            name=name,
-            description=data.get("description", existing["description"]),
-            platforms=data.get("platforms", existing["platforms"]),
-            applies_to=data.get("applies_to", existing.get("applies_to")),
-            project_id=project_id,
-        )
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
+    async with _reconciling(name, project_id):
+        try:
+            await tmpl.save_template(
+                name=name,
+                description=data.get("description", existing["description"]),
+                platforms=data.get("platforms", existing["platforms"]),
+                applies_to=data.get("applies_to", existing.get("applies_to")),
+                project_id=project_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     return {"status": "ok"}
 
 
@@ -220,8 +267,8 @@ async def add_template_slot(name: str, data: dict, project_slug: str | None = No
     else:
         max_chars_value = tmpl.default_max_chars(platform)
     _validate_slot_body_sections(str(data.get("body", "")))
-    try:
-        return await tmpl.add_slot(
+    async with _reconciling(name, project_id):
+        return await _add_slot_or_400(
             template_id,
             platform,
             body=str(data.get("body", "")),
@@ -233,8 +280,6 @@ async def add_template_slot(name: str, data: dict, project_slug: str | None = No
                 int(data["order_index"]) if "order_index" in data and data["order_index"] is not None else None
             ),
         )
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
 
 
 @router.patch("/{name}/slots/{slot_id}")
@@ -263,10 +308,11 @@ async def update_template_slot(name: str, slot_id: int, data: dict, project_slug
             except (TypeError, ValueError) as exc:
                 raise HTTPException(400, "social_account_id must be an integer or null") from exc
 
-    try:
-        return await tmpl.update_slot(slot_id, **kwargs)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
+    async with _reconciling(name, project_id):
+        try:
+            return await tmpl.update_slot(slot_id, **kwargs)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
 
 @router.delete("/{name}/slots/{slot_id}")
@@ -276,8 +322,9 @@ async def delete_template_slot(name: str, slot_id: int, project_slug: str | None
     existing = await tmpl.get_slot(slot_id)
     if existing is None or existing["template_id"] != template_id:
         raise HTTPException(404, f"Slot {slot_id} not found in template '{name}'")
-    try:
-        await tmpl.delete_slot(slot_id)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
+    async with _reconciling(name, project_id):
+        try:
+            await tmpl.delete_slot(slot_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     return {"status": "ok"}

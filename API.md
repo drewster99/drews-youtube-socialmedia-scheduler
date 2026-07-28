@@ -2342,6 +2342,45 @@ Rows are per-platform `social_posts`, not per queue item: a video whose Mastodon
 
 Posts already `posted` (or mid-`sending`) are left alone — they are history. Rendering uses the project's editable `ai_block_default_system_prompt`, same as the generate path.
 
+### `GET /api/reconcile-status`
+
+**Purpose** — Progress of smart-queue template reconciliation, for the banner every page shows. Deliberately not scoped to a project: the work rewrites real schedules, so it has to be visible wherever the user is.
+
+**Response 200**:
+
+```json
+{
+  "active": [{"id": 3, "queue_id": 1, "queue_name": "Daily Shorts",
+              "kind": "slots_added", "label": "Adding posts for new slots",
+              "status": "running", "done": 12, "total": 48, "error": null}],
+  "failed": [],
+  "busy": true,
+  "locked_queue_ids": [1]
+}
+```
+
+`kind` is one of `slots_added`, `slots_removed`, `slot_body_changed`, `applies_to_removed`. A queue in `locked_queue_ids` refuses `PATCH` until its jobs finish.
+
+### `POST /api/projects/{slug}/smart-queues/{queue_id}/reconcile-jobs/{job_id}/dismiss`
+
+**Purpose** — Acknowledge a failed reconciliation so it leaves the app-wide banner. Does not retry it.
+
+**Response 200** — `{"status": "ok"}`.
+
+### `GET /api/projects/{slug}/smart-queues/{queue_id}/slot-gap`
+
+**Purpose** — Which pending items lack which of the template's enabled slots. Writes nothing.
+
+Reconciliation now runs automatically on template change, so a gap here means items accepted *before* that existed — repair, not routine.
+
+**Response 200** — `{"items_missing_slots": N, "missing_posts": N, "by_platform": {"twitter": N}}`.
+
+### `POST /api/projects/{slug}/smart-queues/{queue_id}/backfill-slots`
+
+**Purpose** — Create the posts pending items would have had, had the slots existed. Counterpart to `re-render`: that rewrites rows that exist, this adds rows that never did. Every `scheduled_at` is left alone — a backfilled post inherits its item's time, so nothing on the calendar moves.
+
+**Response 200** — `{"created": N, "skipped": N, "errors": [{"item_id", "platform", "error"}]}`. A slot that cannot carry the video records a `skipped` row with its reason rather than a post that would fail at send time.
+
 ### `GET /api/projects/{slug}/smart-queues/{queue_id}/items`
 
 **Query** — `state` (optional): `queued` | `scheduled` | `posted` | `failed` | `skipped` | `removed`.

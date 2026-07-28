@@ -18,6 +18,7 @@ from yt_scheduler.services import projects as project_service
 from yt_scheduler.services import smart_queue as smart_queue_service
 from yt_scheduler.services import smart_queue_accept
 from yt_scheduler.services import smart_queue_disposition
+from yt_scheduler.services import smart_queue_reconcile
 from yt_scheduler.services.smart_queue import SmartQueueError
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,14 @@ async def list_smart_queues(slug: str):
 
 @router.get("/{queue_id}")
 async def get_smart_queue(slug: str, queue_id: int):
-    return await _queue_in_project_or_404(slug, queue_id)
+    """The queue, plus whether reconciliation currently has it locked.
+
+    Reading is always allowed — refusing to show a queue mid-reconcile would
+    hide exactly the thing the user wants to watch. Saving is what's blocked.
+    """
+    queue = await _queue_in_project_or_404(slug, queue_id)
+    queue["reconcile_locked"] = await smart_queue_reconcile.queue_is_locked(queue_id)
+    return queue
 
 
 @router.post("")
@@ -123,6 +131,14 @@ async def create_smart_queue(slug: str, data: dict):
 async def update_smart_queue(slug: str, queue_id: int, data: dict):
     """Partial update. ``slots``, when present, replaces the whole set."""
     await _queue_in_project_or_404(slug, queue_id)
+    # Saving mid-reconcile would race the worker: both decide what posts a
+    # pending item should have, and the loser's writes are silently wrong.
+    if await smart_queue_reconcile.queue_is_locked(queue_id):
+        raise HTTPException(
+            409,
+            "This schedule is being updated to match a template change. "
+            "Wait for that to finish, then save again.",
+        )
     try:
         await smart_queue_service.update_queue(queue_id, data)
     except SmartQueueError as exc:
@@ -272,6 +288,49 @@ async def rerender_pending(slug: str, queue_id: int):
     """
     queue = await _queue_in_project_or_404(slug, queue_id)
     return await smart_queue_accept.rerender_pending(
+        queue_id, default_ai_system=await _default_ai_system(queue["project_id"])
+    )
+
+
+@router.post("/{queue_id}/reconcile-jobs/{job_id}/dismiss")
+async def dismiss_reconcile_failure(slug: str, queue_id: int, job_id: int):
+    """Acknowledge a failed reconciliation so it leaves the app-wide banner.
+
+    **Response 200** — ``{"status": "ok"}``.
+    """
+    await _queue_in_project_or_404(slug, queue_id)
+    await smart_queue_reconcile.dismiss_failed(job_id)
+    return {"status": "ok"}
+
+
+@router.get("/{queue_id}/slot-gap")
+async def pending_slot_gap(slug: str, queue_id: int):
+    """Which pending items lack which of the template's enabled slots.
+
+    Slot membership is fixed at Accept, so enabling a slot afterwards leaves
+    already-scheduled items without it. Nothing else compares the two, which
+    makes the mismatch invisible until a post you expected never goes out.
+
+    **Response 200** — ``{"items_missing_slots": N, "missing_posts": N,
+    "by_platform": {"twitter": N}}``. Writes nothing.
+    """
+    await _queue_in_project_or_404(slug, queue_id)
+    return await smart_queue_accept.pending_slot_gap(queue_id)
+
+
+@router.post("/{queue_id}/backfill-slots")
+async def backfill_pending_slots(slug: str, queue_id: int):
+    """Create the posts pending items would have had, had the slots existed.
+
+    Counterpart to re-render: that rewrites rows that exist, this adds rows
+    that never did. Existing text and every ``scheduled_at`` are left alone —
+    a backfilled post inherits its item's time, so nothing on the calendar
+    moves.
+
+    **Response 200** — ``{"created": N, "skipped": N, "errors": [...]}``.
+    """
+    queue = await _queue_in_project_or_404(slug, queue_id)
+    return await smart_queue_accept.backfill_pending_slots(
         queue_id, default_ai_system=await _default_ai_system(queue["project_id"])
     )
 

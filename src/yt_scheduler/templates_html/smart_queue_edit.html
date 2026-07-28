@@ -15,7 +15,6 @@
 </div>
 
 <div id="sq-error" class="error-banner" style="display:none;"></div>
-<p class="form-hint" id="sq-busy-note" style="display:none;"></p>
 
 <div class="section">
     <h2>Settings</h2>
@@ -151,8 +150,13 @@
         <button class="btn" id="sq-shuffle-btn" style="display:none;">Shuffle</button>
         <button class="btn btn-primary" id="sq-accept-btn" style="display:none;">Accept</button>
         <button class="btn" id="sq-rerender-btn">Re-render pending posts</button>
+        <button class="btn" id="sq-backfill-btn" style="display:none;">Add missing slots</button>
         <span id="sq-summary" class="form-hint"></span>
     </div>
+    <!-- The busy note has to live beside the buttons that set it: at the top of
+         the page it was off-screen for anyone scrolled down to click them. -->
+    <p class="form-hint" id="sq-busy-note" style="display:none; margin-top:0.5rem;"></p>
+    <p class="form-hint" id="sq-slot-gap" style="display:none; margin-top:0.5rem;"></p>
     <p class="form-hint">
         Accept and Re-render write post text, so they run while this page is open
         and say so; Save and Re-flow apply immediately and you can leave straight
@@ -536,8 +540,73 @@ document.getElementById('sq-accept-btn').addEventListener('click', async () => {
     }
 });
 
+// Slot membership is fixed at Accept, so enabling a template slot afterwards
+// leaves already-scheduled items without it. Nothing else compares the two, so
+// the mismatch is invisible until a post you expected never goes out.
+async function refreshSlotGap() {
+    const note = document.getElementById('sq-slot-gap');
+    const button = document.getElementById('sq-backfill-btn');
+    if (!queueId) {
+        note.style.display = 'none';
+        button.style.display = 'none';
+        return;
+    }
+    try {
+        const gap = await apiCall(
+            `/api/projects/${projectSlug}/smart-queues/${queueId}/slot-gap`,
+            {method: 'GET'}
+        );
+        if (!gap.missing_posts) {
+            note.style.display = 'none';
+            button.style.display = 'none';
+            return;
+        }
+        const platforms = Object.entries(gap.by_platform || {})
+            .map(([name, n]) => `${name} (${n})`).join(', ');
+        note.textContent =
+            `${gap.items_missing_slots} scheduled item${gap.items_missing_slots === 1 ? '' : 's'} `
+            + `${gap.items_missing_slots === 1 ? 'is' : 'are'} missing ${gap.missing_posts} `
+            + `post${gap.missing_posts === 1 ? '' : 's'} for slots added after they were `
+            + `accepted — ${platforms}. "Add missing slots" creates them without moving any times.`;
+        note.style.display = '';
+        button.style.display = '';
+    } catch (err) {
+        // A gap we can't read is not a gap we can claim isn't there.
+        note.textContent = `Couldn't check for missing slots: ${err.message}`;
+        note.style.display = '';
+        button.style.display = 'none';
+    }
+}
+
+document.getElementById('sq-backfill-btn').addEventListener('click', () =>
+    withBusyButton('sq-backfill-btn', 'Adding missing slots…', async () => {
+    showError('');
+    try {
+        const result = await apiCall(
+            `/api/projects/${projectSlug}/smart-queues/${queueId}/backfill-slots`,
+            {method: 'POST'}
+        );
+        const failures = (result.errors || []).length;
+        document.getElementById('sq-summary').textContent =
+            `Added ${result.created} post${result.created === 1 ? '' : 's'}.`
+            + (result.skipped ? ` ${result.skipped} slot${result.skipped === 1 ? '' : 's'} couldn't carry the video — see the item's skipped rows.` : '')
+            + (failures ? ` ${failures} failed — see below.` : '');
+        if (failures) {
+            showError((result.errors || [])
+                .map(e => `item ${e.item_id}${e.platform ? ` (${e.platform})` : ''}: ${e.error}`)
+                .join(' · '));
+        }
+        await refreshSlotGap();
+    } catch (err) {
+        showError(err.message);
+    }
+    }, {mustStay: true}));
+
 document.getElementById('sq-rerender-btn').addEventListener('click', () =>
-    withBusyButton('sq-rerender-btn', 'Re-rendering…', async () => {
+    // Each post can carry an AI block, so this is one Anthropic round-trip per
+    // pending post, run serially. Say so — a silent minutes-long wait on a
+    // disabled button reads as hung.
+    withBusyButton('sq-rerender-btn', 'Re-rendering… (one AI call per post; this can take several minutes)', async () => {
     if (!queueId) {
         // Saving wouldn't help — a queue that has never been saved has no
         // scheduled posts to re-render. Say what's actually true.
@@ -622,6 +691,9 @@ document.getElementById('sq-save-btn').addEventListener('click', () =>
             // saveQueue() writes its own summary when it re-flows; don't stomp it.
             if (summary.textContent === before) summary.textContent = 'Saved.';
             await loadUpcoming();
+            // Switching template is the usual way a gap appears, and Save is
+            // when it lands — so re-check here rather than only on page load.
+            await refreshSlotGap();
         } catch (err) {
             showError(err.message);
         }
@@ -760,6 +832,7 @@ document.getElementById('sq-missed-list').addEventListener('click', async (event
         await loadQueue();
         await loadUpcoming();
         await loadMissed();
+        await refreshSlotGap();
     } catch (err) {
         showError(err.message);
     }

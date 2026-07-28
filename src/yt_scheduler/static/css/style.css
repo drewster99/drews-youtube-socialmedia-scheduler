@@ -1888,3 +1888,44 @@ dialog.modal-xwide {
     .sidebar { display: none; }
     .content { margin-left: 0; }
 }
+
+/* Smart-queue template reconciliation — pinned under the nav on every page,
+   because the work it reports rewrites schedules from wherever you happen to
+   be standing. */
+.reconcile-banner {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    padding: 0.6rem 1rem;
+    background: var(--bg-input, #2a2a2a);
+    border-bottom: 2px solid var(--accent, #4a9eff);
+    font-size: 0.85rem;
+    line-height: 1.5;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+}
+
+.reconcile-banner__spinner {
+    display: inline-block;
+    width: 0.7rem;
+    height: 0.7rem;
+    margin-right: 0.5rem;
+    border: 2px solid var(--accent, #4a9eff);
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: reconcile-spin 0.8s linear infinite;
+    vertical-align: middle;
+}
+
+@keyframes reconcile-spin {
+    to { transform: rotate(360deg); }
+}
+
+.reconcile-banner__failed {
+    color: var(--danger, #ff6b6b);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .reconcile-banner__spinner { animation: none; }
+}

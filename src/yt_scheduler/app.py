@@ -315,7 +315,22 @@ async def lifespan(app: FastAPI):
             "Orphan chunked-upload sweep failed at startup; continuing",
         )
 
+    # The reconcile worker outlives any one request by design: template edits
+    # queue minutes of AI re-rendering that must survive the save request and a
+    # restart. Started best-effort — a queue that can't drain is not a reason
+    # to refuse to boot.
+    try:
+        from yt_scheduler.services import smart_queue_reconcile
+        await smart_queue_reconcile.start_worker()
+    except Exception:
+        logger.exception("Could not start the smart-queue reconcile worker")
+
     yield
+    try:
+        from yt_scheduler.services import smart_queue_reconcile
+        await smart_queue_reconcile.stop_worker()
+    except Exception:
+        logger.exception("Could not stop the smart-queue reconcile worker")
     stop_scheduler()
     await close_db()
     PID_FILE.unlink(missing_ok=True)
@@ -377,6 +392,19 @@ html_templates = Jinja2Templates(directory=str(templates_dir))
 async def api_build():
     """Build identity for the .app + browser to compare against their own."""
     return build_info.as_dict()
+
+
+@app.get("/api/reconcile-status")
+async def api_reconcile_status():
+    """Template-reconciliation progress, for the banner every page shows.
+
+    Deliberately not under ``/api/projects/{slug}`` — the banner has to appear
+    wherever the user happens to be, including screens that know nothing about
+    which queue is being reconciled.
+    """
+    from yt_scheduler.services import smart_queue_reconcile
+
+    return await smart_queue_reconcile.status_summary()
 
 
 # API routes

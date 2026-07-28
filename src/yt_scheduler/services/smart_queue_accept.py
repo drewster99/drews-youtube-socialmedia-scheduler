@@ -520,6 +520,191 @@ async def rerender_pending(queue_id: int, *, default_ai_system: str | None = Non
     return {"updated": updated, "errors": errors}
 
 
+async def _pending_items_missing_slots(queue_id: int) -> tuple[list[dict], dict]:
+    """Pending items paired with the enabled template slots they have no row for.
+
+    Slot membership is fixed at Accept, so enabling a slot afterwards leaves
+    every already-scheduled item without it — invisibly, because nothing
+    compares the two. Returns ``(rows, slots_by_id)`` where each row carries
+    ``missing_slot_ids``.
+    """
+    db = await get_db()
+    queue = await queue_service.get_queue(queue_id)
+    template = await _template_by_id(int(queue["template_id"]))
+    slots_by_id = {
+        int(s["id"]): s
+        for s in template["slots"]
+        if s.get("id") and not s.get("is_disabled")
+    }
+
+    items = await db.execute_fetchall(
+        """
+        SELECT i.id, i.video_id FROM smart_queue_items i
+         WHERE i.queue_id = ? AND i.state = 'scheduled'
+           AND NOT EXISTS (
+               SELECT 1 FROM social_posts p
+                WHERE p.smart_queue_item_id = i.id AND p.status = 'posted'
+           )
+         ORDER BY i.position
+        """,
+        (queue_id,),
+    )
+
+    rows: list[dict] = []
+    for item in items:
+        # A skipped row still counts as "this slot was considered" — re-adding
+        # it would re-litigate a decision already recorded with its reason.
+        existing = await db.execute_fetchall(
+            "SELECT slot_id FROM social_posts WHERE smart_queue_item_id = ?",
+            (int(item["id"]),),
+        )
+        have = {int(r["slot_id"]) for r in existing if r["slot_id"] is not None}
+        missing = [sid for sid in slots_by_id if sid not in have]
+        if missing:
+            rows.append({
+                "item_id": int(item["id"]),
+                "video_id": item["video_id"],
+                "missing_slot_ids": missing,
+            })
+    return rows, slots_by_id
+
+
+async def pending_slot_gap(queue_id: int) -> dict:
+    """Report, without writing anything, which pending items lack which slots.
+
+    Lets the queue screen say so up front instead of leaving the mismatch to be
+    discovered when a post that was expected never goes out.
+    """
+    rows, slots_by_id = await _pending_items_missing_slots(queue_id)
+    platforms: dict[str, int] = {}
+    for row in rows:
+        for slot_id in row["missing_slot_ids"]:
+            name = slots_by_id[slot_id]["platform"]
+            platforms[name] = platforms.get(name, 0) + 1
+    return {
+        "items_missing_slots": len(rows),
+        "missing_posts": sum(len(r["missing_slot_ids"]) for r in rows),
+        "by_platform": platforms,
+    }
+
+
+async def backfill_pending_slots(
+    queue_id: int, *, default_ai_system: str | None = None
+) -> dict:
+    """Create the posts pending items would have had, had the slots existed.
+
+    The counterpart to re-render: that one rewrites rows that exist, this one
+    adds rows that never did. Times and already-rendered text are left alone —
+    a backfilled post inherits its item's ``scheduled_at``, so nothing on the
+    calendar moves.
+
+    Every slot goes through the same :func:`slots_accepting` verdicts Accept
+    uses, so a slot that cannot carry this video records a ``skipped`` row with
+    its reason rather than a post that would fail at send time.
+    """
+    from datetime import datetime as _datetime
+
+    from yt_scheduler.services.scheduler import schedule_social_post
+
+    db = await get_db()
+    rows, slots_by_id = await _pending_items_missing_slots(queue_id)
+    if not rows:
+        return {"created": 0, "skipped": 0, "errors": []}
+
+    media_hosting_configured = await media_hosting.is_configured()
+    created, skipped, errors = 0, 0, []
+
+    for row in rows:
+        video_rows = await db.execute_fetchall(
+            "SELECT * FROM videos WHERE id = ?", (row["video_id"],)
+        )
+        if not video_rows:
+            errors.append({"item_id": row["item_id"], "error": "video no longer exists"})
+            continue
+        video = dict(video_rows[0])
+
+        item_rows = await db.execute_fetchall(
+            "SELECT scheduled_at FROM smart_queue_items WHERE id = ?",
+            (row["item_id"],),
+        )
+        when_iso = item_rows[0]["scheduled_at"] if item_rows else None
+
+        missing_slots = [slots_by_id[sid] for sid in row["missing_slot_ids"]]
+        verdicts = slots_accepting(
+            video, missing_slots, media_hosting_configured=media_hosting_configured
+        )
+        for verdict in verdicts:
+            slot = verdict.slot
+            if not verdict.accepted:
+                async with write_transaction() as write_db:
+                    await write_db.execute(
+                        """
+                        INSERT INTO social_posts
+                            (video_id, platform, content, status, error, slot_id,
+                             smart_queue_item_id)
+                        VALUES (?,?,'','skipped',?,?,?)
+                        """,
+                        (video["id"], slot["platform"], verdict.reason,
+                         slot.get("id"), row["item_id"]),
+                    )
+                skipped += 1
+                continue
+            try:
+                rendered, media_paths = await _render_slot(
+                    db, video, slot, default_ai_system=default_ai_system
+                )
+            except _DETERMINISTIC_RENDER_FAILURES as exc:
+                errors.append({
+                    "item_id": row["item_id"],
+                    "platform": slot["platform"],
+                    "error": str(exc),
+                })
+                continue
+            async with write_transaction() as write_db:
+                cursor = await write_db.execute(
+                    """
+                    INSERT INTO social_posts
+                        (video_id, platform, content, media_paths, status,
+                         social_account_id, max_chars, slot_id,
+                         smart_queue_item_id, scheduled_at)
+                    VALUES (?,?,?,?,'approved',?,?,?,?,?)
+                    """,
+                    (
+                        video["id"], slot["platform"], rendered,
+                        json.dumps(media_paths), slot.get("social_account_id"),
+                        slot.get("max_chars"), slot.get("id"), row["item_id"],
+                        when_iso,
+                    ),
+                )
+                post_id = int(cursor.lastrowid)
+            created += 1
+
+            # Outside the transaction, as Accept does: registering a timer
+            # writes, and a rollback cannot un-register an APScheduler job.
+            # scheduled_at is already committed, so a failure here is
+            # recoverable on restart rather than a post that silently never
+            # goes out.
+            if when_iso:
+                try:
+                    await schedule_social_post(post_id, _datetime.fromisoformat(when_iso))
+                except Exception as exc:
+                    logger.exception(
+                        "backfill: could not register the timer for post %s", post_id
+                    )
+                    errors.append({
+                        "item_id": row["item_id"], "post_id": post_id,
+                        "error": (
+                            f"created for {when_iso}, but its timer could not be "
+                            f"registered ({type(exc).__name__}: {exc}); it will be "
+                            "picked up on the next restart"
+                        ),
+                    })
+
+    logger.info("backfill: queue %s created %s posts, skipped %s, %s errors",
+                queue_id, created, skipped, len(errors))
+    return {"created": created, "skipped": skipped, "errors": errors}
+
+
 async def reflow_pending(queue_id: int) -> dict:
     """Re-stamp every pending item onto the queue's current recurrence.
 
