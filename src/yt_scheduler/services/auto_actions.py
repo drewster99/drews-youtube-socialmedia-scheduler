@@ -1548,16 +1548,18 @@ async def _run_promo_chain_inner(job_id: str) -> None:
     async with write_transaction() as db:
         await db.execute(
             """INSERT INTO videos (
-                id, project_id, title, description, tags, privacy_status,
+                id, youtube_video_id, project_id, title, description, tags,
+                privacy_status,
                 video_file_path, video_file_original_name, status,
                 duration_seconds, tier,
                 item_type, parent_item_id, url,
                 auto_action_state, source_file_origin,
                 cut_start_seconds, cut_end_seconds
-            ) VALUES (?, ?, ?, ?, '[]', 'unlisted', ?, ?, 'uploaded',
+            ) VALUES (?, ?, ?, ?, ?, '[]', 'unlisted', ?, ?, 'uploaded',
                       ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 video_id,
+                video_id,  # the upload result's id IS the YouTube video id
                 project_id,
                 title,
                 "Description pending generation.",

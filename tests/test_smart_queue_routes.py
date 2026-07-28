@@ -124,9 +124,10 @@ async def test_queue_from_another_project_is_not_reachable(client):
 async def test_candidates_preview_writes_nothing(client):
     http, db, template_id = client
     await db.execute(
-        "INSERT INTO videos (id, project_id, title, item_type, duration_seconds, "
-        "privacy_status, width, height) "
-        "VALUES ('vid00000001', 1, 'A clip', 'hook', 60, 'public', 1080, 1920)"
+        "INSERT INTO videos (id, youtube_video_id, project_id, title, item_type, "
+        "duration_seconds, privacy_status, width, height) "
+        "VALUES ('vid00000001', 'vid00000001', 1, 'A clip', 'hook', 60, "
+        "'public', 1080, 1920)"
     )
     await db.commit()
     created = await http.post(
@@ -152,9 +153,10 @@ async def test_candidate_overrides_do_not_persist(client):
     """The screen previews a filter change before saving it."""
     http, db, template_id = client
     await db.execute(
-        "INSERT INTO videos (id, project_id, title, item_type, duration_seconds, "
-        "privacy_status, width, height) "
-        "VALUES ('wide0000000', 1, 'Landscape', 'hook', 60, 'public', 1920, 1080)"
+        "INSERT INTO videos (id, youtube_video_id, project_id, title, item_type, "
+        "duration_seconds, privacy_status, width, height) "
+        "VALUES ('wide0000000', 'wide0000000', 1, 'Landscape', 'hook', 60, "
+        "'public', 1920, 1080)"
     )
     await db.commit()
     created = await http.post(
@@ -209,10 +211,10 @@ async def test_forecast_starts_after_the_existing_schedule(client):
     http, db, template_id = client
     for video_id, title in (("vid00000001", "Booked clip"), ("vid00000002", "Next clip")):
         await db.execute(
-            "INSERT INTO videos (id, project_id, title, item_type, "
-            "duration_seconds, privacy_status, width, height) "
-            "VALUES (?, 1, ?, 'hook', 60, 'public', 1080, 1920)",
-            (video_id, title),
+            "INSERT INTO videos (id, youtube_video_id, project_id, title, "
+            "item_type, duration_seconds, privacy_status, width, height) "
+            "VALUES (?, ?, 1, ?, 'hook', 60, 'public', 1080, 1920)",
+            (video_id, video_id, title),
         )
     await db.commit()
     created = await http.post(
@@ -251,9 +253,10 @@ async def test_accept_with_no_ids_schedules_the_waiting_items(client):
         (template_id,),
     )
     await db.execute(
-        "INSERT INTO videos (id, project_id, title, item_type, duration_seconds, "
-        "privacy_status, width, height) "
-        "VALUES ('vid00000001', 1, 'Auto-added', 'hook', 60, 'public', 1080, 1920)"
+        "INSERT INTO videos (id, youtube_video_id, project_id, title, item_type, "
+        "duration_seconds, privacy_status, width, height) "
+        "VALUES ('vid00000001', 'vid00000001', 1, 'Auto-added', 'hook', 60, "
+        "'public', 1080, 1920)"
     )
     await db.commit()
     created = await http.post(
@@ -285,9 +288,10 @@ async def test_candidates_reports_the_waiting_count(client):
     exist — they are not candidates, because they are already in the queue."""
     http, db, template_id = client
     await db.execute(
-        "INSERT INTO videos (id, project_id, title, item_type, duration_seconds, "
-        "privacy_status, width, height) "
-        "VALUES ('vid00000001', 1, 'Auto-added', 'hook', 60, 'public', 1080, 1920)"
+        "INSERT INTO videos (id, youtube_video_id, project_id, title, item_type, "
+        "duration_seconds, privacy_status, width, height) "
+        "VALUES ('vid00000001', 'vid00000001', 1, 'Auto-added', 'hook', 60, "
+        "'public', 1080, 1920)"
     )
     await db.commit()
     created = await http.post(
@@ -318,10 +322,10 @@ async def test_counts_report_posting_from_the_posts_not_the_item_state(client):
     http, db, template_id = client
     for video_id in ("sent0000000", "waiting0000"):
         await db.execute(
-            "INSERT INTO videos (id, project_id, title, item_type, "
-            "duration_seconds, privacy_status, width, height) "
-            "VALUES (?, 1, 'A clip', 'hook', 60, 'public', 1080, 1920)",
-            (video_id,),
+            "INSERT INTO videos (id, youtube_video_id, project_id, title, "
+            "item_type, duration_seconds, privacy_status, width, height) "
+            "VALUES (?, ?, 1, 'A clip', 'hook', 60, 'public', 1080, 1920)",
+            (video_id, video_id),
         )
     await db.commit()
     created = await http.post(
@@ -371,10 +375,10 @@ async def test_reflow_leaves_already_sent_items_alone(client, monkeypatch):
 
     for video_id in ("sent0000000", "pending0000"):
         await db.execute(
-            "INSERT INTO videos (id, project_id, title, item_type, "
-            "duration_seconds, privacy_status, width, height) "
-            "VALUES (?, 1, 'A clip', 'hook', 60, 'public', 1080, 1920)",
-            (video_id,),
+            "INSERT INTO videos (id, youtube_video_id, project_id, title, "
+            "item_type, duration_seconds, privacy_status, width, height) "
+            "VALUES (?, ?, 1, 'A clip', 'hook', 60, 'public', 1080, 1920)",
+            (video_id, video_id),
         )
     await db.commit()
     created = await http.post(
@@ -450,10 +454,10 @@ async def test_reflow_uses_todays_slot_when_it_is_still_ahead(client, monkeypatc
 
     for video_id in ("sent0000000", "next-up0000"):
         await db.execute(
-            "INSERT INTO videos (id, project_id, title, item_type, "
-            "duration_seconds, privacy_status, width, height) "
-            "VALUES (?, 1, 'A clip', 'hook', 60, 'public', 1080, 1920)",
-            (video_id,),
+            "INSERT INTO videos (id, youtube_video_id, project_id, title, "
+            "item_type, duration_seconds, privacy_status, width, height) "
+            "VALUES (?, ?, 1, 'A clip', 'hook', 60, 'public', 1080, 1920)",
+            (video_id, video_id),
         )
     for position, video_id in enumerate(("sent0000000", "next-up0000")):
         cursor = await db.execute(
@@ -493,10 +497,10 @@ async def test_items_report_whether_they_have_gone_out(client):
     http, db, template_id = client
     for video_id in ("sent0000000", "pending0000"):
         await db.execute(
-            "INSERT INTO videos (id, project_id, title, item_type, "
-            "duration_seconds, privacy_status, width, height) "
-            "VALUES (?, 1, 'A clip', 'hook', 60, 'public', 1080, 1920)",
-            (video_id,),
+            "INSERT INTO videos (id, youtube_video_id, project_id, title, "
+            "item_type, duration_seconds, privacy_status, width, height) "
+            "VALUES (?, ?, 1, 'A clip', 'hook', 60, 'public', 1080, 1920)",
+            (video_id, video_id),
         )
     await db.commit()
     created = await http.post(

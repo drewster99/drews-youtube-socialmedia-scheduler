@@ -2139,7 +2139,7 @@ Terminal jobs (`done` / `failed`) are evicted from the in-memory job dict 30 min
 
 **Query params** — `tiers` (optional): comma-separated subset of `hook|short|segment`. Omit it for every tier; supplying it empty (`?tiers=`) is a `400`, not "everything".
 
-**Response 200** — `{"eligible": [{"id","title","item_type","status"}, ...], "ineligible": [{..., "reason": "..."}, ...], "counts": {"segment": N, "short": N, "hook": N}, "quota_units_estimate": N}`. A clip is ineligible when it has no YouTube video (non-11-char id), its YouTube video is deleted, it has no usable transcript to describe from, or a background chain currently owns the row. `quota_units_estimate` is `len(eligible) × 51` — `videos.list` (1) to read the live snippet plus `videos.update` (50).
+**Response 200** — `{"eligible": [{"id","title","item_type","status"}, ...], "ineligible": [{..., "reason": "..."}, ...], "counts": {"segment": N, "short": N, "hook": N}, "quota_units_estimate": N}`. A clip is ineligible when it has no YouTube video (`youtube_video_id IS NULL`), its YouTube video is deleted, it has no usable transcript to describe from, or a background chain currently owns the row. `quota_units_estimate` is `len(eligible) × 51` — `videos.list` (1) to read the live snippet plus `videos.update` (50).
 
 **Errors** — `404` (project / parent missing), `400` (parent is itself a child, or an unknown tier in `tiers`).
 

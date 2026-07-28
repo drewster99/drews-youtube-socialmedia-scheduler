@@ -178,7 +178,7 @@ def is_eligible(video: dict, queue: dict, applies_to: list[str]) -> Eligibility:
     # written and stays 'unlisted' forever. Reading it would call such an item
     # permanently not-live, which is why the publish path could not run the
     # auto-add funnel for them at all. For these, published *is* live.
-    if is_youtube_backed(video.get("id") or ""):
+    if is_youtube_backed(video):
         if (video.get("privacy_status") or "") != "public":
             reasons.append(
                 f"not live on YouTube (privacy is "
@@ -253,7 +253,8 @@ async def candidate_videos(queue: dict) -> dict:
     rows = await db.execute_fetchall(
         f"""
         SELECT v.id, v.title, v.item_type, v.duration_seconds, v.privacy_status,
-               v.status, v.archived, v.width, v.height, v.created_at,
+               v.status, v.youtube_video_id, v.archived, v.width, v.height,
+               v.created_at,
                {ORIENTATION_SQL} AS orientation
           FROM videos v
          WHERE v.project_id = ?

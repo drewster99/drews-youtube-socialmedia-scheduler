@@ -38,6 +38,7 @@ from pathlib import Path
 
 from yt_scheduler.config import UPLOAD_DIR, safe_upload_ext
 from yt_scheduler.database import get_db, write_transaction
+from yt_scheduler.models import video as video_model
 from yt_scheduler.routers.video_routes import _resolve_video_file, _video_public
 from yt_scheduler.services import (
     auto_actions,
@@ -602,11 +603,10 @@ async def generate_preview(
 
     # Inline-preview metadata: the client uses these to decide whether
     # to render a <video src="/uploads/..."> tag or a YouTube iframe with
-    # start/end. ``parent_youtube_id`` is the 11-char id when the parent
-    # is YouTube-backed (the normal case for the promos page); falsy
-    # otherwise.
+    # start/end. ``parent_youtube_id`` is the parent's YouTube video id (the
+    # normal case for the promos page); empty when it has none.
     public_parent = _video_public(dict(parent))
-    parent_youtube_id = parent_id if len(parent_id) == 11 else ""
+    parent_youtube_id = video_model.youtube_video_id_of(dict(parent)) or ""
     browser_playable = media_service.is_browser_playable(
         parent_probe.codec_name if parent_probe else None,
         parent_probe.container if parent_probe else None,
@@ -958,7 +958,7 @@ async def _description_update_candidates(
     db = await get_db()
     rows = await db.execute_fetchall(
         "SELECT id, title, item_type, status, transcript, auto_action_state, "
-        "youtube_deleted FROM videos "
+        "youtube_deleted, youtube_video_id FROM videos "
         "WHERE parent_item_id = ? AND project_id = ? AND COALESCE(archived, 0) = 0 "
         "ORDER BY item_type, created_at ASC",
         (parent_id, project_id),
@@ -982,7 +982,7 @@ async def _description_update_candidates(
             if transcript else ""
         )
         state = str(clip.get("auto_action_state") or "")
-        if len(clip["id"]) != 11:
+        if not video_model.youtube_video_id_of(clip):
             summary["reason"] = "Not on YouTube (local-only item)."
         elif clip.get("youtube_deleted"):
             summary["reason"] = "The YouTube video has been deleted."

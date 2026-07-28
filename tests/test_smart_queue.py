@@ -24,6 +24,8 @@ def _video(**overrides) -> dict:
         "id": "vid00000001", "item_type": "hook", "duration_seconds": 68.0,
         "privacy_status": "public", "archived": 0,
         "width": 1080, "height": 1920,
+        # Set because the row says so, not because the id looks a certain way.
+        "youtube_video_id": "vid00000001",
     }
     video.update(overrides)
     return video
@@ -343,10 +345,10 @@ class TestCandidates:
         template_id = int(cursor.lastrowid)
         for video_id in ("keep0000000", "taken000000"):
             await db.execute(
-                "INSERT INTO videos (id, project_id, title, item_type, "
-                "duration_seconds, privacy_status, width, height) "
-                "VALUES (?, 1, 'v', 'hook', 60, 'public', 1080, 1920)",
-                (video_id,),
+                "INSERT INTO videos (id, youtube_video_id, project_id, title, "
+                "item_type, duration_seconds, privacy_status, width, height) "
+                "VALUES (?, ?, 1, 'v', 'hook', 60, 'public', 1080, 1920)",
+                (video_id, video_id),
             )
         await db.commit()
         queue_id = await module.create_queue(
@@ -372,9 +374,10 @@ class TestCandidates:
         )
         template_id = int(cursor.lastrowid)
         await db.execute(
-            "INSERT INTO videos (id, project_id, title, item_type, "
-            "duration_seconds, privacy_status, width, height) "
-            "VALUES ('done0000000', 1, 'v', 'hook', 60, 'public', 1080, 1920)"
+            "INSERT INTO videos (id, youtube_video_id, project_id, title, "
+            "item_type, duration_seconds, privacy_status, width, height) "
+            "VALUES ('done0000000', 'done0000000', 1, 'v', 'hook', 60, "
+            "'public', 1080, 1920)"
         )
         await db.commit()
         queue_id = await module.create_queue(
@@ -436,6 +439,7 @@ class TestNonYouTubeItems:
             "id": "ccgubMJsE8q7uHzf0TK2qw", "item_type": "standalone",
             "duration_seconds": 68.0, "privacy_status": "unlisted",
             "status": "published", "archived": 0, "width": 1080, "height": 1920,
+            "youtube_video_id": None,  # the point of this class
         }
         fields.update(overrides)
         return fields
@@ -484,9 +488,10 @@ class TestRecycling:
         )
         template_id = int(cursor.lastrowid)
         await db.execute(
-            "INSERT INTO videos (id, project_id, title, item_type, "
-            "duration_seconds, privacy_status, width, height) "
-            "VALUES ('recycled001', 1, 'v', 'hook', 60, 'public', 1080, 1920)"
+            "INSERT INTO videos (id, youtube_video_id, project_id, title, "
+            "item_type, duration_seconds, privacy_status, width, height) "
+            "VALUES ('recycled001', 'recycled001', 1, 'v', 'hook', 60, "
+            "'public', 1080, 1920)"
         )
         await db.commit()
         queue_id = await module.create_queue(

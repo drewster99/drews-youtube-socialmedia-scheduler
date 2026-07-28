@@ -47,9 +47,10 @@ async def disposition_env(isolated_db, monkeypatch):
     )
     template_id = int(cursor.lastrowid)
     await db.execute(
-        "INSERT INTO videos (id, project_id, title, item_type, duration_seconds, "
-        "privacy_status, width, height) "
-        "VALUES ('vid00000001', 1, 'A clip', 'hook', 60, 'public', 1080, 1920)"
+        "INSERT INTO videos (id, youtube_video_id, project_id, title, item_type, "
+        "duration_seconds, privacy_status, width, height) "
+        "VALUES ('vid00000001', 'vid00000001', 1, 'A clip', 'hook', 60, "
+        "'public', 1080, 1920)"
     )
     await db.commit()
     queue_id = await queue_service.create_queue(

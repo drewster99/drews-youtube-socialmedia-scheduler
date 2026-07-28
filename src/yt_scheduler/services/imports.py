@@ -238,14 +238,16 @@ async def import_video(
     async with write_transaction() as db:
         await db.execute(
             """INSERT INTO videos (
-                id, project_id, title, description, tags, privacy_status,
+                id, youtube_video_id, project_id, title, description, tags,
+                privacy_status,
                 thumbnail_path, status, imported_from_youtube,
                 duration_seconds, tier, youtube_kind, url,
                 thumbnail_source, youtube_thumbnail_path, youtube_thumbnail_url,
                 item_type, parent_item_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'uploaded', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'uploaded', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                video_id, project_id, title, description, json.dumps(tags_list),
+                # imported straight from YouTube: the id is the video id
+                video_id, video_id, project_id, title, description, json.dumps(tags_list),
                 privacy, thumbnail_path, duration, tier, youtube_kind, youtube_url,
                 thumbnail_source_value, youtube_thumbnail_path_value, youtube_thumbnail_url_value,
                 item_type_value, parent_item_id or None,

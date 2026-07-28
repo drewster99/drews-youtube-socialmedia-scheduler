@@ -315,8 +315,8 @@ Recovery is manual and user-initiated.
 
 ### What "live" means depends on what backs the item
 
-A YouTube-backed row (its id *is* the 11-character YouTube video id) is live
-when `privacy_status = 'public'`. Status is not the authority there — it drifts
+A YouTube-backed row (`videos.youtube_video_id IS NOT NULL`, migration 037) is
+live when `privacy_status = 'public'`. Status is not the authority there — it drifts
 off `published` whenever privacy is flipped from the metadata dropdown.
 
 An item created outside YouTube has no YouTube presence, so `privacy_status` is

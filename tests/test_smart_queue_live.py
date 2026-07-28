@@ -44,9 +44,11 @@ async def _add_video(db, video_id="vid00000001", **overrides):
     }
     fields.update(overrides)
     await db.execute(
-        "INSERT INTO videos (id, project_id, title, item_type, duration_seconds, "
-        "privacy_status, width, height) VALUES (?, 1, 'A clip', ?, ?, ?, ?, ?)",
-        (video_id, fields["item_type"], fields["duration_seconds"],
+        "INSERT INTO videos (id, youtube_video_id, project_id, title, item_type, "
+        "duration_seconds, privacy_status, width, height) "
+        "VALUES (?, ?, 1, 'A clip', ?, ?, ?, ?, ?)",
+        (video_id, fields.get("youtube_video_id", video_id),
+         fields["item_type"], fields["duration_seconds"],
          fields["privacy_status"], fields["width"], fields["height"]),
     )
     await db.commit()

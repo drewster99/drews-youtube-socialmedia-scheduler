@@ -28,6 +28,7 @@ from yt_scheduler.services import (
     ai, auto_actions, chunked_uploads, events, media as media_service, tiers,
     transcripts as transcript_service, youtube,
 )
+from yt_scheduler.models import video as video_model
 from yt_scheduler.services.auth import set_active_project
 from yt_scheduler.services.projects import get_project_by_id
 
@@ -532,13 +533,14 @@ async def upload_video(payload: dict = Body(...)):
     youtube_url = f"https://youtu.be/{video_id}"
     async with write_transaction() as db:
         await db.execute(
-            """INSERT INTO videos (id, project_id, title, description, tags, privacy_status, publish_at,
+            """INSERT INTO videos (id, youtube_video_id, project_id, title, description, tags, privacy_status, publish_at,
                thumbnail_path, video_file_path, video_file_original_name, pinned_links, status,
                duration_seconds, tier,
                item_type, parent_item_id, url, source_file_origin)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uploaded', ?, ?, ?, ?, ?, 'uploaded')""",
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uploaded', ?, ?, ?, ?, ?, 'uploaded')""",
             (
                 video_id,
+                video_id,  # the upload result's id IS the YouTube video id
                 project["id"],
                 title,
                 description,
@@ -732,11 +734,9 @@ async def update_video(video_id: str, data: dict):
     before = dict(rows[0])
     before["tags"] = _decode_tags(before.get("tags"))
 
-    # Real YouTube video ids are 11 chars; standalone item ids this app mints are
-    # 22 (secrets.token_urlsafe(16)[:22]). Same discriminator the scheduler uses
-    # (LENGTH(id) = 11). A 22-char row has no YouTube video to update, so calling
+    # A row with no YouTube video has nothing to update there, and calling
     # YouTube for one raises ValueError("not found") and 500s the whole edit.
-    is_youtube_backed = len(video_id) == 11
+    is_youtube_backed = video_model.is_youtube_backed(before)
 
     def _youtube_field_changed() -> bool:
         """Has any YouTube-facing field actually changed?
@@ -1413,11 +1413,12 @@ async def apply_description(video_id: str):
     desc = video.get("generated_description", "")
     if not desc:
         raise HTTPException(400, "No generated description. Generate one first.")
+    youtube_id = video_model.youtube_video_id_of(video)
 
-    # 22-char standalone items have no YouTube video — apply locally only.
-    # For real videos the push must succeed BEFORE we persist, or the DB would
-    # claim YouTube already has a description it never received.
-    if len(video_id) == 11:
+    # An item with no YouTube video is applied locally only. For the rest the
+    # push must succeed BEFORE we persist, or the DB would claim YouTube
+    # already has a description it never received.
+    if youtube_id:
         await _bind_project_for_video(video_id)
         try:
             await asyncio.to_thread(

@@ -20,6 +20,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from yt_scheduler import build_info
 from yt_scheduler.config import HOST, PID_FILE, PORT, ensure_dirs
 from yt_scheduler.database import close_db, get_db
+from yt_scheduler.models import video as video_model
 from yt_scheduler.routers import (
     auth_routes,
     expand_routes,
@@ -502,7 +503,8 @@ async def project_generate_from_source_page(
 
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT id, title, video_file_path, source_file_origin FROM videos "
+        "SELECT id, title, video_file_path, source_file_origin, "
+        "youtube_video_id FROM videos "
         "WHERE id = ? AND project_id = ?",
         (parent_id, int(project["id"])),
     )
@@ -543,9 +545,9 @@ async def project_generate_from_source_page(
                 height=probe.display_height if probe else None,
                 source_origin=current_video.get("source_file_origin"),
             )
-        # 11-char id is the YouTube convention used elsewhere in the app.
-        if len(parent_id) == 11:
-            parent_meta["youtube_id"] = parent_id
+        parent_youtube_id = video_model.youtube_video_id_of(current_video)
+        if parent_youtube_id:
+            parent_meta["youtube_id"] = parent_youtube_id
 
     return html_templates.TemplateResponse(
         request,

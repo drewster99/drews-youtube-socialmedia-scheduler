@@ -96,6 +96,9 @@ def _insert(video_id: str, **cols) -> None:
         "status": "ready",
         "video_file_path": str(path),
         "description": "Old description with the link at the bottom.",
+        # These clips live on YouTube; the row states it rather than leaving it
+        # to be guessed from the id, which is what the code used to do.
+        "youtube_video_id": video_id,
     }
     row.update(cols)
     keys = ", ".join(["id", *row.keys()])
@@ -188,8 +191,11 @@ def test_preview_names_why_a_clip_is_skipped(client: TestClient) -> None:
     _insert(CHILD_A, parent_item_id=PARENT, item_type="hook", transcript="")
     _insert(CHILD_B, parent_item_id=PARENT, item_type="hook",
             transcript=TRANSCRIPT, youtube_deleted=1)
+    # Local-only says so outright now. It used to be expressed by giving the
+    # clip a name that wasn't 11 characters long, which is not something a
+    # reader could be expected to notice.
     _insert("localonly", parent_item_id=PARENT, item_type="hook",
-            transcript=TRANSCRIPT)
+            transcript=TRANSCRIPT, youtube_video_id=None)
 
     data = client.get(f"{_base()}/update-descriptions/preview").json()
     assert data["eligible"] == []
