@@ -46,6 +46,22 @@ async def _queue_in_project_or_404(slug: str, queue_id: int) -> dict:
     return queue
 
 
+async def _require_not_reconciling(queue_id: int) -> None:
+    """Refuse schedule mutations while reconciliation owns this queue.
+
+    Not only PATCH: Accept, re-flow, re-render and backfill all decide what
+    posts a pending item should have, which is exactly what the worker is
+    deciding. Whichever writes second wins silently, and the losing decision is
+    invisible.
+    """
+    if await smart_queue_reconcile.queue_is_locked(queue_id):
+        raise HTTPException(
+            409,
+            "This schedule is being updated to match a template change. "
+            "Wait for that to finish, then try again.",
+        )
+
+
 @router.get("")
 async def list_smart_queues(slug: str):
     """Every smart queue in this project, with slots and item-state counts."""
@@ -131,14 +147,7 @@ async def create_smart_queue(slug: str, data: dict):
 async def update_smart_queue(slug: str, queue_id: int, data: dict):
     """Partial update. ``slots``, when present, replaces the whole set."""
     await _queue_in_project_or_404(slug, queue_id)
-    # Saving mid-reconcile would race the worker: both decide what posts a
-    # pending item should have, and the loser's writes are silently wrong.
-    if await smart_queue_reconcile.queue_is_locked(queue_id):
-        raise HTTPException(
-            409,
-            "This schedule is being updated to match a template change. "
-            "Wait for that to finish, then save again.",
-        )
+    await _require_not_reconciling(queue_id)
     try:
         await smart_queue_service.update_queue(queue_id, data)
     except SmartQueueError as exc:
@@ -152,6 +161,7 @@ async def update_smart_queue(slug: str, queue_id: int, data: dict):
 async def delete_smart_queue(slug: str, queue_id: int):
     """Delete a queue. Cancels everything pending; keeps all posting history."""
     await _queue_in_project_or_404(slug, queue_id)
+    await _require_not_reconciling(queue_id)
     cancelled = await smart_queue_service.delete_queue(queue_id)
     return {"deleted": True, "cancelled_posts": cancelled}
 
@@ -244,6 +254,7 @@ async def accept_selection(slug: str, queue_id: int, data: dict):
     after the last one on the books.
     """
     queue = await _queue_in_project_or_404(slug, queue_id)
+    await _require_not_reconciling(queue_id)
     video_ids = data.get("video_ids") or []
     if not isinstance(video_ids, list):
         raise HTTPException(400, "video_ids must be a list.")
@@ -272,6 +283,7 @@ async def reflow_pending(slug: str, queue_id: int):
     moves.
     """
     await _queue_in_project_or_404(slug, queue_id)
+    await _require_not_reconciling(queue_id)
     try:
         return await smart_queue_accept.reflow_pending(queue_id)
     except SmartQueueError as exc:
@@ -287,6 +299,8 @@ async def rerender_pending(slug: str, queue_id: int):
     Errors are per post so one bad render doesn't hide the rest.
     """
     queue = await _queue_in_project_or_404(slug, queue_id)
+    await _require_not_reconciling(queue_id)
+    await _require_not_reconciling(queue_id)
     return await smart_queue_accept.rerender_pending(
         queue_id, default_ai_system=await _default_ai_system(queue["project_id"])
     )
@@ -330,6 +344,7 @@ async def backfill_pending_slots(slug: str, queue_id: int):
     **Response 200** — ``{"created": N, "skipped": N, "errors": [...]}``.
     """
     queue = await _queue_in_project_or_404(slug, queue_id)
+    await _require_not_reconciling(queue_id)
     return await smart_queue_accept.backfill_pending_slots(
         queue_id, default_ai_system=await _default_ai_system(queue["project_id"])
     )

@@ -212,3 +212,38 @@ async def test_a_failed_job_is_reported_not_swallowed(monkeypatch, isolated_db):
     # A failed job releases the lock: leaving the queue unsaveable forever
     # because one job died would be worse than the failure.
     assert await reconcile.queue_is_locked(2) is False
+
+
+async def test_every_schedule_mutation_is_guarded_by_the_lock(isolated_db):
+    """PATCH is not the only way to rewrite a schedule. Accept, re-flow,
+    re-render and backfill all decide what posts a pending item should have —
+    the same decision the worker is making — so each must refuse while a job
+    is outstanding, or whichever writes second wins silently."""
+    import inspect
+
+    routes = importlib.import_module("yt_scheduler.routers.smart_queue_routes")
+    guarded = {
+        "accept_selection", "reflow_pending", "rerender_pending",
+        "backfill_pending_slots", "update_smart_queue", "delete_smart_queue",
+    }
+    for name in guarded:
+        source = inspect.getsource(getattr(routes, name))
+        assert "_require_not_reconciling" in source, (
+            f"{name} mutates the schedule but doesn't check the reconcile lock"
+        )
+
+
+async def test_enqueue_failure_is_recorded_rather_than_lost(isolated_db):
+    """A template edit is already committed when enqueueing runs. If that
+    fails, re-saving would diff against the new state and see no change, so
+    the schedule would never catch up and nothing would say so."""
+    reconcile = importlib.import_module("yt_scheduler.services.smart_queue_reconcile")
+    await _make_queue(isolated_db, 7)
+
+    await reconcile.record_enqueue_failure(7, "database is locked")
+
+    summary = await reconcile.status_summary()
+    assert summary["failed"], "a lost reconciliation must be visible"
+    assert "database is locked" in summary["failed"][0]["error"]
+    # Not a unit of work, so it must not hold the queue hostage.
+    assert await reconcile.queue_is_locked(7) is False

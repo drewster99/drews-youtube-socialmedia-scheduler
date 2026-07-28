@@ -111,11 +111,20 @@ async def _reconciling(name: str, project_id: int):
     after_template = await tmpl.get_template(name, project_id=project_id)
     if after_template is None:
         return
-    result = await reconcile.enqueue_for_template(
-        int(after_template["id"]),
-        before,
-        reconcile.snapshot_template(after_template),
-    )
+    try:
+        result = await reconcile.enqueue_for_template(
+            int(after_template["id"]),
+            before,
+            reconcile.snapshot_template(after_template),
+        )
+    except Exception as exc:
+        # The edit is already committed, so failing the request would report a
+        # save that actually happened as a failure — and re-saving would diff
+        # against the NEW state and miss the change permanently. Surface it as
+        # a failed job instead, which puts it in the app-wide banner.
+        logger.exception("Could not queue reconciliation for template %r", name)
+        await reconcile.record_enqueue_failure(int(after_template["id"]), str(exc))
+        return
     if result["jobs"]:
         logger.info("template %r change queued %s reconcile job(s) across %s queue(s)",
                     name, result["jobs"], result["queues"])

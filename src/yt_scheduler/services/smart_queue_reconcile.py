@@ -37,6 +37,9 @@ KIND_SLOTS_ADDED = "slots_added"
 KIND_SLOTS_REMOVED = "slots_removed"
 KIND_SLOT_BODY_CHANGED = "slot_body_changed"
 KIND_APPLIES_TO_REMOVED = "applies_to_removed"
+# Not a unit of work — only ever recorded already-failed, so a template edit
+# that could not be queued is visible rather than silently unreconciled.
+KIND_ENQUEUE_FAILED = "enqueue_failed"
 
 STATUS_PENDING = "pending"
 STATUS_RUNNING = "running"
@@ -50,6 +53,7 @@ KIND_LABELS = {
     KIND_SLOTS_REMOVED: "Removing posts for deleted slots",
     KIND_SLOT_BODY_CHANGED: "Re-rendering posts for edited slots",
     KIND_APPLIES_TO_REMOVED: "Removing posts for videos no longer included",
+    KIND_ENQUEUE_FAILED: "Template change could not be scheduled",
 }
 
 # One worker, process-wide. Serialises every queue's reconciliation against
@@ -164,6 +168,32 @@ async def enqueue_for_template(template_id: int, before: TemplateSnapshot,
     return {"queues": len(rows), "jobs": total}
 
 
+async def record_enqueue_failure(template_id: int, error: str) -> None:
+    """Record that a template edit could not be turned into reconcile jobs.
+
+    The edit is committed by this point, so the alternative is a schedule that
+    silently never catches up — re-saving would diff against the new state and
+    see no change. A failed row puts it in the banner where it can be seen and
+    the edit re-applied deliberately.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id FROM smart_queues WHERE template_id = ?", (template_id,)
+    )
+    if not rows:
+        return
+    async with write_transaction() as write_db:
+        for row in rows:
+            await write_db.execute(
+                "INSERT INTO smart_queue_reconcile_jobs "
+                "(queue_id, kind, payload, status, last_error, finished_at) "
+                "VALUES (?,?,?,?,?,datetime('now'))",
+                (int(row["id"]), KIND_ENQUEUE_FAILED, "{}", STATUS_FAILED,
+                 f"Template change was saved but could not be scheduled for "
+                 f"reconciliation: {error}. Re-apply the template edit."),
+            )
+
+
 async def queue_is_locked(queue_id: int) -> bool:
     """True while this queue has reconciliation outstanding.
 
@@ -174,7 +204,7 @@ async def queue_is_locked(queue_id: int) -> bool:
     rows = await db.execute_fetchall(
         "SELECT 1 FROM smart_queue_reconcile_jobs "
         "WHERE queue_id = ? AND status IN (?,?) LIMIT 1",
-        (queue_id, STATUS_PENDING, STATUS_RUNNING),
+        (queue_id, *_UNFINISHED),
     )
     return bool(rows)
 
@@ -196,7 +226,7 @@ async def status_summary() -> dict:
             OR (j.status = ? AND j.finished_at > datetime('now','-1 day'))
          ORDER BY j.id
         """,
-        (STATUS_PENDING, STATUS_RUNNING, STATUS_FAILED),
+        (*_UNFINISHED, STATUS_FAILED),
     )
     active, failed = [], []
     for row in rows:
