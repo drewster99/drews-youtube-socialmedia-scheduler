@@ -342,10 +342,11 @@ async def generate_posts(
             for name in url_refs_in_body & ctx.get("empty_url_keys", set()):
                 empty_url_refs.add(name)
 
-            if platform == "threads" and _VIDEO_DIRECTIVE_RE.search(body):
+            if not social.platform_accepts_attached_media(platform) and \
+                    _VIDEO_DIRECTIVE_RE.search(body):
                 warnings.append(
-                    "Threads slot skipped — {{video}} attachments aren't supported "
-                    "on Threads yet (its API posts text only)."
+                    f"{platform} slot skipped — {{{{video}}}} attachments aren't "
+                    f"supported on {platform} (its API posts text only)."
                 )
                 continue
 
@@ -455,10 +456,10 @@ async def generate_posts(
                 if fallback:
                     media_paths = [fallback]
 
-            if platform == "threads" and media_paths:
+            if media_paths and not social.platform_accepts_attached_media(platform):
                 warnings.append(
-                    "Threads slot will post text-only — Threads can't attach media yet, "
-                    "so its image/video attachment was dropped."
+                    f"{platform} slot will post text-only — {platform} can't attach "
+                    "media, so its image/video attachment was dropped."
                 )
                 media_paths = []
 

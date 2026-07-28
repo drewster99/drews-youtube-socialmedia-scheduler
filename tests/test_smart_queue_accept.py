@@ -151,19 +151,48 @@ async def test_slot_over_the_platform_duration_cap_is_skipped_not_failed(
     assert items[0]["state"] == "skipped"
 
 
-async def test_platform_that_cannot_take_media_is_skipped_with_the_reason(
+async def test_hosted_media_platform_is_skipped_when_hosting_is_unconfigured(
     accept_env, monkeypatch
 ):
+    """Threads can carry video now, but only through media hosting. Without it
+    the slot must be skipped up front rather than failing at its posting time
+    every day."""
     accept, _queue_service, db, queue_id, _scheduled = accept_env
     await db.execute(
         "UPDATE template_slots SET platform = 'threads' WHERE platform = 'bluesky'"
     )
     await db.commit()
 
+    async def _unconfigured():
+        return False
+
+    monkeypatch.setattr(accept.media_hosting, "is_configured", _unconfigured)
+
     result = await accept.accept_selection(queue_id, ["v1"])
 
     assert result["scheduled"] == 0
-    assert "public URL" in result["skipped"][0]["reason"]
+    assert "media hosting isn't configured" in result["skipped"][0]["reason"]
+
+
+async def test_hosted_media_platform_is_scheduled_once_hosting_is_configured(
+    accept_env, monkeypatch
+):
+    """The mirror image: with hosting set up, a Threads slot is a normal slot."""
+    accept, _queue_service, db, queue_id, _scheduled = accept_env
+    await db.execute(
+        "UPDATE template_slots SET platform = 'threads' WHERE platform = 'bluesky'"
+    )
+    await db.commit()
+
+    async def _configured():
+        return True
+
+    monkeypatch.setattr(accept.media_hosting, "is_configured", _configured)
+
+    result = await accept.accept_selection(queue_id, ["v1"])
+
+    assert result["scheduled"] == 1
+    assert result["skipped"] == []
 
 
 async def test_disabled_slots_produce_no_row_at_all(accept_env):

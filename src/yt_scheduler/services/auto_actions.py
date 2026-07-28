@@ -42,6 +42,7 @@ from yt_scheduler.services import (
     ai,
     events,
     project_settings,
+    social,
     templates as tmpl,
     tiers,
     transcripts as transcript_service,
@@ -560,12 +561,14 @@ async def _maybe_generate_socials(
             # a dropped section never attaches media — same order as the
             # manual generate route.
             body = tmpl.resolve_sections(body, slot_vars)
-            # Threads can't attach media (text-only API) — skip a {{video}}
-            # slot rather than auto-post it without the video. Checked after
-            # section resolution so a {{video}} inside a dropped section
-            # doesn't skip a slot that would render text-only anyway.
-            if platform == "threads" and video_directive_re.search(body):
-                logger.info("auto-social: skipping Threads slot for %s — uses {{video}}", video_id)
+            # A platform whose API takes no attachment at all — skip a
+            # {{video}} slot rather than auto-post it without the video.
+            # Checked after section resolution so a {{video}} inside a dropped
+            # section doesn't skip a slot that would render text-only anyway.
+            if not social.platform_accepts_attached_media(platform) and \
+                    video_directive_re.search(body):
+                logger.info("auto-social: skipping %s slot for %s — uses {{video}}",
+                            platform, video_id)
                 continue
             cleaned, media_paths, _alts = tmpl.extract_media_directives(
                 body,
@@ -585,10 +588,12 @@ async def _maybe_generate_socials(
             if fallback:
                 media_paths = [fallback]
 
-        # Threads can't attach media — drop it (the {{video}} case was already
-        # skipped above; this catches {{thumbnail}}/{{image:...}}/fallbacks).
-        if platform == "threads" and media_paths:
-            logger.info("auto-social: Threads slot for %s — dropping media (Threads is text-only)", video_id)
+        # Platform takes no attachment — drop it (the {{video}} case was
+        # already skipped above; this catches {{thumbnail}}/{{image:...}}/
+        # fallbacks).
+        if media_paths and not social.platform_accepts_attached_media(platform):
+            logger.info("auto-social: %s slot for %s — dropping media (no attachment support)",
+                        platform, video_id)
             media_paths = []
 
         media_paths_json = json.dumps(media_paths) if media_paths else None

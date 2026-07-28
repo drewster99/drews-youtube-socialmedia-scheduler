@@ -187,20 +187,24 @@ async def test_non_video_attachments_skip_preparation(upload_dir, monkeypatch):
     assert probed == [], "images are not video and must not be probed"
 
 
-async def test_threads_skips_preparation_entirely(managed_video, monkeypatch):
-    """Threads fetches media from a public URL we don't have, so its poster
-    rejects attachments. Preparing first would burn a transcode on a post
-    that cannot succeed."""
+async def test_threads_prepares_media_like_every_other_platform(managed_video,
+                                                                monkeypatch):
+    """Threads now carries media, via hosting rather than an upload, so its
+    attachments go through the same probe/transcode gate as everyone else."""
     probed = []
-    monkeypatch.setattr(
-        media, "probe_video_file", lambda p: probed.append(p)
-    )
+
+    def _probe(path):
+        probed.append(path)
+        return None  # unprobeable -> prepared_media raises before any network
+
+    monkeypatch.setattr(media, "probe_video_file", _probe)
     poster = social.ThreadsPoster(bundle={})
 
-    assert poster.accepts_media is False
+    assert poster.accepts_media is True
+    assert poster.requires_hosted_media is True
     with pytest.raises(social.MediaUploadError):
         await poster.post("hi", media_paths=[str(managed_video)])
-    assert probed == []
+    assert probed == [str(managed_video)], "Threads media must be probed now"
 
 
 def _async(value):

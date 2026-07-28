@@ -31,6 +31,32 @@ A local web app for managing YouTube video publishing across multiple projects, 
 3. **APIs & Services → Credentials → Create OAuth 2.0 Client ID** → Application type **Desktop app**.
 4. Download the JSON; that's your `client_secret.json`.
 
+### Cloudflare R2 setup (optional — only for posting media to Threads)
+
+Threads doesn't accept a media upload. Its API fetches images and video from a
+URL Meta cURLs itself, and this app serves on `127.0.0.1`, so a clip has to be
+briefly reachable over HTTPS. Skip this unless you post media to Threads.
+
+1. **R2 → Create bucket.** Leave public access **off** — no `r2.dev` subdomain,
+   no custom domain. Signed URLs need neither, and those switches are what would
+   make the bucket world-readable.
+2. **R2 → API Tokens → Create**, permission **Object Read & Write**, scoped to
+   that bucket. Not Admin: Admin can create and delete buckets, which this never
+   needs. Copy the **Access Key ID** and **Secret Access Key** — the secret is
+   shown once. (The *Cloudflare API token* on the same screen is a different
+   thing and won't work here.)
+3. **Account ID** is the subdomain of the endpoint shown:
+   `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`.
+4. **Set a lifecycle rule** on the bucket to delete objects after N days. This
+   is **required, not optional** — it is the only thing that removes uploaded
+   media. The app never deletes: with Object Lock's minimum retention an early
+   delete is impossible, so access ends when the signed URL expires (2 hours)
+   and the lifecycle rule reclaims the bytes later.
+
+Enter all four under **Settings → Media hosting**, then use **Test connection**
+— it does a real upload and read-back, so a wrong account ID or an under-scoped
+token fails there instead of opaquely at send time.
+
 ### Install (Python / web UI)
 
 ```bash

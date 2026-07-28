@@ -120,34 +120,26 @@ before clicking Generate.
 - Defer until the feature has been used enough to know whether users care.
   If they don't notice spend, this is wasted scope.
 
-## Public media hosting (unblocks native video on Threads)
+## ~~Public media hosting~~ — shipped
 
-Threads is the one connected platform we cannot attach a video to. Not a
-platform limitation: its API *does* take video, but only as a `video_url`
-that Meta fetches itself — "we will cURL your video using the URL provided
-so it must be on a public server". This app serves on `127.0.0.1`, so
-there is no URL to hand it, and `ThreadsPoster.accepts_media` is `False`.
+Threads takes images and video as an `image_url` / `video_url` Meta fetches
+itself, and this app serves on `127.0.0.1`. Now handled by
+`services/media_hosting.py`: the file goes to a private Cloudflare R2 bucket and
+Meta gets a presigned GET URL valid two hours. `services/sigv4.py` does the
+signing over stdlib `hmac`/`hashlib` — no new dependency.
 
-Every other platform takes a direct binary upload, so this affects Threads
-alone today.
+`ThreadsPoster.accepts_media` is `True`, with `requires_hosted_media` marking
+the dependency so `smart_queue_accept` can skip a Threads slot with a useful
+reason when hosting isn't set up. Credentials live under
+Settings → Media hosting.
 
-**Acceptance:**
+No cleanup code: the bucket enforces Object Lock with a 24-hour minimum
+retention, so early deletion is impossible. The bucket's 7-day lifecycle rule
+removes objects, and signed-URL expiry — not deletion — is what ends access.
 
-- A way to publish one media file at a short-lived public URL — Cloudflare
-  (we already host the Threads OAuth bounce page there, see `cloudflare/`)
-  or Firebase Storage or similar.
-- The URL must expire or be revoked after the post is created; a clip
-  should not stay world-readable indefinitely because it was posted once.
-- `ThreadsPoster` flips to `accepts_media = True` and uploads via the
-  container flow (create with `video_url` → poll status → publish).
-
-**Notes:**
-
-- Interacts with the smart queue: a Threads slot in a queue template
-  currently records a `skipped` row for every video item.
-- Whatever hosts the file must receive the *transcoded* output, not the
-  master — see `PLATFORM_MEDIA_LIMITS["threads"]` (1 GB, 5 min, 1920
-  horizontal max).
+Still open: **carousels**. Threads needs a `CAROUSEL` container for more than
+one attachment; the poster refuses multi-media posts rather than silently
+dropping the extras.
 
 ## Source-file backup cleanup
 

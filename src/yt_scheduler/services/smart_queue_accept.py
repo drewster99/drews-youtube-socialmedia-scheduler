@@ -20,6 +20,7 @@ from datetime import datetime
 
 from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.services._keyed_locks import KeyedLocks
+from yt_scheduler.services import media_hosting
 from yt_scheduler.services import smart_queue as queue_service
 from yt_scheduler.services import social, templates as tmpl
 from yt_scheduler.services.render_context import (
@@ -59,7 +60,8 @@ class SlotVerdict:
     reason: str | None = None
 
 
-def slots_accepting(video: dict, slots: list[dict]) -> list[SlotVerdict]:
+def slots_accepting(video: dict, slots: list[dict], *,
+                    media_hosting_configured: bool = True) -> list[SlotVerdict]:
     """Decide, per slot, whether this video can be posted there.
 
     Checked against the platform's published envelope *before* anything is
@@ -85,6 +87,17 @@ def slots_accepting(video: dict, slots: list[dict]) -> list[SlotVerdict]:
                 slot, False,
                 f"{platform} can't take an attached video "
                 "(its API fetches media from a public URL)",
+            ))
+            continue
+
+        # The platform can carry the video, but only via hosting we haven't
+        # been given. Caught here so it reads as "not attempted, here's why"
+        # rather than failing at the scheduled minute every day.
+        if social.platform_requires_hosted_media(platform) and not media_hosting_configured:
+            verdicts.append(SlotVerdict(
+                slot, False,
+                f"{platform} fetches media from a URL and media hosting isn't "
+                "configured — set it up under Settings → Media hosting",
             ))
             continue
 
@@ -126,7 +139,8 @@ class VideoPlan:
 
 
 async def _plan_video(
-    db, video: dict, slots: list[dict], *, default_ai_system: str | None
+    db, video: dict, slots: list[dict], *, default_ai_system: str | None,
+    media_hosting_configured: bool = True,
 ) -> VideoPlan:
     """Render every slot for one video and classify each outcome.
 
@@ -139,7 +153,9 @@ async def _plan_video(
     """
     posts: list[tuple[dict, str, list[str]]] = []
     skipped_slots: list[SlotVerdict] = []
-    for verdict in slots_accepting(video, slots):
+    for verdict in slots_accepting(
+        video, slots, media_hosting_configured=media_hosting_configured
+    ):
         if not verdict.accepted:
             skipped_slots.append(verdict)
             continue
@@ -282,12 +298,17 @@ async def accept_selection(
 
         created_items: list[dict] = []
 
+        # Read once for the whole batch: it is install-wide config, and every
+        # slot of every video would otherwise re-answer the same question.
+        media_hosting_configured = await media_hosting.is_configured()
+
         for item_id, video in batch:
             video_id = video["id"]
 
             # Everything that touches the network happens here, before any lock.
             plan = await _plan_video(
-                db, video, slots, default_ai_system=default_ai_system
+                db, video, slots, default_ai_system=default_ai_system,
+                media_hosting_configured=media_hosting_configured,
             )
             if plan.transient_error is not None:
                 errors.append({"video_id": video_id, "error": plan.transient_error})

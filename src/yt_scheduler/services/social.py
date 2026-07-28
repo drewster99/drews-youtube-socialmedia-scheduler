@@ -468,6 +468,12 @@ class SocialPoster:
     # a file the poster is about to refuse.
     accepts_media: bool = True
 
+    # True when the platform fetches attachments from a URL instead of taking
+    # an upload, so posting media needs configured media hosting. Distinct from
+    # ``accepts_media``: that is a permanent property of the platform's API,
+    # this is a dependency we can satisfy or fail to.
+    requires_hosted_media: bool = False
+
     def __init__(self, bundle: dict | None = None) -> None:
         self._bundle: dict | None = bundle
 
@@ -1830,12 +1836,19 @@ class LinkedInPoster(SocialPoster):
 
 
 class ThreadsPoster(SocialPoster):
-    # Threads fetches media from a public URL rather than accepting an upload;
-    # nothing this app serves is publicly reachable. See ROADMAP.
-    accepts_media = False
+    # Threads fetches media from a URL rather than accepting an upload, for
+    # images and video alike. media_hosting puts the file in a private R2
+    # bucket and hands Meta a short-lived signed URL.
+    accepts_media = True
+    requires_hosted_media = True
 
     platform = "threads"
     required_keys = ["access_token", "user_id"]
+
+    # Threads' image ceiling. PLATFORM_MEDIA_LIMITS covers video only (and
+    # prepared_media probes only video), so an oversized image would otherwise
+    # upload fine and be rejected by Meta with no useful explanation.
+    MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
     async def _post_prepared(
         self,
@@ -1845,22 +1858,21 @@ class ThreadsPoster(SocialPoster):
         media_paths: list[str] | None = None,
         alt_texts: list[str] | None = None,
     ) -> dict:
-        # We can't attach media to Threads. Not a platform limitation — the
-        # Threads API does take video, but only as a `video_url` it fetches
-        # itself ("we will cURL your video ... it must be on a public
-        # server"). This app serves on 127.0.0.1 with no public hosting, so
-        # there is no URL to hand Meta. See ROADMAP "Public media hosting".
-        # Generation drops a Threads slot's media (and warns there), so a
-        # freshly generated post never reaches this. A post created by older
-        # code may still carry media_paths — refuse to post it silently
-        # text-only; surface it so the user removes the attachment and retries.
         text = (text or "").strip()
         creds = await self._get_creds()
-        if self._resolve_media_inputs(media_path, media_paths, alt_texts)[0]:
+        paths, _alts = self._resolve_media_inputs(media_path, media_paths, alt_texts)
+
+        # Threads takes one media object per post; more than one needs a
+        # CAROUSEL container, which we don't build. Dropping the extras
+        # silently would publish something the user didn't compose.
+        if len(paths) > 1:
             raise MediaUploadError(
-                "Threads can't attach media — its API is text-only. Remove the "
-                "attachment from this post to send it as text, then retry."
+                f"Threads takes one attachment per post, but this one has "
+                f"{len(paths)}. Carousels aren't supported yet — remove the "
+                "extras and retry. Nothing was posted."
             )
+
+        container_params = await self._media_container_params(paths)
 
         try:
             import httpx
@@ -1871,7 +1883,11 @@ class ThreadsPoster(SocialPoster):
             async with httpx.AsyncClient() as client:
                 create_resp = await client.post(
                     f"https://graph.threads.net/v1.0/{user_id}/threads",
-                    params={"media_type": "TEXT", "text": text, "access_token": access_token},
+                    params={
+                        **container_params,
+                        "text": text,
+                        "access_token": access_token,
+                    },
                 )
                 if create_resp.status_code == 401:
                     raise CredentialAuthError(
@@ -1890,6 +1906,11 @@ class ThreadsPoster(SocialPoster):
                 # poll the container's status until it reports FINISHED.
                 await self._await_container_finished(
                     client, container_id, access_token, creds.get("uuid"),
+                    attempts=(
+                        self._TEXT_CONTAINER_POLL_ATTEMPTS
+                        if container_params["media_type"] == "TEXT"
+                        else self._MEDIA_CONTAINER_POLL_ATTEMPTS
+                    ),
                 )
 
                 publish_resp = await client.post(
@@ -1914,7 +1935,63 @@ class ThreadsPoster(SocialPoster):
         except Exception as e:
             raise RuntimeError(f"Threads post failed: {_exception_detail(e)}") from e
 
-    _CONTAINER_POLL_ATTEMPTS = 10
+    async def _media_container_params(self, paths: list[str]) -> dict[str, str]:
+        """Build the container's media fields, hosting the attachment if any.
+
+        Returns the ``TEXT`` container unchanged when there is no attachment,
+        so a text-only Threads post takes exactly the path it always has.
+        """
+        from yt_scheduler.services import media_hosting
+
+        if not paths:
+            return {"media_type": "TEXT"}
+
+        path = Path(paths[0])
+        mime = mimetypes.guess_type(path.name)[0] or ""
+        if mime.startswith("video/"):
+            media_type, url_field = "VIDEO", "video_url"
+        elif mime.startswith("image/"):
+            media_type, url_field = "IMAGE", "image_url"
+            size = path.stat().st_size
+            if size > self.MAX_IMAGE_BYTES:
+                raise MediaUploadError(
+                    f"Can't post to threads: {path.name} is "
+                    f"{size / 1e6:.1f} MB, over Threads' "
+                    f"{self.MAX_IMAGE_BYTES / 1e6:.0f} MB image limit. "
+                    "Nothing was posted."
+                )
+        else:
+            raise MediaUploadError(
+                f"Can't post to threads: {path.name} is neither image nor video "
+                f"(detected {mime or 'unknown type'}). Nothing was posted."
+            )
+
+        try:
+            hosted = await media_hosting.host_file(path)
+        except media_hosting.MediaHostingNotConfigured as exc:
+            # Never quietly degrade to a text-only post: the user composed an
+            # attachment and would have no way to tell it had been dropped.
+            raise MediaUploadError(
+                f"Can't post media to Threads — {exc} Threads fetches media "
+                "from a URL rather than accepting an upload, so hosting is "
+                "required. Nothing was posted."
+            ) from exc
+        except media_hosting.MediaHostingError as exc:
+            raise MediaUploadError(
+                f"Can't post to threads: hosting {path.name} failed — {exc} "
+                "Nothing was posted."
+            ) from exc
+
+        return {"media_type": media_type, url_field: hosted.url}
+
+    _TEXT_CONTAINER_POLL_ATTEMPTS = 10
+
+    # Meta: "wait on average 30 seconds before publishing a Threads media
+    # container to give our server enough time to fully process the upload."
+    # Meta downloads the file from our signed URL during this window, so the
+    # budget has to cover their fetch as well as their transcode.
+    _MEDIA_CONTAINER_POLL_ATTEMPTS = 150
+
     _CONTAINER_POLL_DELAY_SECONDS = 1.0
 
     async def _await_container_finished(
@@ -1923,6 +2000,8 @@ class ThreadsPoster(SocialPoster):
         container_id: str,
         access_token: str,
         cred_uuid: str | None,
+        *,
+        attempts: int | None = None,
     ) -> None:
         """Poll a Threads media container until its status is ``FINISHED``.
 
@@ -1932,8 +2011,9 @@ class ThreadsPoster(SocialPoster):
         poll; the loop exists to absorb the brief server-side processing gap
         that otherwise makes ``threads_publish`` return a 400.
         """
+        budget = attempts if attempts is not None else self._TEXT_CONTAINER_POLL_ATTEMPTS
         last_status = "UNKNOWN"
-        for attempt in range(self._CONTAINER_POLL_ATTEMPTS):
+        for attempt in range(budget):
             status_resp = await client.get(
                 f"https://graph.threads.net/v1.0/{container_id}",
                 params={"fields": "status,error_message", "access_token": access_token},
@@ -1964,11 +2044,11 @@ class ThreadsPoster(SocialPoster):
                     f"Threads container {last_status}: "
                     f"{data.get('error_message') or 'no detail from Threads'}"
                 )
-            if attempt < self._CONTAINER_POLL_ATTEMPTS - 1:
+            if attempt < budget - 1:
                 await asyncio.sleep(self._CONTAINER_POLL_DELAY_SECONDS)
         raise RuntimeError(
             f"Threads container not ready to publish (last status={last_status}) "
-            f"after {self._CONTAINER_POLL_ATTEMPTS} checks."
+            f"after {budget} checks."
         )
 
 
@@ -1996,6 +2076,19 @@ def platform_accepts_attached_media(platform: str) -> bool:
     if poster_class is None:
         raise ValueError(f"Unknown platform: {platform}. Available: {ALL_PLATFORMS}")
     return poster_class.accepts_media
+
+
+def platform_requires_hosted_media(platform: str) -> bool:
+    """Whether attaching media on this platform depends on configured hosting.
+
+    True for platforms that fetch from a URL rather than accepting an upload.
+    Lets callers report "hosting isn't set up" up front instead of discovering
+    it at send time.
+    """
+    poster_class = _POSTERS.get(platform)
+    if poster_class is None:
+        raise ValueError(f"Unknown platform: {platform}. Available: {ALL_PLATFORMS}")
+    return poster_class.requires_hosted_media
 
 # Per-platform video envelopes. Same shape of idea as
 # DEFAULT_MAX_CHARS_BY_PLATFORM in services/templates.py, which already
