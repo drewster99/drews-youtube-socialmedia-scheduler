@@ -734,10 +734,15 @@ async function loadUpcoming() {
                     {weekday:'short', month:'numeric', day:'numeric',
                      hour:'numeric', minute:'2-digit'})
                 : 'not scheduled yet';
+            // Linked, because this list was the only place a scheduled item
+            // was visible and there was no route from it to the post text the
+            // queue had actually written.
+            const href = `/projects/${encodeURIComponent(projectSlug)}`
+                + `/videos/${encodeURIComponent(item.video_id)}`;
             return `<div style="display:flex; gap:0.75rem; padding:0.2rem 0;">
                 <span style="min-width:11rem; color: var(--text-dim);">${escapeHtml(when)}</span>
                 <span style="min-width:5rem;">${escapeHtml(item.item_type || '')}</span>
-                <span>${escapeHtml(item.title || item.video_id)}</span>
+                <a href="${href}">${escapeHtml(item.title || item.video_id)}</a>
             </div>`;
         }).join('');
     } catch (err) {
