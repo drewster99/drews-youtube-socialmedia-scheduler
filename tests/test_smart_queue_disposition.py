@@ -49,7 +49,7 @@ async def disposition_env(isolated_db, monkeypatch):
     await db.execute(
         "INSERT INTO videos (id, project_id, title, item_type, duration_seconds, "
         "privacy_status, width, height) "
-        "VALUES ('v1', 1, 'A clip', 'hook', 60, 'public', 1080, 1920)"
+        "VALUES ('vid00000001', 1, 'A clip', 'hook', 60, 'public', 1080, 1920)"
     )
     await db.commit()
     queue_id = await queue_service.create_queue(
@@ -64,14 +64,14 @@ async def _make_missed(db, queue_id, *, hours_ago=5.0, status="approved"):
     when = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
     cursor = await db.execute(
         "INSERT INTO smart_queue_items (queue_id, video_id, position, "
-        "scheduled_at, state) VALUES (?, 'v1', 0, ?, 'scheduled')",
+        "scheduled_at, state) VALUES (?, 'vid00000001', 0, ?, 'scheduled')",
         (queue_id, when),
     )
     item_id = int(cursor.lastrowid)
     cursor = await db.execute(
         "INSERT INTO social_posts (video_id, platform, content, status, "
         "scheduled_at, smart_queue_item_id) "
-        "VALUES ('v1', 'bluesky', 'hi', ?, ?, ?)",
+        "VALUES ('vid00000001', 'bluesky', 'hi', ?, ?, ?)",
         (status, when, item_id),
     )
     post_id = int(cursor.lastrowid)
@@ -184,7 +184,7 @@ async def test_remove_makes_the_video_eligible_again(disposition_env):
 
     queue = await queue_service.get_queue(queue_id)
     candidates = await queue_service.candidate_videos(queue)
-    assert [v["id"] for v in candidates["eligible"]] == ["v1"]
+    assert [v["id"] for v in candidates["eligible"]] == ["vid00000001"]
 
 
 async def test_unknown_action_is_rejected(disposition_env):

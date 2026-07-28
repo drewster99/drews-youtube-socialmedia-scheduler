@@ -324,14 +324,19 @@ async def publish_video_job(video_id: str) -> dict:
                 )
             results["published"] = True
             results["youtube_skipped"] = True
-            # Deliberately NOT calling on_video_became_live here. This branch
-            # never sets privacy_status — the item has no YouTube presence — so
-            # it stays 'unlisted', is_eligible reads that as "not live", and the
-            # funnel would record a permanent "no" for a video that is as live
-            # as it will ever get, so it could never be auto-added afterwards.
-            # Auto-add for non-YouTube items needs a decision about what "live"
-            # means for them; until then, leaving the marker unset keeps the
-            # question open rather than answering it wrongly and for good.
+            # Non-YouTube items reach their public state here, so this is where
+            # the auto-add funnel belongs for them. It used to be skipped: the
+            # branch never sets privacy_status (there is no YouTube presence),
+            # is_eligible read that as "not live", and the funnel would have
+            # recorded a permanent "no" for an item that was as live as it
+            # would ever get. is_eligible now asks status for items with no
+            # YouTube behind them, so the question has an answer and running
+            # the funnel here is correct rather than destructive.
+            from yt_scheduler.services.smart_queue_live import (
+                on_video_became_live,
+            )
+
+            await on_video_became_live(video_id)
 
             await events.record_event(
                 video_id,

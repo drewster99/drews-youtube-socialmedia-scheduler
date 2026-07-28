@@ -313,6 +313,22 @@ or **Remove from queue**.
 No governor, no sweeper, no new spacing machinery, no automatic retry.
 Recovery is manual and user-initiated.
 
+### What "live" means depends on what backs the item
+
+A YouTube-backed row (its id *is* the 11-character YouTube video id) is live
+when `privacy_status = 'public'`. Status is not the authority there — it drifts
+off `published` whenever privacy is flipped from the metadata dropdown.
+
+An item created outside YouTube has no YouTube presence, so `privacy_status` is
+written once at creation and never updated. Reading it called such an item
+permanently not-live, which is why the publish path could not run the auto-add
+funnel for them at all. For these, `status = 'published'` *is* live, and the
+non-YouTube publish branch now runs the funnel.
+
+`applies_to` also gained `standalone`, without which no template could cover a
+standalone item and so it could never enter a queue. It is off by default:
+adding it to the default would silently widen every existing template.
+
 ### Posting outcome is derived too
 
 `smart_queue_items.state` only ever holds `queued`, `scheduled` or `removed`.
@@ -325,8 +341,14 @@ from reading the column instead:
   already gone out, handing it a fresh occurrence and pushing every remaining
   video back one slot — visible as "re-flow skipped today".
 
-Both now ask the posts. A partially-sent item is treated as sent: part of it
-is already public, so moving the rest is a split, not a re-flow.
+* candidate selection blocked every posted video unconditionally, so
+  unchecking *exclude already posted* — the whole recycling mechanism — could
+  never do anything.
+
+All of them now ask the posts. A partially-sent item is treated as sent: part
+of it is already public, so moving the rest is a split, not a re-flow.
+`state = 'posted'` is still honoured alongside the posts, since the schema
+declares it even though nothing writes it.
 
 "Missed" is a **derived** state — `scheduled_at` in the past and not
 posted — computed when the screen loads. No background job, no stored

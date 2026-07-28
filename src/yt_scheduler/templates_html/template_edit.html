@@ -24,6 +24,9 @@
             <label class="chip"><input type="checkbox" name="applies_to" value="short" checked> Short</label>
             <label class="chip"><input type="checkbox" name="applies_to" value="segment" checked> Segment</label>
             <label class="chip"><input type="checkbox" name="applies_to" value="video" checked> Video</label>
+            <!-- Unchecked by default: adding it to the default would silently
+                 widen every existing template to cover standalone items. -->
+            <label class="chip"><input type="checkbox" name="applies_to" value="standalone"> Standalone</label>
         </div>
         <small class="form-hint">This template only suggests for videos in the selected tiers. At least one must be checked.</small>
     </div>

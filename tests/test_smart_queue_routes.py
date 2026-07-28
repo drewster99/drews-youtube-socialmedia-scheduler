@@ -126,7 +126,7 @@ async def test_candidates_preview_writes_nothing(client):
     await db.execute(
         "INSERT INTO videos (id, project_id, title, item_type, duration_seconds, "
         "privacy_status, width, height) "
-        "VALUES ('v1', 1, 'A clip', 'hook', 60, 'public', 1080, 1920)"
+        "VALUES ('vid00000001', 1, 'A clip', 'hook', 60, 'public', 1080, 1920)"
     )
     await db.commit()
     created = await http.post(
@@ -139,7 +139,7 @@ async def test_candidates_preview_writes_nothing(client):
     )
     assert response.status_code == 200
     body = response.json()
-    assert [v["id"] for v in body["eligible"]] == ["v1"]
+    assert [v["id"] for v in body["eligible"]] == ["vid00000001"]
     assert body["summary"] == {"total": 1, "by_type": {"hook": 1}}
     assert len(body["forecast"]) == 1
     assert body["ends_at"] is not None
@@ -154,7 +154,7 @@ async def test_candidate_overrides_do_not_persist(client):
     await db.execute(
         "INSERT INTO videos (id, project_id, title, item_type, duration_seconds, "
         "privacy_status, width, height) "
-        "VALUES ('wide', 1, 'Landscape', 'hook', 60, 'public', 1920, 1080)"
+        "VALUES ('wide0000000', 1, 'Landscape', 'hook', 60, 'public', 1920, 1080)"
     )
     await db.commit()
     created = await http.post(
@@ -207,7 +207,7 @@ async def test_forecast_starts_after_the_existing_schedule(client):
     from datetime import datetime, timedelta, timezone
 
     http, db, template_id = client
-    for video_id, title in (("v1", "Booked clip"), ("v2", "Next clip")):
+    for video_id, title in (("vid00000001", "Booked clip"), ("vid00000002", "Next clip")):
         await db.execute(
             "INSERT INTO videos (id, project_id, title, item_type, "
             "duration_seconds, privacy_status, width, height) "
@@ -223,7 +223,7 @@ async def test_forecast_starts_after_the_existing_schedule(client):
     booked = datetime.now(timezone.utc) + timedelta(weeks=5)
     await db.execute(
         "INSERT INTO smart_queue_items (queue_id, video_id, position, "
-        "scheduled_at, state) VALUES (?, 'v1', 0, ?, 'scheduled')",
+        "scheduled_at, state) VALUES (?, 'vid00000001', 0, ?, 'scheduled')",
         (queue_id, booked.isoformat()),
     )
     await db.commit()
@@ -232,7 +232,7 @@ async def test_forecast_starts_after_the_existing_schedule(client):
         f"/api/projects/default/smart-queues/{queue_id}/candidates", json={}
     )).json()
 
-    assert [v["id"] for v in body["eligible"]] == ["v2"]
+    assert [v["id"] for v in body["eligible"]] == ["vid00000002"]
     assert body["forecast"], "a queue with posting times must forecast candidates"
     assert datetime.fromisoformat(body["forecast"][0]) > booked, (
         f"forecast {body['forecast'][0]} lands before the already-booked "
@@ -253,7 +253,7 @@ async def test_accept_with_no_ids_schedules_the_waiting_items(client):
     await db.execute(
         "INSERT INTO videos (id, project_id, title, item_type, duration_seconds, "
         "privacy_status, width, height) "
-        "VALUES ('v1', 1, 'Auto-added', 'hook', 60, 'public', 1080, 1920)"
+        "VALUES ('vid00000001', 1, 'Auto-added', 'hook', 60, 'public', 1080, 1920)"
     )
     await db.commit()
     created = await http.post(
@@ -262,7 +262,7 @@ async def test_accept_with_no_ids_schedules_the_waiting_items(client):
     queue_id = created.json()["id"]
     await db.execute(
         "INSERT INTO smart_queue_items (queue_id, video_id, position, state) "
-        "VALUES (?, 'v1', 0, 'queued')",
+        "VALUES (?, 'vid00000001', 0, 'queued')",
         (queue_id,),
     )
     await db.commit()
@@ -287,7 +287,7 @@ async def test_candidates_reports_the_waiting_count(client):
     await db.execute(
         "INSERT INTO videos (id, project_id, title, item_type, duration_seconds, "
         "privacy_status, width, height) "
-        "VALUES ('v1', 1, 'Auto-added', 'hook', 60, 'public', 1080, 1920)"
+        "VALUES ('vid00000001', 1, 'Auto-added', 'hook', 60, 'public', 1080, 1920)"
     )
     await db.commit()
     created = await http.post(
@@ -296,7 +296,7 @@ async def test_candidates_reports_the_waiting_count(client):
     queue_id = created.json()["id"]
     await db.execute(
         "INSERT INTO smart_queue_items (queue_id, video_id, position, state) "
-        "VALUES (?, 'v1', 0, 'queued')",
+        "VALUES (?, 'vid00000001', 0, 'queued')",
         (queue_id,),
     )
     await db.commit()
@@ -316,7 +316,7 @@ async def test_counts_report_posting_from_the_posts_not_the_item_state(client):
     above a Recent list showing the post.
     """
     http, db, template_id = client
-    for video_id in ("sent", "waiting"):
+    for video_id in ("sent0000000", "waiting0000"):
         await db.execute(
             "INSERT INTO videos (id, project_id, title, item_type, "
             "duration_seconds, privacy_status, width, height) "
@@ -331,7 +331,7 @@ async def test_counts_report_posting_from_the_posts_not_the_item_state(client):
 
     # Both items stay 'scheduled' — that is exactly what the real code leaves
     # behind after one of them has posted.
-    for position, video_id in enumerate(("sent", "waiting")):
+    for position, video_id in enumerate(("sent0000000", "waiting0000")):
         cursor = await db.execute(
             "INSERT INTO smart_queue_items (queue_id, video_id, position, "
             "scheduled_at, state) VALUES (?, ?, ?, '2026-01-01T09:00:00+00:00', "
@@ -341,7 +341,7 @@ async def test_counts_report_posting_from_the_posts_not_the_item_state(client):
         await db.execute(
             "INSERT INTO social_posts (video_id, platform, content, status, "
             "smart_queue_item_id) VALUES (?, 'bluesky', 'x', ?, ?)",
-            (video_id, "posted" if video_id == "sent" else "approved",
+            (video_id, "posted" if video_id == "sent0000000" else "approved",
              int(cursor.lastrowid)),
         )
     await db.commit()
@@ -369,7 +369,7 @@ async def test_reflow_leaves_already_sent_items_alone(client, monkeypatch):
 
     monkeypatch.setattr(scheduler, "schedule_social_post", noop)
 
-    for video_id in ("sent", "pending"):
+    for video_id in ("sent0000000", "pending0000"):
         await db.execute(
             "INSERT INTO videos (id, project_id, title, item_type, "
             "duration_seconds, privacy_status, width, height) "
@@ -384,7 +384,7 @@ async def test_reflow_leaves_already_sent_items_alone(client, monkeypatch):
 
     was = "2020-01-06T09:00:00+00:00"
     item_ids = {}
-    for position, video_id in enumerate(("sent", "pending")):
+    for position, video_id in enumerate(("sent0000000", "pending0000")):
         cursor = await db.execute(
             "INSERT INTO smart_queue_items (queue_id, video_id, position, "
             "scheduled_at, state) VALUES (?, ?, ?, ?, 'scheduled')",
@@ -394,7 +394,7 @@ async def test_reflow_leaves_already_sent_items_alone(client, monkeypatch):
         await db.execute(
             "INSERT INTO social_posts (video_id, platform, content, status, "
             "smart_queue_item_id) VALUES (?, 'bluesky', 'x', ?, ?)",
-            (video_id, "posted" if video_id == "sent" else "approved",
+            (video_id, "posted" if video_id == "sent0000000" else "approved",
              item_ids[video_id]),
         )
     await db.commit()
@@ -411,8 +411,8 @@ async def test_reflow_leaves_already_sent_items_alone(client, monkeypatch):
             "SELECT video_id, scheduled_at FROM smart_queue_items"
         )
     }
-    assert rows["sent"] == was, "an already-posted video must not be re-dated"
-    assert rows["pending"] != was, "the unsent one moves onto the new times"
+    assert rows["sent0000000"] == was, "an already-posted video must not be re-dated"
+    assert rows["pending0000"] != was, "the unsent one moves onto the new times"
 
 
 async def test_reflow_uses_todays_slot_when_it_is_still_ahead(client, monkeypatch):
@@ -448,14 +448,14 @@ async def test_reflow_uses_todays_slot_when_it_is_still_ahead(client, monkeypatc
     )
     queue_id = created.json()["id"]
 
-    for video_id in ("sent", "next-up"):
+    for video_id in ("sent0000000", "next-up0000"):
         await db.execute(
             "INSERT INTO videos (id, project_id, title, item_type, "
             "duration_seconds, privacy_status, width, height) "
             "VALUES (?, 1, 'A clip', 'hook', 60, 'public', 1080, 1920)",
             (video_id,),
         )
-    for position, video_id in enumerate(("sent", "next-up")):
+    for position, video_id in enumerate(("sent0000000", "next-up0000")):
         cursor = await db.execute(
             "INSERT INTO smart_queue_items (queue_id, video_id, position, "
             "scheduled_at, state) VALUES (?, ?, ?, '2020-01-06T09:00:00+00:00', "
@@ -465,7 +465,7 @@ async def test_reflow_uses_todays_slot_when_it_is_still_ahead(client, monkeypatc
         await db.execute(
             "INSERT INTO social_posts (video_id, platform, content, status, "
             "smart_queue_item_id) VALUES (?, 'bluesky', 'x', ?, ?)",
-            (video_id, "posted" if video_id == "sent" else "approved",
+            (video_id, "posted" if video_id == "sent0000000" else "approved",
              int(cursor.lastrowid)),
         )
     await db.commit()
@@ -478,9 +478,9 @@ async def test_reflow_uses_todays_slot_when_it_is_still_ahead(client, monkeypatc
             "SELECT video_id, scheduled_at FROM smart_queue_items"
         )
     }
-    scheduled = datetime.fromisoformat(rows["next-up"])
+    scheduled = datetime.fromisoformat(rows["next-up0000"])
     assert scheduled.date() == soon.date() and scheduled.hour == soon.hour, (
-        f"next video went to {rows['next-up']}, but the {soon:%H:%M} slot today "
+        f"next video went to {rows['next-up0000']}, but the {soon:%H:%M} slot today "
         "had not passed yet"
     )
 
@@ -491,7 +491,7 @@ async def test_items_report_whether_they_have_gone_out(client):
     as upcoming, because sending never moves the item off 'scheduled'.
     """
     http, db, template_id = client
-    for video_id in ("sent", "pending"):
+    for video_id in ("sent0000000", "pending0000"):
         await db.execute(
             "INSERT INTO videos (id, project_id, title, item_type, "
             "duration_seconds, privacy_status, width, height) "
@@ -503,7 +503,7 @@ async def test_items_report_whether_they_have_gone_out(client):
         "/api/projects/default/smart-queues", json=_payload(template_id)
     )
     queue_id = created.json()["id"]
-    for position, video_id in enumerate(("sent", "pending")):
+    for position, video_id in enumerate(("sent0000000", "pending0000")):
         cursor = await db.execute(
             "INSERT INTO smart_queue_items (queue_id, video_id, position, "
             "scheduled_at, state) VALUES (?, ?, ?, '2026-01-01T09:00:00+00:00', "
@@ -513,7 +513,7 @@ async def test_items_report_whether_they_have_gone_out(client):
         await db.execute(
             "INSERT INTO social_posts (video_id, platform, content, status, "
             "smart_queue_item_id) VALUES (?, 'bluesky', 'x', ?, ?)",
-            (video_id, "posted" if video_id == "sent" else "approved",
+            (video_id, "posted" if video_id == "sent0000000" else "approved",
              int(cursor.lastrowid)),
         )
     await db.commit()
@@ -523,8 +523,8 @@ async def test_items_report_whether_they_have_gone_out(client):
     )).json()["items"]
     by_video = {item["video_id"]: item for item in items}
 
-    assert by_video["sent"]["state"] == "scheduled", (
+    assert by_video["sent0000000"]["state"] == "scheduled", (
         "precondition: sending does not move the item's state"
     )
-    assert by_video["sent"]["has_posted"] == 1
-    assert by_video["pending"]["has_posted"] == 0
+    assert by_video["sent0000000"]["has_posted"] == 1
+    assert by_video["pending0000"]["has_posted"] == 0

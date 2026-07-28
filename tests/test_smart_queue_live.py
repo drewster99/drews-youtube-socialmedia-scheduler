@@ -37,7 +37,7 @@ async def live_env(isolated_db):
     return live, queue_service, db, queue_id
 
 
-async def _add_video(db, video_id="v1", **overrides):
+async def _add_video(db, video_id="vid00000001", **overrides):
     fields = {
         "item_type": "hook", "duration_seconds": 60.0,
         "privacy_status": "public", "width": 1080, "height": 1920,
@@ -56,13 +56,13 @@ async def test_eligible_video_is_appended(live_env):
     live, _queue_service, db, queue_id = live_env
     await _add_video(db)
 
-    result = await live.on_video_became_live("v1")
+    result = await live.on_video_became_live("vid00000001")
 
     assert result["added_to"] == [queue_id]
     rows = await db.execute_fetchall(
         "SELECT video_id, position, state, scheduled_at FROM smart_queue_items"
     )
-    assert rows[0]["video_id"] == "v1"
+    assert rows[0]["video_id"] == "vid00000001"
     # `queued`, not `scheduled`: scheduled means "has a posting time", and
     # writing it here produced an item Accept could never reach — the video
     # sat in the queue forever and never posted.
@@ -75,12 +75,12 @@ async def test_second_transition_does_not_add_again(live_env):
     live, _queue_service, db, queue_id = live_env
     await _add_video(db)
 
-    await live.on_video_became_live("v1")
+    await live.on_video_became_live("vid00000001")
     # Simulate the item being posted and the user re-publishing the video.
     await db.execute("UPDATE smart_queue_items SET state = 'posted'")
     await db.commit()
 
-    second = await live.on_video_became_live("v1")
+    second = await live.on_video_became_live("vid00000001")
 
     assert second["considered"] is False
     assert second["added_to"] == []
@@ -93,12 +93,12 @@ async def test_ineligible_video_is_marked_but_not_added(live_env):
     live, _queue_service, db, _queue_id = live_env
     await _add_video(db, width=1920, height=1080)  # landscape
 
-    result = await live.on_video_became_live("v1")
+    result = await live.on_video_became_live("vid00000001")
 
     assert result["considered"] is True
     assert result["added_to"] == []
     rows = await db.execute_fetchall(
-        "SELECT auto_add_considered_at FROM videos WHERE id = 'v1'"
+        "SELECT auto_add_considered_at FROM videos WHERE id = 'vid00000001'"
     )
     assert rows[0]["auto_add_considered_at"] is not None
 
@@ -109,15 +109,15 @@ async def test_undecidable_video_is_left_unmarked(live_env, monkeypatch):
     live, _queue_service, db, _queue_id = live_env
     await _add_video(db, width=None, height=None)
     await db.execute(
-        "UPDATE videos SET video_file_path = NULL WHERE id = 'v1'"
+        "UPDATE videos SET video_file_path = NULL WHERE id = 'vid00000001'"
     )
     await db.commit()
 
-    result = await live.on_video_became_live("v1")
+    result = await live.on_video_became_live("vid00000001")
 
     assert result["considered"] is False
     rows = await db.execute_fetchall(
-        "SELECT auto_add_considered_at FROM videos WHERE id = 'v1'"
+        "SELECT auto_add_considered_at FROM videos WHERE id = 'vid00000001'"
     )
     assert rows[0]["auto_add_considered_at"] is None
 
@@ -129,11 +129,11 @@ async def test_no_auto_add_queue_leaves_the_marker_unset(live_env, db=None):
     await queue_service.update_queue(queue_id, {"auto_add_on_live": 0})
     await _add_video(db)
 
-    result = await live.on_video_became_live("v1")
+    result = await live.on_video_became_live("vid00000001")
 
     assert result["considered"] is False
     rows = await db.execute_fetchall(
-        "SELECT auto_add_considered_at FROM videos WHERE id = 'v1'"
+        "SELECT auto_add_considered_at FROM videos WHERE id = 'vid00000001'"
     )
     assert rows[0]["auto_add_considered_at"] is None
 
@@ -143,11 +143,11 @@ async def test_already_pending_is_not_duplicated(live_env):
     await _add_video(db)
     await db.execute(
         "INSERT INTO smart_queue_items (queue_id, video_id, position, state) "
-        "VALUES (?, 'v1', 0, 'queued')", (queue_id,),
+        "VALUES (?, 'vid00000001', 0, 'queued')", (queue_id,),
     )
     await db.commit()
 
-    await live.on_video_became_live("v1")
+    await live.on_video_became_live("vid00000001")
 
     rows = await db.execute_fetchall("SELECT COUNT(*) n FROM smart_queue_items")
     assert rows[0]["n"] == 1

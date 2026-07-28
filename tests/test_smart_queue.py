@@ -21,7 +21,7 @@ async def queue_module(isolated_db):
 def _video(**overrides) -> dict:
     """A vertical 68s hook that is live — the eligible base case."""
     video = {
-        "id": "v1", "item_type": "hook", "duration_seconds": 68.0,
+        "id": "vid00000001", "item_type": "hook", "duration_seconds": 68.0,
         "privacy_status": "public", "archived": 0,
         "width": 1080, "height": 1920,
     }
@@ -341,7 +341,7 @@ class TestCandidates:
             "VALUES (1, 'tpl', '[\"hook\"]')"
         )
         template_id = int(cursor.lastrowid)
-        for video_id in ("keep", "taken"):
+        for video_id in ("keep0000000", "taken000000"):
             await db.execute(
                 "INSERT INTO videos (id, project_id, title, item_type, "
                 "duration_seconds, privacy_status, width, height) "
@@ -355,13 +355,13 @@ class TestCandidates:
         )
         await db.execute(
             "INSERT INTO smart_queue_items (queue_id, video_id, position, state) "
-            "VALUES (?, 'taken', 0, 'scheduled')",
+            "VALUES (?, 'taken000000', 0, 'scheduled')",
             (queue_id,),
         )
         await db.commit()
 
         result = await module.candidate_videos(await module.get_queue(queue_id))
-        assert [v["id"] for v in result["eligible"]] == ["keep"]
+        assert [v["id"] for v in result["eligible"]] == ["keep0000000"]
 
     async def test_unchecking_exclude_posted_resurfaces_them(self, queue_module):
         """This is the whole recycling mechanism — no special case needed."""
@@ -374,7 +374,7 @@ class TestCandidates:
         await db.execute(
             "INSERT INTO videos (id, project_id, title, item_type, "
             "duration_seconds, privacy_status, width, height) "
-            "VALUES ('done', 1, 'v', 'hook', 60, 'public', 1080, 1920)"
+            "VALUES ('done0000000', 1, 'v', 'hook', 60, 'public', 1080, 1920)"
         )
         await db.commit()
         queue_id = await module.create_queue(
@@ -383,7 +383,7 @@ class TestCandidates:
         )
         await db.execute(
             "INSERT INTO smart_queue_items (queue_id, video_id, position, state) "
-            "VALUES (?, 'done', 0, 'posted')",
+            "VALUES (?, 'done0000000', 0, 'posted')",
             (queue_id,),
         )
         await db.commit()
@@ -395,7 +395,7 @@ class TestCandidates:
 
         queue["exclude_already_posted"] = 0
         assert [v["id"] for v in
-                (await module.candidate_videos(queue))["eligible"]] == ["done"]
+                (await module.candidate_videos(queue))["eligible"]] == ["done0000000"]
 
     async def test_counts_videos_with_unknown_dimensions(self, queue_module):
         """They must be accounted for, not silently missing from the total."""
@@ -408,7 +408,7 @@ class TestCandidates:
         await db.execute(
             "INSERT INTO videos (id, project_id, title, item_type, "
             "duration_seconds, privacy_status) "
-            "VALUES ('blind', 1, 'v', 'hook', 60, 'public')"
+            "VALUES ('blind000000', 1, 'v', 'hook', 60, 'public')"
         )
         await db.commit()
         queue_id = await module.create_queue(
@@ -418,3 +418,115 @@ class TestCandidates:
         result = await module.candidate_videos(await module.get_queue(queue_id))
         assert result["unknown_dimensions"] == 1
         assert result["eligible"] == []
+
+
+class TestNonYouTubeItems:
+    """Items created outside YouTube have no privacy_status worth reading.
+
+    It is written once at creation and never updated, so it sits at 'unlisted'
+    for the item's whole life. Keying liveness on it called such an item
+    permanently not-live, which is why the publish path could not run the
+    auto-add funnel for them at all.
+    """
+
+    @staticmethod
+    def _standalone(**overrides) -> dict:
+        # 22-char id: what the app mints for an item with no YouTube behind it.
+        fields = {
+            "id": "ccgubMJsE8q7uHzf0TK2qw", "item_type": "standalone",
+            "duration_seconds": 68.0, "privacy_status": "unlisted",
+            "status": "published", "archived": 0, "width": 1080, "height": 1920,
+        }
+        fields.update(overrides)
+        return fields
+
+    async def test_published_is_live_when_there_is_no_youtube(self, queue_module):
+        module, _ = queue_module
+        verdict = module.is_eligible(
+            self._standalone(), _queue(), ["standalone"]
+        )
+        assert verdict.ok, verdict.reasons
+
+    async def test_unpublished_is_not_live(self, queue_module):
+        module, _ = queue_module
+        verdict = module.is_eligible(
+            self._standalone(status="draft"), _queue(), ["standalone"]
+        )
+        assert not verdict.ok
+        assert any("not published" in r for r in verdict.reasons)
+
+    async def test_a_youtube_item_still_keys_on_privacy(self, queue_module):
+        """The published-means-live rule must not leak onto YouTube rows —
+        status drifts off 'published' whenever privacy is flipped."""
+        module, _ = queue_module
+        verdict = module.is_eligible(
+            _video(privacy_status="unlisted", status="published"),
+            _queue(), APPLIES_TO,
+        )
+        assert not verdict.ok
+        assert any("not live on YouTube" in r for r in verdict.reasons)
+
+    async def test_a_template_can_cover_standalone_items(self, queue_module):
+        """applies_to had no 'standalone' value, so no template could cover one
+        and a standalone item could never enter any queue."""
+        module, _ = queue_module
+        assert module.tier_matches_item_type("standalone", "standalone")
+        assert not module.tier_matches_item_type("video", "standalone")
+
+
+class TestRecycling:
+    """Unchecking exclude-already-posted is the whole recycling mechanism."""
+
+    async def _queue_with_sent_video(self, module, db, *, exclude_posted):
+        cursor = await db.execute(
+            "INSERT INTO templates (project_id, name, applies_to) "
+            "VALUES (1, 'tpl', '[\"hook\"]')"
+        )
+        template_id = int(cursor.lastrowid)
+        await db.execute(
+            "INSERT INTO videos (id, project_id, title, item_type, "
+            "duration_seconds, privacy_status, width, height) "
+            "VALUES ('recycled001', 1, 'v', 'hook', 60, 'public', 1080, 1920)"
+        )
+        await db.commit()
+        queue_id = await module.create_queue(
+            project_id=1, name="Q", template_id=template_id, timezone_name="UTC",
+            slots=[{"weekday": 0, "time_of_day": "09:00"}],
+        )
+        # The real shape after a send: the ITEM still says 'scheduled' — only
+        # the post records that it went out.
+        cursor = await db.execute(
+            "INSERT INTO smart_queue_items (queue_id, video_id, position, state) "
+            "VALUES (?, 'recycled001', 0, 'scheduled')",
+            (queue_id,),
+        )
+        await db.execute(
+            "INSERT INTO social_posts (video_id, platform, content, status, "
+            "smart_queue_item_id) VALUES ('recycled001', 'bluesky', 'x', "
+            "'posted', ?)",
+            (int(cursor.lastrowid),),
+        )
+        await db.commit()
+        queue = await module.get_queue(queue_id)
+        queue["exclude_already_posted"] = 1 if exclude_posted else 0
+        return queue
+
+    async def test_a_sent_video_comes_back_when_the_filter_is_off(
+        self, queue_module
+    ):
+        """It never did. A posted item keeps state='scheduled', so listing the
+        pending states blocked it unconditionally and the checkbox did nothing
+        — recycling was off no matter what the box said."""
+        module, db = queue_module
+        queue = await self._queue_with_sent_video(
+            module, db, exclude_posted=False
+        )
+        eligible = (await module.candidate_videos(queue))["eligible"]
+        assert [v["id"] for v in eligible] == ["recycled001"]
+
+    async def test_it_stays_hidden_while_the_filter_is_on(self, queue_module):
+        module, db = queue_module
+        queue = await self._queue_with_sent_video(
+            module, db, exclude_posted=True
+        )
+        assert (await module.candidate_videos(queue))["eligible"] == []

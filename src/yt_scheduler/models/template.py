@@ -9,6 +9,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 Tier = Literal["hook", "short", "segment", "video"]
 
+#: What a template declares it can be used for. Overlaps Tier by construction,
+#: but is deliberately a separate vocabulary: 'standalone' is a kind of item,
+#: never a duration-derived tier, so it must not leak into videos.tier. Without
+#: it a standalone item could not be covered by any template, and so could
+#: never enter a smart queue.
+TemplateAppliesTo = Literal["hook", "short", "segment", "video", "standalone"]
+
 
 class Template(BaseModel):
     """Per-platform social template body + media settings."""
@@ -20,7 +27,7 @@ class Template(BaseModel):
     name: str
     description: str = ""
     platforms: dict
-    applies_to: list[Tier] = Field(default_factory=lambda: ["hook", "short", "segment", "video"])
+    applies_to: list[TemplateAppliesTo] = Field(default_factory=lambda: ["hook", "short", "segment", "video"])
     is_builtin: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -43,5 +50,5 @@ class PromptTemplate(BaseModel):
     name: str
     body: str
     system_body: str | None = None
-    applies_to: list[Tier] = Field(default_factory=lambda: ["hook", "short", "segment", "video"])
+    applies_to: list[TemplateAppliesTo] = Field(default_factory=lambda: ["hook", "short", "segment", "video"])
     updated_at: datetime | None = None

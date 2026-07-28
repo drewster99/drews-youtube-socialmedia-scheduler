@@ -21,6 +21,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from yt_scheduler.database import get_db, write_transaction
+from yt_scheduler.models.video import is_youtube_backed
 from yt_scheduler.services.video_dimensions import ORIENTATION_SQL, orientation_of
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,21 @@ ITEM_STATES = (
 # the exclude-already-posted filter is on — that filter is what makes
 # recycling work, so it stays separate.
 PENDING_ITEM_STATES = (ITEM_STATE_QUEUED, "scheduled")
+
+#: Has this occurrence gone out? Two encodings both mean yes, and reading only
+#: one of them is what caused the "0 posted" chip, the re-flow that re-dated a
+#: sent video, and recycling that could never be switched on:
+#:
+#: * a posted ``social_posts`` row — what sending actually writes, and the only
+#:   one that occurs in practice, since sending never touches the item;
+#: * ``state = 'posted'`` — declared in ITEM_STATES and in the schema CHECK, so
+#:   it is a legitimate way to say it even though nothing writes it today.
+#:
+#: Assumes the queue-items row is aliased ``i``.
+ITEM_HAS_POSTED_SQL = (
+    "(i.state = 'posted' OR EXISTS (SELECT 1 FROM social_posts p "
+    "WHERE p.smart_queue_item_id = i.id AND p.status = 'posted'))"
+)
 
 DEFAULT_MAX_DURATION_SECONDS = 180.0
 DEFAULT_ORIENTATIONS = ["portrait", "square"]
@@ -152,12 +168,25 @@ def is_eligible(video: dict, queue: dict, applies_to: list[str]) -> Eligibility:
             f"type '{item_type or 'unset'}' is not one the template applies to"
         )
 
-    # privacy_status is the authority on liveness, not status: status drifts
-    # off 'published' whenever privacy is flipped via the metadata dropdown.
-    if (video.get("privacy_status") or "") != "public":
+    # Liveness means "as publicly available as this item gets", and that is a
+    # different column depending on what backs the item.
+    #
+    # YouTube-backed: privacy_status, not status — status drifts off
+    # 'published' whenever privacy is flipped via the metadata dropdown.
+    #
+    # Everything else has no YouTube presence, so privacy_status is never
+    # written and stays 'unlisted' forever. Reading it would call such an item
+    # permanently not-live, which is why the publish path could not run the
+    # auto-add funnel for them at all. For these, published *is* live.
+    if is_youtube_backed(video.get("id") or ""):
+        if (video.get("privacy_status") or "") != "public":
+            reasons.append(
+                f"not live on YouTube (privacy is "
+                f"{video.get('privacy_status') or 'unset'})"
+            )
+    elif (video.get("status") or "") != "published":
         reasons.append(
-            f"not live on YouTube (privacy is "
-            f"{video.get('privacy_status') or 'unset'})"
+            f"not published yet (status is {video.get('status') or 'unset'})"
         )
 
     if video.get("archived"):
@@ -208,29 +237,34 @@ async def candidate_videos(queue: dict) -> dict:
     db = await get_db()
     applies_to = await template_applies_to(queue["template_id"])
 
-    # Already scheduled by THIS queue is always excluded; already posted by it
-    # is excluded only when the filter is on (unchecking it is how recycling
-    # works).
-    blocked_states = list(PENDING_ITEM_STATES)
+    # Already pending in THIS queue is always excluded; already posted by it is
+    # excluded only when the filter is on — unchecking it is how recycling
+    # works.
+    #
+    # "Pending" has to exclude items that have posted. They keep
+    # state='scheduled' for life, so listing that state alone blocked every
+    # posted video unconditionally and the exclude-already-posted toggle could
+    # never do anything: recycling was off no matter what the box said.
+    placeholders = ",".join("?" for _ in PENDING_ITEM_STATES)
+    blocked = f"(i.state IN ({placeholders}) AND NOT {ITEM_HAS_POSTED_SQL})"
     if queue.get("exclude_already_posted"):
-        blocked_states.append("posted")
-    placeholders = ",".join("?" for _ in blocked_states)
+        blocked = f"({blocked} OR {ITEM_HAS_POSTED_SQL})"
 
     rows = await db.execute_fetchall(
         f"""
         SELECT v.id, v.title, v.item_type, v.duration_seconds, v.privacy_status,
-               v.archived, v.width, v.height, v.created_at,
+               v.status, v.archived, v.width, v.height, v.created_at,
                {ORIENTATION_SQL} AS orientation
           FROM videos v
          WHERE v.project_id = ?
            AND NOT EXISTS (
                  SELECT 1 FROM smart_queue_items i
                   WHERE i.video_id = v.id AND i.queue_id = ?
-                    AND i.state IN ({placeholders})
+                    AND {blocked}
                )
          ORDER BY v.created_at
         """,
-        (queue["project_id"], queue["id"], *blocked_states),
+        (queue["project_id"], queue["id"], *PENDING_ITEM_STATES),
     )
 
     eligible: list[dict] = []
@@ -336,9 +370,10 @@ async def already_scheduled_video_ids(
     state_placeholders = ",".join("?" for _ in PENDING_ITEM_STATES)
     db = await get_db()
     rows = await db.execute_fetchall(
-        f"SELECT DISTINCT video_id FROM smart_queue_items "
-        f"WHERE queue_id = ? AND state IN ({state_placeholders}) "
-        f"AND video_id IN ({placeholders})",
+        f"SELECT DISTINCT i.video_id FROM smart_queue_items i "
+        f"WHERE i.queue_id = ? AND i.state IN ({state_placeholders}) "
+        f"AND NOT {ITEM_HAS_POSTED_SQL} "
+        f"AND i.video_id IN ({placeholders})",
         (queue_id, *PENDING_ITEM_STATES, *video_ids),
     )
     return {row["video_id"] for row in rows}
