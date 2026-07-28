@@ -403,8 +403,10 @@ async def api_platform_capabilities():
     it encoded and had to be hunted down.
     """
     from yt_scheduler.services import social
+    from yt_scheduler.services.social_identity import LIVE_CHECK_PLATFORMS
 
     return {
+        "supports_live_check": sorted(LIVE_CHECK_PLATFORMS),
         "accepts_media": [
             p for p in social.ALL_PLATFORMS
             if social.platform_accepts_attached_media(p)

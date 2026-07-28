@@ -2352,7 +2352,7 @@ Posts already `posted` (or mid-`sending`) are left alone — they are history. R
 
 **Response 200** — `{"ok": true, "detail": "Token is valid.", "username": "..."}`, or `{"ok": false, "detail": "Threads rejected the token (HTTP 400): ..."}`.
 
-`ok: false` with `"unreachable": true` means the provider couldn't be reached, which says nothing about the token — reported separately so a network blip isn't read as an expired credential.
+`ok: false` with `"unreachable": true` means we couldn't get an answer — a network failure *or* a 5xx from the provider. Neither is a verdict on the token, and both are kept distinct from a 4xx rejection so a bad day at the provider isn't read as an expired credential.
 
 **Errors** — `404` (unknown credential, or no stored bundle), `501` (platform has no live check implemented).
 
@@ -2360,7 +2360,9 @@ Posts already `posted` (or mid-`sending`) are left alone — they are history. R
 
 **Purpose** — Which platforms accept an attachment, and which need media hosting configured to do it. Exists so the UI never hardcodes a platform name for this; every client-side attempt to answer it ("Threads is text-only") outlived the fact it encoded.
 
-**Response 200** — `{"accepts_media": ["twitter", "bluesky", "mastodon", "linkedin", "threads"], "requires_hosted_media": ["threads"]}`.
+**Response 200** — `{"accepts_media": [...], "requires_hosted_media": ["threads"], "supports_live_check": ["threads"]}`.
+
+`supports_live_check` lists platforms with a working `POST /api/social-credentials/{uuid}/verify`; the Settings UI shows a Verify button only for those, rather than one that always 501s.
 
 ### `GET /api/reconcile-status`
 

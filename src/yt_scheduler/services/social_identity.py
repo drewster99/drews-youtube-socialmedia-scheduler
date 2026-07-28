@@ -160,6 +160,12 @@ async def upsert_social_account(platform: str, *, project_id: int) -> int | None
     return account_id
 
 
+# Platforms with a live credential check implemented below. Exposed through
+# /api/platform-capabilities so the UI shows a Verify button only where it
+# would work, rather than offering one that always fails.
+LIVE_CHECK_PLATFORMS = frozenset({"threads"})
+
+
 class CredentialCheckUnsupported(RuntimeError):
     """This platform has no cheap identity endpoint to probe."""
 
@@ -178,7 +184,7 @@ async def verify_live(platform: str, bundle: dict) -> dict:
     """
     import httpx
 
-    if platform != "threads":
+    if platform not in LIVE_CHECK_PLATFORMS:
         raise CredentialCheckUnsupported(
             f"No live credential check implemented for {platform}."
         )
@@ -211,10 +217,26 @@ async def verify_live(platform: str, bundle: dict) -> dict:
 
     body = ""
     try:
-        error = (resp.json() or {}).get("error") or {}
-        body = error.get("message") or resp.text[:200]
+        parsed = resp.json()
+        error = parsed.get("error") if isinstance(parsed, dict) else None
+        if isinstance(error, dict):
+            body = error.get("message") or ""
     except ValueError:
+        body = ""
+    if not body:
         body = resp.text[:200]
+
+    # A 5xx is the provider having a bad day, not a verdict on the token.
+    # Reporting it as "rejected" would send the user to re-authenticate a
+    # perfectly good credential — the same distinction refresh_if_stale makes.
+    if resp.status_code >= 500:
+        return {
+            "ok": False,
+            "unreachable": True,
+            "detail": f"Threads couldn't answer right now (HTTP {resp.status_code}): "
+                      f"{body}. This says nothing about the token — try again.",
+            "username": None,
+        }
     return {
         "ok": False,
         "detail": f"Threads rejected the token (HTTP {resp.status_code}): {body}",

@@ -731,8 +731,9 @@ function renderCredentialRow(cred) {
             </div>
             <div style="display:flex; gap:0.25rem; align-items:center;">
                 ${reconnectBtn}
+                ${liveCheckPlatforms.has(cred.platform) ? `
                 <button class="btn btn-sm" title="Ask the provider whether this token still works"
-                        data-cred-action="verify">Verify</button>
+                        data-cred-action="verify">Verify</button>` : ''}
                 <button class="btn-icon" title="Re-read the cached username (does not contact the provider)"
                         data-cred-action="refresh-username">↻</button>
                 <button class="btn-icon" title="Remove"
@@ -826,6 +827,24 @@ async function pasteThreadsToken() {
  * contacts anyone — which is why a Threads token that had been dead for weeks
  * still looked connected. This is the one that actually finds out.
  */
+// Which platforms have a live credential check. Fetched from the server so the
+// UI never hardcodes platform names for this -- the same reason
+// /api/platform-capabilities exists.
+let liveCheckPlatforms = new Set();
+
+async function loadLiveCheckPlatforms() {
+    try {
+        const resp = await fetch('/api/platform-capabilities');
+        if (!resp.ok) return;
+        const caps = await resp.json();
+        liveCheckPlatforms = new Set(caps.supports_live_check || []);
+        loadSocialPlatforms();
+    } catch (err) {
+        // Leaving the set empty hides the button, which is the safe direction:
+        // better absent than present and always failing.
+    }
+}
+
 async function verifyCredential(uuid, button) {
     const original = button.textContent;
     button.disabled = true;
@@ -997,6 +1016,7 @@ loadMediaHostingStatus();
 loadThreadsOAuthStatus();
 loadOAuthClients();
 loadSocialPlatforms();
+loadLiveCheckPlatforms();
 loadSettings();
 loadGlobalVariables();
 
