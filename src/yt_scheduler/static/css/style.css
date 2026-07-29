@@ -1953,8 +1953,46 @@ dialog.modal-xwide {
     color: var(--accent, #4a9eff);
 }
 
-.failed-sends-banner__more {
+/* Reads as the inline link it behaves like, not as a form control. */
+.failed-sends-banner__toggle {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    color: var(--accent, #4a9eff);
+    text-decoration: underline;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.failed-sends-banner__list {
+    list-style: none;
+    margin: 0.5rem 0 0;
+    padding: 0;
+    /* Errors render in full when expanded, so bound the height here instead:
+       eight stack traces in a sticky banner would bury the page. */
+    max-height: 40vh;
+    overflow-y: auto;
+}
+
+.failed-sends-banner__list li {
+    padding: 0.4rem 0;
+    border-top: 1px solid var(--border, #333);
+}
+
+.failed-sends-banner__platform {
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 0.78rem;
+    letter-spacing: 0.02em;
+}
+
+.failed-sends-banner__error {
     color: var(--text-muted, #999);
+}
+
+.failed-sends-banner__list a {
+    white-space: nowrap;
 }
 
 .slot-hosting-warn { color: var(--danger); margin-top: 0.35rem; }
