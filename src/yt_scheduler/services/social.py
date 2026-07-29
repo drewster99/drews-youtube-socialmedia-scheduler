@@ -21,10 +21,6 @@ import httpx
 from yt_scheduler import config
 from yt_scheduler.services import media as media_service
 
-from yt_scheduler.services.keychain import (
-    store_secret_async,
-)
-
 logger = logging.getLogger(__name__)
 
 
@@ -89,12 +85,18 @@ async def _twitter_refresh_bearer(creds: dict[str, str]) -> str | None:
     updated["bearer_token"] = new_bearer
     if new_refresh:
         updated["refresh_token"] = new_refresh
-    # X access tokens live ~2h; persist the expiry so the background refresh
-    # job can pre-emptively renew before it lapses.
-    if payload.get("expires_in"):
-        updated["expires_at"] = int(time.time()) + int(payload["expires_in"])
+    # X access tokens live ~2h; persist the acquisition time and expiry so the
+    # background refresh job can pre-emptively renew before it lapses.
+    from yt_scheduler.services.social_credentials import save_bundle, stamp_token_metadata
 
-    await store_secret_async("twitter", f"cred.{cred_uuid}", json.dumps(updated))
+    expires_in = payload.get("expires_in")
+    stamp_token_metadata(
+        updated,
+        expires_in_seconds=int(expires_in) if expires_in else None,
+    )
+    # save_bundle rather than a raw Keychain write: it also mirrors the token
+    # metadata onto the credential row for the Settings list.
+    await save_bundle("twitter", cred_uuid, updated)
     return new_bearer
 
 
@@ -1409,11 +1411,16 @@ class BlueskyPoster(SocialPoster):
             redirect_uri=creds["redirect_uri"],
             nonce=creds.get("dpop_nonce_as"),
         )
+        from yt_scheduler.services.social_credentials import stamp_token_metadata
+
         creds["access_token"] = result["access_token"]
         if result.get("refresh_token"):
             creds["refresh_token"] = result["refresh_token"]
-        if result.get("expires_in"):
-            creds["expires_at"] = int(time.time()) + int(result["expires_in"])
+        expires_in = result.get("expires_in")
+        stamp_token_metadata(
+            creds,
+            expires_in_seconds=int(expires_in) if expires_in else None,
+        )
         if result.get("dpop_nonce_as"):
             creds["dpop_nonce_as"] = result["dpop_nonce_as"]
         await save_bundle("bluesky", creds["uuid"], creds)
@@ -2005,7 +2012,7 @@ class ThreadsPoster(SocialPoster):
             get_credential_lock,
             load_bundle,
             save_bundle,
-            set_token_expiry,
+            stamp_token_metadata,
         )
 
         async with get_credential_lock(uuid):
@@ -2072,9 +2079,8 @@ class ThreadsPoster(SocialPoster):
             expires_in = int(data.get("expires_in") or self._TOKEN_TTL_FALLBACK_SECONDS)
             updated = dict(current)
             updated["access_token"] = new_token
-            updated["expires_at"] = int(time.time()) + expires_in
+            stamp_token_metadata(updated, expires_in_seconds=expires_in)
             await save_bundle("threads", uuid, updated)
-            await set_token_expiry(uuid, updated["expires_at"])
             await clear_needs_reauth(uuid)
             logger.info("Threads token refreshed; valid for %.0f more days",
                         expires_in / 86400)

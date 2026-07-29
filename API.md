@@ -1967,10 +1967,14 @@ Source: `src/yt_scheduler/routers/social_credentials_routes.py`
     "provider_account_id": "...", "username": "alice",
     "display_name": "Alice", "is_nickname": false,
     "credentials_ref": "...", "created_at": "...", "deleted_at": null,
-    "needs_reauth": false, "label": "@alice @X"
+    "needs_reauth": false, "label": "@alice @X",
+    "token_acquired_at": "2026-07-28T19:24:18+00:00",
+    "token_expires_at": "2026-09-26T19:13:47+00:00"
   }
 ]
 ```
+
+`token_acquired_at` / `token_expires_at` are non-secret mirrors of the Keychain bundle's token metadata, stamped by every flow that mints or refreshes a token and mirrored by `save_bundle` / `upsert_credential`. Either can be `null`, meaning the flow that last wrote the bundle predates stamping (acquired) or the issuer never reported a lifetime (expires — e.g. Mastodon tokens don't expire, and a pasted Threads token's age is unknown until its first refresh). `null` renders as unknown, never as "doesn't expire".
 
 **Errors** — `400` (unknown `platform`).
 

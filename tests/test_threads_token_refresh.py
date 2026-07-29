@@ -64,8 +64,6 @@ def stored(monkeypatch, social):
     async def fake_clear(uuid):
         saved["cleared_reauth"] = True
 
-    async def fake_set_expiry(uuid, expires_at):
-        saved["row_expiry"] = expires_at
 
     class _NullLock:
         async def __aenter__(self): return self
@@ -75,7 +73,6 @@ def stored(monkeypatch, social):
     monkeypatch.setattr(creds_mod, "load_bundle", fake_load_bundle)
     monkeypatch.setattr(creds_mod, "save_bundle", fake_save_bundle)
     monkeypatch.setattr(creds_mod, "clear_needs_reauth", fake_clear)
-    monkeypatch.setattr(creds_mod, "set_token_expiry", fake_set_expiry)
     monkeypatch.setattr(creds_mod, "get_credential_lock", lambda uuid: _NullLock())
     return saved
 
@@ -108,8 +105,11 @@ async def test_a_token_near_expiry_is_renewed(social, meta, stored):
     assert dict(calls[0].url.params)["access_token"] == "old-token"
     assert stored["bundle"]["access_token"] == "new-token"
     assert stored["bundle"]["expires_at"] > int(time.time()) + 30 * 24 * 3600
+    # The row mirror rides on save_bundle now (tested in
+    # test_token_metadata_mirror.py), so the bundle carrying both dates is
+    # what guarantees the Settings list will show the renewal.
+    assert stored["bundle"]["acquired_at"] <= int(time.time())
     assert stored["cleared_reauth"] is True
-    assert stored["row_expiry"] == stored["bundle"]["expires_at"]
 
 
 async def test_a_healthy_token_is_left_alone(social, meta, stored):

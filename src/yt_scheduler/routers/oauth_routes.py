@@ -41,6 +41,7 @@ from yt_scheduler.services import bluesky_http, bluesky_oauth, oauth_clients, yo
 from yt_scheduler.services.projects import slugify
 from yt_scheduler.services.social_credentials import (
     display_name_for,
+    stamp_token_metadata,
     upsert_credential,
 )
 
@@ -73,7 +74,7 @@ def _stamp_threads_expiry(bundle: dict, token_data: dict | None) -> None:
         seconds = int(expires_in) if expires_in is not None else _THREADS_DEFAULT_TTL_SECONDS
     except (TypeError, ValueError):
         seconds = _THREADS_DEFAULT_TTL_SECONDS
-    bundle["expires_at"] = int(time.time()) + seconds
+    stamp_token_metadata(bundle, expires_in_seconds=seconds)
 
 TWITTER_REDIRECT_PATH = "/api/oauth/twitter/callback"
 # media.write covers v2 simple + chunked media upload (images, GIFs, videos).
@@ -225,6 +226,13 @@ async def linkedin_callback(code: str | None = None, state: str | None = None, e
         "client_id": pending["client_id"],
         "client_secret": pending["client_secret"],
     }
+    # LinkedIn issues ~60-day tokens with no refresh flow for standard apps, so
+    # the recorded expiry is the only warning before posting starts to fail.
+    _linkedin_expires_in = token_data.get("expires_in")
+    stamp_token_metadata(
+        bundle,
+        expires_in_seconds=int(_linkedin_expires_in) if _linkedin_expires_in else None,
+    )
     cred = await _persist_oauth_credential(
         platform="linkedin",
         provider_account_id=sub,
@@ -563,6 +571,9 @@ async def threads_paste_token(data: dict):
         raise HTTPException(502, "Threads /me response missing user id")
 
     bundle = {"access_token": access_token, "user_id": str(user_id)}
+    # A pasted token's mint time is Meta's secret, so only the paste moment is
+    # recorded; the first successful refresh replaces it with real dates.
+    stamp_token_metadata(bundle)
     # Carry the stored app secret along so a future token refresh has it; the
     # poster itself only needs access_token + user_id.
     _, app_secret = await oauth_clients.get_oauth_client_async("threads")
@@ -747,9 +758,12 @@ async def twitter_callback(
     }
     if refresh_token:
         bundle["refresh_token"] = refresh_token
-    if token_data.get("expires_in"):
-        # ~2h for X; lets the background refresh job renew it before it lapses.
-        bundle["expires_at"] = int(time.time()) + int(token_data["expires_in"])
+    # ~2h expiry for X; lets the background refresh job renew it before it lapses.
+    _twitter_expires_in = token_data.get("expires_in")
+    stamp_token_metadata(
+        bundle,
+        expires_in_seconds=int(_twitter_expires_in) if _twitter_expires_in else None,
+    )
     if pending.get("client_secret"):
         bundle["client_secret"] = pending["client_secret"]
     if username:
@@ -937,6 +951,9 @@ async def mastodon_callback(
         "client_id": pending["client_id"],
         "client_secret": pending["client_secret"],
     }
+    # Mastodon tokens carry no expiry (they live until revoked), so only the
+    # acquisition time is recorded.
+    stamp_token_metadata(bundle)
     if handle:
         bundle["username"] = handle
 

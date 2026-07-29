@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime, timezone
 import logging
 import uuid as uuidlib
@@ -93,6 +94,13 @@ def _row_to_dict(row) -> dict:
         # assuming the latter is how a lapsed Threads token kept looking
         # connected for weeks. Guarded by a key check because rows read before
         # migration 039 don't carry the column.
+        # When this token was obtained, ISO-8601, or None when no flow has
+        # stamped it yet. With token_expires_at it gives the token's lifetime.
+        # Guarded like token_expires_at: rows read before migration 040 don't
+        # carry the column.
+        "token_acquired_at": (
+            row["token_acquired_at"] if "token_acquired_at" in row.keys() else None
+        ),
         "token_expires_at": (
             row["token_expires_at"] if "token_expires_at" in row.keys() else None
         ),
@@ -184,25 +192,68 @@ async def load_bundle(platform: str, uuid: str) -> dict | None:
     return bundle
 
 
+def stamp_token_metadata(bundle: dict, *, expires_in_seconds: int | None = None) -> None:
+    """Record in the bundle when this token was obtained and, when the issuer
+    said, when it expires.
+
+    Call at every place a token is minted or refreshed — the acquiring flow is
+    the only code that knows the moment of acquisition. ``save_bundle`` /
+    ``upsert_credential`` mirror both fields onto the credential row so the
+    Settings list can show a token's age, lifetime and expiry without a
+    Keychain read per row.
+    """
+    now = int(time.time())
+    bundle["acquired_at"] = now
+    if expires_in_seconds is not None:
+        bundle["expires_at"] = now + int(expires_in_seconds)
+
+
 async def save_bundle(platform: str, uuid: str, bundle: dict) -> None:
     bundle["uuid"] = uuid
     await store_secret_async(
         platform, f"{CREDENTIAL_KEY_PREFIX}{uuid}", json.dumps(bundle),
     )
+    # The bundle is the source of truth for token metadata; the row is its
+    # non-secret mirror, refreshed on every bundle write so refresh flows
+    # never have to remember a second call. A brand-new credential's row
+    # doesn't exist yet at this point — upsert_credential's INSERT carries
+    # the same values instead, so nothing is lost.
+    await _mirror_token_metadata(uuid, bundle)
 
 
-def _expiry_iso(expires_at) -> str | None:
-    """Bundle ``expires_at`` (unix seconds) as an ISO timestamp, or None.
+def _unix_seconds_iso(seconds) -> str | None:
+    """A bundle unix-seconds timestamp as ISO-8601, or None.
 
     None on anything unparseable rather than a guessed date: a wrong expiry
     would either nag about a healthy token or stay silent about a dead one.
     """
-    if not expires_at:
+    if not seconds:
         return None
     try:
-        return datetime.fromtimestamp(int(expires_at), tz=timezone.utc).isoformat()
+        return datetime.fromtimestamp(int(seconds), tz=timezone.utc).isoformat()
     except (TypeError, ValueError, OSError):
         return None
+
+
+async def _mirror_token_metadata(uuid: str, bundle: dict) -> None:
+    """Mirror the bundle's ``acquired_at`` / ``expires_at`` onto the row.
+
+    COALESCE keeps a previously-known value when the new bundle doesn't carry
+    the field — a partial bundle update (e.g. Bluesky rotating a DPoP nonce
+    mid-post on a pre-stamping bundle) must not erase real dates.
+    """
+    expires_iso = _unix_seconds_iso(bundle.get("expires_at"))
+    acquired_iso = _unix_seconds_iso(bundle.get("acquired_at"))
+    if expires_iso is None and acquired_iso is None:
+        return
+    async with write_transaction() as db:
+        await db.execute(
+            "UPDATE social_accounts "
+            "SET token_expires_at = COALESCE(?, token_expires_at), "
+            "    token_acquired_at = COALESCE(?, token_acquired_at) "
+            "WHERE uuid = ?",
+            (expires_iso, acquired_iso, uuid),
+        )
 
 
 async def upsert_credential(
@@ -225,10 +276,11 @@ async def upsert_credential(
     # Captured for X accounts; COALESCE keeps a previously-known value when a
     # re-auth couldn't fetch it (e.g. the /users/me lookup hiccuped).
     verified_type = bundle.get("verified_type")
-    # Mirrored out of the bundle so the Settings list can show "expires in N
-    # days" without a Keychain read per row. Not a secret; NULL means the
-    # issuer didn't say, which is different from "never expires".
-    token_expires_at = _expiry_iso(bundle.get("expires_at"))
+    # Mirrored out of the bundle so the Settings list can show a token's age
+    # and "expires in N days" without a Keychain read per row. Not secrets;
+    # NULL means the issuer didn't say, which is different from "never".
+    token_expires_at = _unix_seconds_iso(bundle.get("expires_at"))
+    token_acquired_at = _unix_seconds_iso(bundle.get("acquired_at"))
     cursor = await db.execute(
         "SELECT id, uuid FROM social_accounts "
         "WHERE platform = ? AND provider_account_id = ?",
@@ -249,16 +301,17 @@ async def upsert_credential(
         # Clear needs_reauth: the user just successfully re-OAuthed. The
         # save_bundle (Keychain, above) stays OUTSIDE the transaction — never
         # await a network/to_thread call while holding the write lock.
+        # Token metadata (token_expires_at / token_acquired_at) is mirrored by
+        # save_bundle above — the bundle is its single source of truth.
         async with write_transaction() as db:
             await db.execute(
                 "UPDATE social_accounts "
                 "SET username = ?, display_name = ?, is_nickname = ?, "
                 "    deleted_at = NULL, needs_reauth = 0, "
-                "    verified_type = COALESCE(?, verified_type), "
-                "    token_expires_at = COALESCE(?, token_expires_at) "
+                "    verified_type = COALESCE(?, verified_type) "
                 "WHERE id = ?",
                 (username, display_name, 1 if is_nickname else 0, verified_type,
-                 token_expires_at, existing_id),
+                 existing_id),
             )
         return await get_credential_by_id(existing_id)  # type: ignore[return-value]
 
@@ -273,11 +326,13 @@ async def upsert_credential(
         cursor = await db.execute(
             "INSERT INTO social_accounts "
             "(uuid, platform, provider_account_id, username, display_name, "
-            " is_nickname, credentials_ref, verified_type) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " is_nickname, credentials_ref, verified_type, "
+            " token_expires_at, token_acquired_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 new_uuid, platform, provider_account_id, username, display_name,
                 1 if is_nickname else 0, f"{CREDENTIAL_KEY_PREFIX}{new_uuid}", verified_type,
+                token_expires_at, token_acquired_at,
             ),
         )
     new_id = int(cursor.lastrowid)
@@ -294,22 +349,6 @@ async def mark_needs_reauth(uuid: str) -> None:
     async with write_transaction() as db:
         await db.execute(
             "UPDATE social_accounts SET needs_reauth = 1 WHERE uuid = ?", (uuid,)
-        )
-
-
-async def set_token_expiry(uuid: str, expires_at) -> None:
-    """Mirror a refreshed token's new expiry onto the credential row.
-
-    Called after a successful refresh so the Settings list reflects the renewal
-    rather than continuing to show the old, now-wrong date.
-    """
-    iso = _expiry_iso(expires_at)
-    if iso is None:
-        return
-    async with write_transaction() as db:
-        await db.execute(
-            "UPDATE social_accounts SET token_expires_at = ? WHERE uuid = ?",
-            (iso, uuid),
         )
 
 

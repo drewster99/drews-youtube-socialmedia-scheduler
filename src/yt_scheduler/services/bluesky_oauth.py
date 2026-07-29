@@ -593,6 +593,7 @@ def credentialed_bundle(
         "private_key_pem": private_key_pem,
         "access_token": access_token,
         "refresh_token": refresh_token,
+        "acquired_at": int(time.time()),
         "expires_at": int(time.time()) + int(expires_in or 7200),
         "dpop_nonce_as": dpop_nonce_as,
         "dpop_nonce_pds": None,
