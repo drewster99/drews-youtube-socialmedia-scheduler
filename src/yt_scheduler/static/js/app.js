@@ -6,7 +6,7 @@ function showToast(message, type = 'info') {
     toast.className = `toast toast-${type}`;
     toast.textContent = message;
     container.appendChild(toast);
-    const duration = type === 'error' ? 8000 : 3000;
+    const duration = type === 'error' ? 12000 : 3000;
     setTimeout(() => {
         toast.style.opacity = '0';
         toast.style.transition = 'opacity 0.3s';

@@ -1,9 +1,9 @@
 /**
  * App-wide banner for social posts whose most recent send attempt failed.
  *
- * A failed send used to exist only as an 8-second toast and a badge on the one
- * page that owns the post — invisible from everywhere else, and invisible for
- * scheduled sends that fail with no page open at all. This loads from
+ * A failed send used to exist only as a short-lived toast and a badge on the
+ * one page that owns the post — invisible from everywhere else, and invisible
+ * for scheduled sends that fail with no page open at all. This loads from
  * base.html on every page and stays up until the failed posts are retried
  * successfully or deleted. The social_posts table is the single source of
  * truth, so there is no separate dismissed state to drift out of sync.
