@@ -59,6 +59,18 @@ from yt_scheduler.services import bluesky_http
 
 logger = logging.getLogger(__name__)
 
+
+class AuthServerUnavailable(Exception):
+    """The authorization server couldn't answer — 5xx, 429, or DPoP nonce
+    churn. Says nothing about the credential, so callers retry later and
+    never flag ``needs_reauth``.
+
+    Deliberately NOT a RuntimeError: poster refresh paths convert
+    RuntimeError to CredentialAuthError (terminal), and a conversion site
+    that forgets this class must fail transient, never terminal.
+    """
+
+
 # Public Bluesky entryway. Used for handle resolution as a fallback when
 # the user types just a handle without enough info to find their PDS.
 BSKY_API_FALLBACK = "https://bsky.social"
@@ -541,13 +553,30 @@ async def refresh_tokens(
     if _is_dpop_nonce_error(resp):
         new_nonce = resp.headers.get("DPoP-Nonce")
         if not new_nonce:
-            raise RuntimeError("Refresh endpoint demanded DPoP nonce but did not provide one")
+            # Server misbehavior, and the refresh token was NOT consumed —
+            # retry later rather than sending the user through re-OAuth.
+            raise AuthServerUnavailable(
+                "Refresh endpoint demanded a DPoP nonce but did not provide one"
+            )
         used_nonce = new_nonce
         resp = await _do(used_nonce)
+        if _is_dpop_nonce_error(resp):
+            # A second bounce is nonce churn, not a credential verdict; the
+            # refresh token is still unconsumed.
+            raise AuthServerUnavailable(
+                "Refresh endpoint kept demanding new DPoP nonces"
+            )
 
+    # A 5xx or 429 is the authorization server having a bad day, not a
+    # verdict on the credential — same distinction the other platforms make.
+    if resp.status_code >= 500 or resp.status_code == 429:
+        raise AuthServerUnavailable(
+            f"Authorization server unavailable: HTTP {resp.status_code} "
+            f"{(resp.text or '')[:500]}"
+        )
     if resp.status_code != 200:
         raise RuntimeError(
-            f"Refresh failed: HTTP {resp.status_code} {resp.text}"
+            f"Refresh failed: HTTP {resp.status_code} {(resp.text or '')[:500]}"
         )
     body = resp.json() or {}
     body["dpop_nonce_as"] = resp.headers.get("DPoP-Nonce") or used_nonce

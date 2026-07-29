@@ -30,16 +30,34 @@ def social(isolated_data_dir):
 
 @pytest.fixture
 def meta(monkeypatch):
-    """Stand in for graph.threads.net, recording what was asked of it."""
+    """Stand in for graph.threads.net, recording what was asked of it.
+
+    Routed by path: the refresh endpoint and the /me live-check (the refresh
+    5xx tiebreaker) answer independently. An unmatched path fails loudly."""
     calls: list[httpx.Request] = []
-    state = {"status": 200, "payload": {"access_token": "new-token",
-                                        "expires_in": 5183944}}
+    state = {
+        "status": 200,
+        "payload": {"access_token": "new-token", "expires_in": 5183944},
+        "me_status": 200,
+        "me_payload": {"id": "42", "username": "drewbensonhq"},
+        "me_exception": None,
+    }
 
     async def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
-        if state["status"] != 200:
-            return httpx.Response(state["status"], json={"error": state["payload"]})
-        return httpx.Response(200, json=state["payload"])
+        if "refresh_access_token" in str(request.url):
+            if state["status"] != 200:
+                return httpx.Response(state["status"], json={"error": state["payload"]})
+            return httpx.Response(200, json=state["payload"])
+        if request.url.path.endswith("/me"):
+            if state["me_exception"] is not None:
+                raise state["me_exception"]
+            if state["me_status"] != 200:
+                return httpx.Response(
+                    state["me_status"], json={"error": state["me_payload"]}
+                )
+            return httpx.Response(200, json=state["me_payload"])
+        raise AssertionError(f"unexpected request to {request.url}")
 
     original = httpx.AsyncClient.__init__
     monkeypatch.setattr(
@@ -48,6 +66,14 @@ def meta(monkeypatch):
             self, *a, **{**kw, "transport": httpx.MockTransport(handler)}),
     )
     return calls, state
+
+
+@pytest.fixture(autouse=True)
+def _reset_dual_failure_counter(social):
+    """The dual-failure backstop is process memory; tests must not leak it."""
+    social._threads_refresh_dual_failures.clear()
+    yield
+    social._threads_refresh_dual_failures.clear()
 
 
 @pytest.fixture
@@ -179,15 +205,112 @@ async def test_a_network_error_is_retried_not_treated_as_expiry(
 
 
 async def test_a_meta_outage_is_not_a_verdict_on_the_token(social, meta, stored):
-    """A 5xx from the refresh endpoint says Meta is unwell, not that the
-    credential is dead. Flagging needs_reauth would send the user through OAuth
-    for a working token."""
+    """A genuine full outage — refresh AND /me both 5xx, no recorded expiry —
+    is retried, not flagged. Flagging needs_reauth would send the user through
+    OAuth for a working token."""
     calls, state = meta
     state["status"] = 503
     state["payload"] = {"message": "Service temporarily unavailable"}
+    state["me_status"] = 503
+    state["me_payload"] = {"message": "Service temporarily unavailable"}
 
     assert await social.ThreadsPoster(bundle=dict(CREDS)).refresh_if_stale() is False
     assert "bundle" not in stored
+
+
+async def test_a_refresh_500_with_a_dead_token_flags_reauth(social, meta, stored):
+    """The production loop this fix exists for: Meta 500s a dead token's
+    refresh exactly like an outage, but /me gives a real verdict — a 4xx.
+    The old code read the 500 optimistically every 20 minutes for weeks."""
+    calls, state = meta
+    state["status"] = 500
+    state["payload"] = {"message": "An unknown error occurred", "code": 1}
+    state["me_status"] = 400
+    state["me_payload"] = {"message": "Invalid OAuth access token", "code": 190}
+
+    with pytest.raises(social.CredentialAuthError) as exc_info:
+        await social.ThreadsPoster(bundle=dict(CREDS)).refresh_if_stale()
+    assert "Reconnect Threads" in str(exc_info.value)
+    assert "bundle" not in stored
+
+
+async def test_a_refresh_500_with_a_still_verifying_token_is_retried(social, meta, stored):
+    calls, state = meta
+    state["status"] = 500
+    state["payload"] = {"message": "An unknown error occurred", "code": 1}
+
+    assert await social.ThreadsPoster(bundle=dict(CREDS)).refresh_if_stale() is False
+    assert "bundle" not in stored
+    assert any(r.url.path.endswith("/me") for r in calls), "the tiebreaker must ask /me"
+
+
+async def test_a_full_outage_past_recorded_expiry_is_terminal(social, meta, stored):
+    """th_refresh_token cannot renew a token past expiry, so waiting out the
+    outage cannot save this credential — flag it now."""
+    calls, state = meta
+    state["status"] = 500
+    state["payload"] = {"message": "An unknown error occurred", "code": 1}
+    state["me_exception"] = httpx.ConnectError("no route to host")
+    creds = dict(CREDS, expires_at=int(time.time()) - 3600)
+
+    with pytest.raises(social.CredentialAuthError) as exc_info:
+        await social.ThreadsPoster(bundle=creds).refresh_if_stale()
+    assert "past its recorded expiry" in str(exc_info.value)
+
+
+async def test_the_dual_failure_backstop_flags_after_bounded_retries(social, meta, stored):
+    """No recorded expiry + both endpoints unreadable could loop forever —
+    which is Meta's signature for a dead token too. Bounded, then flagged."""
+    calls, state = meta
+    state["status"] = 500
+    state["payload"] = {"message": "An unknown error occurred", "code": 1}
+    state["me_status"] = 503
+    state["me_payload"] = {"message": "Service temporarily unavailable"}
+
+    poster = social.ThreadsPoster(bundle=dict(CREDS))
+    threshold = social._THREADS_DUAL_FAILURE_FLAG_THRESHOLD
+    for _ in range(threshold - 1):
+        assert await poster.refresh_if_stale() is False
+    with pytest.raises(social.CredentialAuthError) as exc_info:
+        await poster.refresh_if_stale()
+    assert "predates expiry tracking" in str(exc_info.value)
+
+
+async def test_a_verifying_token_resets_the_dual_failure_count(social, meta, stored):
+    calls, state = meta
+    state["status"] = 500
+    state["payload"] = {"message": "An unknown error occurred", "code": 1}
+    state["me_status"] = 503
+    state["me_payload"] = {"message": "Service temporarily unavailable"}
+
+    poster = social.ThreadsPoster(bundle=dict(CREDS))
+    for _ in range(social._THREADS_DUAL_FAILURE_FLAG_THRESHOLD - 1):
+        assert await poster.refresh_if_stale() is False
+
+    state["me_status"] = 200
+    assert await poster.refresh_if_stale() is False
+    assert social._threads_refresh_dual_failures == {}
+
+
+async def test_a_4xx_refresh_verdict_never_asks_me(social, meta, stored):
+    """The tiebreaker exists for ambiguous 5xx only — it must never dilute a
+    real 4xx verdict from the refresh endpoint."""
+    calls, state = meta
+    state["status"] = 400
+    state["payload"] = {"message": "Invalid OAuth access token", "code": 190}
+
+    with pytest.raises(social.CredentialAuthError):
+        await social.ThreadsPoster(bundle=dict(CREDS)).refresh_if_stale()
+    assert not any(r.url.path.endswith("/me") for r in calls)
+
+
+def test_threads_live_check_backs_the_refresh_tiebreaker():
+    """If threads ever left LIVE_CHECK_PLATFORMS, the tiebreaker would raise
+    CredentialCheckUnsupported, which the sweep logs as 'transient' — silently
+    reinstating the forever-loop."""
+    from yt_scheduler.services.social_identity import LIVE_CHECK_PLATFORMS
+
+    assert "threads" in LIVE_CHECK_PLATFORMS
 
 
 async def test_expiry_reaches_the_api_so_the_ui_can_show_it(isolated_db):

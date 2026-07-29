@@ -336,6 +336,17 @@ CAPTION_CHECK_INTERVAL_MINUTES = _parse_int_env(
     "DYS_CAPTION_CHECK_MINUTES", "YTP_CAPTION_CHECK_MINUTES", 15
 )
 
+# Lookahead for the pre-emptive token-refresh sweep: a credential is renewed
+# once its token expires within this window. Per-poster, exposed as
+# SocialPoster.token_refresh_window_secs. 45 minutes suits ~2-hour tokens
+# (Twitter, Bluesky). Threads tokens live 60 days and CANNOT be refreshed once
+# expired, so their window is a week: renewal fires when <7 days remain
+# (steady-state ~every 53 days, comfortably past Meta's 24-hour minimum token
+# age), and the app merely has to run once during the final week — a sleeping
+# laptop during any one sweep is a non-event.
+SOCIAL_TOKEN_REFRESH_WINDOW_SECONDS = 45 * 60
+THREADS_TOKEN_REFRESH_WINDOW_SECONDS = 7 * 24 * 3600
+
 # ---------------------------------------------------------------------------
 # Outbound HTTP call budgets
 #
@@ -392,6 +403,11 @@ USERNAME_RESOLVE_TIMEOUT_SECONDS = DEFAULT_API_CALL_TIMEOUT_SECONDS
 # segment, each request getting its own budget.
 TWITTER_CHUNKED_UPLOAD_TIMEOUT_SECONDS = 120
 TWITTER_VIDEO_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024
+
+# Per-request budget for the read-only status checks that settle an ambiguous
+# Threads publish (response lost mid-call). Deliberately short: the checks
+# retry, and the whole recovery is bounded by their attempt count.
+THREADS_PUBLISH_RESOLVE_TIMEOUT_SECONDS = 15
 
 # Threads media goes to R2 as a single streamed PUT (no protocol-level
 # chunking); the chunk size is the per-read buffer of that stream — it bounds

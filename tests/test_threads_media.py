@@ -252,3 +252,245 @@ async def test_platform_capability_flags_are_the_single_source_of_truth(social):
     # Everyone else takes a direct upload and must not gain a hosting dependency.
     for platform in ("twitter", "bluesky", "mastodon", "linkedin"):
         assert social.platform_requires_hosted_media(platform) is False
+
+
+# --- Ambiguous publish resolution -------------------------------------------
+#
+# A ReadTimeout on /threads_publish means the request was sent and the
+# response was lost — Meta may have published (post 365 did exactly this in
+# production, and the stored error told the user to Send again, i.e. to
+# double-post). The resolver settles the outcome with read-only status
+# checks and never issues a second publish.
+
+
+@pytest.fixture
+def ambiguous_graph(monkeypatch, social):
+    """Graph where the publish leg is scriptable, everything else canned."""
+    monkeypatch.setattr(social.ThreadsPoster, "_PUBLISH_RESOLVE_DELAY_SECONDS", 0.0)
+    calls: list[httpx.Request] = []
+    state = {
+        "publish_exception": None,
+        "publish_response": (200, {"id": "post-9"}),
+        "publish_attempted": False,
+        "status_sequence": [],
+        "status_default": (200, {"status": "FINISHED"}),
+        "container_lookup": (400, {"error": {"message": "unsupported"}}),
+        "threads_listing": (200, {"data": []}),
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        path = request.url.path
+        params = dict(request.url.params)
+        if path.endswith("/threads_publish"):
+            state["publish_attempted"] = True
+            if state["publish_exception"] is not None:
+                raise state["publish_exception"]
+            code, payload = state["publish_response"]
+            return httpx.Response(code, json=payload)
+        if path.endswith("/threads"):
+            if request.method == "POST":
+                return httpx.Response(200, json={"id": "container-1"})
+            code, payload = state["threads_listing"]
+            return httpx.Response(code, json=payload)
+        if "status" in params.get("fields", ""):
+            # The pre-publish poll uses this endpoint too; the scripted
+            # sequence is only for the post-publish resolver.
+            if not state["publish_attempted"]:
+                return httpx.Response(200, json={"status": "FINISHED"})
+            if state["status_sequence"]:
+                item = state["status_sequence"].pop(0)
+                if item == "raise":
+                    raise httpx.ReadTimeout("status check timed out", request=request)
+                code, payload = item
+                return httpx.Response(code, json=payload)
+            code, payload = state["status_default"]
+            return httpx.Response(code, json=payload)
+        code, payload = state["container_lookup"]
+        return httpx.Response(code, json=payload)
+
+    original = httpx.AsyncClient.__init__
+    monkeypatch.setattr(
+        httpx.AsyncClient, "__init__",
+        lambda self, *a, **kw: original(
+            self, *a, **{**kw, "transport": httpx.MockTransport(handler)}),
+    )
+    return calls, state
+
+
+def _publish_requests(calls) -> list:
+    return [r for r in calls if r.url.path.endswith("/threads_publish")]
+
+
+async def test_lost_response_with_published_container_is_a_success(
+    ambiguous_graph, social,
+):
+    calls, state = ambiguous_graph
+    state["publish_exception"] = httpx.ReadTimeout("response never arrived")
+    state["status_sequence"] = [(200, {"status": "PUBLISHED"})]
+    state["container_lookup"] = (
+        200, {"id": "post-9", "permalink": "https://threads.net/t/AbCdE"})
+
+    result = await social.ThreadsPoster(bundle=CREDS)._post_prepared("hello")
+
+    assert result["url"] == "https://threads.net/t/AbCdE"
+    assert "lost publish response" in result["warning"]
+    assert len(_publish_requests(calls)) == 1, "never publish twice"
+
+
+async def test_lost_response_with_error_container_is_retry_safe(
+    ambiguous_graph, social,
+):
+    calls, state = ambiguous_graph
+    state["publish_exception"] = httpx.ReadTimeout("response never arrived")
+    state["status_sequence"] = [(200, {"status": "ERROR", "error_message": "boom"})]
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await social.ThreadsPoster(bundle=CREDS)._post_prepared("hello")
+    message = str(exc_info.value)
+    assert "Nothing was published" in message
+    assert "boom" in message
+    assert "Check your network connection" not in message
+
+
+async def test_lost_response_with_persistent_finished_is_unknown(
+    ambiguous_graph, social, monkeypatch,
+):
+    """FINISHED is the expected pre-publish state, so seeing it again proves
+    only 'not yet' — a confident 'retry is safe' here rebuilds the duplicate
+    with extra steps."""
+    monkeypatch.setattr(social.ThreadsPoster, "_PUBLISH_RESOLVE_ATTEMPTS", 3)
+    calls, state = ambiguous_graph
+    state["publish_exception"] = httpx.ReadTimeout("response never arrived")
+
+    with pytest.raises(social.ThreadsPublishOutcomeUnknown) as exc_info:
+        await social.ThreadsPoster(bundle=CREDS)._post_prepared("hello")
+    message = str(exc_info.value)
+    assert "Check your Threads profile" in message
+    assert "container-1" in message
+    assert "probably safe" in message
+
+
+async def test_lost_response_with_unreachable_checks_is_unknown_and_bounded(
+    ambiguous_graph, social,
+):
+    calls, state = ambiguous_graph
+    state["publish_exception"] = httpx.ReadTimeout("response never arrived")
+    state["status_sequence"] = ["raise"] * 30
+
+    with pytest.raises(social.ThreadsPublishOutcomeUnknown) as exc_info:
+        await social.ThreadsPoster(bundle=CREDS)._post_prepared("hello")
+    message = str(exc_info.value)
+    assert message.index("Check your Threads profile") < 50, \
+        "the advice must survive the banner's 200-char truncation"
+    cap = social.ThreadsPoster._PUBLISH_RESOLVE_MAX_CONSECUTIVE_CHECK_FAILURES
+    assert len(state["status_sequence"]) == 30 - cap, \
+        "consecutive check failures must stop the polling early"
+
+
+async def test_connect_error_on_publish_stays_a_plain_failure(
+    ambiguous_graph, social,
+):
+    """No connection means the request never arrived — no ambiguity, retry is
+    genuinely safe, and the resolver must not run."""
+    calls, state = ambiguous_graph
+    state["publish_exception"] = httpx.ConnectError("no route to host")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await social.ThreadsPoster(bundle=CREDS)._post_prepared("hello")
+    assert not isinstance(exc_info.value, social.ThreadsPublishOutcomeUnknown)
+    assert "use Send to retry" in str(exc_info.value)
+    post_publish_status_reads = [
+        r for r in calls
+        if "status" in dict(r.url.params).get("fields", "")
+        and calls.index(r) > calls.index(_publish_requests(calls)[0])
+    ]
+    assert post_publish_status_reads == []
+
+
+async def test_permalink_fallback_fences_by_text_and_timestamp(
+    ambiguous_graph, social,
+):
+    from datetime import datetime, timezone
+
+    calls, state = ambiguous_graph
+    state["publish_exception"] = httpx.ReadTimeout("response never arrived")
+    state["status_sequence"] = [(200, {"status": "PUBLISHED"})]
+    fresh_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+0000")
+    state["threads_listing"] = (200, {"data": [
+        {"id": "old-1", "permalink": "https://threads.net/t/OLD",
+         "text": "hello", "timestamp": "2020-01-01T00:00:00+0000"},
+        {"id": "new-1", "permalink": "https://threads.net/t/NEW",
+         "text": "hello", "timestamp": fresh_stamp},
+    ]})
+
+    result = await social.ThreadsPoster(bundle=CREDS)._post_prepared("hello")
+
+    assert result["url"] == "https://threads.net/t/NEW"
+
+
+async def test_permalink_fallback_degrades_when_ambiguous(
+    ambiguous_graph, social,
+):
+    """Two candidates pass the fence: picking either risks the wrong
+    permalink, and liveness is already proven — degrade honestly."""
+    from datetime import datetime, timezone
+
+    calls, state = ambiguous_graph
+    state["publish_exception"] = httpx.ReadTimeout("response never arrived")
+    state["status_sequence"] = [(200, {"status": "PUBLISHED"})]
+    fresh_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+0000")
+    state["threads_listing"] = (200, {"data": [
+        {"id": "a", "permalink": "https://threads.net/t/A",
+         "text": "hello", "timestamp": fresh_stamp},
+        {"id": "b", "permalink": "https://threads.net/t/B",
+         "text": "hello", "timestamp": fresh_stamp},
+    ]})
+
+    result = await social.ThreadsPoster(bundle=CREDS)._post_prepared("hello")
+
+    assert result["url"] == ""
+    assert "permalink could not be recovered" in result["warning"]
+
+
+async def test_a_200_publish_without_an_id_uses_the_resolver(
+    ambiguous_graph, social,
+):
+    """Meta said 200, so the post almost certainly landed — a bare KeyError
+    would invite the same blind retry as a lost response."""
+    calls, state = ambiguous_graph
+    state["publish_response"] = (200, {"unexpected": "shape"})
+    state["status_sequence"] = [(200, {"status": "PUBLISHED"})]
+    state["container_lookup"] = (
+        200, {"id": "post-9", "permalink": "https://threads.net/t/AbCdE"})
+
+    result = await social.ThreadsPoster(bundle=CREDS)._post_prepared("hello")
+
+    assert result["url"] == "https://threads.net/t/AbCdE"
+
+
+async def test_a_401_during_resolution_flags_reauth_but_warns(
+    ambiguous_graph, social,
+):
+    calls, state = ambiguous_graph
+    state["publish_exception"] = httpx.ReadTimeout("response never arrived")
+    state["status_sequence"] = [(401, {"error": {"message": "bad token"}})]
+
+    with pytest.raises(social.CredentialAuthError) as exc_info:
+        await social.ThreadsPoster(bundle=CREDS)._post_prepared("hello")
+    assert "before resending" in str(exc_info.value)
+
+
+async def test_a_clean_publish_never_touches_the_resolver(
+    ambiguous_graph, social,
+):
+    calls, _state = ambiguous_graph
+
+    result = await social.ThreadsPoster(bundle=CREDS)._post_prepared("hello")
+
+    assert result["id"] == "post-9"
+    assert "warning" not in result
+    lookups = [
+        r for r in calls if "permalink" in dict(r.url.params).get("fields", "")
+    ]
+    assert lookups == []

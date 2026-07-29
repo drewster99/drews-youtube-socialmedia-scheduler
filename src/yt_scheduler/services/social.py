@@ -20,6 +20,7 @@ import httpx
 # routers already refer to this module.
 from yt_scheduler import config
 from yt_scheduler.services import media as media_service
+from yt_scheduler.services.keychain import KeychainWriteError, SecretsIndexError
 
 logger = logging.getLogger(__name__)
 
@@ -70,10 +71,14 @@ async def _twitter_refresh_bearer(creds: dict[str, str]) -> str | None:
         timeout=config.TWITTER_BEARER_REFRESH_TIMEOUT_SECONDS
     ) as client:
         resp = await client.post(_TWITTER_TOKEN_URL, data=body, auth=auth)
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"X token refresh rejected ({resp.status_code}): {resp.text}"
+    # A 5xx or 429 is the endpoint having a bad day, not a verdict on the
+    # credential — the same distinction the Threads refresh makes.
+    if resp.status_code >= 500 or resp.status_code == 429:
+        raise TokenEndpointUnavailable(
+            f"X token endpoint unavailable: {_http_error_detail(resp)}"
         )
+    if resp.status_code != 200:
+        raise RuntimeError(f"X token refresh rejected: {_http_error_detail(resp)}")
     payload = resp.json() or {}
     new_bearer = payload.get("access_token")
     if not new_bearer:
@@ -259,6 +264,17 @@ async def _twitter_v2_upload(bearer_token: str, media_path: Path) -> str:
     return await _twitter_v2_simple_upload(bearer_token, media_path, mime or "image/jpeg")
 
 
+class TokenEndpointUnavailable(Exception):
+    """The X token endpoint couldn't answer — a 5xx, a 429 rate limit, or
+    similar. Says nothing about the credential, so callers retry later and
+    never flag ``needs_reauth``.
+
+    Deliberately NOT a RuntimeError: the refresh paths convert RuntimeError
+    to :class:`CredentialAuthError` (terminal), and a conversion site that
+    forgets this class must fail transient, never terminal.
+    """
+
+
 class CredentialAuthError(RuntimeError):
     """Raised by a poster when the platform rejected our credentials and
     no automatic recovery (e.g. token refresh) is possible.
@@ -296,7 +312,9 @@ def _http_error_detail(resp: httpx.Response) -> str:
     try:
         data = resp.json()
     except (ValueError, json.JSONDecodeError):
-        text = (resp.text or "").strip()
+        # Cap it: a Cloudflare HTML 502 page must not flow whole into
+        # social_posts.error and the logs.
+        text = (resp.text or "").strip()[:500]
         return f"HTTP {resp.status_code}: {text}" if text else f"HTTP {resp.status_code}"
     err = data.get("error") if isinstance(data, dict) else None
     if isinstance(err, dict):
@@ -308,6 +326,11 @@ def _http_error_detail(resp: httpx.Response) -> str:
         if parts:
             return f"HTTP {resp.status_code}: " + ", ".join(parts)
     if isinstance(err, str) and err:
+        # RFC 6749 token-endpoint shape: {"error": "invalid_grant",
+        # "error_description": "..."} — the description is the useful half.
+        description = data.get("error_description")
+        if isinstance(description, str) and description:
+            return f"HTTP {resp.status_code}: {err}: {description}"
         return f"HTTP {resp.status_code}: {err}"
     return f"HTTP {resp.status_code}: {json.dumps(data)[:500]}"
 
@@ -489,6 +512,12 @@ class SocialPoster:
     # that sets this False is asserting its credentials don't expire; one that
     # sets it True must override refresh_if_stale.
     supports_token_refresh: bool = False
+
+    # How close to expiry a token must be before the background sweep renews
+    # it. Platform behavior, so it lives on the poster; the numbers live in
+    # config with the scheduler's other knobs. Meaningful only when
+    # supports_token_refresh is True.
+    token_refresh_window_secs: int = config.SOCIAL_TOKEN_REFRESH_WINDOW_SECONDS
 
     def __init__(self, bundle: dict | None = None) -> None:
         self._bundle: dict | None = bundle
@@ -785,8 +814,23 @@ class TwitterPoster(SocialPoster):
                 return False
             try:
                 new_bearer = await _twitter_refresh_bearer(current)
+            except TokenEndpointUnavailable as exc:
+                logger.warning(
+                    "X token refresh deferred for %s; will retry: %s", uuid, exc
+                )
+                return False
+            except (KeychainWriteError, SecretsIndexError):
+                # A LOCAL storage failure is not a provider verdict — telling
+                # the user to re-OAuth would run a flow whose result the
+                # broken Keychain couldn't even persist.
+                logger.error("Keychain write failed persisting X refresh for %s", uuid)
+                raise
             except RuntimeError as exc:
-                raise CredentialAuthError(uuid, str(exc)) from exc
+                raise CredentialAuthError(
+                    uuid,
+                    f"X token could not be refreshed ({exc}). "
+                    "Reconnect X in Settings.",
+                ) from exc
             if not new_bearer:
                 return False  # no refresh token in the bundle — nothing to do
             await clear_needs_reauth(uuid)
@@ -902,6 +946,15 @@ class TwitterPoster(SocialPoster):
                     )
                 try:
                     new_b = await _twitter_refresh_bearer(current)
+                except (KeychainWriteError, SecretsIndexError):
+                    # Local storage failure, not a provider verdict — the post
+                    # fails loudly via the generic handler without the false
+                    # Reconnect nag. TokenEndpointUnavailable escapes here
+                    # naturally for the same reason (not a RuntimeError).
+                    logger.error(
+                        "Keychain write failed persisting X refresh for %s", uuid
+                    )
+                    raise
                 except RuntimeError as rexc:
                     raise CredentialAuthError(
                         uuid,
@@ -1110,10 +1163,17 @@ class BlueskyPoster(SocialPoster):
 
         try:
             await self._ensure_fresh_token(creds)
+        except (KeychainWriteError, SecretsIndexError):
+            logger.error(
+                "Keychain write failed persisting Bluesky refresh for %s",
+                creds.get("uuid"),
+            )
+            raise
         except RuntimeError as exc:
-            # refresh_tokens raises RuntimeError on a non-200 from the
-            # AS — invalid_grant, expired_token, etc. all mean the
-            # user has to re-OAuth.
+            # refresh_tokens raises RuntimeError only on an AS *verdict*
+            # (invalid_grant, expired_token, …), which means the user has to
+            # re-OAuth. AS outages raise AuthServerUnavailable, which is not
+            # a RuntimeError and so fails the post without the reauth flag.
             raise CredentialAuthError(creds.get("uuid"), str(exc)) from exc
 
         embed = None
@@ -1200,6 +1260,12 @@ class BlueskyPoster(SocialPoster):
                 retried = await self._handle_dpop_or_token_error(
                     resp, creds, bluesky_oauth, save_bundle,
                 )
+            except (KeychainWriteError, SecretsIndexError):
+                logger.error(
+                    "Keychain write failed persisting Bluesky refresh for %s",
+                    creds.get("uuid"),
+                )
+                raise
             except RuntimeError as exc:
                 raise CredentialAuthError(creds.get("uuid"), str(exc)) from exc
             if retried:
@@ -1396,10 +1462,28 @@ class BlueskyPoster(SocialPoster):
         expires_at = int(creds.get("expires_at") or 0)
         if expires_at and expires_at - window_secs > int(time.time()):
             return False
+        from yt_scheduler.services.bluesky_oauth import AuthServerUnavailable
+
         try:
             return await self._refresh_under_lock(creds, window_secs=window_secs)
+        except AuthServerUnavailable as exc:
+            logger.warning(
+                "Bluesky token refresh deferred for %s; will retry: %s",
+                creds.get("uuid"), exc,
+            )
+            return False
+        except (KeychainWriteError, SecretsIndexError):
+            logger.error(
+                "Keychain write failed persisting Bluesky refresh for %s",
+                creds.get("uuid"),
+            )
+            raise
         except RuntimeError as exc:
-            raise CredentialAuthError(creds.get("uuid"), str(exc)) from exc
+            raise CredentialAuthError(
+                creds.get("uuid"),
+                f"Bluesky token could not be refreshed ({exc}). "
+                "Reconnect Bluesky in Settings.",
+            ) from exc
 
     async def _refresh_access_token(
         self, creds: dict, bluesky_oauth, save_bundle,
@@ -1460,6 +1544,12 @@ class BlueskyPoster(SocialPoster):
                 retried = await self._handle_dpop_or_token_error(
                     resp, creds, bluesky_oauth, save_bundle,
                 )
+            except (KeychainWriteError, SecretsIndexError):
+                logger.error(
+                    "Keychain write failed persisting Bluesky refresh for %s",
+                    creds.get("uuid"),
+                )
+                raise
             except RuntimeError as exc:
                 raise CredentialAuthError(creds.get("uuid"), str(exc)) from exc
             if retried:
@@ -1877,6 +1967,27 @@ class LinkedInPoster(SocialPoster):
         return asset_urn
 
 
+class ThreadsPublishOutcomeUnknown(RuntimeError):
+    """The publish request was sent but its outcome could not be settled.
+
+    The message must reach the UI verbatim: a blind retry risks a double
+    post, so it tells the user to check their profile first. Passed through
+    the poster's catch-all unwrapped for exactly that reason.
+    """
+
+
+# Consecutive sweeps on which a credential's refresh 5xx'd AND live
+# verification couldn't answer, keyed by credential uuid. Consulted only for
+# bundles with no recorded expiry (pre-stamping) — with both endpoints
+# unreadable and no date to consult, this bound is what stops the dead-token
+# forever-loop. Process memory by design: a restart re-arms the bound, and the
+# guarded population only shrinks as bundles get stamped.
+_threads_refresh_dual_failures: dict[str, int] = {}
+# ≈3 hours of consecutive 20-minute sweeps — longer than any observed Meta
+# blip, far shorter than the weeks the old optimistic reading allowed.
+_THREADS_DUAL_FAILURE_FLAG_THRESHOLD = 9
+
+
 class ThreadsPoster(SocialPoster):
     # Threads fetches media from a URL rather than accepting an upload, for
     # images and video alike. media_hosting puts the file in a private R2
@@ -1892,10 +2003,13 @@ class ThreadsPoster(SocialPoster):
     # Twitter/Bluesky shape and ended up unimplemented.
     supports_token_refresh = True
 
-    # Meta issues 60-day tokens and will renew one that is at least 24 hours
-    # old and not yet expired. Past expiry there is no way back but a fresh
-    # OAuth, so the sweep has to act well before then.
-    _TOKEN_MIN_AGE_SECONDS = 24 * 3600
+    # A lapsed 60-day token is unrecoverable (manual re-OAuth only), so
+    # refresh with a week of margin rather than the default 45 minutes — a
+    # sleeping laptop during any one sweep must be a non-event. Meta renews
+    # any token at least 24 hours old; the reactive "too early" branch in
+    # refresh_if_stale handles the younger-than-that case.
+    token_refresh_window_secs = config.THREADS_TOKEN_REFRESH_WINDOW_SECONDS
+
     _TOKEN_TTL_FALLBACK_SECONDS = 60 * 24 * 3600
 
     # Threads' image ceiling. PLATFORM_MEDIA_LIMITS covers video only (and
@@ -1968,10 +2082,23 @@ class ThreadsPoster(SocialPoster):
                     ),
                 )
 
-                publish_resp = await client.post(
-                    f"https://graph.threads.net/v1.0/{user_id}/threads_publish",
-                    params={"creation_id": container_id, "access_token": access_token},
-                )
+                from datetime import datetime, timezone
+
+                publish_started_at = datetime.now(timezone.utc)
+                try:
+                    publish_resp = await client.post(
+                        f"https://graph.threads.net/v1.0/{user_id}/threads_publish",
+                        params={"creation_id": container_id, "access_token": access_token},
+                    )
+                except self._PUBLISH_AMBIGUOUS_TRANSPORT_ERRORS as exc:
+                    # The request may have reached Meta; the response is what
+                    # was lost. Retrying blind can double-post — resolve the
+                    # actual outcome from the container's status instead.
+                    return await self._resolve_ambiguous_publish(
+                        client, container_id, user_id, access_token,
+                        cred_uuid=creds.get("uuid"), text=text,
+                        publish_started_at=publish_started_at, cause=exc,
+                    )
                 if publish_resp.status_code == 401:
                     raise CredentialAuthError(
                         creds.get("uuid"),
@@ -1981,11 +2108,21 @@ class ThreadsPoster(SocialPoster):
                     raise RuntimeError(
                         f"Threads publish failed: {_http_error_detail(publish_resp)}"
                     )
-                post_id = publish_resp.json()["id"]
+                try:
+                    post_id = publish_resp.json()["id"]
+                except (KeyError, TypeError, ValueError) as exc:
+                    # Meta said 200, so the publish almost certainly landed —
+                    # a bare KeyError here would invite the same blind retry
+                    # as a lost response. Same ambiguity, same resolver.
+                    return await self._resolve_ambiguous_publish(
+                        client, container_id, user_id, access_token,
+                        cred_uuid=creds.get("uuid"), text=text,
+                        publish_started_at=publish_started_at, cause=exc,
+                    )
 
                 username = creds.get("username", "")
                 return {"url": f"https://threads.net/@{username}/post/{post_id}", "id": post_id}
-        except (CredentialAuthError, MediaUploadError):
+        except (CredentialAuthError, MediaUploadError, ThreadsPublishOutcomeUnknown):
             raise
         except Exception as e:
             raise RuntimeError(f"Threads post failed: {_exception_detail(e)}") from e
@@ -1999,6 +2136,10 @@ class ThreadsPoster(SocialPoster):
         raises :class:`CredentialAuthError` so the credential is flagged
         ``needs_reauth`` instead of failing every post with an opaque 500,
         which is what happened before this existed.
+
+        A refresh 5xx is ambiguous (Meta 500s both outages and dead tokens),
+        so it is tie-broken by a live ``GET /me`` check plus a recorded-expiry
+        backstop rather than read optimistically forever.
         """
         creds = await self._get_creds()
         uuid = creds.get("uuid")
@@ -2047,15 +2188,73 @@ class ThreadsPoster(SocialPoster):
 
             if resp.status_code != 200:
                 detail = _http_error_detail(resp)
-                # 5xx is Meta having a bad day, not a verdict on the token.
-                # Flagging needs_reauth here would march the user through OAuth
-                # for a perfectly good credential; the next sweep retries.
+                # Meta answers BOTH a real outage AND a refresh of an
+                # already-dead token with a 5xx here (an expired token gets
+                # the generic 500 code=1), so the status alone is not a
+                # verdict either way. Reading it optimistically forever is
+                # how a dead June token 500'd every 20 minutes for weeks
+                # while Settings showed a healthy credential. GET /me is the
+                # tiebreaker: it answers a live token 200 and a dead one 4xx.
                 if resp.status_code >= 500:
-                    logger.warning(
-                        "Threads token refresh got %s from Meta; will retry: %s",
-                        resp.status_code, detail,
+                    from yt_scheduler.services.social_identity import verify_live
+
+                    verdict = await verify_live(self.platform, current)
+                    if verdict["ok"]:
+                        _threads_refresh_dual_failures.pop(uuid, None)
+                        logger.warning(
+                            "Threads token refresh got %s from Meta but the "
+                            "token still verifies; will retry: %s",
+                            resp.status_code, detail,
+                        )
+                        return False
+                    if verdict.get("unreachable"):
+                        expires_at = int(current.get("expires_at") or 0)
+                        if expires_at and expires_at <= int(time.time()):
+                            # Both endpoints down AND the recorded expiry has
+                            # passed: th_refresh_token cannot renew a token
+                            # past expiry, so waiting out the outage cannot
+                            # save this credential.
+                            raise CredentialAuthError(
+                                uuid,
+                                f"Threads refresh failed ({detail}), live "
+                                f"verification got no answer "
+                                f"({verdict['detail']}), and the token is "
+                                "past its recorded expiry. An expired token "
+                                "can only be replaced — reconnect Threads in "
+                                "Settings.",
+                            )
+                        if not expires_at:
+                            # Pre-stamping bundle: no recorded expiry to
+                            # consult, and Meta is 5xx-ing both endpoints —
+                            # which is also its signature for a dead token.
+                            # Retry a bounded number of sweeps, then flag; a
+                            # false flag during a marathon outage self-heals
+                            # at the next successful refresh.
+                            failures = _threads_refresh_dual_failures.get(uuid, 0) + 1
+                            _threads_refresh_dual_failures[uuid] = failures
+                            if failures >= _THREADS_DUAL_FAILURE_FLAG_THRESHOLD:
+                                raise CredentialAuthError(
+                                    uuid,
+                                    "Threads refresh has returned 5xx and "
+                                    f"live verification has been unanswerable "
+                                    f"for {failures} consecutive attempts, "
+                                    "and this credential predates expiry "
+                                    "tracking. Reconnect Threads in Settings.",
+                                )
+                        logger.warning(
+                            "Threads token refresh got %s and live "
+                            "verification couldn't reach Meta either; will "
+                            "retry: %s / %s",
+                            resp.status_code, detail, verdict["detail"],
+                        )
+                        return False
+                    raise CredentialAuthError(
+                        uuid,
+                        f"Threads token could not be refreshed ({detail}) and "
+                        f"live verification rejected it ({verdict['detail']}). "
+                        "Reconnect Threads in Settings — an expired token can "
+                        "only be replaced, not renewed.",
                     )
-                    return False
                 # Meta refuses a token younger than 24h. Also "come back
                 # later" rather than a dead credential.
                 if "24 hours" in detail or "too early" in detail.lower():
@@ -2082,9 +2281,179 @@ class ThreadsPoster(SocialPoster):
             stamp_token_metadata(updated, expires_in_seconds=expires_in)
             await save_bundle("threads", uuid, updated)
             await clear_needs_reauth(uuid)
+            _threads_refresh_dual_failures.pop(uuid, None)
             logger.info("Threads token refreshed; valid for %.0f more days",
                         expires_in / 86400)
             return True
+
+    async def _resolve_ambiguous_publish(
+        self, client, container_id: str, user_id: str, access_token: str,
+        *, cred_uuid: str | None, text: str, publish_started_at, cause: Exception,
+    ) -> dict:
+        """Settle a publish whose response was lost, using read-only status
+        checks — never a second publish, which is what mints duplicates.
+        """
+        last_status: str | None = None
+        last_read_succeeded = False
+        consecutive_failures = 0
+        checks_failed = 0
+        for attempt in range(self._PUBLISH_RESOLVE_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(self._PUBLISH_RESOLVE_DELAY_SECONDS)
+            try:
+                resp = await client.get(
+                    f"https://graph.threads.net/v1.0/{container_id}",
+                    params={"fields": "status,error_message",
+                            "access_token": access_token},
+                    timeout=config.THREADS_PUBLISH_RESOLVE_TIMEOUT_SECONDS,
+                )
+            except httpx.HTTPError:
+                checks_failed += 1
+                consecutive_failures += 1
+                last_read_succeeded = False
+                if consecutive_failures >= self._PUBLISH_RESOLVE_MAX_CONSECUTIVE_CHECK_FAILURES:
+                    break
+                continue
+            consecutive_failures = 0
+            if resp.status_code == 401:
+                raise CredentialAuthError(
+                    cred_uuid,
+                    "Threads publish outcome unknown — check your Threads "
+                    "profile for this post before resending. The follow-up "
+                    "status check was rejected (401): re-OAuth Threads in "
+                    f"Settings. Container {container_id}.",
+                )
+            if resp.status_code >= 400:
+                # A 4xx on the status read is "can't verify", never proof of
+                # "not published".
+                checks_failed += 1
+                last_read_succeeded = False
+                continue
+            data = resp.json()
+            if not isinstance(data, dict) or data.get("error"):
+                checks_failed += 1
+                last_read_succeeded = False
+                continue
+            last_read_succeeded = True
+            last_status = data.get("status")
+            if last_status == "PUBLISHED":
+                logger.warning(
+                    "Threads publish response was lost (%s) but container %s "
+                    "reports PUBLISHED; recovering the post identity.",
+                    _exception_detail(cause), container_id,
+                )
+                return await self._published_result_after_lost_response(
+                    client, container_id, user_id, access_token,
+                    text=text, publish_started_at=publish_started_at,
+                )
+            if last_status in ("ERROR", "EXPIRED"):
+                raise RuntimeError(
+                    f"Threads publish failed: after the response was lost, "
+                    f"container {container_id} reported {last_status} "
+                    f"({data.get('error_message') or 'no detail from Threads'}). "
+                    "Nothing was published — Send again to retry."
+                )
+            # FINISHED / IN_PROGRESS: not published *yet* — Meta may still be
+            # completing the publish we never heard back about; keep watching.
+        if last_status == "FINISHED" and last_read_succeeded:
+            # Still unpublished after the whole window — but a finite poll
+            # cannot prove Meta won't complete it later, so this stays an
+            # honest "probably", never a confident "retry is safe".
+            raise ThreadsPublishOutcomeUnknown(
+                "Check your Threads profile for this post before resending: "
+                f"the publish response was lost ({_exception_detail(cause)}) "
+                f"and container {container_id} still read FINISHED "
+                f"(unpublished) after {self._PUBLISH_RESOLVE_ATTEMPTS} checks "
+                "— probably safe to Send again, but verify first."
+            )
+        raise ThreadsPublishOutcomeUnknown(
+            "Check your Threads profile for this post before resending — "
+            "retrying may publish a duplicate. The publish request was sent "
+            f"but the response was lost ({_exception_detail(cause)}), and "
+            f"follow-up status checks could not settle it (last "
+            f"status={last_status or 'unavailable'}, {checks_failed} check(s) "
+            f"failed). Container {container_id}."
+        )
+
+    async def _published_result_after_lost_response(
+        self, client, container_id: str, user_id: str, access_token: str,
+        *, text: str, publish_started_at,
+    ) -> dict:
+        """Recover the published post's permalink after a lost response.
+
+        The post is provably live (container status PUBLISHED), so failures
+        here must degrade to posted-with-warning — failing the send would
+        reopen the exact duplicate trap this resolver closes.
+        """
+        from datetime import datetime, timedelta
+
+        recovered_warning = (
+            "Threads confirmed this post after a lost publish response."
+        )
+        try:
+            resp = await client.get(
+                f"https://graph.threads.net/v1.0/{container_id}",
+                params={"fields": "id,permalink", "access_token": access_token},
+                timeout=config.THREADS_PUBLISH_RESOLVE_TIMEOUT_SECONDS,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                permalink = data.get("permalink") if isinstance(data, dict) else None
+                if permalink:
+                    return {"url": permalink, "id": data.get("id"),
+                            "warning": recovered_warning}
+        except httpx.HTTPError:
+            pass
+
+        # Fallback: find the post in the account's recent threads, fenced by
+        # text AND timestamp so an older identical post can never be matched.
+        try:
+            resp = await client.get(
+                f"https://graph.threads.net/v1.0/{user_id}/threads",
+                params={"fields": "id,permalink,text,timestamp", "limit": "10",
+                        "access_token": access_token},
+                timeout=config.THREADS_PUBLISH_RESOLVE_TIMEOUT_SECONDS,
+            )
+            if resp.status_code == 200:
+                entries = (resp.json() or {}).get("data") or []
+                fence = publish_started_at - timedelta(
+                    seconds=self._PUBLISH_CLOCK_SKEW_ALLOWANCE_SECONDS
+                )
+                matches = []
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    # Graph omits `text` on empty posts; absent means empty
+                    # here, not unknown.
+                    if (entry.get("text") or "").strip() != (text or "").strip():
+                        continue
+                    try:
+                        stamp = datetime.fromisoformat(entry.get("timestamp") or "")
+                    except (TypeError, ValueError):
+                        continue  # unverifiable, never "a match"
+                    if stamp.tzinfo is None:
+                        continue
+                    if stamp >= fence:
+                        matches.append(entry)
+                # Unique match only: with two candidates, picking either
+                # risks attaching the wrong permalink. Liveness is already
+                # proven, so degrading is safe and honest.
+                if len(matches) == 1 and matches[0].get("permalink"):
+                    return {"url": matches[0]["permalink"],
+                            "id": matches[0].get("id"),
+                            "warning": recovered_warning}
+        except httpx.HTTPError:
+            pass
+
+        logger.warning(
+            "Threads container %s is PUBLISHED but the permalink could not "
+            "be recovered.", container_id,
+        )
+        return {
+            "url": "", "id": None,
+            "warning": "Published to Threads, but the permalink could not be "
+                       "recovered — open Threads to find the post.",
+        }
 
     def _token_is_due(self, creds: dict, window_secs: int) -> bool:
         """Whether this token is close enough to expiry to be worth renewing.
@@ -2147,6 +2516,30 @@ class ThreadsPoster(SocialPoster):
             ) from exc
 
         return {"media_type": media_type, url_field: hosted.url}
+
+    # Transport failures on the publish call where the request may have
+    # REACHED Meta even though no response came back — retrying blind mints a
+    # duplicate post. Connect-phase errors are deliberately absent: no
+    # connection means the request never arrived, so plain failure + retry is
+    # safe. (ConnectTimeout subclasses TimeoutException, so a blanket
+    # TimeoutException catch here would be wrong.)
+    _PUBLISH_AMBIGUOUS_TRANSPORT_ERRORS = (
+        httpx.ReadTimeout,          # request sent in full; response never arrived
+        httpx.ReadError,
+        httpx.WriteTimeout,         # unknowable how much of the request was written
+        httpx.WriteError,
+        httpx.RemoteProtocolError,  # server dropped the connection without replying
+    )
+    # ~2 minutes of read-only status checks: the ambiguous timeout itself
+    # proves Meta's publish commit can trail the request by >2 minutes of
+    # client patience, so a short window would read FINISHED and wrongly
+    # bless a duplicate-minting retry.
+    _PUBLISH_RESOLVE_ATTEMPTS = 24
+    _PUBLISH_RESOLVE_DELAY_SECONDS = 5.0
+    # Stop early when the network is clearly down — further checks are noise.
+    _PUBLISH_RESOLVE_MAX_CONSECUTIVE_CHECK_FAILURES = 4
+    # Meta's clock vs ours, when fencing the permalink fallback by timestamp.
+    _PUBLISH_CLOCK_SKEW_ALLOWANCE_SECONDS = 120
 
     _TEXT_CONTAINER_POLL_ATTEMPTS = 10
 

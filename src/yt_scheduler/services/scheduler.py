@@ -463,6 +463,10 @@ async def publish_video_job(video_id: str) -> dict:
                         "social_account_id": post.get("social_account_id"),
                         "post_url": post_result.get("url", ""),
                         "posted_at": datetime.now(timezone.utc).isoformat(),
+                        # e.g. a Threads publish recovered after a lost
+                        # response — with no page open, the event feed is the
+                        # only durable surface for it.
+                        "warning": post_result.get("warning"),
                     },
                 )
                 logger.info(f"Posted to {platform}: {post_result.get('url', '')}")
@@ -695,6 +699,9 @@ async def _send_scheduled_post(post_id: int) -> None:
                 "social_account_id": post.get("social_account_id"),
                 "post_url": result.get("url", ""),
                 "posted_at": datetime.now(timezone.utc).isoformat(),
+                # See publish_video_job: the warning must survive somewhere
+                # durable when no page is open to show the toast.
+                "warning": result.get("warning"),
             },
         )
     except Exception as exc:
@@ -1533,20 +1540,21 @@ async def moderate_comments_job() -> None:
 
 
 # How often to sweep social credentials looking for tokens to pre-emptively
-# refresh, and the lookahead window — anything whose access token expires
-# within this many seconds gets renewed now rather than lapsing into
-# "needs re-auth" between posts.
+# refresh. The lookahead window is per-platform (a poster class attribute,
+# ``SocialPoster.token_refresh_window_secs``): 45 minutes suits ~2-hour
+# Twitter/Bluesky tokens, while a 60-day Threads token — unrefreshable once
+# expired — renews with a week of margin.
 _TOKEN_REFRESH_INTERVAL_MINUTES = 20
-_TOKEN_REFRESH_WINDOW_SECS = 45 * 60
 
 
 async def refresh_social_tokens_job() -> None:
     """Pre-emptively refresh social access tokens nearing expiry.
 
     Walks every (non-deleted) social credential; for those whose access token
-    is within ``_TOKEN_REFRESH_WINDOW_SECS`` of expiry, runs the platform's
-    refresh flow (serialised per-credential against the post-time refresh, so
-    the two never present the same rotating refresh token concurrently).
+    is within the poster's ``token_refresh_window_secs`` of expiry, runs the
+    platform's refresh flow (serialised per-credential against the post-time
+    refresh, so the two never present the same rotating refresh token
+    concurrently).
     Credentials are handled independently — one bad one doesn't stop the rest.
     A *terminal* refresh failure flags the credential ``needs_reauth`` (same as
     the post path); a transient/network error is left for the next sweep.
@@ -1573,7 +1581,7 @@ async def refresh_social_tokens_job() -> None:
             logger.warning("Token refresh sweep: skipping %s — %s", label, exc)
             continue
         try:
-            if await poster.refresh_if_stale(window_secs=_TOKEN_REFRESH_WINDOW_SECS):
+            if await poster.refresh_if_stale(window_secs=poster.token_refresh_window_secs):
                 renewed += 1
                 logger.info("Token refresh sweep: renewed %s", label)
         except CredentialAuthError as exc:
@@ -1668,12 +1676,21 @@ def start_scheduler(
         id="moderate_comments",
         replace_existing=True,
     )
+    # Early first run so a laptop opened only briefly inside a token's final
+    # refresh window still renews it — the default first fire would be a full
+    # interval after launch. Under pytest next_run_time=None adds the job
+    # PAUSED (never fires), which is what the network-touching backfill jobs
+    # below rely on too.
+    token_refresh_first_run = None
+    if "pytest" not in sys.modules:
+        token_refresh_first_run = datetime.now(timezone.utc) + timedelta(seconds=60)
     scheduler.add_job(
         refresh_social_tokens_job,
         "interval",
         minutes=_TOKEN_REFRESH_INTERVAL_MINUTES,
         id="refresh_social_tokens",
         replace_existing=True,
+        next_run_time=token_refresh_first_run,
     )
     scheduler.add_job(
         prune_social_post_traces_job,
