@@ -11,6 +11,10 @@ Three defects this covers:
   boot.
 * publish_video_job fell through to a fabricated project_id=1 / item_type
   'episode' when the video row was gone, then called YouTube on a deleted id.
+* A successful send wrote status/posted_at/post_url but left ``error`` holding
+  the previous attempt's text, so a delivered post still rendered "use Send to
+  retry" — and a Threads post that had timed out at the publish step (published
+  anyway, response lost) was re-sent on that advice and went out twice.
 """
 
 from __future__ import annotations
@@ -44,11 +48,20 @@ async def app_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     await database.close_db()
 
 
-async def _seed_video(db, video_id: str = "vidD", privacy: str = "public") -> None:
+async def _seed_video(
+    db,
+    video_id: str = "vidD",
+    privacy: str = "public",
+    *,
+    youtube_video_id: str | None = "ytDupVideo",
+    status: str = "published",
+) -> None:
+    """Seed a video. ``youtube_video_id=None`` makes it a non-YouTube item,
+    for which privacy_status carries no meaning and ``status`` decides liveness."""
     await db.execute(
-        "INSERT INTO videos (id, project_id, title, status, privacy_status) "
-        "VALUES (?, 1, 'Dup', 'published', ?)",
-        (video_id, privacy),
+        "INSERT INTO videos (id, project_id, title, status, privacy_status, youtube_video_id) "
+        "VALUES (?, 1, 'Dup', ?, ?, ?)",
+        (video_id, status, privacy, youtube_video_id),
     )
     await db.commit()
 
@@ -115,6 +128,128 @@ async def test_terminal_failure_clears_scheduled_at(app_db, monkeypatch) -> None
     row = await _row(db, post_id)
     assert row["status"] == "failed"
     assert "non-public" in row["error"]
+    assert row["scheduled_at"] is None
+    assert row["scheduler_job_id"] is None
+
+
+async def test_non_youtube_item_is_not_blocked_by_privacy_status(app_db, monkeypatch) -> None:
+    """privacy_status defaults to 'unlisted' on every row, YouTube-backed or not.
+
+    Reading it unconditionally permanently blocked posts for items that never
+    carried a YouTube link — they could never become 'public', so every send
+    failed with 'refusing to post a link to a non-public video' about a link
+    that does not exist.
+    """
+    scheduler, db = app_db
+    await _seed_video(db, privacy="unlisted", youtube_video_id=None)
+    post_id = await _seed_post(db, status="approved", content="no youtube here")
+
+    sent: list[str] = []
+
+    class _DeliveringPoster:
+        async def is_configured(self) -> bool:
+            return True
+
+        async def post(self, content, media_paths=None) -> dict:
+            sent.append(content)
+            return {"url": "https://example.test/post/2"}
+
+    social = importlib.import_module("yt_scheduler.services.social")
+    monkeypatch.setattr(social, "get_poster", lambda platform: _DeliveringPoster())
+
+    await scheduler._send_scheduled_post(post_id)
+
+    assert sent == ["no youtube here"], "a non-YouTube item must not be privacy-gated"
+    assert (await _row(db, post_id))["status"] == "posted"
+
+
+async def test_non_youtube_item_is_blocked_until_published(app_db, monkeypatch) -> None:
+    """For an item with no YouTube behind it, `status` is what liveness means.
+
+    Skipping the check entirely for these would announce an unpublished item.
+    smart_queue.is_eligible draws the line at status == 'published'; this path
+    must draw it in the same place or the two disagree about the same video.
+    """
+    scheduler, db = app_db
+    await _seed_video(db, privacy="unlisted", youtube_video_id=None, status="draft")
+    post_id = await _seed_post(db, status="approved", content="not ready")
+
+    class _ExplodingPoster:
+        async def is_configured(self) -> bool:
+            return True
+
+        async def post(self, content, media_paths=None) -> dict:
+            raise AssertionError("must not announce an unpublished item")
+
+    social = importlib.import_module("yt_scheduler.services.social")
+    monkeypatch.setattr(social, "get_poster", lambda platform: _ExplodingPoster())
+
+    await scheduler._send_scheduled_post(post_id)
+
+    row = await _row(db, post_id)
+    assert row["status"] == "failed"
+    assert "not published yet" in row["error"]
+
+
+async def test_youtube_backed_unlisted_video_is_still_blocked(app_db, monkeypatch) -> None:
+    """The guard must keep working for rows that DO have a YouTube video."""
+    scheduler, db = app_db
+    await _seed_video(db, privacy="unlisted", youtube_video_id="ytRealVideo")
+    post_id = await _seed_post(db, status="approved", content="has youtube")
+
+    social = importlib.import_module("yt_scheduler.services.social")
+
+    class _ExplodingPoster:
+        async def is_configured(self) -> bool:
+            return True
+
+        async def post(self, content, media_paths=None) -> dict:
+            raise AssertionError("must not reach the platform for an unlisted video")
+
+    monkeypatch.setattr(social, "get_poster", lambda platform: _ExplodingPoster())
+
+    await scheduler._send_scheduled_post(post_id)
+
+    row = await _row(db, post_id)
+    assert row["status"] == "failed"
+    assert "non-public" in row["error"]
+
+
+async def test_successful_send_clears_the_previous_attempt_error(app_db, monkeypatch) -> None:
+    """A delivered post must carry no failure text — that text invites a re-send."""
+    scheduler, db = app_db
+    await _seed_video(db)
+    post_id = await _seed_post(db, status="approved", content="second attempt")
+    await db.execute(
+        "UPDATE social_posts SET error = ? WHERE id = ?",
+        (
+            "Threads post failed: ReadTimeout: timed out contacting "
+            "graph.threads.net. Check your network connection, then use Send to retry.",
+            post_id,
+        ),
+    )
+    await db.commit()
+
+    class _DeliveringPoster:
+        async def is_configured(self) -> bool:
+            return True
+
+        async def post(self, content, media_paths=None) -> dict:
+            return {"url": "https://example.test/post/1"}
+
+    # _send_scheduled_post imports get_poster lazily from the service module,
+    # so patch it there rather than on the scheduler module object.
+    social = importlib.import_module("yt_scheduler.services.social")
+    monkeypatch.setattr(social, "get_poster", lambda platform: _DeliveringPoster())
+
+    await scheduler._send_scheduled_post(post_id)
+
+    row = await _row(db, post_id)
+    assert row["status"] == "posted"
+    assert row["error"] is None, (
+        "a posted row still carrying the prior failure text is what produced a "
+        "duplicate Threads post"
+    )
     assert row["scheduled_at"] is None
     assert row["scheduler_job_id"] is None
 

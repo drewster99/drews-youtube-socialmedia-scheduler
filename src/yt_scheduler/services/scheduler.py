@@ -11,6 +11,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from yt_scheduler.config import CAPTION_CHECK_INTERVAL_MINUTES, COMMENT_CHECK_INTERVAL_MINUTES
 from yt_scheduler.database import get_db, write_transaction
+from yt_scheduler.models.social_post import mark_posted
+from yt_scheduler.models.video import is_youtube_backed
 from yt_scheduler.services import (
     events,
     moderation,
@@ -442,14 +444,7 @@ async def publish_video_job(video_id: str) -> dict:
                 # Commit each terminal state inside the loop so a crash mid-batch
                 # can't lose an already-sent post's 'posted' status (which would
                 # otherwise leave it re-claimable and risk a re-send).
-                async with write_transaction() as db:
-                    await db.execute(
-                        """UPDATE social_posts
-                        SET status = 'posted', posted_at = datetime('now'), post_url = ?,
-                            scheduled_at = NULL, scheduler_job_id = NULL
-                        WHERE id = ?""",
-                        (post_result.get("url", ""), post_id),
-                    )
+                await mark_posted(post_id, post_url=post_result.get("url", ""))
                 results["social_results"][platform].append({
                     "post_id": post_id,
                     "status": "posted",
@@ -531,21 +526,42 @@ async def _send_scheduled_post(post_id: int) -> None:
     video_id = post.get("video_id")
     if video_id:
         cursor = await db.execute(
-            "SELECT privacy_status, status FROM videos WHERE id = ?", (video_id,)
+            "SELECT youtube_video_id, privacy_status, status FROM videos WHERE id = ?",
+            (video_id,),
         )
         vrow = await cursor.fetchone()
-        # Only privacy_status decides whether viewers can see the YouTube
-        # link. The lifecycle `status` column drifts off 'published'
-        # whenever the user flips privacy via the metadata dropdown
-        # (video_routes update_video updates privacy_status without
-        # bumping status), so gating on it produces false failures with
-        # the contradictory "video is public, not public" message.
-        if vrow and vrow["privacy_status"] != "public":
-            err = (
-                f"YouTube video is still {vrow['privacy_status']!r}; "
-                "refusing to post a link to a non-public video. "
-                "Re-publish the video and use Send to retry."
-            )
+        # "Live enough to announce" is a different column depending on what
+        # backs the item, exactly as smart_queue.is_eligible decides it. Kept
+        # deliberately identical to that function: two places answering the
+        # same question differently is what produced both bugs below.
+        #
+        # YouTube-backed → privacy_status, not status. The lifecycle `status`
+        # column drifts off 'published' whenever privacy is flipped via the
+        # metadata dropdown (update_video writes privacy_status without bumping
+        # status), so gating on it produced the contradictory "video is public,
+        # not public" failure.
+        #
+        # Everything else has no YouTube presence, so privacy_status is never
+        # written and stays 'unlisted' forever. Reading it called such an item
+        # permanently non-public and refused to post a link that does not
+        # exist — a gist announcement went out fine on the three platforms sent
+        # by hand and was blocked on the two that went through this path.
+        err = None
+        if vrow is not None:
+            if is_youtube_backed(dict(vrow)):
+                if vrow["privacy_status"] != "public":
+                    err = (
+                        f"YouTube video is still {vrow['privacy_status']!r}; "
+                        "refusing to post a link to a non-public video. "
+                        "Re-publish the video and use Send to retry."
+                    )
+            elif vrow["status"] != "published":
+                err = (
+                    f"This item is not published yet (status "
+                    f"{vrow['status'] or 'unset'!r}); refusing to announce it. "
+                    "Publish it and use Send to retry."
+                )
+        if err is not None:
             async with write_transaction() as db:
                 await db.execute(
                     "UPDATE social_posts SET status = 'failed', error = ?, "
@@ -685,12 +701,7 @@ async def _send_scheduled_post(post_id: int) -> None:
             post["content"],
             media_paths=decode_media_paths(post),
         )
-        async with write_transaction() as db:
-            await db.execute(
-                "UPDATE social_posts SET status = 'posted', posted_at = datetime('now'), "
-                "post_url = ?, scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
-                (result.get("url", ""), post_id),
-            )
+        await mark_posted(post_id, post_url=result.get("url", ""))
         await events.record_event(
             post["video_id"],
             "social_post_published",

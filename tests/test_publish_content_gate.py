@@ -36,6 +36,9 @@ async def _insert_video(db, video_id: str, **overrides) -> None:
         "status": "uploaded",
         "item_type": "episode",
         "url": f"https://youtu.be/{video_id}",
+        # YouTube-backed, matching the youtu.be url above — privacy_status is
+        # only consulted for rows that have a YouTube video behind them.
+        "youtube_video_id": video_id,
     }
     fields.update(overrides)
     columns = ", ".join(fields)

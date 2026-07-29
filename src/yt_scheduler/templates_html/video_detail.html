@@ -1856,6 +1856,28 @@ async function loadSocialPosts() {
             }
             const overLimit = limit && effLen > limit;
 
+            // The scheduled path refuses to announce a non-public YouTube video
+            // and marks the post failed. Manual Send has no such gate — by
+            // design, since the user is standing right there — but the button
+            // gave no hint that the link would be dead, so say it before the
+            // click rather than leaving it to be discovered on the timeline.
+            //
+            // Gated on the post actually carrying a YouTube link, not merely on
+            // the video being unlisted: a promo post with only a clip and no
+            // link is unaffected, and warning on those would train the warning
+            // to be ignored. privacy_status is only read for YouTube-backed
+            // rows — it defaults to 'unlisted' on items that have no YouTube
+            // video at all, which is what blocked gist posts from sending.
+            const linksToYouTube = /youtu\.be\/|youtube\.com\//i.test(content);
+            const notPublicNote = (!isPosted
+                                   && linksToYouTube
+                                   && videoData?.youtube_video_id
+                                   && videoData?.privacy_status !== 'public')
+                ? `<div class="post-warn">This post links to the YouTube video, which is
+                   ${escapeHtml(videoData.privacy_status || 'not public')} — anyone following
+                   that link will hit a video they can't watch. Publish it first.</div>`
+                : '';
+
             let actions = '';
             if (isPosted) {
                 if (p.post_url) {
@@ -1922,6 +1944,7 @@ async function loadSocialPosts() {
                     </div>
                     ${displayBody}
                     ${lenNote}
+                    ${notPublicNote}
                     <div class="social-post-actions">${actions}</div>
                 </div>
             `;

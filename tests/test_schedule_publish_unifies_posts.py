@@ -49,11 +49,17 @@ async def app_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 
 
 async def _seed(db, post_specs: list[tuple[str, str]]) -> tuple[str, list[int]]:
-    """Insert one video + N posts. Returns (video_id, [post_ids])."""
+    """Insert one video + N posts. Returns (video_id, [post_ids]).
+
+    The video is YouTube-backed: every test here is about announcing a YouTube
+    link, and the privacy gate only applies to rows that have one. Deliberately
+    NOT equal to ``id`` — the two are separate columns and conflating them is
+    the pattern migration 037 removed.
+    """
     video_id = "vidS"
     await db.execute(
-        "INSERT INTO videos (id, project_id, title, status) "
-        "VALUES (?, 1, 'Sched', 'uploaded')",
+        "INSERT INTO videos (id, project_id, title, status, youtube_video_id) "
+        "VALUES (?, 1, 'Sched', 'uploaded', 'ytSchedVideo')",
         (video_id,),
     )
     pids = []

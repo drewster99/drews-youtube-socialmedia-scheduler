@@ -16,6 +16,7 @@ from yt_scheduler.config import (
     require_managed_media_paths,
 )
 from yt_scheduler.database import get_db, write_transaction
+from yt_scheduler.models.social_post import mark_posted
 from yt_scheduler.services import events, social, templates as tmpl
 from yt_scheduler.services.social import decode_media_paths as _decode_media_paths
 from yt_scheduler.services.scheduler import cancel_scheduled_post, get_publish_lock
@@ -958,19 +959,7 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
             post["content"],
             media_paths=_decode_media_paths(post),
         )
-        # Manual Send on a post that was scheduled (status='approved'
-        # with a pending APScheduler job) supersedes that job — clear
-        # the schedule columns so the future job-id can't reference a
-        # post that's already done, and so the UI doesn't show "still
-        # scheduled" alongside a posted_at timestamp.
-        async with write_transaction() as db:
-            await db.execute(
-                """UPDATE social_posts
-                SET status = 'posted', posted_at = datetime('now'), post_url = ?,
-                    scheduler_job_id = NULL, scheduled_at = NULL
-                WHERE id = ?""",
-                (result.get("url", ""), post_id),
-            )
+        await mark_posted(post_id, post_url=result.get("url", ""))
         from datetime import datetime as _dt, timezone as _tz
         await events.record_event(
             post["video_id"],
@@ -1150,17 +1139,9 @@ async def send_all_posts(
                 post["content"],
                 media_paths=_decode_media_paths(post),
             )
-            # Same supersede-the-schedule reasoning as send_post.
             # Commit each post's terminal state inside the loop so a crash
             # part-way through a batch can't lose an already-sent post's status.
-            async with write_transaction() as db:
-                await db.execute(
-                    """UPDATE social_posts
-                    SET status = 'posted', posted_at = datetime('now'), post_url = ?,
-                        scheduler_job_id = NULL, scheduled_at = NULL
-                    WHERE id = ?""",
-                    (result.get("url", ""), post["id"]),
-                )
+            await mark_posted(post["id"], post_url=result.get("url", ""))
             results.append(_entry(
                 post, cred,
                 status="posted",
