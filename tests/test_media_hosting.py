@@ -96,6 +96,34 @@ async def test_file_larger_than_one_chunk_still_arrives_whole(captured, tmp_path
     assert captured[0].headers["content-length"] == str(len(payload))
 
 
+async def test_file_smaller_than_one_chunk_arrives_whole(captured, tmp_path, monkeypatch, media_hosting, config):
+    """The common case: the first read returns the whole file short, and the
+    second read's empty answer must end the stream rather than pad or repeat."""
+    monkeypatch.setattr(media_hosting, "MEDIA_HOSTING_UPLOAD_CHUNK_BYTES", 1024)
+    path = tmp_path / "small.mp4"
+    payload = bytes(i % 256 for i in range(100))
+    path.write_bytes(payload)
+
+    await media_hosting.host_file(path, config=config)
+
+    assert captured[0].content == payload
+    assert captured[0].headers["content-length"] == str(len(payload))
+
+
+async def test_file_exactly_a_whole_number_of_chunks_arrives_whole(captured, tmp_path, monkeypatch, media_hosting, config):
+    """Boundary: when the file divides evenly, the final read is empty rather
+    than short — an off-by-one here duplicates or drops the last chunk."""
+    monkeypatch.setattr(media_hosting, "MEDIA_HOSTING_UPLOAD_CHUNK_BYTES", 1024)
+    path = tmp_path / "exact.mp4"
+    payload = bytes(i % 256 for i in range(3 * 1024))
+    path.write_bytes(payload)
+
+    await media_hosting.host_file(path, config=config)
+
+    assert captured[0].content == payload
+    assert captured[0].headers["content-length"] == str(len(payload))
+
+
 @pytest.mark.parametrize("name,expected", [
     ("clip.mp4", "video/mp4"),
     ("frame.jpg", "image/jpeg"),
