@@ -677,12 +677,26 @@ async def upload_page(request: Request):
 
 
 # --- Backwards-compatibility redirects --------------------------------------
-# Pre-rename URLs land on the Default project so existing bookmarks still work.
+# Pre-rename URLs resolve to the project that actually owns the resource.
+# Listing pages (every project has one) still land on the Default project.
 
 @app.get("/videos/{video_id}")
 async def legacy_video_redirect(video_id: str):
+    """Redirect a pre-rename video URL to the owning project's detail page.
+
+    Hardcoding the default project sent every other project's video to a
+    guaranteed 404 — the detail route filters by project ownership.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT p.slug FROM videos v JOIN projects p ON p.id = v.project_id "
+        "WHERE v.id = ?",
+        (video_id,),
+    )
+    if not rows:
+        raise HTTPException(404, f"Video '{video_id}' not found")
     return RedirectResponse(
-        url=f"/projects/{DEFAULT_PROJECT_SLUG}/videos/{video_id}", status_code=307
+        url=f"/projects/{rows[0]['slug']}/videos/{video_id}", status_code=307
     )
 
 
@@ -695,8 +709,32 @@ async def legacy_templates_redirect():
 
 @app.get("/templates/{name}")
 async def legacy_template_edit_redirect(name: str):
-    return RedirectResponse(
-        url=f"/projects/{DEFAULT_PROJECT_SLUG}/templates/{name}", status_code=307
+    """Redirect a pre-rename template URL to the project that owns the name.
+
+    Template names are unique per project, not globally, so ownership can be
+    ambiguous. The default project wins when it owns the name (a pre-rename
+    URL could only ever have meant that project); a single other owner is
+    unambiguous; anything else is a 404 naming the candidates — guessing
+    would land in an editor that auto-creates a junk template on a missing
+    name, silently mutating a project from a stale bookmark.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT p.slug FROM templates t JOIN projects p ON p.id = t.project_id "
+        "WHERE t.name = ? ORDER BY (p.slug = ?) DESC",
+        (name, DEFAULT_PROJECT_SLUG),
+    )
+    if not rows:
+        raise HTTPException(404, f"Template '{name}' not found in any project")
+    slugs = [row["slug"] for row in rows]
+    if slugs[0] == DEFAULT_PROJECT_SLUG or len(slugs) == 1:
+        return RedirectResponse(
+            url=f"/projects/{slugs[0]}/templates/{name}", status_code=307
+        )
+    raise HTTPException(
+        404,
+        f"Template '{name}' exists in projects {', '.join(repr(s) for s in slugs)}; "
+        "open it from its project's Templates page",
     )
 
 

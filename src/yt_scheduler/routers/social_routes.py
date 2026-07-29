@@ -624,7 +624,7 @@ async def list_failed_posts():
         post = dict(row)
         # The server vends the ready page URL: the video-detail route 404s
         # unless the slug actually owns the video, so the banner must not
-        # guess a slug (the /videos/{id} redirect assumes the default project).
+        # guess a slug.
         slug = post.pop("project_slug")
         post["page_url"] = f"/projects/{slug}/videos/{post['video_id']}"
         posts.append(post)

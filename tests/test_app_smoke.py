@@ -64,10 +64,120 @@ def test_unknown_project_404(client: TestClient) -> None:
     assert resp.status_code == 404
 
 
-def test_legacy_video_url_redirects(client: TestClient) -> None:
-    resp = client.get("/videos/abc123", follow_redirects=False)
+def _seed_sync(coro_fn) -> None:
+    """Run an async seeding function against the app's live DB connection."""
+    import asyncio
+
+    asyncio.run(coro_fn())
+
+
+async def _insert_project_and_video(slug: str, video_id: str) -> None:
+    from yt_scheduler.database import get_db
+
+    db = await get_db()
+    await db.execute(
+        "INSERT OR IGNORE INTO projects (slug, name) VALUES (?, ?)",
+        (slug, slug.title()),
+    )
+    rows = await db.execute_fetchall(
+        "SELECT id FROM projects WHERE slug = ?", (slug,)
+    )
+    await db.execute(
+        "INSERT INTO videos (id, project_id, title, status) "
+        "VALUES (?, ?, 'Seeded', 'draft')",
+        (video_id, int(rows[0]["id"])),
+    )
+    await db.commit()
+
+
+def test_legacy_video_url_redirects_to_owning_project(client: TestClient) -> None:
+    """The old behavior hardcoded the default project, sending every other
+    project's video to a guaranteed 404 at the ownership-checked detail page."""
+    _seed_sync(lambda: _insert_project_and_video("elsewhere", "vidElse01"))
+
+    resp = client.get("/videos/vidElse01", follow_redirects=False)
     assert resp.status_code == 307
-    assert resp.headers["location"] == "/projects/default/videos/abc123"
+    assert resp.headers["location"] == "/projects/elsewhere/videos/vidElse01"
+
+
+def test_legacy_video_url_redirects_default_project_video(client: TestClient) -> None:
+    _seed_sync(lambda: _insert_project_and_video("default", "vidDflt01"))
+
+    resp = client.get("/videos/vidDflt01", follow_redirects=False)
+    assert resp.status_code == 307
+    assert resp.headers["location"] == "/projects/default/videos/vidDflt01"
+
+
+def test_legacy_video_url_404_for_unknown_video(client: TestClient) -> None:
+    """Redirecting an unknown id into the default project produced a second,
+    misleading 404 ("not found in project 'default'") — fail honestly here."""
+    resp = client.get("/videos/abc123", follow_redirects=False)
+    assert resp.status_code == 404
+    assert "abc123" in resp.json()["detail"]
+
+
+def test_legacy_video_url_end_to_end(client: TestClient) -> None:
+    """The exact regression: a non-default project's legacy URL must land on
+    a rendered detail page, not a 404."""
+    _seed_sync(lambda: _insert_project_and_video("endtoend", "vidE2E01"))
+
+    resp = client.get("/videos/vidE2E01", follow_redirects=True)
+    assert resp.status_code == 200
+
+
+async def _insert_template(project_slug: str, name: str) -> None:
+    from yt_scheduler.database import get_db
+
+    db = await get_db()
+    await db.execute(
+        "INSERT OR IGNORE INTO projects (slug, name) VALUES (?, ?)",
+        (project_slug, project_slug.title()),
+    )
+    rows = await db.execute_fetchall(
+        "SELECT id FROM projects WHERE slug = ?", (project_slug,)
+    )
+    await db.execute(
+        "INSERT INTO templates (project_id, name) VALUES (?, ?)",
+        (int(rows[0]["id"]), name),
+    )
+    await db.commit()
+
+
+def test_legacy_template_url_prefers_default_project(client: TestClient) -> None:
+    """A pre-rename URL could only ever have meant the default project's
+    template, so default wins even when another project shares the name."""
+    _seed_sync(lambda: _insert_template("default", "shared-name"))
+    _seed_sync(lambda: _insert_template("rival", "shared-name"))
+
+    resp = client.get("/templates/shared-name", follow_redirects=False)
+    assert resp.status_code == 307
+    assert resp.headers["location"] == "/projects/default/templates/shared-name"
+
+
+def test_legacy_template_url_redirects_to_sole_owner(client: TestClient) -> None:
+    _seed_sync(lambda: _insert_template("soleowner", "only-here"))
+
+    resp = client.get("/templates/only-here", follow_redirects=False)
+    assert resp.status_code == 307
+    assert resp.headers["location"] == "/projects/soleowner/templates/only-here"
+
+
+def test_legacy_template_url_404_when_ambiguous(client: TestClient) -> None:
+    """Guessing between non-default owners would land in an editor that
+    auto-creates a junk template on a missing name — a GET that writes."""
+    _seed_sync(lambda: _insert_template("proj-a", "both-have-it"))
+    _seed_sync(lambda: _insert_template("proj-b", "both-have-it"))
+
+    resp = client.get("/templates/both-have-it", follow_redirects=False)
+    assert resp.status_code == 404
+    detail = resp.json()["detail"]
+    assert "proj-a" in detail and "proj-b" in detail
+
+
+def test_legacy_template_url_404_when_unknown(client: TestClient) -> None:
+    resp = client.get("/templates/no-such-template", follow_redirects=False)
+    assert resp.status_code == 404
+    assert "no-such-template" in resp.json()["detail"]
 
 
 def test_api_lists_default_project(client: TestClient) -> None:

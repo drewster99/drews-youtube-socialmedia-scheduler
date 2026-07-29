@@ -87,13 +87,13 @@ Socials-from-template composer wizard. **404** on bad `slug`.
 Upload form. Reached from the Dashboard's "Upload new video" button.
 
 ### `GET /videos/{video_id}` → 307 Redirect
-Backwards-compatibility redirect to `/projects/<DEFAULT_PROJECT_SLUG>/videos/{video_id}`.
+Backwards-compatibility redirect to the **owning** project's detail page (`/projects/{slug}/videos/{video_id}`). `404` when the video doesn't exist — redirecting an unknown id to the default project just produced a second, misleading 404.
 
 ### `GET /templates` → 307 Redirect
 Backwards-compatibility redirect to `/projects/<DEFAULT_PROJECT_SLUG>/templates`.
 
 ### `GET /templates/{name}` → 307 Redirect
-Backwards-compatibility redirect to `/projects/<DEFAULT_PROJECT_SLUG>/templates/{name}`.
+Backwards-compatibility redirect to the project that owns the template name: the default project when it owns one by that name, otherwise the single owning project. `404` when no project owns the name, or when several non-default projects do (the detail names the candidate projects) — a guessed redirect landed in an editor that auto-creates a junk template on a missing name.
 
 ### `GET /moderation` → 307 Redirect
 Backwards-compatibility redirect to `/projects/<DEFAULT_PROJECT_SLUG>/moderation`.
