@@ -964,7 +964,11 @@ body {
 .tag-unresolved { color: var(--danger); font-weight: 600; }
 
 /* Over-limit / leftover-tag flags on generated social-post cards */
-.social-post-over-limit { border-color: var(--danger); }
+/* Red outline: this card can't go out as it stands — the body exceeds the
+   platform's hard limit, or the last send failed. Both read as "needs your
+   attention", so they share one border treatment. */
+.social-post-over-limit,
+.social-post-failed { border-color: var(--danger); }
 .post-warn { color: var(--danger); font-size: 0.8rem; margin-top: 0.3rem; }
 
 /* Brief highlight when the Log "Find the post →" link scrolls a failed

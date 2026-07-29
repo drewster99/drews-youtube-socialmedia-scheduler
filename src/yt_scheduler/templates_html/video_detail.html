@@ -1892,6 +1892,14 @@ async function loadSocialPosts() {
                 const undoLink = (lastShorten && lastShorten.postId === p.id && lastShorten.after === content)
                     ? `<button class="btn btn-sm" onclick="undoShorten(${p.id})">Undo shorten</button>`
                     : '';
+                // Remove is offered on drafts only — the same rule the server
+                // enforces. Pushed to the far right so a destructive click
+                // isn't neighbouring Send.
+                const removeButton = (p.status === 'draft')
+                    ? `<button class="btn btn-sm btn-danger" style="margin-left: auto;"
+                           onclick="removePost(${p.id})"
+                           title="Delete this draft — it has not been sent">Remove</button>`
+                    : '';
                 actions = `
                     <button class="btn btn-sm btn-primary" onclick="openSocialPostEditor(${p.id})" title="Open editor (also: click the post body)">Edit</button>
                     <button class="btn btn-sm" onclick="shortenPost(${p.id})" title="Ask the AI to shorten this post">Make it shorter</button>
@@ -1900,7 +1908,8 @@ async function loadSocialPosts() {
                     <button class="btn btn-sm btn-success" onclick="sendPost(${p.id})"
                         ${!isConfigured ? 'disabled title="Configure this platform in Settings first"' : ''}>
                         Send
-                    </button>`;
+                    </button>
+                    ${removeButton}`;
             }
             if (isFailed && p.error) {
                 postErrorsById.set(p.id, p.error);
@@ -1934,7 +1943,7 @@ async function loadSocialPosts() {
                 }
             }
             return `
-                <div class="social-post-card ${overLimit ? 'social-post-over-limit' : ''}" data-post-card="${p.id}" style="${opacity}">
+                <div class="social-post-card ${overLimit ? 'social-post-over-limit' : ''} ${isFailed ? 'social-post-failed' : ''}" data-post-card="${p.id}" style="${opacity}">
                     <div class="social-post-header">
                         <span class="platform-badge platform-${p.platform}">${p.platform}</span>
                         <button class="trace-info-btn" title="Show how this post was generated"
@@ -2706,6 +2715,36 @@ async function approvePost(postId) {
         }
     } finally {
         setPostCardBusy(postId, false);
+    }
+}
+
+async function removePost(postId) {
+    // Name the platform and quote the opening line: several cards on this page
+    // are near-identical, and the delete is not undoable.
+    const post = (socialPostsCache || []).find(p => p.id === postId);
+    if (!post) return;
+    const preview = (post.content || '').trim().split('\n')[0].slice(0, 100);
+    const ok = confirm(
+        `Remove this ${post.platform} draft?\n\n  "${preview}${preview.length >= 100 ? '…' : ''}"\n\n`
+        + 'It has not been sent. This cannot be undone.'
+    );
+    if (!ok) return;
+
+    setPostCardBusy(postId, true);
+    try {
+        const resp = await fetch(`/api/social/posts/${postId}`, {method: 'DELETE', _silent: true});
+        if (resp.ok) {
+            showToast('Draft removed', 'success');
+        } else {
+            // 409 means the row left 'draft' since this page last polled (it was
+            // approved, sent, or is sending). Say so and re-render, rather than
+            // leaving a button that looks like it did nothing.
+            const detail = (await resp.json().catch(() => ({}))).detail;
+            showToast(detail || 'Could not remove this post', 'error');
+        }
+    } finally {
+        setPostCardBusy(postId, false);
+        loadSocialPosts();
     }
 }
 

@@ -1152,6 +1152,18 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 
 **Errors** — `400` (a `media_path`/`media_paths` entry is outside `UPLOAD_DIR`, or an invalid `status`).
 
+### `DELETE /api/social/posts/{post_id}`
+
+**Purpose** — Remove a draft social post. Backs the **Remove** button on the video-detail page (drafts only, behind a confirm).
+
+**Preconditions** — `status` must be `'draft'`. Every other status is refused: `posted` is the audit trail of a post the world has seen, `sending` is mid-flight, `approved` may have a live per-post job behind it, and `failed` is the record `GET /api/social/failed-posts` and the app-wide banner are built from.
+
+**Response 200** — `{"status": "ok", "cancelled_schedule": true | false}`. `cancelled_schedule` is true only in the odd case where the draft still carried a `scheduler_job_id` (a `PUT` can set `status` back to `draft` without clearing it); the job is torn down before the row is deleted so no trigger fires against a missing post.
+
+**Side effects** — Deletes the `social_posts` row; the matching `social_post_traces` row goes with it via `ON DELETE CASCADE`. The removal is logged (post id, platform, video id, content length) — the row itself is unrecoverable.
+
+**Errors** — `404` (no such post); `409` (status is not `draft`, including the race where a send claims the row between the status read and the delete — the guard is repeated in the `DELETE` statement, so the send wins).
+
 ### `POST /api/social/posts/{post_id}/shorten`
 
 **Purpose** — Ask the model to rewrite a generated post shorter, preserving meaning and every URL. Applies the result to `social_posts.content` in place.

@@ -704,6 +704,70 @@ async def update_post(post_id: int, data: dict):
     return {"status": "ok"}
 
 
+@router.delete("/posts/{post_id}")
+async def remove_post(post_id: int):
+    """Remove a draft social post.
+
+    Drafts only, and deliberately so: ``posted`` is the audit trail of something
+    the world has already seen, ``sending`` is mid-flight, ``approved`` may have
+    a live per-post DateTrigger behind it, and ``failed`` is the record the
+    app-wide failed-sends banner is built from. Each of those needs its own
+    decision, so none of them is removable here.
+
+    The status guard is repeated inside the DELETE rather than trusting the
+    read: a send that flips the row out of ``draft`` in between must win, and a
+    conditional DELETE lets it, where a plain delete-by-id would drop a post
+    that is already on the wire.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT status, platform, video_id, content, scheduler_job_id "
+        "FROM social_posts WHERE id = ?",
+        (post_id,),
+    )
+    if not rows:
+        raise HTTPException(404, f"Social post {post_id} not found")
+    post = dict(rows[0])
+    if post["status"] != "draft":
+        raise HTTPException(
+            409,
+            f"Only draft posts can be removed — post {post_id} is "
+            f"'{post['status']}'.",
+        )
+
+    # A draft is not supposed to carry a job at all (schedule_social_post
+    # stamps 'approved'), but PUT lets a client set the status back to 'draft'
+    # without clearing scheduler_job_id, and a trigger left behind would fire
+    # against a row that no longer exists.
+    cancelled_schedule = False
+    if post["scheduler_job_id"]:
+        cancelled_schedule = await cancel_scheduled_post(post_id)
+
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            "DELETE FROM social_posts WHERE id = ? AND status = 'draft'",
+            (post_id,),
+        )
+        removed = (cursor.rowcount or 0) > 0
+
+    if not removed:
+        raise HTTPException(
+            409, f"Post {post_id} changed status while being removed — nothing removed."
+        )
+
+    # The row is gone for good and nothing else records that it existed, so the
+    # server log is the only place this is recoverable from.
+    logger.info(
+        "Removed draft social post %s (%s, video %s, %d chars)%s",
+        post_id,
+        post["platform"],
+        post["video_id"],
+        len(post["content"] or ""),
+        " — cancelled its pending schedule" if cancelled_schedule else "",
+    )
+    return {"status": "ok", "cancelled_schedule": cancelled_schedule}
+
+
 @router.post("/posts/{post_id}/shorten")
 async def shorten_post(post_id: int, data: dict | None = None):
     """Ask the model to shorten a generated post to at most ``target_chars``
