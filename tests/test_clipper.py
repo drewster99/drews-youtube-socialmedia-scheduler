@@ -375,7 +375,10 @@ async def test_index_over_requests_when_existing_then_caps_output(
     # Derived, not hardcoded: the bonus is a tuning knob and this test is
     # about the over-request happening at all, not about its size.
     assert f"UP TO {6 + clipper._EXISTING_OVERREQUEST_BONUS}" in captured["user_text"]
-    assert len(out) == 6  # capped at the base max
+    assert len(out.accepted) == 6  # capped at the base max
+    # The 3 that didn't fit are reported, not silently dropped.
+    assert len(out.rejected) == 3
+    assert out.raw_count == 9
 
 
 @pytest.mark.asyncio
@@ -484,3 +487,92 @@ def test_evict_stale_generate_jobs_calls_preview_cleanup(tmp_path, monkeypatch):
 
     assert job_id not in clipper._GENERATE_JOBS
     assert not leftover.exists()
+
+
+@pytest.mark.asyncio
+async def test_truncated_tool_response_fails_loudly(monkeypatch: pytest.MonkeyPatch):
+    """A tool_use call cut off at max_tokens arrives as an ordinary 200 with no
+    usable block. Reporting that as "no proposals" would be a statement about
+    the model that is actually about a truncated response — the exact lie the
+    KindProposals return type exists to prevent."""
+    from yt_scheduler.services import ai, clip_edges, clipper
+
+    units = [clip_edges.ClipUnit(index=i + 1, text=f"u{i}", start=i * 10.0,
+                                 end=i * 10 + 8.0, words=[]) for i in range(30)]
+
+    class _Msg:
+        stop_reason = "max_tokens"
+        content = []          # truncated before any tool_use block landed
+
+    monkeypatch.setattr(ai, "get_client", lambda: type(
+        "C", (), {"messages": type("M", (), {"create": staticmethod(lambda **kw: _Msg())})}
+    )())
+
+    async def _model():
+        return "claude-x"
+
+    monkeypatch.setattr(ai, "_resolve_model", _model)
+
+    async def _editorial(kind, *, project_id):
+        return "## editorial"
+
+    monkeypatch.setattr(clipper, "editorial_block_for_kind", _editorial)
+
+    out = await clipper.propose_clips_for_kind_indexed(
+        kind="hook", units=units, parent_title="P", parent_duration_seconds=600.0,
+        existing_ranges=[], project_id=1, max_proposals=5,
+    )
+    assert out.accepted == [] and out.rejected == []
+    assert out.error is not None
+    assert "max_tokens" in out.error and "propose_clips" in out.error
+
+
+@pytest.mark.asyncio
+async def test_one_kind_failing_does_not_take_down_the_others(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A raised exception in one kind's pass is captured for that kind only.
+    Without return_exceptions the siblings would also be lost — and worse,
+    they'd keep running uncancelled, billing tokens nobody reads."""
+    from yt_scheduler.services import clipper
+
+    async def flaky(*, kind, **kw):
+        if kind == "hook":
+            raise RuntimeError("anthropic key missing")
+        return clipper.KindProposals(kind=kind, accepted=[], rejected=[], raw_count=0)
+
+    monkeypatch.setattr(clipper, "propose_clips_for_kind_indexed", flaky)
+
+    out = await clipper.propose_all_clips(
+        kinds=["hook", "short", "segment"], units=[], parent_title="P",
+        parent_duration_seconds=600.0, existing_ranges_per_kind={}, project_id=1,
+    )
+    assert set(out) == {"hook", "short", "segment"}
+    assert out["hook"].error is not None
+    assert "anthropic key missing" in out["hook"].error
+    assert out["short"].error is None and out["segment"].error is None
+
+
+def test_generate_job_payload_omits_private_fields():
+    """Deny-by-default: the job dict holds an absolute filesystem path the
+    browser must never see, and a new field is dropped unless whitelisted."""
+    from yt_scheduler.services import clipper
+
+    job = {
+        "job_id": "gen_x", "parent_id": "p", "project_id": 1, "state": "done",
+        "last_error": None, "kinds": ["hook"], "crop_vertical": {}, "proposals": {},
+        "progress_message": "", "rejected": {}, "raw_counts": {}, "kind_errors": {},
+        "parent_video_path": "/Users/someone/secret/master.mov",
+        "existing_titles_per_kind": {}, "cuts_total": 3,
+    }
+    public = clipper._public_job(job) if hasattr(clipper, "_public_job") else None
+    if public is None:
+        clipper._GENERATE_JOBS["gen_x"] = job
+        try:
+            public = clipper.get_generate_job("gen_x")
+        finally:
+            clipper._GENERATE_JOBS.pop("gen_x", None)
+    assert "parent_video_path" not in public
+    assert "cuts_total" not in public
+    for key in ("rejected", "raw_counts", "kind_errors"):
+        assert key in public, f"{key} must reach the browser"

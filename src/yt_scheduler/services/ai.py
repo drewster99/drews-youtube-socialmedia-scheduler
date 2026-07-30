@@ -49,21 +49,38 @@ def _elide_base64_media(value: object) -> object:
     """Deep-copy a payload with base64 media blocks replaced by a summary."""
     if isinstance(value, dict):
         data = value.get("data")
-        if isinstance(data, str) and "media_type" in value:
+        if isinstance(data, (str, bytes, bytearray)) and "media_type" in value:
             return {
                 **{k: v for k, v in value.items() if k != "data"},
                 "data": f"<base64 {value.get('media_type')} elided, {len(data)} chars>",
             }
         return {k: _elide_base64_media(v) for k, v in value.items()}
-    if isinstance(value, list):
+    # Tuples as well as lists: the SDK accepts any sequence of content blocks,
+    # and a tuple-wrapped image would otherwise reach json.dumps un-elided.
+    # Deliberately NOT widened to Iterable — that would consume a generator the
+    # SDK has not read yet, destroying the request in the act of logging it,
+    # and would recurse per-character over strings.
+    if isinstance(value, (list, tuple)):
         return [_elide_base64_media(item) for item in value]
     return value
 
 
 def _as_json(value: object) -> str:
-    return json.dumps(
-        _elide_base64_media(value), indent=2, ensure_ascii=False, default=str,
-    )
+    """A payload rendered for the log. Never raises.
+
+    Logging must not be able to kill the call it describes. Both halves of
+    this can raise: the elide walk hits RecursionError on a self-referencing
+    structure before ``json.dumps`` ever runs, and ``json.dumps`` itself
+    rejects non-``str`` dict keys (``default=`` does not apply to keys) and
+    circular references that survived the walk. So the guard spans both.
+    """
+    try:
+        return json.dumps(
+            _elide_base64_media(value), indent=2, ensure_ascii=False, default=str,
+        )
+    except Exception as exc:
+        # Bounded: a pathological exception message must not become the log line.
+        return f"<unloggable {type(value).__name__}: {type(exc).__name__}: {exc!s:.200}>"
 
 
 def _response_payload(message: object) -> object:
@@ -101,6 +118,11 @@ def _response_payload(message: object) -> object:
 
 
 def _log_request(label: str, kwargs: dict) -> None:
+    # The payloads are serialized as call arguments, so logging's own level
+    # check comes too late to save the work — a clip-proposal request is ~46 KB
+    # of JSON. Check first.
+    if not logger.isEnabledFor(logging.INFO):
+        return
     system = kwargs.get("system")
     if isinstance(system, str):
         system_text = system or "(none)"
@@ -131,6 +153,19 @@ def _log_response(
     label: str, message: object, elapsed_ms: int, max_tokens: object,
 ) -> None:
     stop_reason = getattr(message, "stop_reason", None)
+    # FIRST, before anything that can fail. This is the one operationally
+    # load-bearing signal in this function — a tool_use response cut off
+    # mid-JSON still arrives as a normal 200, and the caller just sees fewer
+    # results than it asked for. It must not be lost to a formatting problem
+    # in the payload dump below.
+    if stop_reason == "max_tokens":
+        logger.warning(
+            "Claude [%s] stopped at max_tokens=%s — the response is TRUNCATED "
+            "and content was lost. Raise max_tokens or request less output.",
+            label, max_tokens,
+        )
+    if not logger.isEnabledFor(logging.INFO):
+        return
     usage = getattr(message, "usage", None)
     # Usage repeats on the header line as well as inside the payload: the
     # header is the greppable one-liner when scanning a log for cost or for
@@ -141,17 +176,10 @@ def _log_response(
         "----- response -----\n%s\n"
         "===== end Claude RESPONSE [%s] =====",
         label, stop_reason, elapsed_ms, usage,
+        # _response_payload is evaluated HERE, outside _as_json's guard — which
+        # is why the caller wraps this whole function, not just the JSON step.
         _as_json(_response_payload(message)), label,
     )
-    # The failure this whole module was missing: a tool_use response cut off
-    # mid-JSON still arrives as a normal 200, and the caller just sees fewer
-    # results than it asked for.
-    if stop_reason == "max_tokens":
-        logger.warning(
-            "Claude [%s] stopped at max_tokens=%s — the response is TRUNCATED "
-            "and content was lost. Raise max_tokens or request less output.",
-            label, max_tokens,
-        )
 
 
 def create_message(client: anthropic.Anthropic, *, label: str, **kwargs):
@@ -159,8 +187,22 @@ def create_message(client: anthropic.Anthropic, *, label: str, **kwargs):
 
     ``label`` names the call in the log (e.g. ``clip-proposal:hook``) and is
     what you grep for. Every Claude call in this app goes through here.
+
+    Logging cannot veto the call. A request-side formatting failure would kill
+    a call that would have succeeded; a response-side one would throw away an
+    answer already paid for. Both are reported at ERROR with a traceback and
+    the same ``label``, so the record stays greppable — this is observability
+    failing, not the user's operation, so it must not surface as a failure of
+    the operation. ``except Exception``, not bare: KeyboardInterrupt and
+    SystemExit still propagate.
     """
-    _log_request(label, kwargs)
+    try:
+        _log_request(label, kwargs)
+    except Exception:
+        logger.exception(
+            "===== Claude LOG FAILURE (request) [%s] — call proceeds unlogged =====",
+            label,
+        )
     start = time.monotonic()
     try:
         message = client.messages.create(**kwargs)
@@ -170,10 +212,16 @@ def create_message(client: anthropic.Anthropic, *, label: str, **kwargs):
             label, int((time.monotonic() - start) * 1000), exc,
         )
         raise
-    _log_response(
-        label, message, int((time.monotonic() - start) * 1000),
-        kwargs.get("max_tokens"),
-    )
+    try:
+        _log_response(
+            label, message, int((time.monotonic() - start) * 1000),
+            kwargs.get("max_tokens"),
+        )
+    except Exception:
+        logger.exception(
+            "===== Claude LOG FAILURE (response) [%s] — response returned unlogged =====",
+            label,
+        )
     return message
 
 

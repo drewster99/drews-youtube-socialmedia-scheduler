@@ -18,8 +18,11 @@ The Claude response is structured: the model is forced to call the
 ``propose_clips`` tool with a strict JSON-Schema-validated payload, so
 we never have to text-parse a JSON blob.
 
-Per-kind constraints — the three bands are contiguous, so a clip that
-misses one kind's window lands inside the next kind's:
+Per-kind constraints. The bands touch at their endpoints, but nothing
+reclassifies across them: each kind is its own Claude call, the validator
+runs with a fixed ``kind``, and a proposal outside that kind's window is
+DROPPED, not handed to the neighbouring kind. Adjacency is not a safety
+net — a 90 s "hook" is discarded even when shorts were also requested.
 
 | Kind    | Min (s) | Max (s)             | Default output cap |
 |---------|---------|---------------------|--------------------|
@@ -54,13 +57,14 @@ import math
 import re
 import secrets
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Literal
 
 from yt_scheduler.config import UPLOAD_DIR
 from yt_scheduler.services import ai, clip_edges, media as media_service
 from yt_scheduler.services.background import spawn_background
-from yt_scheduler.services.clip_edges import ClipUnit
+from yt_scheduler.services.clip_edges import ClipEdges, ClipUnit
 
 logger = logging.getLogger(__name__)
 
@@ -84,16 +88,11 @@ _SEGMENT_MAX_FRACTION_OF_PARENT_DURATION: float = 0.75
 # emit a 60-second "hook" that's effectively the whole video.
 _PARENT_HEADROOM_SECONDS: float = 15.0
 
-# Server-side cap. Claude is also told this in the prompt body, but we
-# enforce it regardless so a prompt edit can't silently raise it.
-# The Generate-from-source UI lets the user pick a per-kind cap; this
-# is the default applied when the caller hasn't specified one, and
-# ``MAX_PROPOSALS_PER_KIND_CAP`` is the absolute ceiling we'll honour
-# (also the upper bound on the UI's number input).
-DEFAULT_MAX_PROPOSALS_PER_KIND: int = 20
+# Absolute ceiling we'll honour for a per-kind cap, whatever the caller asks
+# for — also the upper bound on the Generate modal's number input.
 MAX_PROPOSALS_PER_KIND_CAP: int = 50
-# Per-kind defaults matching the prototype's KIND_SPEC counts, applied when the
-# caller (the Generate UI) didn't specify a cap for that kind.
+# How many proposals to request per kind when the caller didn't say. Read it
+# through ``default_max_proposals_for_kind``, never directly.
 _DEFAULT_MAX_PER_KIND: dict[ClipKind, int] = {"hook": 20, "short": 15, "segment": 8}
 # When a kind already has cut clips on this parent, we ask Claude for a few
 # extra candidates so that after post-LLM dedup/overlap removal we still have a
@@ -115,6 +114,78 @@ _MAX_OVERLAP_FRACTION: float = 0.5
 # Database") without suppressing genuinely different clips that happen to
 # share a few words.
 _TITLE_SIMILARITY_THRESHOLD: float = 0.8
+
+
+class RejectionReason(str, Enum):
+    """Why the server refused a clip Claude proposed.
+
+    A code rather than a bare sentence so the UI can group and the tests can
+    assert on the decision instead of on its wording.
+    """
+
+    INVALID_INDICES = "invalid_indices"
+    INDEX_OUT_OF_BOUNDS = "index_out_of_bounds"
+    DURATION_OUT_OF_BAND = "duration_out_of_band"
+    DUPLICATE_TITLE = "duplicate_title"
+    OVERLAPS_EXISTING = "overlaps_existing"
+    OVER_OUTPUT_CAP = "over_output_cap"
+
+
+@dataclass(frozen=True)
+class RejectedProposal:
+    """A clip Claude proposed that the server refused, and why.
+
+    Exists so a discarded proposal reaches the screen. Before this, the count
+    on the review page was the only signal — 23 proposals arriving and 7
+    surviving looked identical to Claude finding 7, and the reason lived only
+    in the server log.
+    """
+
+    kind: ClipKind
+    reason: RejectionReason
+    detail: str
+    title: str = ""
+    first_index: int | None = None
+    last_index: int | None = None
+    duration_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class KindProposals:
+    """Everything that happened to one kind's proposal pass.
+
+    ``error`` is the absence of a run (the Claude call failed); rejections are
+    a successful run's refusals. They are different facts and must not be
+    collapsed — an error means the count is unknown, not zero. ``raw_count``
+    is what Claude actually returned, which is what lets the UI say "23
+    proposed, 7 kept" instead of "no proposals".
+    """
+
+    kind: ClipKind
+    accepted: list[ProposedClip]
+    rejected: list[RejectedProposal]
+    error: str | None = None
+    raw_count: int = 0
+
+    def __post_init__(self) -> None:
+        if self.error is not None and (self.accepted or self.rejected):
+            raise ValueError(
+                f"KindProposals for {self.kind} has an error and also results; "
+                "a failed pass produced neither."
+            )
+        # Every proposal Claude sent is either accepted or rejected. The UI
+        # subtracts these to say "N proposed, M kept", so a proposal that
+        # vanished without a reason would make that arithmetic quietly lie.
+        if self.error is None and self.raw_count != len(self.accepted) + len(self.rejected):
+            raise ValueError(
+                f"KindProposals for {self.kind}: raw_count={self.raw_count} but "
+                f"{len(self.accepted)} accepted + {len(self.rejected)} rejected — "
+                "a proposal was discarded without being recorded."
+            )
+
+    @classmethod
+    def failed(cls, kind: ClipKind, error: str) -> "KindProposals":
+        return cls(kind=kind, accepted=[], rejected=[], error=error)
 
 
 @dataclass(frozen=True)
@@ -254,8 +325,12 @@ def default_max_proposals_for_kind(kind: ClipKind) -> int:
     box the modal renders, and the internal fallback all read this. They
     used to be three separate constants, so the modal offered 8 of a kind
     whose declared default was 15.
+
+    Subscript, not ``.get`` with a default: an unknown kind is a bug, and
+    every other per-kind lookup here (``_PER_KIND_BOUNDS``,
+    ``CLIP_EDITORIAL_PROMPT_KEYS``) already raises on one.
     """
-    return _DEFAULT_MAX_PER_KIND.get(kind, DEFAULT_MAX_PROPOSALS_PER_KIND)
+    return _DEFAULT_MAX_PER_KIND[kind]
 
 
 def clip_kind_bands() -> list[ClipKindBand]:
@@ -325,6 +400,12 @@ _INDEX_PROPOSAL_TOOL = {
                         },
                         "rating": {
                             "type": "integer",
+                            "minimum": 1,
+                            "maximum": 4,
+                            # Bounded in the schema, not just the prose: rating
+                            # decides which clips survive the output cap and
+                            # which of two overlapping clips wins, so a stray
+                            # 0 or 9 would silently reorder the batch.
                             "description": "1-4 self-score (4 = best), judging content and title together.",
                         },
                     },
@@ -458,66 +539,109 @@ def _validate_indexed_proposals(
     existing_ranges: list[tuple[float, float]], max_proposals: int,
     parent_duration_seconds: float,
     existing_titles: list[str] | None = None,
-) -> list[ProposedClip]:
-    """Resolve index ranges to clips: drop bad/duplicate indices and any clip
-    outside the kind's duration window; compute the gap-ramp edges.
+) -> tuple[list[ProposedClip], list[RejectedProposal]]:
+    """Resolve index ranges to clips, returning what survived AND what didn't.
+
+    Two passes, because the checks are of two different kinds:
+
+    1. **Independent** — bad indices, out-of-band duration, a title that
+       duplicates one already on the parent. These judge a proposal on its
+       own and are evaluated for every entry.
+    2. **Mutual** — overlap and within-batch title duplication. These are
+       contests between candidates, so the survivors are ranked first
+       (rating, then length, then the model's own order) and taken greedily.
+       Ranking is what makes the output cap keep the BEST N rather than the
+       first N, and what decides which of two overlapping clips wins.
+
+    Rejections are returned rather than only logged: a proposal discarded in
+    silence is indistinguishable to the user from one Claude never made.
 
     ``existing_titles``: titles of same-kind clips already on this parent.
-    Proposals whose title near-matches one are dropped — the only duplicate
-    signal available for imported clips, which carry no cut range."""
+    The only duplicate signal available for imported clips, which carry no
+    cut range for the overlap check to see.
+    """
     min_s, max_s = _PER_KIND_BOUNDS[kind]
     # Segments have no fixed upper bound — cap at a fraction of the parent so a
     # "segment" can run long but can't just be (nearly) the whole video.
     if max_s is None and parent_duration_seconds > 0:
         max_s = _SEGMENT_MAX_FRACTION_OF_PARENT_DURATION * parent_duration_seconds
-    out: list[ProposedClip] = []
-    accepted: list[tuple[float, float]] = []
-    accepted_titles: list[str] = []
+
+    rejected: list[RejectedProposal] = []
+
+    def _reject(
+        reason: RejectionReason, detail: str, *, title: str = "",
+        first_index: int | None = None, last_index: int | None = None,
+        duration_seconds: float | None = None,
+    ) -> None:
+        logger.info("Dropping clip proposal %r: %s", title or "<untitled>", detail)
+        rejected.append(RejectedProposal(
+            kind=kind, reason=reason, detail=detail, title=title,
+            first_index=first_index, last_index=last_index,
+            duration_seconds=duration_seconds,
+        ))
+
+    # --- Pass 1: independent checks -------------------------------------
+    # (sort keys..., title, raw_title, reason, rating, edges, first, last)
+    Candidate = tuple[
+        float, float, float, str, str, str, int | None, ClipEdges, int, int,
+    ]
+    candidates: list[Candidate] = []
     for entry in raw_proposals:
-        if len(out) >= max_proposals:
-            break
+        if not isinstance(entry, dict):
+            _reject(
+                RejectionReason.INVALID_INDICES,
+                f"entry is a {type(entry).__name__}, not an object",
+            )
+            continue
         try:
             first_index = int(entry["first_index"])
             last_index = int(entry["last_index"])
         except (KeyError, TypeError, ValueError):
-            logger.info("Dropping clip proposal: missing/invalid indices %r", entry)
+            _reject(
+                RejectionReason.INVALID_INDICES,
+                f"missing or non-integer first_index/last_index in {entry!r}",
+            )
             continue
         raw_title = str(entry.get("title") or "").strip()
         title = raw_title or f"Untitled {kind}"
-        # Title guard — imported clips have no cut range (unknowable for a
-        # YouTube import), so the range-overlap check below can't see them.
-        # A near-identical title to an existing same-kind clip means the
-        # model re-found the same moment; drop it before any edge math.
-        # We check both clips ALREADY on the parent and clips accepted
-        # earlier in THIS batch — the model can re-propose the same moment
-        # twice in one call with non-overlapping ranges, which the range
-        # guard alone would miss. Only REAL titles dedup: the synthetic
-        # "Untitled <kind>" fallback must not collide two distinct untitled
-        # clips (title is schema-required, so this is defensive).
-        prior_titles = list(existing_titles or []) + accepted_titles
+
+        resolved = clip_edges.resolve_unit_range(units, first_index, last_index)
+        if resolved is None:
+            _reject(
+                RejectionReason.INDEX_OUT_OF_BOUNDS,
+                f"index range {first_index}-{last_index} is out of bounds "
+                f"(the transcript has {len(units)} units)",
+                title=title, first_index=first_index, last_index=last_index,
+            )
+            continue
+
+        if resolved.duration < min_s or (max_s is not None and resolved.duration > max_s):
+            side = "under" if resolved.duration < min_s else "over"
+            _reject(
+                RejectionReason.DURATION_OUT_OF_BAND,
+                f"{resolved.duration:.1f}s is {side} the {kind} window "
+                f"[{min_s:g}s, {max_s:g}s]",
+                title=title, first_index=first_index, last_index=last_index,
+                duration_seconds=resolved.duration,
+            )
+            continue
+
+        # Only REAL titles dedup: the synthetic "Untitled <kind>" fallback must
+        # not collide two distinct untitled clips.
         duplicate_of = next(
-            (t for t in prior_titles if raw_title and _titles_similar(raw_title, t)),
+            (t for t in (existing_titles or [])
+             if raw_title and _titles_similar(raw_title, t)),
             None,
         )
         if duplicate_of is not None:
-            logger.info(
-                "Dropping clip proposal %r: title duplicates existing %s %r.",
-                title, kind, duplicate_of,
+            _reject(
+                RejectionReason.DUPLICATE_TITLE,
+                f"title duplicates an existing {kind} clip, {duplicate_of!r}",
+                title=title, first_index=first_index, last_index=last_index,
+                duration_seconds=resolved.duration,
             )
             continue
-        resolved = clip_edges.resolve_unit_range(units, first_index, last_index)
-        if resolved is None:
-            logger.info(
-                "Dropping clip proposal %r: index range %s-%s out of bounds "
-                "(have %d units).", title, first_index, last_index, len(units),
-            )
-            continue
-        if resolved.duration < min_s or (max_s is not None and resolved.duration > max_s):
-            logger.info(
-                "Dropping clip proposal %r: duration %.1fs out of [%s, %s].",
-                title, resolved.duration, min_s, max_s,
-            )
-            continue
+
         # Echo cross-check (prototype parity): a mismatch is logged but not
         # rejected — the unit indices are authoritative.
         start_echo = str(entry.get("start_echo") or "")
@@ -532,41 +656,94 @@ def _validate_indexed_proposals(
                 "Clip proposal %r: end_echo %r doesn't match unit %d; trusting index.",
                 title, end_echo[:60], last_index,
             )
+
+        raw_rating = entry.get("rating")
+        rating = int(raw_rating) if isinstance(raw_rating, (int, float)) else None
         edges = clip_edges.compute_edges(units, first_index, last_index)
-        # Overlap guard — against already-cut clips and earlier proposals in
-        # this same batch (the model is told not to overlap; enforce it).
-        # Symmetric: measured against the SHORTER of the two clips, so a long
-        # proposal that fully contains a short existing clip is also dropped
-        # (against its own length alone, that containment would pass).
-        prior = existing_ranges + accepted
-        proposal_length = edges.final_end - edges.final_start
-        overlaps_prior = False
-        for s, e in prior:
-            shorter_length = min(proposal_length, e - s)
+        candidates.append((
+            # Sort key first: best rating, then longest, then earliest in the
+            # transcript — never random, so a rerun is reproducible.
+            -(rating if rating is not None else 0),
+            -(edges.final_end - edges.final_start),
+            float(first_index),
+            title, raw_title, str(entry.get("reason") or "").strip(),
+            rating, edges, first_index, last_index,
+        ))
+
+    # --- Pass 2: mutual contests, best-first -----------------------------
+    candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+
+    out: list[ProposedClip] = []
+    accepted_ranges: list[tuple[float, float]] = []
+    accepted_titles: list[str] = []
+    for (_r, _len, _idx, title, raw_title, reason_text,
+         rating, edges, first_index, last_index) in candidates:
+        duration = edges.final_end - edges.final_start
+        # Within-batch title duplication is a contest too — the better-ranked
+        # of the pair is already in accepted_titles by the time we get here.
+        duplicate_of = next(
+            (t for t in accepted_titles if raw_title and _titles_similar(raw_title, t)),
+            None,
+        )
+        if duplicate_of is not None:
+            _reject(
+                RejectionReason.DUPLICATE_TITLE,
+                f"title duplicates {duplicate_of!r}, already accepted in this batch",
+                title=title, first_index=first_index, last_index=last_index,
+                duration_seconds=duration,
+            )
+            continue
+
+        # Overlap guard — against already-cut clips and better-ranked proposals
+        # from this batch. Symmetric: measured against the SHORTER of the two
+        # clips, so a long proposal that fully contains a short existing clip is
+        # also dropped (against its own length alone, containment would pass).
+        conflict: tuple[float, float] | None = None
+        for s, e in existing_ranges + accepted_ranges:
+            shorter_length = min(duration, e - s)
             if shorter_length <= 0:
                 continue
             overlap = _overlap_seconds(edges.final_start, edges.final_end, s, e)
             if overlap > _MAX_OVERLAP_FRACTION * shorter_length:
-                overlaps_prior = True
+                conflict = (s, e)
                 break
-        if overlaps_prior:
-            logger.info("Dropping clip proposal %r: overlaps an existing range.", title)
+        if conflict is not None:
+            _reject(
+                RejectionReason.OVERLAPS_EXISTING,
+                f"overlaps {conflict[0]:.1f}s-{conflict[1]:.1f}s by more than "
+                f"{_MAX_OVERLAP_FRACTION:.0%} of the shorter clip",
+                title=title, first_index=first_index, last_index=last_index,
+                duration_seconds=duration,
+            )
             continue
-        rating = entry.get("rating")
+
+        # Checked last, once the clip has cleared every other test: a
+        # proposal that would have been refused anyway must be told the real
+        # reason, not that it merely ranked too low.
+        if len(out) >= max_proposals:
+            _reject(
+                RejectionReason.OVER_OUTPUT_CAP,
+                f"beyond the {max_proposals}-proposal cap for {kind} "
+                "(lower-ranked than the ones kept)",
+                title=title, first_index=first_index, last_index=last_index,
+                duration_seconds=duration,
+            )
+            continue
+
         out.append(ProposedClip(
             kind=kind,
             start_seconds=edges.final_start,
             end_seconds=edges.final_end,
             title=title,
-            reason=str(entry.get("reason") or "").strip(),
-            rating=int(rating) if isinstance(rating, (int, float)) else None,
+            reason=reason_text,
+            rating=rating,
             audio_fade_in=edges.fade_in,
             audio_fade_out=edges.fade_out,
         ))
-        accepted.append((edges.final_start, edges.final_end))
+        accepted_ranges.append((edges.final_start, edges.final_end))
         if raw_title:
             accepted_titles.append(raw_title)
-    return out
+    return out, rejected
 
 
 async def propose_clips_for_kind_indexed(
@@ -579,15 +756,22 @@ async def propose_clips_for_kind_indexed(
     project_id: int,
     existing_titles: list[str] | None = None,
     max_proposals: int | None = None,
-) -> list[ProposedClip]:
+) -> KindProposals:
     """Word-stream proposal: one per-kind Claude call over the numbered units.
 
     ``project_id`` resolves this project's editable editorial block for the
     kind; a blank saved prompt raises rather than generating against half a
     system message.
+
+    Returns everything that happened to this kind — what was accepted, what
+    was refused and why, and whether the call itself failed. A caller that
+    only reads ``.accepted`` cannot tell those apart, which is the bug this
+    return type exists to prevent.
     """
     if not is_parent_eligible_for_kind(parent_duration_seconds, kind) or not units:
-        return []
+        # A legitimately empty result, NOT a failure: the parent is too short
+        # for this kind, or there is nothing to read.
+        return KindProposals(kind=kind, accepted=[], rejected=[])
 
     if max_proposals is None or max_proposals <= 0:
         base_max = default_max_proposals_for_kind(kind)
@@ -614,7 +798,7 @@ async def propose_clips_for_kind_indexed(
     kwargs: dict[str, object] = {
         "model": model,
         # Headroom, not a target: at the observed ~120 output tokens per
-        # proposal even the 20-proposal ceiling lands nowhere near this, so a
+        # proposal even MAX_PROPOSALS_PER_KIND_CAP lands nowhere near this, so a
         # full set can never be truncated mid-JSON.
         "max_tokens": 25000,
         "system": system_text,
@@ -631,26 +815,50 @@ async def propose_clips_for_kind_indexed(
             client, label=f"clip-proposal:{kind}", **kwargs,
         )
     except Exception as exc:
-        logger.warning("Claude clip-proposal (index) call failed for %s: %s", kind, exc)
-        return []
+        # Carried, not swallowed: returning an empty list here would render
+        # identically to "Claude found nothing good", which is a different
+        # fact and one the user cannot act on.
+        logger.exception("Claude clip-proposal (index) call failed for %s", kind)
+        return KindProposals.failed(kind, f"{type(exc).__name__}: {exc}")
 
-    raw_proposals: list[dict] = []
+    # A response that carries no usable tool call is a FAILURE, not an empty
+    # result. Claude hitting max_tokens mid-JSON arrives as an ordinary 200,
+    # and reporting that as "no proposals" is the same lie this whole return
+    # type exists to prevent.
+    stop_reason = getattr(message, "stop_reason", None)
+    tool_block = None
     for block in getattr(message, "content", []) or []:
         if getattr(block, "type", None) == "tool_use" and getattr(block, "name", "") == "propose_clips":
-            entries = (getattr(block, "input", None) or {}).get("proposals")
-            if isinstance(entries, list):
-                raw_proposals = [e for e in entries if isinstance(e, dict)]
+            tool_block = block
             break
+    if tool_block is None:
+        return KindProposals.failed(kind, (
+            f"Claude returned no propose_clips tool call (stop_reason="
+            f"{stop_reason!r}) — the response was truncated or answered in prose."
+        ))
+    entries = (getattr(tool_block, "input", None) or {}).get("proposals")
+    if not isinstance(entries, list):
+        return KindProposals.failed(kind, (
+            f"propose_clips carried no 'proposals' array (got "
+            f"{type(entries).__name__}, stop_reason={stop_reason!r})."
+        ))
+    raw_proposals = list(entries)
 
-    proposals = _validate_indexed_proposals(
+    accepted, rejected = _validate_indexed_proposals(
         raw_proposals, kind=kind, units=units,
         existing_ranges=existing_ranges, max_proposals=base_max,
         parent_duration_seconds=parent_duration_seconds,
         existing_titles=existing_titles,
     )
-    logger.info("Clip-proposal (index) for %s: %d raw -> %d accepted (asked up to %d)",
-                kind, len(raw_proposals), len(proposals), ask_max)
-    return proposals
+    logger.info(
+        "Clip-proposal (index) for %s: %d raw -> %d accepted, %d rejected "
+        "(asked up to %d)",
+        kind, len(raw_proposals), len(accepted), len(rejected), ask_max,
+    )
+    return KindProposals(
+        kind=kind, accepted=accepted, rejected=rejected,
+        raw_count=len(entries),
+    )
 
 
 # Cap on simultaneously-running ffmpeg cut jobs. Precise cuts re-encode
@@ -776,6 +984,10 @@ def get_generate_job(job_id: str) -> dict | None:
     public_keys = {
         "job_id", "parent_id", "project_id", "state", "last_error",
         "kinds", "crop_vertical", "proposals", "progress_message",
+        # Deny-by-default: the job dict also holds parent_video_path, an
+        # absolute filesystem path the browser must never see. Add new fields
+        # here deliberately — a field not listed is silently dropped.
+        "rejected", "raw_counts", "kind_errors",
     }
     return {k: v for k, v in job.items() if k in public_keys}
 
@@ -867,14 +1079,16 @@ async def cut_clip_from_parent(
 
     Sample-accurate (precise=True). ``vertical_crop`` requests a 9:16
     (1080×1920) output with optional ``x_shift_normalized`` to follow
-    a non-center subject (3d feeds non-zero shift values from vision).
+    a non-center subject. Inert since the Claude-vision pass was replaced by
+    the on-device clipcrop recrop — kept only so stored rejection rows and the
+    confirm payload still round-trip.
 
     Encoder selection + concurrency:
 
     * Hardware (videotoolbox) is preferred when ffmpeg was built with
-      it; the cut is gated by :data:`_HARDWARE_CUT_SEMAPHORE` (4-wide).
+      it; the cut is gated by :data:`_HARDWARE_CUT_SEMAPHORE`.
     * Software (libx264) is the fallback; gated by
-      :data:`_SOFTWARE_CUT_SEMAPHORE` (8-wide).
+      :data:`_SOFTWARE_CUT_SEMAPHORE`.
 
     The two semaphores are independent, so a mixed batch (some hardware
     cuts, some software) fills both lanes at once. Output extension is
@@ -986,13 +1200,17 @@ async def propose_all_clips(
     project_id: int,
     max_per_kind: dict[ClipKind, int] | None = None,
     existing_titles_per_kind: dict[ClipKind, list[str]] | None = None,
-) -> dict[ClipKind, list[ProposedClip]]:
+) -> dict[ClipKind, KindProposals]:
     """Fan out one Claude call per requested kind, in parallel.
 
     Returns a dict keyed by kind, in the same order ``kinds`` was passed.
-    Kinds the parent is ineligible for are returned as empty lists so the
-    UI can render "0 proposals" rather than the request silently
-    disappearing.
+    Kinds the parent is ineligible for come back with empty lists so the UI
+    can render "0 proposals" rather than the request silently disappearing.
+
+    One kind failing does NOT take the others down. Beyond the obvious UX
+    reason, a bare ``gather`` propagates the first exception without
+    cancelling its siblings — the other Claude calls would keep running and
+    bill tokens for results nobody reads.
 
     ``units`` is the word-stream segmentation built from the on-device
     transcriber's word timing — always the index-based proposal path (there is
@@ -1004,8 +1222,8 @@ async def propose_all_clips(
 
     caps = max_per_kind or {}
 
-    async def _one(k: ClipKind) -> tuple[ClipKind, list[ProposedClip]]:
-        proposals = await propose_clips_for_kind_indexed(
+    async def _one(k: ClipKind) -> KindProposals:
+        return await propose_clips_for_kind_indexed(
             kind=k,
             units=units,
             parent_title=parent_title,
@@ -1015,10 +1233,20 @@ async def propose_all_clips(
             existing_titles=(existing_titles_per_kind or {}).get(k, []),
             max_proposals=caps.get(k),
         )
-        return k, proposals
 
-    results = await asyncio.gather(*(_one(k) for k in kinds))
-    return dict(results)
+    settled = await asyncio.gather(
+        *(_one(k) for k in kinds), return_exceptions=True,
+    )
+    out: dict[ClipKind, KindProposals] = {}
+    for k, result in zip(kinds, settled):
+        if isinstance(result, BaseException):
+            logger.exception(
+                "Clip proposal pass failed for kind=%s", k, exc_info=result,
+            )
+            out[k] = KindProposals.failed(k, f"{type(result).__name__}: {result}")
+        else:
+            out[k] = result
+    return out
 
 
 # --- Rejection persistence (migration 028) -----------------------------
@@ -1313,7 +1541,7 @@ async def _run_generate_job(job_id: str) -> None:
         # Proposing — fan out the per-kind index calls.
         job["state"] = "proposing"
         job["progress_message"] = "Asking Claude to propose clips…"
-        proposals = await propose_all_clips(
+        runs = await propose_all_clips(
             kinds=job["kinds"],
             units=units,
             parent_title=job["parent_title"],
@@ -1323,6 +1551,32 @@ async def _run_generate_job(job_id: str) -> None:
             max_per_kind=job.get("max_per_kind"),
             existing_titles_per_kind=job["existing_titles_per_kind"],
         )
+        proposals = {k: run.accepted for k, run in runs.items()}
+        # What Claude proposed but the server refused, and which kinds failed
+        # outright. Both reach the review page: "23 proposed, 7 kept" is a
+        # different fact from "Claude found 7", and the user can only act on
+        # the difference if we say it.
+        job["rejected"] = {
+            k: [
+                {
+                    "kind": r.kind,
+                    "reason": r.reason.value,
+                    "detail": r.detail,
+                    "title": r.title,
+                    "duration_seconds": r.duration_seconds,
+                }
+                for r in run.rejected
+            ]
+            for k, run in runs.items() if run.rejected
+        }
+        # Failed kinds are omitted, not reported as 0: their count is unknown,
+        # and a 0 would feed the UI's "N proposed" arithmetic a false zero.
+        job["raw_counts"] = {
+            k: run.raw_count for k, run in runs.items() if run.error is None
+        }
+        job["kind_errors"] = {
+            k: run.error for k, run in runs.items() if run.error is not None
+        }
 
         # Per-kind 9:16 toggles the user set in the review modal (hooks/shorts
         # default on, segments off); they ride on the job from the preview
@@ -1347,9 +1601,10 @@ async def _run_generate_job(job_id: str) -> None:
         # still produce files via asyncio.gather(return_exceptions=True).
         job["state"] = "cutting_previews"
         total = sum(len(v) for v in proposals.values())
-        # cuts_completed is read by the polling endpoint so the UI can
-        # show "M of N" instead of just a single static label. Bumped
-        # by each task's wrapper as soon as ffmpeg returns.
+        # Internal counters only — they are NOT in the public job dict. What
+        # the UI sees is progress_message, rendered from them below, so the
+        # user gets "M of N" instead of a single static label. Bumped by each
+        # task's wrapper as soon as ffmpeg returns.
         job["cuts_total"] = total
         job["cuts_completed"] = 0
         job["progress_message"] = f"Cutting clips… 0 of {total}"

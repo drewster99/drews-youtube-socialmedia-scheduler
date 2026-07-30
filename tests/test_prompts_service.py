@@ -211,3 +211,28 @@ async def test_non_empty_custom_body_is_preserved(prompts_env) -> None:
         "tags_from_metadata_prompt", project_id=1
     )
     assert record["body"] == "My custom tags prompt"
+
+
+def test_retired_keys_are_never_also_seeds():
+    """Re-adding a retired key must be a conscious act.
+
+    A stale saved row for that key would otherwise beat the newly-added seed
+    in both the resolver and the Settings list, feeding Claude the retired
+    prompt while the screen shows it as the user's own.
+    """
+    from yt_scheduler.services.prompts import _RETIRED_KEYS, _SEEDS_BY_KEY
+
+    assert not (set(_RETIRED_KEYS) & set(_SEEDS_BY_KEY))
+
+
+async def test_retired_key_raises_rather_than_resolving(isolated_db):
+    """Deterministic on every install: a retired key is an error whether or
+    not this machine happens to have a stale row for it."""
+    import pytest
+
+    from yt_scheduler.services import prompts
+
+    with pytest.raises(prompts.RetiredPromptKey):
+        await prompts.get_prompt_with_fallback(
+            "promo_clip_crop_refinement", project_id=1,
+        )

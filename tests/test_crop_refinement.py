@@ -43,14 +43,22 @@ async def test_run_generate_job_transcribes_on_device_and_routes_crop_per_kind(
 
     async def fake_propose(**kw):
         return {
-            "hook": [clipper.ProposedClip(
-                kind="hook", start_seconds=5, end_seconds=20,
-                title="h1", reason="x",
-            )],
-            "segment": [clipper.ProposedClip(
-                kind="segment", start_seconds=120, end_seconds=300,
-                title="seg1", reason="x",
-            )],
+            "hook": clipper.KindProposals(
+                kind="hook",
+                accepted=[clipper.ProposedClip(
+                    kind="hook", start_seconds=5, end_seconds=20,
+                    title="h1", reason="x",
+                )],
+                rejected=[], raw_count=1,
+            ),
+            "segment": clipper.KindProposals(
+                kind="segment",
+                accepted=[clipper.ProposedClip(
+                    kind="segment", start_seconds=120, end_seconds=300,
+                    title="seg1", reason="x",
+                )],
+                rejected=[], raw_count=1,
+            ),
         }
 
     monkeypatch.setattr(clipper, "propose_all_clips", fake_propose)
@@ -94,21 +102,3 @@ async def test_run_generate_job_transcribes_on_device_and_routes_crop_per_kind(
     assert cut_crops == {"hook": True, "segment": False}
 
     clipper._GENERATE_JOBS.pop(job_id, None)
-
-
-# --- extract_keyframes_in_range -----------------------------------------
-
-def test_extract_keyframes_in_range_empty_when_inverted_window(tmp_path):
-    from yt_scheduler.services.media import extract_keyframes_in_range
-
-    f = tmp_path / "a.mp4"
-    f.write_bytes(b"\x00")
-    assert extract_keyframes_in_range(f, start_seconds=20, end_seconds=10) == []
-
-
-def test_extract_keyframes_in_range_empty_when_missing(tmp_path):
-    from yt_scheduler.services.media import extract_keyframes_in_range
-
-    assert extract_keyframes_in_range(
-        tmp_path / "nope.mp4", start_seconds=0, end_seconds=10,
-    ) == []

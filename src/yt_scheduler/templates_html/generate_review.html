@@ -18,7 +18,7 @@
 
 <section id="gen-picker" class="card">
     <h3 style="margin-top: 0;">Pick what to propose</h3>
-    <p class="form-hint">Cutting from this primary video. Claude looks at the transcript and proposes ranges; for vertical-crop kinds, a vision pass refines the crop position per proposal.</p>
+    <p class="form-hint">Cutting from this primary video. Claude reads the transcript and proposes ranges; vertical-crop kinds are reframed to 9:16 on-device at cut time by head-tracking.</p>
     <fieldset id="gen-kinds-fieldset" style="padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: var(--radius-sm); margin: 0.6rem 0;">
         <legend>Kinds to propose</legend>
         <label class="generate-kind-row">
@@ -129,6 +129,10 @@ let abortController = null;
 let dispatchToken = 0;
 let activeProposals = {};      // {kind: [public-dict, ...]}; restored items appended here
 let restoredIds = new Set();   // rejection_ids of items the user restored this session
+let lastRejected = {};         // {kind: [server-refused proposal, ...]}
+let lastKindErrors = {};       // {kind: error text} — the call itself failed
+let lastRawCounts = {};        // {kind: how many Claude actually returned}
+let lastAcceptedCount = 0;     // accepted by the LAST run, before any dismissals
 
 function bumpToken() { dispatchToken += 1; return dispatchToken; }
 
@@ -354,6 +358,15 @@ document.getElementById('gen-go').addEventListener('click', async () => {
         segment: clampMax('gen-max-segment'),
     };
     document.getElementById('gen-go').disabled = true;
+    // Drop the previous run's results before starting a new one. Restore is
+    // still clickable while this run polls, and without the reset it would
+    // repaint run 1's proposals, errors and rejections over run 2's progress —
+    // complete with a live Insert button on stale data.
+    activeProposals = {};
+    lastRejected = {};
+    lastKindErrors = {};
+    lastRawCounts = {};
+    lastAcceptedCount = 0;
     showSection('gen-progress');
     document.getElementById('gen-progress-text').textContent = 'Starting…';
 
@@ -474,6 +487,14 @@ async function pollJob(jobId, myToken) {
             const restored = (activeProposals[k] || []).filter(p => p._restored);
             activeProposals[k] = [...fresh, ...restored];
         }
+        // What the server refused and which kinds failed outright. Without
+        // these the page can only show a count, and a count cannot tell the
+        // difference between "Claude found 7" and "Claude found 23, we kept 7".
+        lastRejected = body.rejected || {};
+        lastKindErrors = body.kind_errors || {};
+        lastRawCounts = body.raw_counts || {};
+        lastAcceptedCount = Object.values(body.proposals || {})
+            .reduce((a, v) => a + (Array.isArray(v) ? v.length : 0), 0);
         renderProposals();
         showSection('gen-proposals-wrap');
         return;
@@ -505,11 +526,81 @@ function renderProposals() {
         section.appendChild(grid);
         container.appendChild(section);
     }
+    renderKindErrors(container);
+    renderRejected(container);
+
+    // The zero-state used to say "Claude returned no proposals" even when
+    // Claude returned 23 and the server refused all of them — a statement
+    // about the model that was actually about us.
+    // Every branch reports what the RUN did. `total` is what's on screen now,
+    // which diverges from the run the moment the user dismisses something.
+    const rawTotal = Object.values(lastRawCounts).reduce((a, b) => a + b, 0);
+    const rejectedTotal = rejectedRows().length;
+    const failedKinds = Object.keys(lastKindErrors);
+    const failedNote = failedKinds.length
+        ? ` ${failedKinds.length} kind${failedKinds.length === 1 ? '' : 's'} failed outright — see below.`
+        : '';
     const summary = document.getElementById('gen-proposals-summary');
-    summary.textContent = total
-        ? `${total} proposal${total === 1 ? '' : 's'}. Uncheck or Dismiss anything you don't want, then Insert selected.`
-        : 'Claude returned no proposals for this video.';
+    if (total) {
+        const dropped = rejectedTotal ? ` ${rejectedTotal} more didn't pass — see below.` : '';
+        summary.textContent = `${total} proposal${total === 1 ? '' : 's'}.${dropped}${failedNote} `
+            + `Uncheck or Dismiss anything you don't want, then Insert selected.`;
+    } else if (lastAcceptedCount) {
+        // Nothing on screen because the user dismissed it all — NOT because
+        // validation refused it. Saying "none passed" here would be false.
+        summary.textContent = `You dismissed all ${lastAcceptedCount} proposal`
+            + `${lastAcceptedCount === 1 ? '' : 's'}.${failedNote}`;
+    } else if (rejectedTotal) {
+        summary.textContent = `Claude proposed ${rawTotal} clip${rawTotal === 1 ? '' : 's'}, `
+            + `but none passed validation — reasons below.${failedNote}`;
+    } else if (failedKinds.length) {
+        summary.textContent = 'No proposals: every requested kind failed. See the errors below.';
+    } else {
+        summary.textContent = 'Claude returned no proposals for this video.';
+    }
     updateConfirmState();
+}
+
+// Derived from the data, not from a hardcoded kind list, so the count in the
+// summary and the rows in the disclosure can never disagree. `.flat()` also
+// tolerates a malformed value instead of throwing mid-render and leaving the
+// panel showing the previous run's text.
+function rejectedRows() {
+    return Object.values(lastRejected).flat().filter(Boolean);
+}
+
+// A kind whose Claude call failed must not render as "0 proposals" — that is
+// indistinguishable from "found nothing" and the user can't act on it.
+function renderKindErrors(container) {
+    const kinds = Object.keys(lastKindErrors);
+    if (!kinds.length) return;
+    const box = document.createElement('div');
+    box.className = 'card';
+    box.style.cssText = 'border-color: var(--danger); margin: 0.6rem 0;';
+    box.innerHTML = `<h4 style="margin-top:0; color: var(--danger);">`
+        + `${kinds.length} kind${kinds.length === 1 ? '' : 's'} failed</h4>`
+        + kinds.map(k =>
+            `<p style="margin:0.3rem 0;"><strong>${escapeHtml(KIND_LABELS[k] || k)}</strong>: `
+            + `${escapeHtml(lastKindErrors[k])}</p>`).join('');
+    container.prepend(box);
+}
+
+// Proposals the server refused. Collapsed by default: overlap and duplicate
+// drops are routine and high-volume, and a banner would train the user to
+// ignore the disclosure that matters.
+function renderRejected(container) {
+    const rows = rejectedRows();
+    if (!rows.length) return;
+    const details = document.createElement('details');
+    details.style.margin = '0.8rem 0 0';
+    details.innerHTML = `<summary style="cursor:pointer;">`
+        + `${rows.length} proposal${rows.length === 1 ? '' : 's'} not shown</summary>`
+        + `<ul class="form-hint" style="margin:0.4rem 0 0 1rem;">`
+        + rows.map(r =>
+            `<li><strong>${escapeHtml(KIND_LABELS[r.kind] || r.kind)}</strong> — `
+            + `${escapeHtml(r.title || 'untitled')}: ${escapeHtml(r.detail)}</li>`).join('')
+        + `</ul>`;
+    container.appendChild(details);
 }
 
 // Cut & insert is only valid when at least one proposal is checked to Include.

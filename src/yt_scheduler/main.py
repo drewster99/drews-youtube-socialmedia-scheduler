@@ -12,6 +12,50 @@ import uvicorn
 from yt_scheduler.config import HOST, LOG_DIR, PORT, ensure_dirs
 
 
+# Roll server.log once it passes this, at startup only. Full LLM request
+# logging writes the whole prompt on every Claude call, so the file grows in
+# steps now, not drips.
+SERVER_LOG_MAX_BYTES = 32 * 1024 * 1024
+SERVER_LOG_KEEP = 3
+
+
+def _rotate_server_log(log_file: Path) -> str | None:
+    """Roll ``server.log`` aside if it has grown past the cap.
+
+    Called from ``_redirect_stdio_to_log`` BEFORE the ``os.open``/``dup2``,
+    and that ordering is the whole point: at this instant no descriptor is
+    bound to the file, so a plain rename is safe.
+
+    A ``RotatingFileHandler`` over this path would NOT be. The dup2'd fds 1/2
+    follow the *inode* through a rename, so after the first roll every
+    traceback, ``print``, and uvicorn line would go to ``server.log.1`` — and
+    after enough rolls, to an unlinked inode no tool can read. Silent loss of
+    the error channel, by the machinery meant to preserve it.
+
+    A rotation failure must never stop the server from starting, so the whole
+    function is best-effort. It RETURNS the failure rather than printing it:
+    at this point stderr is still launchd's, so a print here would land in the
+    boot log, not in the server.log the message is about. The caller emits it
+    after the redirect.
+    """
+    try:
+        if not log_file.exists() or log_file.stat().st_size < SERVER_LOG_MAX_BYTES:
+            return
+        oldest = log_file.with_name(f"{log_file.name}.{SERVER_LOG_KEEP}")
+        if oldest.exists():
+            oldest.unlink()
+        # Shift the survivors down, newest last, so nothing is overwritten
+        # before it has been moved.
+        for n in range(SERVER_LOG_KEEP, 1, -1):
+            older = log_file.with_name(f"{log_file.name}.{n - 1}")
+            if older.exists():
+                older.rename(log_file.with_name(f"{log_file.name}.{n}"))
+        log_file.rename(log_file.with_name(f"{log_file.name}.1"))
+    except OSError as exc:
+        return f"server.log rotation skipped: {exc!r}"
+    return None
+
+
 def _redirect_stdio_to_log() -> None:
     """Send stdout + stderr to ``LOG_DIR/server.log`` so launchd can use
     ``/dev/null`` for its own redirects.
@@ -27,12 +71,17 @@ def _redirect_stdio_to_log() -> None:
     ensure_dirs()
     log_file = LOG_DIR / "server.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
+    rotation_error = _rotate_server_log(log_file)
     fd = os.open(str(log_file), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     os.dup2(fd, 1)
     os.dup2(fd, 2)
     os.close(fd)
     sys.stdout = os.fdopen(1, "w", buffering=1)
     sys.stderr = os.fdopen(2, "w", buffering=1)
+    if rotation_error:
+        # Now that stderr IS server.log, the complaint about server.log lands
+        # where someone reading server.log will find it.
+        print(rotation_error, file=sys.stderr)
 
 
 def _bundle_passphrase(*, confirm: bool) -> str:

@@ -397,6 +397,26 @@ _SEEDS_BY_KEY: dict[str, SeedPrompt] = {
 }
 
 
+class RetiredPromptKey(KeyError):
+    """Asked for a prompt key that was deliberately retired."""
+
+
+# Keys that once shipped a seed and no longer do. Retiring is a declared act,
+# not just a deletion: without this, a fresh install raises KeyError while an
+# install with a stale saved row silently keeps generating from retired text —
+# behaviour that differs per machine. It also makes re-using a name a test
+# failure rather than a silent stale-row-beats-new-seed swap.
+#
+# Saved rows for these keys are NEVER deleted; they are the user's text.
+# If a prompt is being RENAMED rather than retired, migrate the row's key
+# instead, or the user's customisation is stranded.
+_RETIRED_KEYS: dict[str, str] = {
+    "promo_clip_crop_refinement":
+        "The Claude-vision crop pass was replaced by the on-device Swift "
+        "clipcrop (YOLO head-tracking) in 7aa3012.",
+}
+
+
 def _row_to_dict(row) -> dict:
     data = dict(row)
     applies_to = data.pop("applies_to", None)
@@ -492,6 +512,11 @@ async def get_prompt_with_fallback(
 
     Raises ``KeyError`` for unknown keys.
     """
+    # Checked before the promo-variant branch so nothing can route around it.
+    if key in _RETIRED_KEYS:
+        raise RetiredPromptKey(
+            f"Prompt key '{key}' was retired: {_RETIRED_KEYS[key]}"
+        )
     base_seed = _SEEDS_BY_KEY.get(key)
 
     if prefer_promo_variant:
