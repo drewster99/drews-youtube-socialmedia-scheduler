@@ -32,6 +32,12 @@ from yt_scheduler.services.render_context import (
 # are intentionally excluded — only draft↔approved transitions are client-driven.
 _CLIENT_WRITABLE_POST_STATUSES: frozenset[str] = frozenset({"draft", "approved"})
 
+# Statuses DELETE /api/social/posts/{id} will remove. Neither has anything
+# pending: a draft was never sent, and a failed send already cleared its
+# scheduling columns. The three excluded statuses each have something in flight
+# or on the record — see remove_post.
+_REMOVABLE_POST_STATUSES: frozenset[str] = frozenset({"draft", "failed"})
+
 
 
 router = APIRouter(prefix="/api/social", tags=["social"])
@@ -706,47 +712,74 @@ async def update_post(post_id: int, data: dict):
 
 @router.delete("/posts/{post_id}")
 async def remove_post(post_id: int):
-    """Remove a draft social post.
+    """Remove a draft or failed social post.
 
-    Drafts only, and deliberately so: ``posted`` is the audit trail of something
-    the world has already seen, ``sending`` is mid-flight, ``approved`` may have
-    a live per-post DateTrigger behind it, and ``failed`` is the record the
-    app-wide failed-sends banner is built from. Each of those needs its own
-    decision, so none of them is removable here.
+    Those two are removable because neither has anything pending: a draft was
+    never sent, and every failure path already cleared the row's scheduling
+    columns, so nothing will pick it up again. For a failed post outside a smart
+    queue this is the only exit at all — the app-wide failed-sends banner is
+    driven by ``status``, so the row IS the notification, and nothing retries it.
+
+    The other three stay: ``posted`` is the audit trail of something the world
+    has already seen, ``sending`` is mid-flight, and ``approved`` may have a live
+    per-post DateTrigger behind it.
+
+    A post owned by a smart queue item is refused outright, whatever its status.
+    The queue derives an item's state from its posting rows (see
+    ``smart_queue.list_queues``: ``LEFT JOIN social_posts`` … ``ELSE i.state``),
+    so deleting the row would leave the item bucketed as 'scheduled' forever
+    with nothing left to post, and its video never eligible to be queued again.
+    Those items already have a purpose-built exit — the queue's missed-postings
+    screen, whose ``remove`` disposition moves the ITEM to 'removed' — and that
+    state machine belongs to the queue, not to this endpoint.
 
     The status guard is repeated inside the DELETE rather than trusting the
-    read: a send that flips the row out of ``draft`` in between must win, and a
-    conditional DELETE lets it, where a plain delete-by-id would drop a post
-    that is already on the wire.
+    read: a send that flips the row out of a removable status in between must
+    win, and a conditional DELETE lets it, where a plain delete-by-id would drop
+    a post that is already on the wire. Queue ownership needs no such re-check —
+    ``smart_queue_item_id`` is only ever written when the row is inserted.
     """
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT status, platform, video_id, content, scheduler_job_id "
-        "FROM social_posts WHERE id = ?",
+        "SELECT p.status, p.platform, p.video_id, p.content, p.error, "
+        "       p.scheduler_job_id, p.smart_queue_item_id, i.queue_id "
+        "  FROM social_posts p "
+        "  LEFT JOIN smart_queue_items i ON i.id = p.smart_queue_item_id "
+        " WHERE p.id = ?",
         (post_id,),
     )
     if not rows:
         raise HTTPException(404, f"Social post {post_id} not found")
     post = dict(rows[0])
-    if post["status"] != "draft":
+    removable = sorted(_REMOVABLE_POST_STATUSES)
+    if post["status"] not in _REMOVABLE_POST_STATUSES:
         raise HTTPException(
             409,
-            f"Only draft posts can be removed — post {post_id} is "
-            f"'{post['status']}'.",
+            f"Only {' or '.join(removable)} posts can be removed — post "
+            f"{post_id} is '{post['status']}'.",
+        )
+    if post["smart_queue_item_id"] is not None:
+        raise HTTPException(
+            409,
+            f"Post {post_id} belongs to smart queue {post['queue_id']} and can't "
+            "be removed here — deleting it would strand the queue item. Use the "
+            "queue's missed-postings screen, which can post it now, reschedule "
+            "it to the end, or remove the item from the queue.",
         )
 
-    # A draft is not supposed to carry a job at all (schedule_social_post
-    # stamps 'approved'), but PUT lets a client set the status back to 'draft'
-    # without clearing scheduler_job_id, and a trigger left behind would fire
-    # against a row that no longer exists.
+    # Neither removable status is supposed to carry a job (scheduling stamps
+    # 'approved'; every failure path NULLs the scheduling columns), but PUT lets
+    # a client set the status back to 'draft' without clearing scheduler_job_id,
+    # and a trigger left behind would fire against a row that no longer exists.
     cancelled_schedule = False
     if post["scheduler_job_id"]:
         cancelled_schedule = await cancel_scheduled_post(post_id)
 
+    placeholders = ", ".join("?" for _ in removable)
     async with write_transaction() as db:
         cursor = await db.execute(
-            "DELETE FROM social_posts WHERE id = ? AND status = 'draft'",
-            (post_id,),
+            f"DELETE FROM social_posts WHERE id = ? AND status IN ({placeholders})",
+            (post_id, *removable),
         )
         removed = (cursor.rowcount or 0) > 0
 
@@ -755,15 +788,24 @@ async def remove_post(post_id: int):
             409, f"Post {post_id} changed status while being removed — nothing removed."
         )
 
+    notes = []
+    if cancelled_schedule:
+        notes.append("cancelled its pending schedule")
+    if post["error"]:
+        # A failed post's error text was the whole content of the banner entry
+        # this removal just silenced; it should outlive the row somewhere.
+        notes.append(f"discarded error: {post['error']}")
+
     # The row is gone for good and nothing else records that it existed, so the
     # server log is the only place this is recoverable from.
     logger.info(
-        "Removed draft social post %s (%s, video %s, %d chars)%s",
+        "Removed %s social post %s (%s, video %s, %d chars)%s",
+        post["status"],
         post_id,
         post["platform"],
         post["video_id"],
         len(post["content"] or ""),
-        " — cancelled its pending schedule" if cancelled_schedule else "",
+        (" — " + "; ".join(notes)) if notes else "",
     )
     return {"status": "ok", "cancelled_schedule": cancelled_schedule}
 

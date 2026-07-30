@@ -135,4 +135,10 @@
     window.addEventListener('focus', check);
     check();
     setInterval(check, POLL_MS);
+
+    // A page that removes or retries a failed post knows the list changed
+    // before the next poll does. Without this the banner keeps naming a post
+    // that no longer exists — including a "View →" link to a card that is gone.
+    // Exposing the existing check keeps one fetch/render implementation.
+    window.refreshFailedSendsBanner = check;
 })();

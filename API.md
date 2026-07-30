@@ -1154,15 +1154,19 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 
 ### `DELETE /api/social/posts/{post_id}`
 
-**Purpose** — Remove a draft social post. Backs the **Remove** button on the video-detail page (drafts only, behind a confirm).
+**Purpose** — Remove a draft or failed social post. Backs the **Remove** button on the video-detail page (behind a confirm).
 
-**Preconditions** — `status` must be `'draft'`. Every other status is refused: `posted` is the audit trail of a post the world has seen, `sending` is mid-flight, `approved` may have a live per-post job behind it, and `failed` is the record `GET /api/social/failed-posts` and the app-wide banner are built from.
+**Preconditions** — `status` must be `'draft'` or `'failed'` (`_REMOVABLE_POST_STATUSES`), **and** `smart_queue_item_id` must be NULL. Neither removable status has anything pending: a draft was never sent, and every failure path clears `scheduled_at`/`scheduler_job_id`, so nothing retries a failed post — for one outside a smart queue, removal is its only exit from `GET /api/social/failed-posts` and the app-wide banner. The other three statuses are refused: `posted` is the audit trail of a post the world has seen, `sending` is mid-flight, and `approved` may have a live per-post job behind it.
 
-**Response 200** — `{"status": "ok", "cancelled_schedule": true | false}`. `cancelled_schedule` is true only in the odd case where the draft still carried a `scheduler_job_id` (a `PUT` can set `status` back to `draft` without clearing it); the job is torn down before the row is deleted so no trigger fires against a missing post.
+A post owned by a smart queue item is refused whatever its status. `smart_queue.list_queues` derives an item's bucket from its posting rows (`LEFT JOIN social_posts` … `ELSE i.state`), so deleting the row would leave the item reported as `scheduled` forever with nothing left to post, and its video never eligible to be queued again. Those posts have their own exit: `POST /api/projects/{slug}/smart-queues/{queue_id}/missed/{post_id}` with `action: "remove"`, which moves the *item* to `removed`.
 
-**Side effects** — Deletes the `social_posts` row; the matching `social_post_traces` row goes with it via `ON DELETE CASCADE`. The removal is logged (post id, platform, video id, content length) — the row itself is unrecoverable.
+Note that `failed` is not proof nothing reached the platform — a publish whose response was lost to a timeout is recorded as failed. Removing the row deletes our record, not the platform's post.
 
-**Errors** — `404` (no such post); `409` (status is not `draft`, including the race where a send claims the row between the status read and the delete — the guard is repeated in the `DELETE` statement, so the send wins).
+**Response 200** — `{"status": "ok", "cancelled_schedule": true | false}`. `cancelled_schedule` is true only in the odd case where the row still carried a `scheduler_job_id` (a `PUT` can set `status` back to `draft` without clearing it); the job is torn down before the row is deleted so no trigger fires against a missing post.
+
+**Side effects** — Deletes the `social_posts` row; the matching `social_post_traces` row goes with it via `ON DELETE CASCADE`. The removal is logged (status, post id, platform, video id, content length, and the discarded `error` text when there was one) — the row itself is unrecoverable.
+
+**Errors** — `404` (no such post); `409` (status is not removable, including the race where a send claims the row between the status read and the delete — the guard is repeated in the `DELETE` statement, so the send wins).
 
 ### `POST /api/social/posts/{post_id}/shorten`
 

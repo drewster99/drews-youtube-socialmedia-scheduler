@@ -1892,13 +1892,28 @@ async function loadSocialPosts() {
                 const undoLink = (lastShorten && lastShorten.postId === p.id && lastShorten.after === content)
                     ? `<button class="btn btn-sm" onclick="undoShorten(${p.id})">Undo shorten</button>`
                     : '';
-                // Remove is offered on drafts only — the same rule the server
-                // enforces. Pushed to the far right so a destructive click
-                // isn't neighbouring Send.
-                const removeButton = (p.status === 'draft')
+                // Remove is offered on drafts and failed sends — the same rule
+                // the server enforces. Neither has anything pending, and a
+                // failed post has no other exit: nothing retries it, so without
+                // this it sits in the app-wide banner forever. Pushed to the far
+                // right so a destructive click isn't neighbouring Send.
+                const isRemovable = p.status === 'draft' || isFailed;
+                // A queue-owned post must go through the queue's missed-postings
+                // screen: deleting the row here would strand the queue item,
+                // which derives its state from its posting rows. Shown disabled
+                // with the reason rather than hidden — same idiom as Send on an
+                // unconfigured platform — so the absence isn't a mystery.
+                const queueOwned = p.smart_queue_item_id != null;
+                const removeTitle = queueOwned
+                    ? 'Part of a smart queue — remove it from the queue’s missed-postings screen'
+                    : (isFailed
+                        ? 'Delete this failed post and clear it from the failed-sends banner'
+                        : 'Delete this draft — it has not been sent');
+                const removeButton = isRemovable
                     ? `<button class="btn btn-sm btn-danger" style="margin-left: auto;"
                            onclick="removePost(${p.id})"
-                           title="Delete this draft — it has not been sent">Remove</button>`
+                           ${queueOwned ? 'disabled data-stays-disabled' : ''}
+                           title="${removeTitle}">Remove</button>`
                     : '';
                 actions = `
                     <button class="btn btn-sm btn-primary" onclick="openSocialPostEditor(${p.id})" title="Open editor (also: click the post body)">Edit</button>
@@ -1906,7 +1921,7 @@ async function loadSocialPosts() {
                     ${undoLink}
                     ${!wasApproved ? `<button class="btn btn-sm" onclick="approvePost(${p.id})">Approve</button>` : ''}
                     <button class="btn btn-sm btn-success" onclick="sendPost(${p.id})"
-                        ${!isConfigured ? 'disabled title="Configure this platform in Settings first"' : ''}>
+                        ${!isConfigured ? 'disabled data-stays-disabled title="Configure this platform in Settings first"' : ''}>
                         Send
                     </button>
                     ${removeButton}`;
@@ -2544,7 +2559,14 @@ async function doGeneratePosts(platforms) {
 function setPostCardBusy(postId, busy) {
     const card = document.querySelector(`.social-post-card[data-post-card="${postId}"]`);
     if (!card) return;
-    card.querySelectorAll('button').forEach(b => { b.disabled = !!busy; });
+    // Buttons disabled by the render for a standing reason (unconfigured
+    // platform, queue-owned post) must not be switched on by the end of an
+    // unrelated busy cycle: this blanket-enabled every button, so one shorten
+    // handed back a live Send for a platform with no credentials.
+    card.querySelectorAll('button').forEach(b => {
+        if (!busy && b.hasAttribute('data-stays-disabled')) return;
+        b.disabled = !!busy;
+    });
     card.style.pointerEvents = busy ? 'none' : '';
     card.style.opacity = busy ? '0.6' : '';
 }
@@ -2723,22 +2745,40 @@ async function removePost(postId) {
     // are near-identical, and the delete is not undoable.
     const post = (socialPostsCache || []).find(p => p.id === postId);
     if (!post) return;
+    const failed = post.status === 'failed';
     const preview = (post.content || '').trim().split('\n')[0].slice(0, 100);
-    const ok = confirm(
-        `Remove this ${post.platform} draft?\n\n  "${preview}${preview.length >= 100 ? '…' : ''}"\n\n`
-        + 'It has not been sent. This cannot be undone.'
-    );
-    if (!ok) return;
+    const lines = [
+        `Remove this ${post.platform} ${failed ? 'failed post' : 'draft'}?`,
+        '',
+        `  "${preview}${preview.length >= 100 ? '…' : ''}"`,
+        '',
+    ];
+    if (failed) {
+        // A send can fail AFTER the platform accepted the post — a publish whose
+        // response was lost to a timeout is exactly how yesterday's Threads post
+        // went out twice. So 'failed' is not proof that nothing was published,
+        // and the confirm must not imply it is.
+        lines.push('This deletes our record of the failed send and clears it from the');
+        lines.push('failed-sends banner. It does NOT delete anything the platform may');
+        lines.push('already have published — check there first if the send timed out.');
+    } else {
+        lines.push('It has not been sent.');
+    }
+    lines.push('This cannot be undone.');
+    if (!confirm(lines.join('\n'))) return;
 
     setPostCardBusy(postId, true);
     try {
         const resp = await fetch(`/api/social/posts/${postId}`, {method: 'DELETE', _silent: true});
         if (resp.ok) {
-            showToast('Draft removed', 'success');
+            showToast(failed ? 'Failed post removed' : 'Draft removed', 'success');
+            // The banner is on every page and polls on its own clock; refresh it
+            // now so it stops naming a post that no longer exists.
+            if (window.refreshFailedSendsBanner) window.refreshFailedSendsBanner();
         } else {
-            // 409 means the row left 'draft' since this page last polled (it was
-            // approved, sent, or is sending). Say so and re-render, rather than
-            // leaving a button that looks like it did nothing.
+            // 409 means the row left draft/failed since this page last polled
+            // (approved, sending, or already posted). Say so and re-render,
+            // rather than leaving a button that looks like it did nothing.
             const detail = (await resp.json().catch(() => ({}))).detail;
             showToast(detail || 'Could not remove this post', 'error');
         }
