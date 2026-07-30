@@ -350,6 +350,17 @@ of it is already public, so moving the rest is a split, not a re-flow.
 `state = 'posted'` is still honoured alongside the posts, since the schema
 declares it even though nothing writes it.
 
+Deriving from the posts has one consequence that has to be paid for: an item
+whose postings are all **deleted** has nothing left to derive from, so it falls
+back to its stored `state` and sits in the `scheduled` count forever with
+nothing that can ever send — and since `PENDING_ITEM_STATES` covers
+`scheduled`, its video is never offered as a candidate again either. Both
+reconcile handlers that delete postings (`slots_removed`, `applies_to_removed`)
+therefore retire an item left with none to `removed`, with a `reason`. The row
+survives — it is still true that the video was queued — and `removed` releases
+the video for a manual re-add. Items that still have a posting from another
+slot, or any `posted`/`sending` row, are untouched.
+
 "Missed" is a **derived** state — `scheduled_at` in the past and not
 posted — computed when the screen loads. No background job, no stored
 flag.

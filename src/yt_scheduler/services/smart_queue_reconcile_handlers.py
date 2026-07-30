@@ -55,6 +55,53 @@ async def _pending_items(queue_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+async def _retire_emptied_items(item_ids: list[int], reason: str) -> int:
+    """Take items that have no posting rows left out of ``scheduled``.
+
+    An item's displayed state is DERIVED from its ``social_posts`` rows
+    (``smart_queue.list_queues``: ``LEFT JOIN social_posts`` … ``ELSE i.state``),
+    so deleting the last one leaves the item reported as ``scheduled`` for good,
+    with nothing that can ever send — and because ``PENDING_ITEM_STATES`` covers
+    ``scheduled``, its video is never offered as a candidate again either.
+    ``removed`` is the state that says the occurrence is over without claiming it
+    posted, and it is what releases the video (see
+    ``smart_queue_disposition._remove``).
+
+    Both guards live in the statement so the emptiness check can't go stale
+    between read and write:
+
+    * ``state = 'scheduled'`` — a ``queued`` item legitimately has no posts yet
+      (Accept is what creates them), and marking those removed would quietly
+      empty the user's queue.
+    * ``NOT EXISTS`` any post — an item that still has a ``posted`` or
+      ``sending`` row is history, not an empty shell.
+    """
+    if not item_ids:
+        return 0
+    placeholders = ",".join("?" for _ in item_ids)
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            f"""
+            UPDATE smart_queue_items
+               SET state = 'removed', reason = ?
+             WHERE id IN ({placeholders})
+               AND state = 'scheduled'
+               AND NOT EXISTS (
+                   SELECT 1 FROM social_posts p
+                    WHERE p.smart_queue_item_id = smart_queue_items.id
+               )
+            """,
+            (reason, *item_ids),
+        )
+        retired = cursor.rowcount or 0
+    if retired:
+        logger.info(
+            "Reconcile: retired %d queue item(s) left with no postings — %s",
+            retired, reason,
+        )
+    return retired
+
+
 async def _default_ai_system_for_queue(queue_id: int) -> str | None:
     from yt_scheduler.services import prompts as prompt_service
 
@@ -192,6 +239,11 @@ async def remove_slots(queue_id: int, slot_ids: list[int], progress: Progress) -
 
     Without this they keep their timers and go out from a slot the user
     deleted — the most surprising possible outcome of a deletion.
+
+    An item whose LAST posting goes this way is retired too: the queue reads an
+    item's state from its posts, so one left with none would sit in the
+    ``scheduled`` count forever with nothing to send. Items that still have
+    postings from other slots are untouched.
     """
     from yt_scheduler.services.scheduler import cancel_scheduled_post
 
@@ -199,13 +251,14 @@ async def remove_slots(queue_id: int, slot_ids: list[int], progress: Progress) -
     placeholders = ",".join("?" * len(slot_ids))
     rows = await db.execute_fetchall(
         f"""
-        SELECT p.id FROM social_posts p
+        SELECT p.id, p.smart_queue_item_id FROM social_posts p
           JOIN smart_queue_items i ON i.id = p.smart_queue_item_id
          WHERE i.queue_id = ? AND p.slot_id IN ({placeholders})
            AND p.status NOT IN (?,?)
         """,
         (queue_id, *slot_ids, *_PENDING_STATUSES),
     )
+    touched_items = {int(r["smart_queue_item_id"]) for r in rows}
     total = len(rows)
     await progress(0, total)
 
@@ -222,7 +275,14 @@ async def remove_slots(queue_id: int, slot_ids: list[int], progress: Progress) -
             await write_db.execute("DELETE FROM social_posts WHERE id = ?", (post_id,))
         await progress(index, total)
 
-    return f"removed {total} post{'' if total == 1 else 's'}"
+    retired = await _retire_emptied_items(
+        sorted(touched_items),
+        "the slot it was scheduled for was deleted from the template",
+    )
+    summary = f"removed {total} post{'' if total == 1 else 's'}"
+    if retired:
+        summary += f", retired {retired} item{'' if retired == 1 else 's'}"
+    return summary
 
 
 async def rerender_slots(queue_id: int, slot_ids: list[int], progress: Progress) -> str:
@@ -282,23 +342,23 @@ async def drop_excluded_videos(queue_id: int, progress: Progress) -> str:
     """Delete pending posts for videos the template no longer applies to.
 
     Narrowing "applies to" is a statement about what this queue should be
-    posting, so what is already scheduled has to follow it. The item is left in
-    place with its posts gone rather than deleted outright — its history of
-    having been queued is still true.
+    posting, so what is already scheduled has to follow it. The item ROW is left
+    in place rather than deleted outright — its history of having been queued is
+    still true — but it is retired to ``removed``, because a scheduled item with
+    no postings left is a slot in the queue that can never fill: it would keep
+    inflating the scheduled count and keep its video from being offered again.
     """
     from yt_scheduler.services.scheduler import cancel_scheduled_post
 
     db = await get_db()
     queue = await queue_service.get_queue(queue_id)
-    template = await _template_by_id(int(queue["template_id"]))
-    applies_to = template.get("applies_to")
-    if isinstance(applies_to, str):
-        try:
-            applies_to = json.loads(applies_to)
-        except (TypeError, ValueError):
-            applies_to = []
-    allowed = {str(a) for a in (applies_to or [])}
-    if not allowed:
+    # Via template_applies_to, not _template_by_id: that loader selects only
+    # id/name/project_id, so `template.get("applies_to")` was always None and
+    # this handler always returned early — the job reported success and deleted
+    # nothing, for every narrowing edit. template_applies_to is the accessor the
+    # eligibility path already uses, and it decodes the JSON.
+    applies_to = await queue_service.template_applies_to(int(queue["template_id"]))
+    if not applies_to:
         # An empty "applies to" means unrestricted in this codebase; deleting
         # everything on that reading would be catastrophic and wrong.
         return "template applies to everything — nothing to remove"
@@ -306,6 +366,7 @@ async def drop_excluded_videos(queue_id: int, progress: Progress) -> str:
     items = await _pending_items(queue_id)
     total = len(items)
     removed_posts = 0
+    emptied_items: list[int] = []
     await progress(0, total)
 
     for index, item in enumerate(items, start=1):
@@ -315,7 +376,15 @@ async def drop_excluded_videos(queue_id: int, progress: Progress) -> str:
         if not video_rows:
             await progress(index, total)
             continue
-        if str(video_rows[0]["item_type"]) in allowed:
+        # tier_matches_item_type, not `in applies_to`: applies_to holds TIERS
+        # (hook|short|segment|video) while videos.item_type holds KINDS
+        # (episode|hook|short|segment|standalone), and the full-length one is
+        # spelled differently in each. Plain membership would read a template
+        # applying to "video" as not covering an 'episode' and delete every
+        # episode's postings — the same mismatch that once made such a template
+        # match nothing, but destructive instead of inert.
+        item_type = str(video_rows[0]["item_type"] or "")
+        if any(queue_service.tier_matches_item_type(t, item_type) for t in applies_to):
             await progress(index, total)
             continue
 
@@ -334,6 +403,14 @@ async def drop_excluded_videos(queue_id: int, progress: Progress) -> str:
                 await write_db.execute("DELETE FROM social_posts WHERE id = ?",
                                        (post_id,))
             removed_posts += 1
+        if posts:
+            emptied_items.append(int(item["id"]))
         await progress(index, total)
 
-    return f"removed {removed_posts} post{'' if removed_posts == 1 else 's'}"
+    retired = await _retire_emptied_items(
+        emptied_items, "the template no longer applies to this item's type"
+    )
+    summary = f"removed {removed_posts} post{'' if removed_posts == 1 else 's'}"
+    if retired:
+        summary += f", retired {retired} item{'' if retired == 1 else 's'}"
+    return summary
