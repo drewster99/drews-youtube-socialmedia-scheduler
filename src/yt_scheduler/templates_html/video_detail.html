@@ -3507,10 +3507,6 @@ function closeFileInfoModal() {
         try { fiReplaceAbort.abort(); } catch (e) { /* already done */ }
         fiReplaceAbort = null;
     }
-    if (typeof fiReplaceXhr !== 'undefined' && fiReplaceXhr) {
-        try { fiReplaceXhr.abort(); } catch (e) { /* already done */ }
-        fiReplaceXhr = null;
-    }
     document.getElementById('file-info-modal').close();
 }
 
@@ -3594,38 +3590,31 @@ function promptForceReplacement(issues) {
     });
 }
 
-// Replace Source uses two different transports depending on the
-// browser:
+// Replace Source uploads through window.chunkedUpload on every browser —
+// the same transport dashboard.html and upload.html have always used.
 //
-//   * Safari → multipart FormData via XHR. Safari/WebKit's
-//     FileReaderLoader has a 32-bit overflow bug (WebKit Bug 272600)
-//     that breaks JS-side reading of File slices ≥4 GB, which kills
-//     the chunked-upload protocol for multi-GB sources. The native
-//     FormData submission path uses Safari's C++ network engine and
-//     bypasses FileReaderLoader entirely. Slower on the server
-//     (Starlette's UploadFile double-buffers to a temp file) but
-//     reliable.
-//   * Other browsers → chunked upload via window.chunkedUpload.
-//     Single-pass server-side disk write.
+// Safari used to be routed to a single multipart FormData POST instead,
+// because WebKit could not read File slices past 4 GiB (cited as Bug
+// 272600). That bug is RESOLVED FIXED (WebKit main, May 2024) and was in
+// fact about reading a WHOLE file ≥4 GiB via ReadableStream — slicing was
+// the documented workaround, which is exactly what this path does.
+// Verified against a 10.9 GB master in Safari before removing the branch:
+// 64 MiB slices at 4 GiB, 4 GiB+1, 8 GiB and the final slice all returned
+// byte-correct data.
+//
+// Dropping it removes, for multi-GB sources: WebKit assembling an 11 GB
+// multipart body before a single byte moves, Starlette parsing that body,
+// and the server's temp spool plus its copy to the destination. Chunks
+// land straight in upload_<id>.partial and finalize is a rename.
+//
+// The server still accepts the multipart shape on this endpoint, so
+// restoring the fallback is a small change if WebKit ever regresses.
 //
 // fiReplaceAbort is an AbortController we fire from Close to cancel
 // in-flight chunked uploads.
 let fiReplaceAbort = null;
-let fiReplaceXhr = null;
-
-function _isSafari() {
-    const ua = navigator.userAgent || '';
-    return /^((?!chrome|chromium|crios|fxios|android).)*safari/i.test(ua);
-}
 
 async function uploadReplacementSource(file) {
-    if (_isSafari()) {
-        return await _uploadReplacementSafariMultipart(file);
-    }
-    return await _uploadReplacementChunked(file);
-}
-
-async function _uploadReplacementChunked(file) {
     const status = document.getElementById('fi-replace-status');
     const progress = document.getElementById('fi-replace-progress');
     status.style.display = '';
@@ -3689,91 +3678,6 @@ async function _uploadReplacementChunked(file) {
     await _handleReplaceSourceResponse(result);
 }
 
-// Safari multipart fallback. Uses XHR with FormData(file) — Safari's
-// native body-streaming path that doesn't go through FileReaderLoader.
-async function _uploadReplacementSafariMultipart(file) {
-    const status = document.getElementById('fi-replace-status');
-    const progress = document.getElementById('fi-replace-progress');
-    status.style.display = '';
-    status.style.color = '';
-    progress.style.display = '';
-    // Indeterminate while WebKit assembles the multipart body from the
-    // file on disk. No byte-level progress is observable from JS until
-    // the first upload.progress event fires, so an animated bar is the
-    // honest signal that work is happening — faking a percentage here
-    // would be a lie. The first progress event flips it to determinate.
-    progress.removeAttribute('value');
-
-    const sizeMb = (file.size / (1024 * 1024)).toFixed(0);
-    // Multi-GB uploads can sit on this status for a minute or two
-    // before the browser starts streaming bytes — the helpful info
-    // is the size, not the wait. Plain copy avoids reading
-    // "unprofessional" and avoids implying the wait is a bug.
-    status.textContent = `Preparing upload: ${file.name} (${sizeMb} MB)… reading file`;
-
-    const xhrResult = await new Promise((resolve) => {
-        const xhr = new XMLHttpRequest();
-        fiReplaceXhr = xhr;
-        xhr.open('POST', `/api/videos/${videoId}/source-file`);
-        xhr.responseType = 'text';
-        xhr.upload.addEventListener('progress', (ev) => {
-            if (!ev.lengthComputable) return;
-            const pct = Math.floor((ev.loaded / ev.total) * 100);
-            progress.value = pct;
-            const mb = (n) => (n / (1024 * 1024)).toFixed(1);
-            status.textContent = `Uploading ${file.name}… ${pct}% (${mb(ev.loaded)} / ${mb(ev.total)} MB)`;
-        });
-        // upload.load fires when the last byte is on the wire. The
-        // server is still ahead of us — for a multi-GB body Starlette
-        // has to read the temp spool back, our handler runs ffprobe
-        // twice (incoming + current), and only then sends the
-        // response. Tell the user that's happening rather than
-        // leaving the bar stuck at 100% Uploading, AND lock the
-        // Close button so they can't cancel mid-DB-write.
-        xhr.upload.addEventListener('load', () => {
-            progress.removeAttribute('value');  // back to indeterminate
-            status.textContent =
-                `Verifying source file on the server… `
-                + `please wait, do not close — this can take a couple `
-                + `of minutes for multi-GB files.`;
-            setReplaceVerifying(true);
-        });
-        xhr.onload = () => {
-            if (fiReplaceXhr === xhr) fiReplaceXhr = null;
-            setReplaceVerifying(false);
-            let body = {};
-            try { body = JSON.parse(xhr.responseText || '{}'); } catch (e) {}
-            resolve({ status: xhr.status, body, kind: 'load' });
-        };
-        xhr.onerror = () => {
-            if (fiReplaceXhr === xhr) fiReplaceXhr = null;
-            setReplaceVerifying(false);
-            resolve({ kind: 'error' });
-        };
-        xhr.onabort = () => {
-            if (fiReplaceXhr === xhr) fiReplaceXhr = null;
-            setReplaceVerifying(false);
-            resolve({ kind: 'aborted' });
-        };
-        const form = new FormData();
-        form.append('file', file);
-        xhr.send(form);
-    });
-
-    progress.style.display = 'none';
-    if (xhrResult.kind === 'aborted') {
-        status.style.display = 'none';
-        return;
-    }
-    if (xhrResult.kind === 'error') {
-        status.style.color = 'var(--danger)';
-        status.textContent = 'Upload failed: network error.';
-        return;
-    }
-    await _handleReplaceSourceResponse({
-        status: xhrResult.status, body: xhrResult.body,
-    });
-}
 
 async function _handleReplaceSourceResponse(result) {
     const status = document.getElementById('fi-replace-status');

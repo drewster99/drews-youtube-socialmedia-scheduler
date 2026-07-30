@@ -2457,7 +2457,9 @@ All large-file domain endpoints (`POST /api/videos/upload`, `POST /api/videos/it
 * FastAPI / Starlette's `UploadFile` buffers the body into a `SpooledTemporaryFile` in `$TMPDIR` before invoking the handler, doubling disk I/O on multi-GB sources (8 GB body → ~24 GB of total disk traffic).
 * Safari/WebKit raises "request body stream exhausted" when `xhr.send(file)` is combined with custom request headers — the entire body stream is consumed once for an engine pre-flight and then can't be re-read for the actual send.
 
-Slicing the file into ~8 MB chunks side-steps both: each chunk is small enough not to spill to a temp file on the server, and small `Blob.slice(...)` bodies don't trip Safari's stream-exhaustion bug.
+Slicing the file into chunks side-steps both: each chunk is small enough not to spill to a temp file on the server, and a sliced body read into an `ArrayBuffer` doesn't trip Safari's stream-exhaustion bug.
+
+Every browser uses this path, including Safari. Safari was previously routed to a single multipart POST for Replace Source, because WebKit could not read File slices past 4 GiB ([Bug 272600](https://bugs.webkit.org/show_bug.cgi?id=272600)); that bug is RESOLVED FIXED (May 2024) and was in fact about reading a *whole* file ≥4 GiB via `ReadableStream`, with slicing as the documented workaround. Verified against a 10.9 GB source in Safari — 64 MiB slices at 4 GiB, 4 GiB+1 and 8 GiB all read byte-correct. `POST /api/videos/{id}/source-file` still accepts a multipart body, so the fallback can be restored client-side if WebKit regresses.
 
 ### `POST /api/uploads/init`
 
@@ -2465,9 +2467,9 @@ Slicing the file into ~8 MB chunks side-steps both: each chunk is small enough n
 
 **Request body** — `{"filename": str, "size": int}`. `size` is the byte count of the source.
 
-**Response 200** — `{"upload_id": str, "chunk_size": int}`. The client slices into chunks no larger than `chunk_size` (currently 8 MB).
+**Response 200** — `{"upload_id": str, "chunk_size": int}`. The client slices into chunks no larger than `chunk_size` (`config.UPLOAD_WIRE_CHUNK_BYTES`, currently 64 MiB — an 11 GB source is ~175 round trips).
 
-**Errors** — `400` (missing fields, non-positive size), `413` (size exceeds the 10 GiB global cap).
+**Errors** — `400` (missing fields, non-positive size), `413` (size exceeds `config.MAX_SOURCE_FILE_BYTES`, 64 GiB by default, overridable with `DYS_MAX_SOURCE_FILE_GIB`). Checked here, before any bytes are sent.
 
 ### `POST /api/uploads/{upload_id}/chunk/{offset}`
 

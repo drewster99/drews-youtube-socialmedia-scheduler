@@ -216,6 +216,8 @@ All via environment variables (loaded from `.env`). Secrets are **never** read f
 | `DYS_DATA_DIR` | `~/.yt-scheduler` | Data directory |
 | `DYS_COMMENT_CHECK_MINUTES` | `30` | Comment moderation poll interval |
 | `DYS_CAPTION_CHECK_MINUTES` | `15` | Caption availability poll interval |
+| `DYS_MAX_SOURCE_FILE_GIB` | `64` | Ceiling on any uploaded source file. One value for both upload paths; enforced before the bytes are read (chunked `/init`, or `Content-Length` on multipart) |
+| `DYS_UPLOAD_CHUNK_MIB` | `64` | Wire chunk announced by `/api/uploads/init`. Each chunk is one ArrayBuffer request body in the browser — turn it down if an engine baulks at the size |
 | `DYS_THREADS_REDIRECT_URL` | `https://nuclearcyborg.com/apps/scheduler/callback-threads-redirect` | Override for the Threads OAuth `redirect_uri` bounce page (Meta rejects `http://`); bounce-page source is in `cloudflare/` |
 
 Legacy `YTP_*` names (`YTP_HOST`, `YTP_PORT`, `YTP_DATA_DIR`, etc.) are still honored as a fallback for older `.env` files.

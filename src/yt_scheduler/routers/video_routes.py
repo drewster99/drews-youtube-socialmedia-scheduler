@@ -16,8 +16,10 @@ from pathlib import Path
 from fastapi import APIRouter, Body, Request, UploadFile, File, HTTPException, Query
 from fastapi.responses import JSONResponse
 
+from yt_scheduler import config
 from yt_scheduler.config import (
     UPLOAD_DIR,
+    UPLOAD_COPY_BUFFER_BYTES,
     media_filename,
     media_url,
     safe_upload_ext,
@@ -1821,7 +1823,10 @@ async def video_file_info(video_id: str) -> dict:
 
 
 _DURATION_TOLERANCE_SECONDS = 2.0
-_MAX_SOURCE_FILE_BYTES = 10 * 1024**3  # 10 GiB; defense against pathological uploads.
+# config.MAX_SOURCE_FILE_BYTES is the single source of truth; chunked_uploads
+# binds the same value as _MAX_UPLOAD_BYTES and enforces it at /init. Read
+# through the module here (config.X, not a from-import) so a test that patches
+# the attribute is seen by this route.
 
 # Per-video locks: serialize concurrent POST /source-file calls for the
 # same video so we can't race the SELECT-row → write-file → UPDATE-row
@@ -2108,6 +2113,21 @@ async def _save_multipart_to_pending(request: Request) -> tuple[Path, str]:
     the body into a ``SpooledTemporaryFile`` first, so each byte
     lands on disk twice. Worth it for the user-facing reliability.
     """
+    # Refuse an over-cap body BEFORE reading it. Content-Length is the whole
+    # multipart envelope, a few hundred bytes larger than the file, so this only
+    # ever rejects something the per-byte check below would also reject. Without
+    # it an over-cap master was transferred in full and only then refused — 6.5
+    # minutes to be told the file was too big, with the answer available in the
+    # request headers before the first byte of video arrived.
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > config.MAX_SOURCE_FILE_BYTES:
+        raise HTTPException(
+            413,
+            f"File too large: {int(declared) / 1024**3:.1f} GB exceeds the "
+            f"{config.MAX_SOURCE_FILE_BYTES / 1024**3:.0f} GiB cap "
+            "(DYS_MAX_SOURCE_FILE_GIB).",
+        )
+
     try:
         form = await request.form()
     except Exception as exc:
@@ -2124,11 +2144,14 @@ async def _save_multipart_to_pending(request: Request) -> tuple[Path, str]:
     )
     incoming_path = UPLOAD_DIR / incoming_name
 
+    # 64 MiB reads, not 1 MiB: a multi-GB master is a few hundred iterations
+    # instead of ~12,000, each of which was allocating a fresh bytes object and
+    # paying a write syscall.
     def _copy_capped(src, target: Path, cap: int) -> tuple[bool, int]:
         written = 0
         with open(target, "wb") as fh:
             while True:
-                chunk = src.read(1024 * 1024)
+                chunk = src.read(UPLOAD_COPY_BUFFER_BYTES)
                 if not chunk:
                     return True, written
                 written += len(chunk)
@@ -2137,13 +2160,17 @@ async def _save_multipart_to_pending(request: Request) -> tuple[Path, str]:
                     return False, written
                 fh.write(chunk)
 
+    # Belt-and-braces behind the Content-Length check above: that header is
+    # client-supplied, so the real byte count still decides.
     ok, bytes_written = await asyncio.to_thread(
-        _copy_capped, file.file, incoming_path, _MAX_SOURCE_FILE_BYTES,
+        _copy_capped, file.file, incoming_path, config.MAX_SOURCE_FILE_BYTES,
     )
     if not ok:
         raise HTTPException(
             413,
-            f"File too large: exceeds {_MAX_SOURCE_FILE_BYTES} byte cap.",
+            f"File too large: exceeds the "
+            f"{config.MAX_SOURCE_FILE_BYTES / 1024**3:.0f} GiB cap "
+            "(DYS_MAX_SOURCE_FILE_GIB).",
         )
     if bytes_written == 0:
         incoming_path.unlink(missing_ok=True)
@@ -2170,12 +2197,13 @@ async def _save_chunked_upload_to_pending(payload: dict) -> tuple[Path, str]:
         raise HTTPException(404, str(exc)) from exc
     except chunked_uploads.UploadConflict as exc:
         raise HTTPException(400, str(exc)) from exc
-    if entry["size"] > _MAX_SOURCE_FILE_BYTES:
+    if entry["size"] > config.MAX_SOURCE_FILE_BYTES:
         Path(entry["path"]).unlink(missing_ok=True)
         raise HTTPException(
             413,
-            f"File too large: {entry['size']} bytes exceeds "
-            f"{_MAX_SOURCE_FILE_BYTES} byte cap.",
+            f"File too large: {entry['size'] / 1024**3:.1f} GB exceeds the "
+            f"{config.MAX_SOURCE_FILE_BYTES / 1024**3:.0f} GiB cap "
+            "(DYS_MAX_SOURCE_FILE_GIB).",
         )
     incoming_name = (
         f"source_pending_{secrets.token_hex(8)}{safe_upload_ext(entry['filename'])}"

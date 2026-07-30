@@ -30,7 +30,7 @@
     // When bundling into the macOS app via build.sh, the build must
     // include any uploads.js edits since the previous build for this
     // to match.
-    const UPLOADS_JS_VERSION = '2026-06-03-safari-multipart-fallback';
+    const UPLOADS_JS_VERSION = '2026-07-30-arraybuffer-64mb-chunks';
     try { console.log('[uploads.js] version:', UPLOADS_JS_VERSION); } catch (e) {}
 
     const RETRY_DELAYS_MS = [500, 1500, 3000];  // per-chunk retry backoff
@@ -159,26 +159,24 @@
 
     // Send the chunk body as an ArrayBuffer, NOT a Blob.
     //
-    // Safari/WebKit has two separate bugs in this area:
-    //   1. xhr.send(blob) / fetch(body: blob) → "request body stream
-    //      exhausted" before the request leaves the browser. The
-    //      engine reads the Blob's one-shot stream once during a
-    //      pre-send pass and the actual send sees empty bytes. Fires
-    //      on whole Files and on small sliced Blobs alike.
-    //   2. blob.arrayBuffer() routes through WebKit's internal
-    //      resource-loader machinery and fails with
-    //      "WebKitBlobResource error 4" on File slices.
+    // Still an ArrayBuffer because of the one WebKit bug that is still
+    // live: xhr.send(blob) / fetch(body: blob) → "request body stream
+    // exhausted" before the request leaves the browser. The engine reads
+    // the Blob's one-shot stream during a pre-send pass and the actual
+    // send transmits nothing. Fires on whole Files and on sliced Blobs
+    // alike, so the bytes have to be materialised first.
     //
-    // We need an ArrayBuffer (defeats bug #1) but we have to materialise
-    // it via the older FileReader API (defeats bug #2). FileReader has
-    // been around since the original File API draft and has its own
-    // code path in WebKit that doesn't go through the resource loader.
+    // HOW they are materialised changed: blob.arrayBuffer() used to fail
+    // with "WebKitBlobResource error 4" on File slices, which is why this
+    // went through the older FileReader API. Measured directly against a
+    // 10.9 GB master in Safari — every slice, including at 4 GiB, 4 GiB+1
+    // and 8 GiB — blob.arrayBuffer() now returns correct bytes at
+    // ~5300-5800 MB/s vs FileReader's ~2200-4900. FileReader remains as
+    // the fallback for an engine where the modern call still throws;
+    // that is a browser-capability difference, not a silent default, so
+    // it says so on the console when it happens.
     //
-    // TODO: once Safari fixes the blob.arrayBuffer() bug on File slices
-    // (filed at Apple as of 2024, not yet resolved), drop the
-    // FileReader wrapper and use the modern API directly.
-    //
-    // Memory: one chunk (~8 MB) in RAM during flight, then GC'd.
+    // Memory: one chunk in RAM during flight, then GC'd.
     async function postBlobXhr(url, blob, signal) {
         if (signal && signal.aborted) {
             throw new ChunkedUploadError('cancelled', 0, true);
@@ -237,11 +235,32 @@
         return new Promise(r => setTimeout(r, ms));
     }
 
-    // Read a Blob's bytes into an ArrayBuffer via the FileReader API.
-    // Equivalent to ``await blob.arrayBuffer()`` for our purposes but
-    // doesn't route through the WebKit resource loader, so it avoids
-    // "WebKitBlobResource error 4" on File slices.
-    function readBlobAsArrayBuffer(blob, signal) {
+    // Read a Blob's bytes into an ArrayBuffer, modern call first.
+    let warnedArrayBufferFallback = false;
+
+    async function readBlobAsArrayBuffer(blob, signal) {
+        if (signal && signal.aborted) {
+            throw new ChunkedUploadError('cancelled', 0, true);
+        }
+        try {
+            return await blob.arrayBuffer();
+        } catch (e) {
+            // An engine where the modern call still throws on File slices.
+            // Say so once — a silent switch to the slower path would hide a
+            // real capability difference behind a mystery slowdown.
+            if (!warnedArrayBufferFallback) {
+                warnedArrayBufferFallback = true;
+                console.warn(
+                    'blob.arrayBuffer() failed on a File slice; using FileReader '
+                    + 'for this chunk (roughly half the throughput). The modern '
+                    + 'call is retried on the next chunk. Reason:', e,
+                );
+            }
+            return await readViaFileReader(blob, signal);
+        }
+    }
+
+    function readViaFileReader(blob, signal) {
         return new Promise((resolve, reject) => {
             const reader = new FileReader();
             function onAbort() {

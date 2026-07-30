@@ -3,8 +3,9 @@
 Consumers (Replace Source, New Upload, New Item) call into a domain
 endpoint with an ``upload_id`` once the bytes are on disk. Each
 upload is initialised with the expected total size, the client then
-appends ~8 MB chunks via PATCH-style POSTs (offset in URL, raw bytes
-as body), and finalize moves the partial file to its canonical name.
+appends ``CHUNK_SIZE_BYTES`` chunks via PATCH-style POSTs (offset in
+URL, raw bytes as body), and finalize moves the partial file to its
+canonical name.
 
 Why this exists:
 
@@ -30,21 +31,20 @@ import time
 from pathlib import Path
 
 from yt_scheduler.config import (
+    MAX_SOURCE_FILE_BYTES,
     UPLOAD_DIR,
+    UPLOAD_WIRE_CHUNK_BYTES,
     safe_upload_ext,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# Tuning knobs. 8 MB chunks balance HTTP round-trip overhead against
-# Safari's per-request stream-exhaustion risk: small enough that the
-# engine doesn't appear to double-read, large enough that an 8 GB
-# upload completes in ~1000 requests instead of hundreds of
-# thousands.
-CHUNK_SIZE_BYTES: int = 8 * 1024 * 1024
+# Both sizing knobs live in config.py so this service and the multipart route
+# can't disagree about them — they did, and the two caps drifted.
+CHUNK_SIZE_BYTES: int = UPLOAD_WIRE_CHUNK_BYTES
 _UPLOAD_TTL_SECONDS: float = 30 * 60  # 30 min idle → evicted
-_MAX_UPLOAD_BYTES: int = 10 * 1024**3  # 10 GiB cap on any single upload
+_MAX_UPLOAD_BYTES: int = MAX_SOURCE_FILE_BYTES
 
 
 # upload_id → {

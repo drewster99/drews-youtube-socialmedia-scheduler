@@ -36,7 +36,7 @@ from fastapi.responses import JSONResponse
 
 from pathlib import Path
 
-from yt_scheduler.config import UPLOAD_DIR, safe_upload_ext
+from yt_scheduler.config import UPLOAD_COPY_BUFFER_BYTES, UPLOAD_DIR, safe_upload_ext
 from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.models import video as video_model
 from yt_scheduler.routers.video_routes import _resolve_video_file, _video_public
@@ -351,8 +351,11 @@ async def upload_promos(
         # other API polls, the promo activity refresh) for the duration
         # of the copy — easily seconds for a multi-GB clip. The thread
         # offload keeps the loop responsive.
+        #
+        # Explicit 64 MiB buffer: copyfileobj defaults to 64 KiB, which is tens
+        # of thousands of read/write pairs for a source-sized file.
         with open(target, "wb") as f:
-            shutil.copyfileobj(src, f)
+            shutil.copyfileobj(src, f, UPLOAD_COPY_BUFFER_BYTES)
 
     for upload in files:
         if not upload.filename:

@@ -328,6 +328,40 @@ THREADS_REDIRECT_URL = (
     os.getenv("DYS_THREADS_REDIRECT_URL") or _DEFAULT_THREADS_REDIRECT_URL
 ).strip().rstrip("/")
 
+# --- Local upload sizing -----------------------------------------------------
+#
+# ONE ceiling for "how big a file may a user hand this app", used by both upload
+# routes. It was previously duplicated — 10 GiB in `video_routes` and again in
+# `chunked_uploads` — and a 11.7 GB podcast master hit it after the whole body
+# had already been transferred. These uploads are a local file being copied
+# across localhost onto the user's own disk, so the cap is a sanity bound
+# against a runaway request, not a resource budget: the real limit is free disk.
+#
+# Enforced BEFORE the bytes are read wherever the size is knowable up front —
+# the chunked path has it in `/init`, the multipart path has `Content-Length`,
+# and the browser has `File.size` before it opens a socket. Discovering the
+# limit only after a six-minute transfer is the failure mode this replaced.
+MAX_SOURCE_FILE_BYTES = _parse_int_env(
+    "DYS_MAX_SOURCE_FILE_GIB", "YTP_MAX_SOURCE_FILE_GIB", 64
+) * 1024**3
+
+# Bulk file-to-file copy buffer. 64 MiB: big enough that a multi-GB master is
+# a few hundred iterations instead of tens of thousands, small enough to stay
+# out of the way in RAM. Used for local disk copies, NOT for network chunking.
+UPLOAD_COPY_BUFFER_BYTES = 64 * 1024 * 1024
+
+# Wire chunk for the chunked-upload protocol, announced to the client by
+# `/api/uploads/init`. Also 64 MiB: each chunk is one HTTP round trip that the
+# browser materialises in RAM and the server reads whole, so this trades memory
+# for round trips — an 11 GB source is ~175 requests instead of ~1400.
+#
+# Env-tunable because this is the only one of these numbers that crosses into
+# the browser: the client sends each chunk as one ArrayBuffer body, and a
+# too-large body is an engine limit we would rather turn down than rebuild for.
+UPLOAD_WIRE_CHUNK_BYTES = _parse_int_env(
+    "DYS_UPLOAD_CHUNK_MIB", "YTP_UPLOAD_CHUNK_MIB", 64
+) * 1024 * 1024
+
 # Scheduler
 COMMENT_CHECK_INTERVAL_MINUTES = _parse_int_env(
     "DYS_COMMENT_CHECK_MINUTES", "YTP_COMMENT_CHECK_MINUTES", 30

@@ -479,13 +479,14 @@ def test_replace_works_when_ffprobe_unavailable(
     assert data["width"] is None
 
 
-def test_replace_via_multipart_safari_fallback(
+def test_replace_via_multipart_accepted(
     client: TestClient, monkeypatch: pytest.MonkeyPatch,
 ):
-    """The /source-file endpoint accepts multipart/form-data as the
-    Safari fallback (chunked-upload fails on WebKit's FileReaderLoader
-    for files ≥4 GB). Exercise the multipart path directly without
-    going through the chunked init/finalize flow.
+    """The /source-file endpoint accepts multipart/form-data as well as an
+    upload_id. No browser sends it today — Safari used to, until WebKit Bug
+    272600 (File slices ≥4 GiB) was confirmed fixed and it moved to the
+    chunked path — but the wire shape stays supported so the client-side
+    fallback can be restored without server work if WebKit regresses.
     """
     _insert("MPMULTI0001", imported_from_youtube=1, duration_seconds=60.0)
     _stub_probe(monkeypatch, {

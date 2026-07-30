@@ -72,10 +72,10 @@ async def append_chunk(
     finalized, 413 chunk would exceed declared size, 400 chunk over
     the per-chunk cap.
     """
-    # Reading the whole chunk into memory is fine — chunks are bounded
-    # to ``CHUNK_SIZE_BYTES`` (8 MB) so this can't be used to OOM the
-    # server, and we have to hand a ``bytes`` to the disk write
-    # anyway.
+    # Reading the whole chunk into memory is fine — chunks are bounded to
+    # ``CHUNK_SIZE_BYTES`` (config.UPLOAD_WIRE_CHUNK_BYTES) and rejected above
+    # it, so this can't be used to OOM the server, and we have to hand a
+    # ``bytes`` to the disk write anyway.
     data = await request.body()
     if not data:
         # Empty PATCH could be a probe; reject so the client doesn't

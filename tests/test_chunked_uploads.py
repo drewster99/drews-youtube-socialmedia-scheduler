@@ -61,11 +61,24 @@ async def test_init_returns_upload_id_and_chunk_size(client: TestClient):
 
 async def test_init_rejects_oversized_declaration(client: TestClient):
     """A declared size past the global cap is rejected up-front
-    (UploadTooLarge → 413 at the HTTP layer)."""
+    (UploadTooLarge → 413 at the HTTP layer).
+
+    Derived from the cap rather than a literal: this used to hardcode 11 GiB as
+    "obviously too big", which quietly stopped testing anything the moment the
+    cap moved past it."""
     from yt_scheduler.services import chunked_uploads as cu
 
     with pytest.raises(cu.UploadTooLarge):
-        await cu.init_upload("huge.mov", size=11 * 1024**3)
+        await cu.init_upload("huge.mov", size=cu._MAX_UPLOAD_BYTES + 1)
+
+
+async def test_init_accepts_a_size_at_the_cap(client: TestClient):
+    """The boundary is inclusive — a file exactly at the cap is allowed."""
+    from yt_scheduler.services import chunked_uploads as cu
+
+    info = await cu.init_upload("big.mov", size=cu._MAX_UPLOAD_BYTES)
+    assert info["upload_id"]
+    await cu.cancel_upload(info["upload_id"])
 
 
 async def test_init_rejects_zero_size(client: TestClient):
@@ -303,8 +316,8 @@ def test_http_chunk_409_distinguishes_from_404(client: TestClient):
 def test_chunked_upload_handles_exact_size_boundary(client: TestClient):
     """A size that is an exact multiple of CHUNK_SIZE_BYTES must
     finalize cleanly (no off-by-one on the last-chunk check). Use a
-    tiny "chunk" via the python API rather than 8 MB to keep the test
-    fast — the API doesn't enforce a minimum chunk size."""
+    tiny "chunk" via the python API rather than a full-sized one to keep
+    the test fast — the API doesn't enforce a minimum chunk size."""
     info = _init(client, size=8)
     uid = info["upload_id"]
     _chunk(client, uid, 0, b"AAAA")
