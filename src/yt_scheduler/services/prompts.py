@@ -5,11 +5,17 @@ in ``services/templates.py``. The variable set passed to ``render_template``
 is generous on purpose: any LLM prompt can pull in transcript, project name,
 channel name, etc., regardless of the calling context.
 
-Each seed defines a ``body`` (user prompt) and optionally a ``system``
-prompt. ``system=None`` means "send no system prompt", which is the right
-default for the description seeds — they instruct Claude entirely through
-the user-message body. Seeds that *do* declare a system prompt expose it
-in the Project Settings UI as a second textarea.
+Each seed defines a ``body`` and optionally a ``system`` prompt.
+``system=None`` means "send no system prompt", which is the right default
+for the description seeds — they instruct Claude entirely through the
+user-message body. Seeds that *do* declare a system prompt expose it in
+the Project Settings UI as a second textarea.
+
+One exception to "body = user prompt": the ``promo_clip_proposals_*``
+seeds are editorial fragments, not whole prompts. ``clipper`` splices each
+one into the middle of a system prompt it builds itself, so the tool
+contract around it can't be edited away. See the comment above those
+seeds.
 """
 
 from __future__ import annotations
@@ -298,229 +304,81 @@ SEED_AI_BLOCK_DEFAULT_SYSTEM_PROMPT = SeedPrompt(
 # description (transcript-driven, then vision) → tags (metadata-driven,
 # then vision) → default system prompt (catch-all, last because it
 # --- Generate-from-source clip proposals ----------------------------------
-# One per kind. The clipper service prepends the parent's SRT transcript as
-# a separate cached message block, so the body here is the per-kind tail
-# (instructions + parent context + existing-ranges + optional crop block).
 #
-# Output is structured: Claude is forced to respond via the
-# ``propose_clips`` tool; the body says so explicitly to keep behavior
-# stable if the prompt is edited.
+# These are EDITORIAL blocks, not whole prompts. ``clipper`` builds the
+# system prompt for a proposal call and splices the body below into the
+# middle of it; the surrounding sections — the transcript's line format,
+# the index-only rule, the tool contract — stay in code so a prompt edit
+# can never break the output format or desync from the check tool.
+#
+# Write plain prose with the two headings shown. ``{{kind}}`` is the only
+# variable; any other name raises at generate time rather than rendering
+# empty.
 
-_CLIP_PROPOSAL_VARIABLES = (
-    "parent_title",
-    "parent_duration_human",
-    # The full SRT transcript of the parent video. Placed inline in the
-    # rendered body where the author writes ``{{parent_transcript}}``
-    # (or ``{{transcript}}`` — both are recognised aliases). The
-    # renderer leaves the literal placeholder in the output (because
-    # the variable is intentionally not in the substitution dict — it's
-    # a system-managed input), and the caller splits there so the SRT
-    # lands in its own cache-controlled block. Authors who omit the
-    # placeholder still get the transcript prepended as a separate
-    # block (backwards-compat fallback in ``clipper`` itself).
-    "parent_transcript",
-    "transcript",
-    "existing_ranges_block",
-    "crop_constraints",
-    # Per-kind length bounds — sourced from clipper._PER_KIND_BOUNDS so
-    # editing the prompt template can't accidentally drift the numbers
-    # away from what the server-side validator enforces.
-    "min_seconds",
-    "max_seconds",
-    # Output cap — sourced from clipper._OUTPUT_CAP_PER_KIND so a future
-    # cap change updates the prompt instruction at the same time.
-    "max_proposals",
+_CLIP_EDITORIAL_VARIABLES = ("kind",)
+
+_CLIP_SHARED_BULLETS = (
+    "- Self-contained: it makes sense with no other context. Starts and "
+    "ends on a complete thought.\n"
+    "- AUDIO ONLY: never pick a clip that depends on something visual (a "
+    "chart, code on screen, a demo, \"look at this\", \"right here\"). If the "
+    "words only make sense with a picture, skip it."
 )
 
 SEED_CLIP_PROPOSALS_HOOK_PROMPT = SeedPrompt(
     key="promo_clip_proposals_hook",
-    name="Promo clip proposals — Hook",
+    name="Promo clip proposals — Hook (editorial)",
     body=(
-        "Parent video: {{parent_title}}\n"
-        "Duration: {{parent_duration_human}}\n\n"
-        "Transcript timeline — every line starts with a [H:MM:SS] or "
-        "[MM:SS] timestamp marking when that line is spoken. Use "
-        "these as the ONLY ground truth for timestamps. Do not "
-        "estimate. Do not interpolate. For each proposal you must:\n"
-        "  1. PICK a transcript line where the clip should start.\n"
-        "  2. PICK a transcript line where the clip should end.\n"
-        "  3. COPY the start line's text VERBATIM (everything after "
-        "its [MM:SS] anchor) into ``start_text_anchor``.\n"
-        "  4. COPY the end line's text VERBATIM into "
-        "``end_text_anchor``.\n"
-        "  5. Provide ``start_seconds`` and ``end_seconds`` from the "
-        "[MM:SS] anchors on those two lines as a cross-check.\n"
-        "Proposals whose anchor text cannot be located in the "
-        "transcript are dropped server-side — do NOT paraphrase or "
-        "summarise the anchor text.\n"
-        "{{parent_transcript}}\n\n"
-        "You are looking for HOOKS — standalone clips that grab attention in "
-        "under 30 seconds. Each proposal must:\n"
-        "- Be between {{min_seconds}} and {{max_seconds}} seconds long.\n"
-        "- Have a self-contained payoff inside the clip itself "
-        "(no cliffhangers, no 'wait for it' that pays off after the cut).\n"
-        "- Start and end at natural sentence boundaries — pick lines "
-        "in the transcript that begin and end complete thoughts.\n"
-        "- Stand alone without context from elsewhere in the video.\n\n"
-        "{{existing_ranges_block??}}"
-        "{{crop_constraints??}}"
-        "\nPropose up to {{max_proposals}} hooks that genuinely stand alone. Returning fewer "
-        "(or zero) is much better than padding with mediocre ones.\n\n"
-        "For each proposal:\n"
-        "- start_text_anchor / end_text_anchor: copy verbatim from the "
-        "transcript lines you're anchoring the clip to.\n"
-        "- start_seconds / end_seconds: numeric form of the anchors above.\n"
-        "- title: a punchy 4-8 word working title for the hook.\n"
-        "- reason: one sentence on what makes this work as a hook.\n\n"
-        "Return your proposals via the propose_clips tool."
+        "## What makes a good hook\n"
+        "- A hook is a single surprising, opinionated, useful, or candid "
+        "moment with an immediate payoff — one clear point, no setup. Since "
+        "hooks are very short, include only minimal lead-in to the main point "
+        "or punchline: a couple of seconds at most. DO include reactions "
+        "afterward, but very little beyond that. The topic should begin right "
+        "away.\n"
+        f"{_CLIP_SHARED_BULLETS}\n\n"
+        "## Title\n"
+        "- The title IS the hook: 3-4 words ideally, but max 8 words, punchy "
+        "and a little opinionated/divisive or questioning (never clickbait "
+        "like \"You won\u2019t believe\"), clearly supported by or discussed in "
+        "the content; state the point, keep it short — few words, short words."
     ),
-    variables=_CLIP_PROPOSAL_VARIABLES,
-    system=(
-        "You find compelling hook clips inside a longer video. A hook is a "
-        "short standalone clip that grabs attention immediately: a strong "
-        "cold open, a surprising statement, a one-line story or punchline "
-        "that pays off entirely within the clip. You output your proposals "
-        "via the propose_clips tool, never as prose."
-    ),
+    variables=_CLIP_EDITORIAL_VARIABLES,
 )
 
 SEED_CLIP_PROPOSALS_SHORT_PROMPT = SeedPrompt(
     key="promo_clip_proposals_short",
-    name="Promo clip proposals — Short",
+    name="Promo clip proposals — Short (editorial)",
     body=(
-        "Parent video: {{parent_title}}\n"
-        "Duration: {{parent_duration_human}}\n\n"
-        "Transcript timeline — every line starts with a [H:MM:SS] or "
-        "[MM:SS] timestamp marking when that line is spoken. Use "
-        "these as the ONLY ground truth for timestamps. Do not "
-        "estimate. Do not interpolate. For each proposal you must:\n"
-        "  1. PICK a transcript line where the clip should start.\n"
-        "  2. PICK a transcript line where the clip should end.\n"
-        "  3. COPY the start line's text VERBATIM (everything after "
-        "its [MM:SS] anchor) into ``start_text_anchor``.\n"
-        "  4. COPY the end line's text VERBATIM into "
-        "``end_text_anchor``.\n"
-        "  5. Provide ``start_seconds`` and ``end_seconds`` from the "
-        "[MM:SS] anchors on those two lines as a cross-check.\n"
-        "Proposals whose anchor text cannot be located in the "
-        "transcript are dropped server-side — do NOT paraphrase or "
-        "summarise the anchor text.\n"
-        "{{parent_transcript}}\n\n"
-        "You are looking for SHORTS — complete bits with a setup→payoff arc "
-        "that fit between {{min_seconds}} and {{max_seconds}} seconds. "
-        "Each proposal must:\n"
-        "- Be between {{min_seconds}} and {{max_seconds}} seconds long.\n"
-        "- Contain a complete idea, story, or answer to a question.\n"
-        "- Have enough setup that a viewer landing cold can follow it.\n"
-        "- Start and end at natural sentence boundaries — pick lines "
-        "in the transcript that begin and end complete thoughts.\n"
-        "- Stand alone — no required context from elsewhere in the video.\n\n"
-        "{{existing_ranges_block??}}"
-        "{{crop_constraints??}}"
-        "\nPropose up to {{max_proposals}} shorts that genuinely have a complete arc. "
-        "Returning fewer (or zero) is much better than padding.\n\n"
-        "For each proposal:\n"
-        "- start_text_anchor / end_text_anchor: copy verbatim from the "
-        "transcript lines you're anchoring the clip to.\n"
-        "- start_seconds / end_seconds: numeric form of the anchors above.\n"
-        "- title: a 4-8 word working title for the short.\n"
-        "- reason: one sentence describing the setup→payoff arc.\n\n"
-        "Return your proposals via the propose_clips tool."
+        "## What makes a good short\n"
+        "- A short is ONE complete mini-story or explanation: a brief setup "
+        "and a satisfying payoff, understandable on its own — one coherent "
+        "idea, not a grab-bag. Include minimal lead-in — a few seconds at "
+        "most. DO include reactions afterward, but not much beyond that.\n"
+        f"{_CLIP_SHARED_BULLETS}\n\n"
+        "## Title\n"
+        "- 4-9 words, punchy and clear, opinionated or questioning — but "
+        "always supported by or resolved in the content; never clickbait."
     ),
-    variables=_CLIP_PROPOSAL_VARIABLES,
-    system=(
-        "You find compelling short clips inside a longer video. A short is a "
-        "clip with a complete setup→payoff arc — a bit, a story, an answer "
-        "to a question — that stands on its own. The exact length band is "
-        "given per-call in the user message. You output your proposals via "
-        "the propose_clips tool, never as prose."
-    ),
-)
-
-SEED_CLIP_CROP_REFINEMENT_PROMPT = SeedPrompt(
-    key="promo_clip_crop_refinement",
-    name="Promo clip crop refinement",
-    body=(
-        "You're judging whether a proposed clip range will crop well to 9:16 "
-        "vertical by taking a column from the source frame. The frames "
-        "below are sampled evenly across the proposed range.\n\n"
-        "Decide one of:\n"
-        "* 'centered' — the subject sits in the center third throughout; a "
-        "plain center crop works.\n"
-        "* 'off_center' — the subject is consistently in one side third (not "
-        "moving back and forth). Estimate ``x_shift_normalized`` in "
-        "[-1.0, 1.0] where -1.0 fully shifts the crop column left and +1.0 "
-        "fully shifts it right. Be conservative — small offsets should map "
-        "to small shifts.\n"
-        "* 'drift' — the subject moves between thirds across the frames; "
-        "no single crop window will follow them. Return 0 for shift.\n"
-        "* 'multi_face' — multiple distinct subjects in different thirds; "
-        "no single crop holds them all. Return 0 for shift.\n"
-        "* 'no_face' — no person/subject is clearly visible (b-roll, "
-        "graphics, screen recording). Return 0 for shift.\n\n"
-        "Return your judgment via the assess_crop tool. Be conservative "
-        "with both shift magnitude and 'off_center' classification: a "
-        "false positive forces a bad reframe, a false negative just gives "
-        "the user a center crop they were probably going to accept."
-    ),
-    variables=(),
-    system=(
-        "You assess whether a video clip frames its subject well for a 9:16 "
-        "vertical crop, and how much to shift the crop window if needed. "
-        "You output your assessment via the assess_crop tool, never as prose."
-    ),
+    variables=_CLIP_EDITORIAL_VARIABLES,
 )
 
 SEED_CLIP_PROPOSALS_SEGMENT_PROMPT = SeedPrompt(
     key="promo_clip_proposals_segment",
-    name="Promo clip proposals — Segment",
+    name="Promo clip proposals — Segment (editorial)",
     body=(
-        "Parent video: {{parent_title}}\n"
-        "Duration: {{parent_duration_human}}\n\n"
-        "Transcript timeline — every line starts with a [H:MM:SS] or "
-        "[MM:SS] timestamp marking when that line is spoken. Use "
-        "these as the ONLY ground truth for timestamps. Do not "
-        "estimate. Do not interpolate. For each proposal you must:\n"
-        "  1. PICK a transcript line where the segment should start.\n"
-        "  2. PICK a transcript line where the segment should end.\n"
-        "  3. COPY the start line's text VERBATIM (everything after "
-        "its [MM:SS] anchor) into ``start_text_anchor``.\n"
-        "  4. COPY the end line's text VERBATIM into "
-        "``end_text_anchor``.\n"
-        "  5. Provide ``start_seconds`` and ``end_seconds`` from the "
-        "[MM:SS] anchors on those two lines as a cross-check.\n"
-        "Proposals whose anchor text cannot be located in the "
-        "transcript are dropped server-side — do NOT paraphrase or "
-        "summarise the anchor text.\n"
-        "{{parent_transcript}}\n\n"
-        "You are looking for SEGMENTS — coherent topic blocks that pull a "
-        "whole sub-topic out of the parent. Each proposal must:\n"
-        "- Be at least {{min_seconds}} seconds long. No fixed maximum — as "
-        "long as the topic naturally runs.\n"
-        "- Cover one coherent subject, with the discussion ending naturally "
-        "rather than mid-thought.\n"
-        "- Start and end at natural sentence and topic boundaries.\n"
-        "- Stand on its own as a discussion of that subject.\n\n"
-        "{{existing_ranges_block??}}"
-        "{{crop_constraints??}}"
-        "\nPropose up to {{max_proposals}} segments that pull out coherent topic blocks. "
-        "Returning fewer (or zero) is much better than padding with weakly-"
-        "bounded slices.\n\n"
-        "For each proposal:\n"
-        "- start_text_anchor / end_text_anchor: copy verbatim from the "
-        "transcript lines you're anchoring the segment to.\n"
-        "- start_seconds / end_seconds: numeric form of the anchors above.\n"
-        "- title: a 4-8 word working title describing the topic.\n"
-        "- reason: one sentence on why this is a coherent standalone segment.\n\n"
-        "Return your proposals via the propose_clips tool."
+        "## What makes a good segment\n"
+        "- A segment is a full, self-contained DISCUSSION of ONE topic, from "
+        "where it is introduced to where it wraps up, before the next topic. "
+        "These are usually at least several minutes long, but the sentence "
+        "that starts the topic should begin within 5 seconds of the start of "
+        "your selection.\n"
+        f"{_CLIP_SHARED_BULLETS}\n\n"
+        "## Title\n"
+        "- 5-10 words, clear, descriptive and informative — NOT divisive and "
+        "NOT clickbait; name the topic, clear and brief."
     ),
-    variables=_CLIP_PROPOSAL_VARIABLES,
-    system=(
-        "You find coherent topic segments inside a longer video. A segment is "
-        "a self-contained discussion of one subject — there is no length "
-        "cap, but the segment must end naturally rather than mid-thought. "
-        "You output your proposals via the propose_clips tool, never as prose."
-    ),
+    variables=_CLIP_EDITORIAL_VARIABLES,
 )
 
 # applies to every {{ai: ...}} block elsewhere).
@@ -536,7 +394,6 @@ _SEEDS_BY_KEY: dict[str, SeedPrompt] = {
     SEED_CLIP_PROPOSALS_HOOK_PROMPT.key: SEED_CLIP_PROPOSALS_HOOK_PROMPT,
     SEED_CLIP_PROPOSALS_SHORT_PROMPT.key: SEED_CLIP_PROPOSALS_SHORT_PROMPT,
     SEED_CLIP_PROPOSALS_SEGMENT_PROMPT.key: SEED_CLIP_PROPOSALS_SEGMENT_PROMPT,
-    SEED_CLIP_CROP_REFINEMENT_PROMPT.key: SEED_CLIP_CROP_REFINEMENT_PROMPT,
 }
 
 

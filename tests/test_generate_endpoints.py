@@ -363,3 +363,29 @@ def test_confirm_filters_invalid_entries(
     assert len(created) == 1
     assert created[0]["item_type"] == "hook"
     assert created[0]["title"] == "ok"
+
+
+def test_generate_page_renders_bands_and_defaults_from_clipper(client: TestClient):
+    """The Generate page's kind labels and count boxes are server-rendered
+    from clipper's own constants.
+
+    Regression: they used to be literals in the markup ("Hooks (5-30 s)",
+    value="8"), which silently disagreed with the validator the moment the
+    bounds or the per-kind defaults moved — the user was told one window and
+    filtered by another. A context-key typo would render an empty label
+    rather than fail, so assert the real numbers appear.
+    """
+    from yt_scheduler.services import clipper
+
+    _insert_parent("PARENTPAGE1", duration=3600.0)
+    resp = client.get("/projects/default/videos/PARENTPAGE1/promos/generate")
+    assert resp.status_code == 200, resp.text
+    html = resp.text
+
+    for band in clipper.clip_kind_bands():
+        assert band.label in html, f"{band.kind} band label missing: {band.label!r}"
+        assert (
+            f'id="gen-max-{band.kind}" value="{band.default_max_proposals}"' in html
+        ), f"{band.kind} count box does not carry its per-kind default"
+
+    assert f'max="{clipper.MAX_PROPOSALS_PER_KIND_CAP}"' in html

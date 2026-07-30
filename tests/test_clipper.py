@@ -95,17 +95,21 @@ def test_srt_to_llm_timeline_falls_back_on_unparseable():
 def test_eligibility_per_kind_bands():
     from yt_scheduler.services.clipper import is_parent_eligible_for_kind
 
-    # Hook needs 30 (max) + 15 (headroom) = 45 s parent.
-    assert is_parent_eligible_for_kind(45.0, "hook") is True
-    assert is_parent_eligible_for_kind(44.0, "hook") is False
+    # Hook needs 60 (max) + 15 (headroom) = 75 s parent.
+    assert is_parent_eligible_for_kind(75.0, "hook") is True
+    assert is_parent_eligible_for_kind(74.0, "hook") is False
 
-    # Short needs 75 + 15 = 90 s parent.
-    assert is_parent_eligible_for_kind(90.0, "short") is True
-    assert is_parent_eligible_for_kind(89.0, "short") is False
+    # Short needs 180 + 15 = 195 s parent.
+    assert is_parent_eligible_for_kind(195.0, "short") is True
+    assert is_parent_eligible_for_kind(194.0, "short") is False
 
-    # Segment has no hard max — needs min (60) + 15 = 75 s.
-    assert is_parent_eligible_for_kind(75.0, "segment") is True
-    assert is_parent_eligible_for_kind(74.0, "segment") is False
+    # Segment's ceiling is 75% of the parent, so the binding constraint is
+    # the FRACTION clearing the 180 s floor (parent >= 240), not the floor
+    # plus headroom (195). A 200 s parent clears the headroom rule and would
+    # still produce nothing: its longest legal segment is 150 s.
+    assert is_parent_eligible_for_kind(240.0, "segment") is True
+    assert is_parent_eligible_for_kind(239.0, "segment") is False
+    assert is_parent_eligible_for_kind(200.0, "segment") is False
 
 
 async def test_start_generate_job_stores_normalised_max_per_kind(monkeypatch):
@@ -141,74 +145,54 @@ async def test_start_generate_job_stores_normalised_max_per_kind(monkeypatch):
         clipper._GENERATE_JOBS.pop(job_id, None)
 
 
-def test_seed_prompts_render_cap_from_output_cap():
-    """The clip-proposal seed bodies use {{max_proposals}} so the "up to N"
-    instruction stays in sync with clipper._OUTPUT_CAP_PER_KIND. A future
-    cap bump (e.g. to 12) updates the prompt at the same time, instead
-    of having Claude propose 12 while the validator still drops past 8."""
-    from yt_scheduler.services import templates
-    from yt_scheduler.services.prompts import _SEEDS_BY_KEY
-    from yt_scheduler.services.clipper import (
-        _OUTPUT_CAP_PER_KIND,
-        _PER_KIND_BOUNDS,
+def test_editorial_block_is_spliced_between_the_code_sections():
+    """The proposal system prompt is code + editable editorial + code.
+
+    The editable middle must land BETWEEN the input-format section and the
+    tool contract. Those two are exactly what a prompt edit must never be
+    able to break, so their presence on either side of the block is the
+    invariant worth pinning.
+    """
+    from yt_scheduler.services.clipper import _build_index_system_text
+
+    system = _build_index_system_text(
+        "hook", "## What makes a good hook\n- Be brief and surprising.",
+    )
+    assert "## Input format" in system
+    assert "## Output format" in system
+    assert "- Be brief and surprising." in system
+    assert (
+        system.index("## Input format")
+        < system.index("- Be brief and surprising.")
+        < system.index("## Output format")
     )
 
-    expected = f"up to {_OUTPUT_CAP_PER_KIND}"
-    for kind, key in [
-        ("hook", "promo_clip_proposals_hook"),
-        ("short", "promo_clip_proposals_short"),
-        ("segment", "promo_clip_proposals_segment"),
-    ]:
-        mn, mx = _PER_KIND_BOUNDS[kind]
-        rendered = templates.render(
-            _SEEDS_BY_KEY[key].body,
-            {
-                "parent_title": "X",
-                "parent_duration_human": "1h",
-                "parent_transcript": "0.0s hello world",
-                "existing_ranges_block": "",
-                "crop_constraints": "",
-                "min_seconds": str(int(mn)),
-                "max_seconds": str(int(mx)) if mx is not None else "",
-                "max_proposals": str(_OUTPUT_CAP_PER_KIND),
-            },
-        )
-        assert expected in rendered, f"Rendered {kind} prompt does not contain {expected!r}"
+
+def test_system_prompt_holds_no_run_specific_data():
+    """Byte-identical across calls for a kind — that is what keeps the run's
+    material (parent title, transcript, counts) in the user turn and makes
+    the system block cacheable."""
+    from yt_scheduler.services.clipper import _build_index_system_text
+
+    assert _build_index_system_text("short", "E") == _build_index_system_text("short", "E")
 
 
-def test_seed_prompts_render_bounds_from_per_kind_bounds():
-    """The clip-proposal seed bodies use {{min_seconds}} / {{max_seconds}}
-    so the duration band stays in sync with clipper._PER_KIND_BOUNDS.
-    Edit one without the other and a future maintainer would otherwise
-    end up with Claude proposing 30-90s shorts that the server then
-    silently filters down to the 45-75s band."""
-    from yt_scheduler.services import templates
+def test_every_clip_kind_maps_to_an_existing_editorial_seed():
+    """Each kind's editorial prose is a real, non-empty prompt key.
+
+    A typo here would only surface as a KeyError partway through a generate
+    run, after transcription has already been paid for.
+    """
+    from yt_scheduler.services.clipper import (
+        CLIP_EDITORIAL_PROMPT_KEYS,
+        _PER_KIND_BOUNDS,
+    )
     from yt_scheduler.services.prompts import _SEEDS_BY_KEY
-    from yt_scheduler.services.clipper import _PER_KIND_BOUNDS
 
-    cases = [
-        ("hook", "promo_clip_proposals_hook", "5 and 30 seconds"),
-        ("short", "promo_clip_proposals_short", "45 and 75 seconds"),
-        ("segment", "promo_clip_proposals_segment", "at least 60 seconds"),
-    ]
-    for kind, key, expected_phrase in cases:
-        mn, mx = _PER_KIND_BOUNDS[kind]
-        rendered = templates.render(
-            _SEEDS_BY_KEY[key].body,
-            {
-                "parent_title": "X",
-                "parent_duration_human": "1h",
-                "parent_transcript": "0.0s hello world",
-                "existing_ranges_block": "",
-                "crop_constraints": "",
-                "min_seconds": str(int(mn)),
-                "max_seconds": str(int(mx)) if mx is not None else "",
-                "max_proposals": "8",
-            },
-        )
-        assert expected_phrase in rendered, (
-            f"Rendered {kind} prompt does not contain {expected_phrase!r}: {rendered}"
-        )
+    assert set(CLIP_EDITORIAL_PROMPT_KEYS) == set(_PER_KIND_BOUNDS)
+    for kind, key in CLIP_EDITORIAL_PROMPT_KEYS.items():
+        assert key in _SEEDS_BY_KEY, f"{kind} points at missing prompt key {key!r}"
+        assert _SEEDS_BY_KEY[key].body.strip(), f"{key} seed body is blank"
 
 
 def test_evict_stale_upload_jobs_drops_old_failures():
@@ -334,8 +318,9 @@ async def test_propose_all_clips_dispatches_each_kind(monkeypatch: pytest.Monkey
 async def test_index_over_requests_when_existing_then_caps_output(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """When the kind already has cut clips, Claude is asked for base+3
-    candidates (no timestamps to 'avoid'); the output is still capped at the
+    """When the kind already has cut clips, Claude is asked for
+    base + _EXISTING_OVERREQUEST_BONUS candidates (no timestamps to
+    'avoid'); the output is still capped at the
     base max after post-LLM dedup/overlap removal."""
     from yt_scheduler.services import ai, clip_edges, clipper
 
@@ -373,13 +358,23 @@ async def test_index_over_requests_when_existing_then_caps_output(
 
     monkeypatch.setattr(ai, "_resolve_model", _model)
 
+    # The editorial block is a DB read; this test is about the over-request
+    # arithmetic, so stub it rather than stand up a prompt_templates row.
+    async def _editorial(kind, *, project_id):
+        return "## What makes a good hook\n- stub"
+
+    monkeypatch.setattr(clipper, "editorial_block_for_kind", _editorial)
+
     out = await clipper.propose_clips_for_kind_indexed(
         kind="hook", units=units, parent_title="P",
         parent_duration_seconds=600.0,
         existing_ranges=[(1000.0, 1010.0)],  # non-empty → over-request
+        project_id=1,
         max_proposals=6,
     )
-    assert "UP TO 9" in captured["user_text"]  # 6 + 3 bonus
+    # Derived, not hardcoded: the bonus is a tuning knob and this test is
+    # about the over-request happening at all, not about its size.
+    assert f"UP TO {6 + clipper._EXISTING_OVERREQUEST_BONUS}" in captured["user_text"]
     assert len(out) == 6  # capped at the base max
 
 

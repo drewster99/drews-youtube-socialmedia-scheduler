@@ -44,9 +44,9 @@ def test_drops_out_of_range_indices():
 
 
 def test_drops_clip_outside_duration_window():
-    units = make_units(6, dur=10.0)
-    # hook window is 5-30s; 1..4 spans 4 units (~43s content) -> too long
-    raw = [{"first_index": 1, "last_index": 4, "title": "long", "reason": "r", "rating": 2}]
+    units = make_units(9, dur=10.0)
+    # hook window is 5-60s; 1..7 spans 7 units (~76s content) -> too long
+    raw = [{"first_index": 1, "last_index": 7, "title": "long", "reason": "r", "rating": 2}]
     out = clipper._validate_indexed_proposals(
         raw, kind="hook", units=units, existing_ranges=[], max_proposals=8,
         parent_duration_seconds=PARENT_DURATION)
@@ -79,7 +79,7 @@ def test_symmetric_overlap_drops_long_proposal_containing_short_existing():
     clip slipped through (6s is < 50% of 22s). Measured against the shorter
     clip, full containment is 100% overlap and must drop."""
     units = make_units(5, dur=10.0, gap=1.0)
-    # units 2..3 span ~[11, 32] (~21s of content) — inside the 5-30s hook
+    # units 2..3 span ~[11, 32] (~21s of content) — inside the 5-60s hook
     # window once gap-ramp edges land; existing (12, 18) sits fully inside.
     raw = [{"first_index": 2, "last_index": 3, "title": "x", "reason": "r", "rating": 3}]
     out = clipper._validate_indexed_proposals(

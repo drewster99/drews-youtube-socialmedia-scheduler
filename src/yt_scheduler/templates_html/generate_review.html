@@ -23,10 +23,11 @@
         <legend>Kinds to propose</legend>
         <label class="generate-kind-row">
             <input type="checkbox" id="gen-kind-hook" checked>
-            Hooks (5–30 s)
+            Hooks ({{ clip_kind_bands.hook.label }})
             <span class="generate-kind-max">
                 up to
-                <input type="number" id="gen-max-hook" value="8" min="1" max="20" step="1"
+                <input type="number" id="gen-max-hook" value="{{ clip_kind_bands.hook.default_max_proposals }}"
+                       min="1" max="{{ clip_max_proposals_cap }}" step="1"
                        style="width:3.5rem; margin: 0 0.2rem;">
             </span>
             <span class="generate-kind-crop">
@@ -36,10 +37,11 @@
         </label>
         <label class="generate-kind-row">
             <input type="checkbox" id="gen-kind-short" checked>
-            Shorts (45–75 s)
+            Shorts ({{ clip_kind_bands.short.label }})
             <span class="generate-kind-max">
                 up to
-                <input type="number" id="gen-max-short" value="8" min="1" max="20" step="1"
+                <input type="number" id="gen-max-short" value="{{ clip_kind_bands.short.default_max_proposals }}"
+                       min="1" max="{{ clip_max_proposals_cap }}" step="1"
                        style="width:3.5rem; margin: 0 0.2rem;">
             </span>
             <span class="generate-kind-crop">
@@ -49,10 +51,11 @@
         </label>
         <label class="generate-kind-row">
             <input type="checkbox" id="gen-kind-segment" checked>
-            Segments (60 s+)
+            Segments ({{ clip_kind_bands.segment.label }})
             <span class="generate-kind-max">
                 up to
-                <input type="number" id="gen-max-segment" value="8" min="1" max="20" step="1"
+                <input type="number" id="gen-max-segment" value="{{ clip_kind_bands.segment.default_max_proposals }}"
+                       min="1" max="{{ clip_max_proposals_cap }}" step="1"
                        style="width:3.5rem; margin: 0 0.2rem;">
             </span>
             <span class="generate-kind-crop">
@@ -332,14 +335,18 @@ document.getElementById('gen-go').addEventListener('click', async () => {
         short: document.getElementById('gen-crop-short').checked,
         segment: document.getElementById('gen-crop-segment').checked,
     };
-    // Per-kind max-proposals cap. Clamp to the input element's min/max
-    // so a hand-edited DOM value still lands inside the server's
-    // accepted range.
+    // Per-kind max-proposals cap. Clamp to the input element's own min/max
+    // and fall back to its server-rendered default, so a hand-edited DOM
+    // value still lands inside the server's accepted range — and so these
+    // bounds exist in exactly one place (clipper) rather than being
+    // restated here.
     const clampMax = (id) => {
         const el = document.getElementById(id);
+        const lo = parseInt(el.min, 10);
+        const hi = parseInt(el.max, 10);
         const n = parseInt(el.value, 10);
-        if (!Number.isFinite(n)) return 8;
-        return Math.max(1, Math.min(20, n));
+        if (!Number.isFinite(n)) return parseInt(el.defaultValue, 10);
+        return Math.max(lo, Math.min(hi, n));
     };
     const maxPerKind = {
         hook: clampMax('gen-max-hook'),

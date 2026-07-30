@@ -507,7 +507,7 @@ async def generate_preview(
     raw_max = payload.get("max_per_kind") or {}
     max_per_kind: dict[str, int] = {}
     for k in requested_kinds:
-        raw_val = raw_max.get(k, clipper.DEFAULT_MAX_PROPOSALS_PER_KIND)
+        raw_val = raw_max.get(k, clipper.default_max_proposals_for_kind(k))
         try:
             n = int(raw_val)
         except (TypeError, ValueError):
@@ -547,7 +547,8 @@ async def generate_preview(
         raise HTTPException(
             400,
             "None of the requested kinds fit this parent's duration "
-            "(each kind requires at least kind_max + 15 s of parent length).",
+            "(a kind needs a parent long enough that its longest legal clip "
+            "still leaves material behind).",
         )
 
     parent_path = _resolve_video_file(parent.get("video_file_path"))

@@ -1,22 +1,34 @@
 """Generate-from-source clip proposals.
 
-Each kind (hook / short / segment) is its own Claude call so the prompt
-can be tuned per-kind via the existing prompt_templates editor. The
-parent's SRT transcript goes in a shared cache-controlled message block
-so when the three per-kind calls fan out in parallel they share a single
-input-cache hit after the first call lands.
+Each kind (hook / short / segment) is its own Claude call. The prompt is
+split three ways:
+
+- **System, in code** (``_build_index_system_text``) — the role, the
+  transcript's line format, and the tool contract. Not editable, so no
+  prompt edit can break the output format.
+- **System, editable** — the editorial middle: what makes a good clip of
+  this kind and how its title should read. Lives in ``prompt_templates``
+  under ``promo_clip_proposals_<kind>`` (seed default in
+  ``services/prompts``) and is spliced in by
+  ``editorial_block_for_kind``.
+- **User** (``_build_index_user_text``) — the run's material: parent
+  title, clips already covered, the count asked for, the transcript.
 
 The Claude response is structured: the model is forced to call the
 ``propose_clips`` tool with a strict JSON-Schema-validated payload, so
 we never have to text-parse a JSON blob.
 
-Per-kind constraints:
+Per-kind constraints — the three bands are contiguous, so a clip that
+misses one kind's window lands inside the next kind's:
 
-| Kind    | Min (s) | Max (s)          | Output cap |
-|---------|---------|------------------|------------|
-| hook    | 5       | 30               | 8          |
-| short   | 45      | 75               | 8          |
-| segment | 60      | (parent length)  | 8          |
+| Kind    | Min (s) | Max (s)             | Default output cap |
+|---------|---------|---------------------|--------------------|
+| hook    | 5       | 60                  | 20                 |
+| short   | 60      | 180                 | 15                 |
+| segment | 180     | 75% of parent       | 8                  |
+
+The caps are ``_DEFAULT_MAX_PER_KIND``; the user can override each one in
+the Generate modal, up to ``MAX_PROPOSALS_PER_KIND_CAP``.
 
 Server-side post-validation drops any proposal that:
 
@@ -26,11 +38,11 @@ Server-side post-validation drops any proposal that:
   ``_MAX_OVERLAP_FRACTION`` of the shorter of the two clips,
 - has a title near-identical to an existing same-kind clip on this parent
   (imported clips carry no cut range, so the range check can't see them),
-- is the 9th+ entry returned by Claude for that kind.
+- exceeds that kind's output cap.
 
-A parent with fewer than ``kind_max + _PARENT_HEADROOM_SECONDS`` seconds
-of duration is ineligible for that kind — the calling endpoint pre-flights
-this and never asks for a kind it can't satisfy.
+A parent too short to host a kind is ineligible for it — see
+``is_parent_eligible_for_kind``. The calling endpoint pre-flights this and
+never asks for a kind it can't satisfy.
 """
 
 from __future__ import annotations
@@ -55,21 +67,21 @@ logger = logging.getLogger(__name__)
 ClipKind = Literal["hook", "short", "segment"]
 
 _PER_KIND_BOUNDS: dict[ClipKind, tuple[float, float | None]] = {
-    "hook": (5.0, 30.0),
-    "short": (45.0, 75.0),
+    "hook": (5.0, 60.0),
+    "short": (60.0, 180.0),
     # No fixed max for segments — capped at a fraction of the parent instead
-    # (see _SEGMENT_MAX_PARENT_FRACTION) so a segment can be long but not the
-    # whole video.
-    "segment": (60.0, None),
+    # (see _SEGMENT_MAX_FRACTION_OF_PARENT_DURATION) so a segment can be long
+    # but not the whole video.
+    "segment": (180.0, None),
 }
 
 # A "segment" can run long, but not be (nearly) the entire parent video.
-_SEGMENT_MAX_PARENT_FRACTION: float = 0.9
+_SEGMENT_MAX_FRACTION_OF_PARENT_DURATION: float = 0.75
 
 # Parent must be at least kind_max + this much longer than the longest
 # clip we'd cut. Generated promos are most useful when they're materially
-# shorter than the parent; without this guard a 31-second parent could
-# emit a 30-second "hook" that's effectively the whole video.
+# shorter than the parent; without this guard a 61-second parent could
+# emit a 60-second "hook" that's effectively the whole video.
 _PARENT_HEADROOM_SECONDS: float = 15.0
 
 # Server-side cap. Claude is also told this in the prompt body, but we
@@ -78,17 +90,15 @@ _PARENT_HEADROOM_SECONDS: float = 15.0
 # is the default applied when the caller hasn't specified one, and
 # ``MAX_PROPOSALS_PER_KIND_CAP`` is the absolute ceiling we'll honour
 # (also the upper bound on the UI's number input).
-DEFAULT_MAX_PROPOSALS_PER_KIND: int = 8
-MAX_PROPOSALS_PER_KIND_CAP: int = 20
+DEFAULT_MAX_PROPOSALS_PER_KIND: int = 20
+MAX_PROPOSALS_PER_KIND_CAP: int = 50
 # Per-kind defaults matching the prototype's KIND_SPEC counts, applied when the
 # caller (the Generate UI) didn't specify a cap for that kind.
-_DEFAULT_MAX_PER_KIND: dict[ClipKind, int] = {"hook": 8, "short": 6, "segment": 6}
+_DEFAULT_MAX_PER_KIND: dict[ClipKind, int] = {"hook": 20, "short": 15, "segment": 8}
 # When a kind already has cut clips on this parent, we ask Claude for a few
 # extra candidates so that after post-LLM dedup/overlap removal we still have a
 # full set of fresh ones. The final output is still capped at the base max.
-_EXISTING_OVERREQUEST_BONUS: int = 3
-# Back-compat alias used by older call sites + tests.
-_OUTPUT_CAP_PER_KIND: int = DEFAULT_MAX_PROPOSALS_PER_KIND
+_EXISTING_OVERREQUEST_BONUS: int = 5
 
 # Overlap with an existing same-kind range that exceeds this fraction of
 # the SHORTER of the two clips → drop the proposal. Measuring against the
@@ -121,9 +131,8 @@ class ProposedClip:
     end_seconds: float
     title: str
     reason: str
-    # Populated by the word-stream (index) proposal path; ignored by the
-    # legacy anchor path. ``rating`` is the model's 1-4 self-score; the fade
-    # lengths drive the audio ramps at cut time (see media.extract_clip).
+    # ``rating`` is the model's 1-4 self-score; the fade lengths drive the
+    # audio ramps at cut time (see media.extract_clip).
     rating: int | None = None
     audio_fade_in: float = 0.0
     audio_fade_out: float = 0.0
@@ -192,22 +201,6 @@ def _titles_similar(a: str, b: str) -> bool:
     return False
 
 
-def _normalize_anchor_text(text: str) -> str:
-    """Collapse whitespace, lower-case, and strip non-word punctuation
-    for fuzzy anchor matching.
-
-    Claude can drop a trailing comma or period when quoting, change
-    smart-quote variants, or write "doesn't" vs the cue's "doesn 't"
-    artifact. Word characters + whitespace is the right granularity:
-    permissive enough to ignore those nuisance variants but strict
-    enough to keep distinct sentences distinct.
-    """
-    if not text:
-        return ""
-    stripped = _PUNCT_STRIP_RE.sub(" ", text.lower())
-    return " ".join(stripped.split())
-
-
 def is_parent_eligible_for_kind(
     parent_duration_seconds: float, kind: ClipKind,
 ) -> bool:
@@ -219,94 +212,69 @@ def is_parent_eligible_for_kind(
     """
     min_s, max_s = _PER_KIND_BOUNDS[kind]
     if max_s is None:
-        return parent_duration_seconds >= min_s + _PARENT_HEADROOM_SECONDS
+        # Segments have no fixed ceiling — the ceiling is a fraction of the
+        # parent. The parent must therefore be long enough that the FRACTION
+        # still clears the kind's minimum, not merely longer than the minimum
+        # itself: at a 0.75 fraction and a 180 s floor, a 200 s parent would
+        # otherwise read as eligible while every proposal it could produce
+        # (max 150 s) is below the floor.
+        longest_possible_segment = (
+            parent_duration_seconds * _SEGMENT_MAX_FRACTION_OF_PARENT_DURATION
+        )
+        return (
+            parent_duration_seconds >= min_s + _PARENT_HEADROOM_SECONDS
+            and longest_possible_segment >= min_s
+        )
     return parent_duration_seconds >= max_s + _PARENT_HEADROOM_SECONDS
 
 
-_PROPOSAL_TOOL = {
-    "name": "propose_clips",
-    "description": (
-        "Submit your proposed clip ranges as structured data. Returns no "
-        "value; the caller reads the tool input."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "proposals": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "start_text_anchor": {
-                            "type": "string",
-                            "description": (
-                                "Copy the EXACT text of the transcript "
-                                "timeline line you want the clip to start "
-                                "at — everything after the [MM:SS] anchor "
-                                "on that line, verbatim. Do not summarise, "
-                                "do not paraphrase, do not combine multiple "
-                                "lines. The server resolves this text back "
-                                "to a real timestamp by finding it in the "
-                                "transcript; proposals whose anchor text "
-                                "can't be located are dropped."
-                            ),
-                        },
-                        "end_text_anchor": {
-                            "type": "string",
-                            "description": (
-                                "Same rules as start_text_anchor, for the "
-                                "LAST transcript line that should be "
-                                "included in the clip. The clip's end "
-                                "time is the start of the line AFTER this "
-                                "anchor (so the anchor line plays in full)."
-                            ),
-                        },
-                        "start_seconds": {
-                            "type": "number",
-                            "description": (
-                                "Numeric start, in seconds, from the "
-                                "[MM:SS] anchor on the start line. "
-                                "Provided as a cross-check — if it "
-                                "disagrees with the resolved anchor by "
-                                "more than a few seconds, the anchor "
-                                "wins. Do not estimate."
-                            ),
-                        },
-                        "end_seconds": {
-                            "type": "number",
-                            "description": (
-                                "Numeric end, in seconds. Same rules as "
-                                "start_seconds — kept as a cross-check; "
-                                "the anchor is authoritative."
-                            ),
-                        },
-                        "title": {
-                            "type": "string",
-                            "description": (
-                                "A punchy 4-8 word working title for the clip."
-                            ),
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": (
-                                "One sentence on why this range stands alone."
-                            ),
-                        },
-                    },
-                    "required": [
-                        "start_text_anchor",
-                        "end_text_anchor",
-                        "start_seconds",
-                        "end_seconds",
-                        "title",
-                        "reason",
-                    ],
-                },
-            },
-        },
-        "required": ["proposals"],
-    },
-}
+@dataclass(frozen=True)
+class ClipKindBand:
+    """One kind's duration window, shaped for display.
+
+    The Generate modal used to spell these numbers out in its own markup,
+    which drifted the moment the bounds moved: it offered "Shorts (45–75 s)"
+    while the validator enforced a different band, so the user was told one
+    thing and filtered by another. Rendering the label from here makes the
+    advertised window and the enforced window the same fact.
+    """
+
+    kind: ClipKind
+    min_seconds: float
+    max_seconds: float | None
+    max_fraction_of_parent_duration: float | None
+    default_max_proposals: int
+    label: str
+
+
+def default_max_proposals_for_kind(kind: ClipKind) -> int:
+    """How many proposals to ask for when the caller didn't say.
+
+    One rule for every caller — the API's missing-key default, the number
+    box the modal renders, and the internal fallback all read this. They
+    used to be three separate constants, so the modal offered 8 of a kind
+    whose declared default was 15.
+    """
+    return _DEFAULT_MAX_PER_KIND.get(kind, DEFAULT_MAX_PROPOSALS_PER_KIND)
+
+
+def clip_kind_bands() -> list[ClipKindBand]:
+    """The per-kind duration windows, in declaration order, for the UI."""
+    bands: list[ClipKindBand] = []
+    for kind, (min_s, max_s) in _PER_KIND_BOUNDS.items():
+        if max_s is not None:
+            label = f"{min_s:g}–{max_s:g} s"
+            fraction = None
+        else:
+            fraction = _SEGMENT_MAX_FRACTION_OF_PARENT_DURATION
+            label = f"{min_s:g} s+, max {fraction:.0%} of video"
+        bands.append(ClipKindBand(
+            kind=kind, min_seconds=min_s, max_seconds=max_s,
+            max_fraction_of_parent_duration=fraction,
+            default_max_proposals=default_max_proposals_for_kind(kind),
+            label=label,
+        ))
+    return bands
 
 
 # --- Word-stream (index) proposal path -------------------------------------
@@ -368,55 +336,78 @@ _INDEX_PROPOSAL_TOOL = {
     },
 }
 
-# Per-kind length window, content focus, and title tone for the index prompt.
-_KIND_INDEX_GUIDANCE: dict[ClipKind, dict[str, str]] = {
-    "hook": {
-        "window": "5 to 30 seconds",
-        "content": (
-            "A hook is a single surprising, opinionated, useful, or candid "
-            "moment with an immediate payoff — one clear point, no setup."
-            "Since hooks are very short, include only minimal lead-in to "
-            "the main point or punchline - a couple seconds at most. DO"
-            "include reactions afterword, but again, very little beyond that."
-            "The topic should begin right away."
-        ),
-        "title": (
-            "The title IS the hook: 3-4 words ideally, but max 8 words, punchy and a little "
-            "opinionated/divisive or questioning (never clickbait like 'You won't believe'); "
-            "state the point, keep it short - few words - short words"
-        ),
-    },
-    "short": {
-        "window": "45 to 75 seconds",
-        "content": (
-            "A short is ONE complete mini-story or explanation: a brief setup "
-            "and a satisfying payoff, understandable on its own — one coherent "
-            "idea, not a grab-bag. Include minimal lead-in - a few seconds at most."
-            "DO include reactions afterword, but not much beyond that."
-        ),
-        "title": "4-9 words, punchy and clear, opinionated or questioning; never clickbait.",
-    },
-    "segment": {
-        "window": "at least 90 seconds (up to several minutes)",
-        "content": (
-            "A segment is a full, self-contained DISCUSSION of ONE topic from "
-            "where it is introduced to where it wraps up, before the next topic."
-            "These can be several minutes, but the sentence that starts the topic"
-            " should begin within 5 seconds of the start of your selection"
-        ),
-        "title": (
-            "5-10 words, clear, descriptive and informative — NOT divisive and "
-            "NOT clickbait; name the topic - clear and brief"
-        ),
-    },
+CLIP_EDITORIAL_PROMPT_KEYS: dict[ClipKind, str] = {
+    "hook": "promo_clip_proposals_hook",
+    "short": "promo_clip_proposals_short",
+    "segment": "promo_clip_proposals_segment",
 }
+
+
+async def editorial_block_for_kind(kind: ClipKind, *, project_id: int) -> str:
+    """The user-editable editorial guidance for one kind, rendered.
+
+    Lives in ``prompt_templates`` (seed default in ``services/prompts``) so
+    the voice — what makes a good clip of this kind, how its title should
+    read — is editable in Project Settings, while the mechanical contract
+    around it stays in code. A blank saved body raises
+    ``EmptyPromptBodyError`` from the resolver rather than quietly
+    generating against half a prompt.
+    """
+    from yt_scheduler.services import prompts as prompt_service
+    from yt_scheduler.services import templates as template_service
+
+    body = await prompt_service.get_prompt_body_with_fallback(
+        CLIP_EDITORIAL_PROMPT_KEYS[kind], project_id=project_id,
+    )
+    return await template_service.async_render(body, {"kind": kind})
+
+
+def _build_index_system_text(kind: ClipKind, editorial_block: str) -> str:
+    """The per-kind instruction: role, the transcript's line format, the
+    editorial guidance, and how to answer.
+
+    Deliberately free of run-specific data (no parent title, no transcript,
+    no counts) so it is byte-identical across every call for this kind —
+    the task belongs in the system prompt, the material in the user turn.
+
+    ``editorial_block`` is the rendered, user-editable middle section; the
+    sections around it are code so no prompt edit can break the output
+    format. Kept synchronous and pure: the caller does the async fetch.
+    """
+    return (
+        f"You select {kind} clips from a podcast transcript for posting as "
+        "standalone vertical videos.\n\n"
+        "## Input format\n"
+        "The user message gives the parent video's title, any clips already "
+        "made from it, and the transcript.\n"
+        "The transcript is a NUMBERED list of complete-thought units, one per "
+        "line:\n"
+        "    <index>\\t(<duration>s)\\t<text>\n"
+        "<duration> is that unit's own length in seconds, rounded. A clip is a "
+        "contiguous run of units from first_index through last_index "
+        "inclusive.\n\n"
+        f"{editorial_block.strip()}\n\n"
+        "## Output format\n"
+        "Answer only by calling the propose_clips tool. Reference units by "
+        "INDEX NUMBER only — never write timestamps and never retype the "
+        "transcript text. For each clip supply:\n"
+        "- first_index and last_index.\n"
+        "- start_echo and end_echo: the first / last ~6 words of those two "
+        "units, verbatim. A sanity check only — the indices are "
+        "authoritative.\n"
+        "- title and reason.\n"
+        "- rating, 1-4 (4 = best), judging content and title together.\n\n"
+        "Return FEWER clips than asked for (even zero) if there aren't that "
+        "many strong ones — do not pad, do not overlap."
+    )
 
 
 def _build_index_user_text(
     kind: ClipKind, units: list[ClipUnit], *, parent_title: str,
     max_proposals: int, existing_titles: list[str] | None = None,
 ) -> str:
-    """Assemble the instruction block + numbered units the model selects from.
+    """The run's material: parent title, what's already covered, the count
+    asked for, and the numbered transcript.
 
     ``existing_titles`` are the titles of same-kind clips already on this
     parent. They're injected as an "already covered" list so the model
@@ -425,17 +416,6 @@ def _build_index_user_text(
     point in different words at a different timestamp. Prevention here is
     the only thing that catches that semantic repeat.
     """
-    spec = _KIND_INDEX_GUIDANCE[kind]
-    min_s, max_s = _PER_KIND_BOUNDS[kind]
-    durs = sorted(u.duration for u in units) or [1.0]
-    median = durs[len(durs) // 2] or 1.0
-    lo_units = max(1, round(min_s / median))
-    hi_units = round((max_s if max_s is not None else min_s * 3) / median)
-    visual = (
-        "AUDIO ONLY: never pick a clip that depends on something visual (a "
-        "chart, code on screen, a demo, 'look at this', 'right here'). If the "
-        "words only make sense with a picture, skip it.\n"
-    )
     already_covered = ""
     titles = [t.strip() for t in (existing_titles or []) if t and t.strip()]
     if titles:
@@ -446,36 +426,12 @@ def _build_index_user_text(
             "the same moment or point again, even phrased differently or from a "
             f"slightly different timestamp:\n{bullets}\n\n"
         )
+    # The count goes ahead of the transcript: after several hundred numbered
+    # lines it would be the easiest instruction in the prompt to lose.
     return (
-        f"You select {kind} clips from a podcast transcript of "
-        f"\"{parent_title}\" for posting as standalone vertical videos.\n\n"
-        "The transcript is a NUMBERED list of complete-thought units, one per "
-        "line as `<index>\\t(<duration>s)\\t<text>`. Choose clips by referencing "
-        "unit INDEX NUMBERS only — never write timestamps and never retype the "
-        "text. A clip is a contiguous run of units from first_index through "
-        "last_index inclusive.\n\n"
-        f"## What makes a good {kind}\n"
-        f"- Length: {spec['window']}.\n"
-        f"- {spec['content']}\n"
-        "- Self-contained: it makes sense with no other context. Starts and "
-        "ends on a complete thought.\n"
-        f"- {visual}\n"
-        "## Title\n"
-        f"- {spec['title']}\n\n"
-        "## Length is a hard constraint — verify it\n"
-        "You are not good at summing many numbers, so do it explicitly: add up "
-        "the (Ns) values from first_index to last_index. If the total is above "
-        "the maximum, drop units from the end; if below the minimum, extend. As "
-        f"a rough guide that window is about {lo_units}-{hi_units} units here. A "
-        "clip outside the length window is REJECTED, not trimmed for you.\n\n"
-        "## Cross-check\nFor each clip also copy start_echo (the first ~6 words "
-        "of first_index, verbatim) and end_echo (the last ~6 words of "
-        "last_index, verbatim). These are a sanity check only — the indices are "
-        "authoritative.\n\n"
-        f"## Rating\nRate each clip 1-4 (4 = best), content and title together.\n\n"
-        f"Propose UP TO {max_proposals} clips. Return FEWER (even zero) if there "
-        "aren't that many strong ones — do not pad, do not overlap.\n\n"
+        f"Parent video: \"{parent_title}\"\n\n"
         f"{already_covered}"
+        f"Propose UP TO {max_proposals} {kind} clips.\n\n"
         "## Transcript\n"
         f"{clip_edges.numbered_units_block(units)}"
     )
@@ -510,10 +466,10 @@ def _validate_indexed_proposals(
     Proposals whose title near-matches one are dropped — the only duplicate
     signal available for imported clips, which carry no cut range."""
     min_s, max_s = _PER_KIND_BOUNDS[kind]
-    # Segments have no fixed upper bound — cap at 90% of the parent so a
+    # Segments have no fixed upper bound — cap at a fraction of the parent so a
     # "segment" can run long but can't just be (nearly) the whole video.
     if max_s is None and parent_duration_seconds > 0:
-        max_s = _SEGMENT_MAX_PARENT_FRACTION * parent_duration_seconds
+        max_s = _SEGMENT_MAX_FRACTION_OF_PARENT_DURATION * parent_duration_seconds
     out: list[ProposedClip] = []
     accepted: list[tuple[float, float]] = []
     accepted_titles: list[str] = []
@@ -620,15 +576,21 @@ async def propose_clips_for_kind_indexed(
     parent_title: str,
     parent_duration_seconds: float,
     existing_ranges: list[tuple[float, float]],
+    project_id: int,
     existing_titles: list[str] | None = None,
     max_proposals: int | None = None,
 ) -> list[ProposedClip]:
-    """Word-stream proposal: one per-kind Claude call over the numbered units."""
+    """Word-stream proposal: one per-kind Claude call over the numbered units.
+
+    ``project_id`` resolves this project's editable editorial block for the
+    kind; a blank saved prompt raises rather than generating against half a
+    system message.
+    """
     if not is_parent_eligible_for_kind(parent_duration_seconds, kind) or not units:
         return []
 
     if max_proposals is None or max_proposals <= 0:
-        base_max = _DEFAULT_MAX_PER_KIND.get(kind, DEFAULT_MAX_PROPOSALS_PER_KIND)
+        base_max = default_max_proposals_for_kind(kind)
     else:
         base_max = min(max_proposals, MAX_PROPOSALS_PER_KIND_CAP)
 
@@ -640,6 +602,9 @@ async def propose_clips_for_kind_indexed(
     if existing_ranges:
         ask_max = min(base_max + _EXISTING_OVERREQUEST_BONUS, MAX_PROPOSALS_PER_KIND_CAP)
 
+    system_text = _build_index_system_text(
+        kind, await editorial_block_for_kind(kind, project_id=project_id),
+    )
     user_text = _build_index_user_text(
         kind, units, parent_title=parent_title, max_proposals=ask_max,
         existing_titles=existing_titles,
@@ -648,7 +613,11 @@ async def propose_clips_for_kind_indexed(
     model = await ai._resolve_model()
     kwargs: dict[str, object] = {
         "model": model,
-        "max_tokens": 2048,
+        # Headroom, not a target: at the observed ~120 output tokens per
+        # proposal even the 20-proposal ceiling lands nowhere near this, so a
+        # full set can never be truncated mid-JSON.
+        "max_tokens": 25000,
+        "system": system_text,
         "messages": [{"role": "user", "content": user_text}],
         "tools": [_INDEX_PROPOSAL_TOOL],
         "tool_choice": {"type": "tool", "name": "propose_clips"},
@@ -658,7 +627,9 @@ async def propose_clips_for_kind_indexed(
 
     client = ai.get_client()
     try:
-        message = await asyncio.to_thread(client.messages.create, **kwargs)
+        message = await ai.create_message_async(
+            client, label=f"clip-proposal:{kind}", **kwargs,
+        )
     except Exception as exc:
         logger.warning("Claude clip-proposal (index) call failed for %s: %s", kind, exc)
         return []
@@ -1040,6 +1011,7 @@ async def propose_all_clips(
             parent_title=parent_title,
             parent_duration_seconds=parent_duration_seconds,
             existing_ranges=existing_ranges_per_kind.get(k, []),
+            project_id=project_id,
             existing_titles=(existing_titles_per_kind or {}).get(k, []),
             max_proposals=caps.get(k),
         )
@@ -1159,22 +1131,6 @@ async def list_rejections(
     return out
 
 
-async def delete_rejection(*, rejection_id: int) -> bool:
-    """Restore a rejected proposal — i.e. drop its row.
-
-    Returns True when a row was actually deleted (the rejection
-    existed); False when the id was unknown. The caller's HTTP layer
-    can map that to a 404 if it wants strictness, or just shrug.
-    """
-    from yt_scheduler.database import write_transaction
-
-    async with write_transaction() as db:
-        cursor = await db.execute(
-            "DELETE FROM generate_rejections WHERE id = ?", (int(rejection_id),),
-        )
-    return bool(cursor.rowcount)
-
-
 def _maybe_float(value: object) -> float | None:
     try:
         if value is None:
@@ -1212,8 +1168,8 @@ def proposal_to_public_dict(
         "title": p.title,
         "reason": p.reason,
         "rating": p.rating,
-        # Audio edge ramps from the word-stream path; carried through so the
-        # final cut applies the same fades as the preview (0 on the anchor path).
+        # Audio edge ramps; carried through so the final cut applies the
+        # same fades as the preview.
         "audio_fade_in": p.audio_fade_in,
         "audio_fade_out": p.audio_fade_out,
         "vertical_crop": crop_vertical,
@@ -1258,9 +1214,7 @@ async def start_generate_job(
         if isinstance(raw, int) and raw > 0:
             normalised_max[k] = min(raw, MAX_PROPOSALS_PER_KIND_CAP)
         else:
-            normalised_max[k] = _DEFAULT_MAX_PER_KIND.get(
-                k, DEFAULT_MAX_PROPOSALS_PER_KIND
-            )
+            normalised_max[k] = default_max_proposals_for_kind(k)
     _GENERATE_JOBS[job_id] = {
         "job_id": job_id,
         "parent_id": parent_id,

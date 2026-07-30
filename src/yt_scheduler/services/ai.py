@@ -9,7 +9,9 @@ missing (e.g. install hasn't applied the migration yet).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 
 import anthropic
 
@@ -24,6 +26,162 @@ def get_client() -> anthropic.Anthropic:
     if not api_key:
         raise RuntimeError("Anthropic API key not configured. Set it in Settings.")
     return anthropic.Anthropic(api_key=api_key)
+
+
+# --- Full LLM call logging -------------------------------------------------
+#
+# Every Claude round-trip in this app goes through ``create_message`` /
+# ``create_message_async``, so a call cannot exist without a matching
+# request+response pair in the server log. This is a wrapper rather than a
+# "remember to log it" convention on purpose: the clip-proposal path used to
+# hand-roll its own verbose logging, the index rewrite dropped it, and for two
+# months the only record of a proposal call was its kind and unit count — no
+# prompt, no stop_reason, no usage. A truncated response or a model ignoring
+# its length window left no evidence to diagnose from.
+#
+# Base64 media is the one thing not written verbatim: a single keyframe is
+# ~200 KB of base64 and a call can carry a dozen, which would bury the log
+# while telling nobody anything. Those blocks are replaced by a summary that
+# still records media type and size.
+
+
+def _elide_base64_media(value: object) -> object:
+    """Deep-copy a payload with base64 media blocks replaced by a summary."""
+    if isinstance(value, dict):
+        data = value.get("data")
+        if isinstance(data, str) and "media_type" in value:
+            return {
+                **{k: v for k, v in value.items() if k != "data"},
+                "data": f"<base64 {value.get('media_type')} elided, {len(data)} chars>",
+            }
+        return {k: _elide_base64_media(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_elide_base64_media(item) for item in value]
+    return value
+
+
+def _as_json(value: object) -> str:
+    return json.dumps(
+        _elide_base64_media(value), indent=2, ensure_ascii=False, default=str,
+    )
+
+
+def _response_payload(message: object) -> object:
+    """The response as a plain structure for logging.
+
+    Prefers the SDK's pydantic ``model_dump``. The attribute-read fallback
+    exists for the plain mock objects the tests use, not for production
+    responses — a real ``model_dump`` failure is reported, never swallowed.
+    """
+    dump = getattr(message, "model_dump", None)
+    if callable(dump):
+        try:
+            return dump(mode="json")
+        except Exception as exc:
+            logger.warning(
+                "Claude response model_dump failed (%r); logging attributes instead.",
+                exc,
+            )
+    usage = getattr(message, "usage", None)
+    return {
+        "id": getattr(message, "id", None),
+        "model": getattr(message, "model", None),
+        "stop_reason": getattr(message, "stop_reason", None),
+        "content": [
+            {
+                "type": getattr(block, "type", type(block).__name__),
+                "text": getattr(block, "text", None),
+                "name": getattr(block, "name", None),
+                "input": getattr(block, "input", None),
+            }
+            for block in (getattr(message, "content", None) or [])
+        ],
+        "usage": str(usage) if usage is not None else None,
+    }
+
+
+def _log_request(label: str, kwargs: dict) -> None:
+    system = kwargs.get("system")
+    if isinstance(system, str):
+        system_text = system or "(none)"
+    elif system:
+        system_text = _as_json(system)
+    else:
+        system_text = "(none)"
+    tools = kwargs.get("tools")
+    logger.info(
+        "===== Claude REQUEST [%s] =====\n"
+        "model=%s max_tokens=%s tool_choice=%s\n"
+        "----- system -----\n%s\n"
+        "----- messages -----\n%s\n"
+        "----- tools -----\n%s\n"
+        "===== end Claude REQUEST [%s] =====",
+        label,
+        kwargs.get("model"),
+        kwargs.get("max_tokens"),
+        kwargs.get("tool_choice"),
+        system_text,
+        _as_json(kwargs.get("messages")),
+        _as_json(tools) if tools else "(none)",
+        label,
+    )
+
+
+def _log_response(
+    label: str, message: object, elapsed_ms: int, max_tokens: object,
+) -> None:
+    stop_reason = getattr(message, "stop_reason", None)
+    usage = getattr(message, "usage", None)
+    # Usage repeats on the header line as well as inside the payload: the
+    # header is the greppable one-liner when scanning a log for cost or for
+    # a response that ran long.
+    logger.info(
+        "===== Claude RESPONSE [%s] =====\n"
+        "stop_reason=%s elapsed=%dms usage=%s\n"
+        "----- response -----\n%s\n"
+        "===== end Claude RESPONSE [%s] =====",
+        label, stop_reason, elapsed_ms, usage,
+        _as_json(_response_payload(message)), label,
+    )
+    # The failure this whole module was missing: a tool_use response cut off
+    # mid-JSON still arrives as a normal 200, and the caller just sees fewer
+    # results than it asked for.
+    if stop_reason == "max_tokens":
+        logger.warning(
+            "Claude [%s] stopped at max_tokens=%s — the response is TRUNCATED "
+            "and content was lost. Raise max_tokens or request less output.",
+            label, max_tokens,
+        )
+
+
+def create_message(client: anthropic.Anthropic, *, label: str, **kwargs):
+    """One fully-logged Claude round-trip.
+
+    ``label`` names the call in the log (e.g. ``clip-proposal:hook``) and is
+    what you grep for. Every Claude call in this app goes through here.
+    """
+    _log_request(label, kwargs)
+    start = time.monotonic()
+    try:
+        message = client.messages.create(**kwargs)
+    except Exception as exc:
+        logger.warning(
+            "===== Claude FAILED [%s] after %dms: %r =====",
+            label, int((time.monotonic() - start) * 1000), exc,
+        )
+        raise
+    _log_response(
+        label, message, int((time.monotonic() - start) * 1000),
+        kwargs.get("max_tokens"),
+    )
+    return message
+
+
+async def create_message_async(
+    client: anthropic.Anthropic, *, label: str, **kwargs,
+):
+    """``create_message`` off the event loop — the SDK client is synchronous."""
+    return await asyncio.to_thread(create_message, client, label=label, **kwargs)
 
 
 class ClaudeEmptyResponseError(RuntimeError):
@@ -219,8 +377,9 @@ async def compare_thumbnails(a_bytes: bytes, b_bytes: bytes) -> str:
     ]
 
     client = get_client()
-    message = await asyncio.to_thread(
-        client.messages.create,
+    message = await create_message_async(
+        client,
+        label="thumbnail-compare",
         model=await _resolve_model(),
         max_tokens=8,
         messages=[{"role": "user", "content": content}],
@@ -343,7 +502,7 @@ async def generate_seo_description(
         kwargs["system"] = prompt["system"]
 
     client = get_client()
-    message = await asyncio.to_thread(client.messages.create, **kwargs)
+    message = await create_message_async(client, label="description-from-transcript", **kwargs)
     return _sanitized_for_youtube(_extract_text(message).strip())
 
 
@@ -409,7 +568,7 @@ async def generate_seo_description_from_frames(
         kwargs["system"] = prompt["system"]
 
     client = get_client()
-    message = await asyncio.to_thread(client.messages.create, **kwargs)
+    message = await create_message_async(client, label="description-from-frames", **kwargs)
     return _sanitized_for_youtube(_extract_text(message).strip())
 
 
@@ -470,7 +629,7 @@ async def generate_tags_from_frames(
         kwargs["system"] = prompt["system"]
 
     client = get_client()
-    message = await asyncio.to_thread(client.messages.create, **kwargs)
+    message = await create_message_async(client, label="tags-from-frames", **kwargs)
     return _clean_tags(_extract_text(message).strip())
 
 
@@ -517,7 +676,7 @@ async def generate_tags_from_metadata(
         kwargs["system"] = prompt["system"]
 
     client = get_client()
-    message = await asyncio.to_thread(client.messages.create, **kwargs)
+    message = await create_message_async(client, label="tags-from-metadata", **kwargs)
     return _clean_tags(_extract_text(message).strip())
 
 
@@ -598,7 +757,7 @@ async def generate_title_from_filename(
         kwargs["system"] = prompt["system"]
 
     client = get_client()
-    message = await asyncio.to_thread(client.messages.create, **kwargs)
+    message = await create_message_async(client, label="title-from-filename", **kwargs)
     raw = _extract_text(message).strip()
     # Some models still wrap output in quotes despite the system prompt.
     if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
@@ -685,8 +844,6 @@ def call_ai_block(
     ms. The collector is the F-series debug-log machinery — leave it
     None for callers that don't care (no overhead either way).
     """
-    import time
-
     client = get_client()
     resolved_model = model or _resolve_model_sync()
     kwargs: dict[str, object] = {
@@ -697,7 +854,7 @@ def call_ai_block(
     if system:
         kwargs["system"] = system
     start = time.monotonic()
-    message = client.messages.create(**kwargs)
+    message = create_message(client, label="ai-block", **kwargs)
     elapsed_ms = int((time.monotonic() - start) * 1000)
     result = _extract_text(message).strip()
     if trace is not None:

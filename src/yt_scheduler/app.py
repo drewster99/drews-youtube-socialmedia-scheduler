@@ -601,6 +601,11 @@ async def project_generate_from_source_page(
         if parent_youtube_id:
             parent_meta["youtube_id"] = parent_youtube_id
 
+    # The modal advertises each kind's duration window and per-kind proposal
+    # cap. Both come from the clipper module that enforces them, so the label
+    # in the UI cannot drift from the filter the server applies.
+    from yt_scheduler.services import clipper as _clipper
+
     return html_templates.TemplateResponse(
         request,
         "generate_review.html",
@@ -609,6 +614,8 @@ async def project_generate_from_source_page(
             "parent_id": parent_id,
             "current_video": current_video,
             "parent_meta": parent_meta,
+            "clip_kind_bands": {b.kind: b for b in _clipper.clip_kind_bands()},
+            "clip_max_proposals_cap": _clipper.MAX_PROPOSALS_PER_KIND_CAP,
         },
     )
 
