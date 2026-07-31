@@ -544,7 +544,9 @@ function renderProposals() {
     if (total) {
         const dropped = rejectedTotal ? ` ${rejectedTotal} more didn't pass — see below.` : '';
         summary.textContent = `${total} proposal${total === 1 ? '' : 's'}.${dropped}${failedNote} `
-            + `Uncheck or Dismiss anything you don't want, then Insert selected.`;
+            + `Checked clips are cut and inserted. Unchecking just skips a clip `
+            + `this run — it can be proposed again later. Dismiss removes a clip `
+            + `and stops it being proposed again.`;
     } else if (lastAcceptedCount) {
         // Nothing on screen because the user dismissed it all — NOT because
         // validation refused it. Saying "none passed" here would be false.
@@ -683,11 +685,13 @@ function buildProposalCard(id, p, kind, idx) {
         : '';
     card.innerHTML = `
         <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem;">
-            <label class="generate-proposal-accept">
+            <label class="generate-proposal-accept"
+                   title="Cut and insert this clip. Unchecking just skips it this run — it isn't remembered.">
                 <input type="checkbox" id="${id}-accept" ${p._accept === false ? '' : 'checked'}>
                 Include
             </label>
             <button type="button" class="btn" data-dismiss
+                    title="Remove this clip and don't propose it (or a near-identical one) again."
                     style="padding:2px 10px; font-size:0.8rem;">Dismiss</button>
         </div>
         <div class="generate-proposal-title">
@@ -764,20 +768,25 @@ document.getElementById('gen-confirm').addEventListener('click', async () => {
         list.forEach((p, idx) => {
             const id = `prop-${kind}-${idx}`;
             const cb = document.getElementById(`${id}-accept`);
-            const target = (cb && cb.checked) ? accepted : rejected;
-            target.push({
-                kind: p.kind,
-                start_seconds: p.start_seconds,
-                end_seconds: p.end_seconds,
-                title: p.title,
-                reason: p.reason || '',
-                vertical_crop: cropFromPickerForKind(p.kind),
-                x_shift_normalized: Number(p.x_shift_normalized || 0),
-                crop_classification: p.crop_classification || null,
-                crop_confidence: Number(p.crop_confidence || 0),
-                audio_fade_in: Number(p.audio_fade_in || 0),
-                audio_fade_out: Number(p.audio_fade_out || 0),
-            });
+            // Unchecked means "skip this clip this run" — NOT a ban. Only the
+            // Dismiss button bans (it persists to generate_rejections on its
+            // own), so we never send an unchecked item as rejected here; it
+            // simply isn't inserted, and can be proposed again next time.
+            if (cb && cb.checked) {
+                accepted.push({
+                    kind: p.kind,
+                    start_seconds: p.start_seconds,
+                    end_seconds: p.end_seconds,
+                    title: p.title,
+                    reason: p.reason || '',
+                    vertical_crop: cropFromPickerForKind(p.kind),
+                    x_shift_normalized: Number(p.x_shift_normalized || 0),
+                    crop_classification: p.crop_classification || null,
+                    crop_confidence: Number(p.crop_confidence || 0),
+                    audio_fade_in: Number(p.audio_fade_in || 0),
+                    audio_fade_out: Number(p.audio_fade_out || 0),
+                });
+            }
         });
     }
     if (!accepted.length) {
