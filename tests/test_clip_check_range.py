@@ -323,3 +323,42 @@ async def test_a_non_json_string_proposals_still_fails_loudly(monkeypatch):
         parent_duration_seconds=2000.0, existing_ranges=[], project_id=1,
     )
     assert out.error is not None and "no usable 'proposals'" in out.error
+
+
+@pytest.mark.asyncio
+async def test_endless_checking_is_forced_to_submit_on_the_final_round(monkeypatch):
+    """A model that only ever calls check_range must be MADE to submit on the
+    last round, not fail with 'never called propose_clips'. Regression: a real
+    hook run burned all 6 rounds checking and lost the whole batch."""
+    clipper = _clipper()
+    units = make_units(30)
+    # check_range for every round up to the last; a propose_clips on the last
+    # (the model complying with the forced tool_choice).
+    scripted = [
+        _Msg([_Block("check_range",
+                     {"first_index": 2, "last_index": 4, "title": "Round Check"},
+                     f"c{r}")])
+        for r in range(clipper.MAX_PROPOSAL_ROUNDS - 1)
+    ]
+    scripted.append(_Msg([_Block("propose_clips", {"proposals": [
+        {"first_index": 2, "last_index": 4, "title": "Forced Submission",
+         "reason": "r", "rating": 4},
+    ]})]))
+    sent = _install_fake_claude(monkeypatch, scripted)
+
+    out = await clipper.propose_clips_for_kind_indexed(
+        kind="hook", units=units, parent_title="P", parent_duration_seconds=2000.0,
+        existing_ranges=[], project_id=1, max_proposals=8,
+    )
+    assert out.error is None, out.error
+    assert [p.title for p in out.accepted] == ["Forced Submission"]
+
+    # The LAST request forced propose_clips; earlier ones left the choice open.
+    assert sent[-1]["tool_choice"] == {"type": "tool", "name": "propose_clips"}
+    assert sent[0]["tool_choice"] == {"type": "any"}
+
+    # The round before the forced one carries the "final check round" nudge.
+    penultimate_user = sent[-1]["messages"][-1]
+    texts = [b.get("text", "") for b in penultimate_user["content"]
+             if isinstance(b, dict) and b.get("type") == "text"]
+    assert any("final check round" in t for t in texts)

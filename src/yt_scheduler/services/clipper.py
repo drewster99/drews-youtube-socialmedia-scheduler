@@ -1047,10 +1047,19 @@ async def propose_clips_for_kind_indexed(
     stop_reason = None
 
     for round_number in range(1, MAX_PROPOSAL_ROUNDS + 1):
+        # On the LAST allowed round, FORCE propose_clips. Without this the model
+        # can spend the whole budget calling check_range and never submit — it
+        # converges (fewer checks each round) but keeps checking "one more"
+        # until the round cap, and the batch is lost. Forcing the final turn
+        # makes it submit the candidates it already validated.
+        is_final_round = round_number == MAX_PROPOSAL_ROUNDS
+        round_kwargs = {**kwargs, "messages": messages}
+        if is_final_round:
+            round_kwargs["tool_choice"] = {"type": "tool", "name": "propose_clips"}
         try:
             message = await ai.create_message_async(
                 client, label=f"clip-proposal:{kind}:r{round_number}",
-                **{**kwargs, "messages": messages},
+                **round_kwargs,
             )
         except Exception as exc:
             # Carried, not swallowed: returning an empty list here would render
@@ -1128,9 +1137,23 @@ async def propose_clips_for_kind_indexed(
                 "content": verdict,
             })
         checks_answered += len(results)
+        # When the NEXT round is the forced-submit one, tell the model so in
+        # this same user turn — a text block alongside the tool_results — so it
+        # stops checking and assembles its final propose_clips instead of being
+        # surprised by the forced tool_choice.
+        content: list = list(results)
+        if round_number == MAX_PROPOSAL_ROUNDS - 1:
+            content.append({
+                "type": "text",
+                "text": (
+                    "This is your final check round. On your next turn, call "
+                    "propose_clips with the candidates that passed — do not "
+                    "check any more ranges."
+                ),
+            })
         messages = messages + [
             {"role": "assistant", "content": blocks},
-            {"role": "user", "content": results},
+            {"role": "user", "content": content},
         ]
         logger.info(
             "Clip-proposal (index) %s round %d: answered %d check_range call%s",
