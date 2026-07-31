@@ -165,3 +165,37 @@ silently.
   it can positively identify as orphaned *video* sources (extension
   set + cross-check against all rows' `video_file_path`). When in
   doubt, leave it.
+
+## Cache the Generate-from-source word-stream transcription
+
+`clipper._run_generate_job` re-transcribes the parent on-device (Apple
+SpeechAnalyzer) on **every** Generate-from-source run — the code deliberately
+never persists word-level timing, on the reasoning that it's "cheap to
+re-derive." The stored `transcripts` row only carries cue-level SRT timing;
+the index-based proposal path needs word-level timing to build its
+complete-thought units, so it re-derives every time.
+
+That's fine for a one-off cut, but painful when iterating on the same parent
+(re-tuning the check_range / propose_clips loop): every run waits through
+transcription again before any proposal work starts.
+
+**Acceptance:**
+
+- Persist the word-stream (the `TranscriptWord` list, or the built
+  `ClipUnit`s) after the first transcription, keyed by parent id + a hash of
+  the source file (so a Replace-source invalidates it).
+- On a subsequent Generate for the same parent+file, reuse the cached word
+  stream and skip transcription entirely; the job goes straight to
+  `proposing`.
+- Invalidate on source-file change (migration 026 `source_file_origin` /
+  Replace-source) and when the transcript is re-derived for any other reason.
+
+**Notes:**
+
+- Word timing is larger than the SRT but still small; a table
+  (`parent_id`, `source_hash`, `words_json`, `created_at`) or a sidecar
+  file next to the source both work. A table is consistent with the rest of
+  the persistence.
+- Until this lands, `scripts/clip_dev.py` is the fast iteration path — it
+  reads the stored SRT (cue-level, one unit per cue) and never transcribes,
+  so loop mechanics can be tuned in seconds without a rebuild.
