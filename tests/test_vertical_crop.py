@@ -372,8 +372,10 @@ async def test_cut_lanes_crop_on_hardware_crop_off_follows_encoder(
     monkeypatch.setattr(media, "_HARDWARE_ENCODERS", frozenset({"h264_videotoolbox"}))
 
     lanes: list[str] = []
-    monkeypatch.setattr(clipper, "_HARDWARE_CUT_SEMAPHORE", _TracingSemaphore(lanes, "hw"))
-    monkeypatch.setattr(clipper, "_SOFTWARE_CUT_SEMAPHORE", _TracingSemaphore(lanes, "sw"))
+    _hw = _TracingSemaphore(lanes, "hw")
+    monkeypatch.setattr(clipper, "_get_hardware_cut_semaphore", lambda: _hw)
+    _sw = _TracingSemaphore(lanes, "sw")
+    monkeypatch.setattr(clipper, "_get_software_cut_semaphore", lambda: _sw)
     monkeypatch.setattr(media, "extract_clip", lambda *a, **k: tmp_path / "fake.mp4")
     monkeypatch.setattr(
         media, "extract_clip_stacked", lambda *a, **k: (tmp_path / "fake.mp4", False),
@@ -404,8 +406,10 @@ async def test_cut_lanes_crop_off_software_when_hardware_unavailable(
     monkeypatch.setattr(media, "_HARDWARE_ENCODERS", frozenset())
 
     lanes: list[str] = []
-    monkeypatch.setattr(clipper, "_HARDWARE_CUT_SEMAPHORE", _TracingSemaphore(lanes, "hw"))
-    monkeypatch.setattr(clipper, "_SOFTWARE_CUT_SEMAPHORE", _TracingSemaphore(lanes, "sw"))
+    _hw = _TracingSemaphore(lanes, "hw")
+    monkeypatch.setattr(clipper, "_get_hardware_cut_semaphore", lambda: _hw)
+    _sw = _TracingSemaphore(lanes, "sw")
+    monkeypatch.setattr(clipper, "_get_software_cut_semaphore", lambda: _sw)
     monkeypatch.setattr(media, "extract_clip", lambda *a, **k: tmp_path / "fake.mp4")
     monkeypatch.setattr(
         media, "extract_clip_stacked", lambda *a, **k: (tmp_path / "fake.mp4", False),
@@ -434,8 +438,10 @@ async def test_cut_clip_cleans_up_partial_output_on_failure(
     monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(clipper, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(media, "_HARDWARE_ENCODERS", frozenset())
-    monkeypatch.setattr(clipper, "_HARDWARE_CUT_SEMAPHORE", _TracingSemaphore([], "hw"))
-    monkeypatch.setattr(clipper, "_SOFTWARE_CUT_SEMAPHORE", _TracingSemaphore([], "sw"))
+    _hw = _TracingSemaphore([], "hw")
+    monkeypatch.setattr(clipper, "_get_hardware_cut_semaphore", lambda: _hw)
+    _sw = _TracingSemaphore([], "sw")
+    monkeypatch.setattr(clipper, "_get_software_cut_semaphore", lambda: _sw)
 
     leaked_paths: list = []
 

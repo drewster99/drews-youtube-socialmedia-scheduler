@@ -72,10 +72,23 @@ async def append_chunk(
     finalized, 413 chunk would exceed declared size, 400 chunk over
     the per-chunk cap.
     """
-    # Reading the whole chunk into memory is fine — chunks are bounded to
-    # ``CHUNK_SIZE_BYTES`` (config.UPLOAD_WIRE_CHUNK_BYTES) and rejected above
-    # it, so this can't be used to OOM the server, and we have to hand a
-    # ``bytes`` to the disk write anyway.
+    # Content-Length FIRST. The per-chunk cap is enforced inside
+    # append_chunk — which runs after ``await request.body()`` has already
+    # materialized the whole body in RAM, so a single rogue multi-GB PATCH
+    # was buffered in full before anything rejected it. Checking the declared
+    # length costs nothing and refuses it before a byte is read.
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            declared_bytes = int(declared)
+        except ValueError:
+            raise HTTPException(400, "Invalid Content-Length header") from None
+        if declared_bytes > chunked_uploads.CHUNK_SIZE_BYTES:
+            raise HTTPException(
+                400,
+                f"Chunk is {declared_bytes} bytes; the per-chunk cap is "
+                f"{chunked_uploads.CHUNK_SIZE_BYTES}.",
+            )
     data = await request.body()
     if not data:
         # Empty PATCH could be a probe; reject so the client doesn't
@@ -88,6 +101,13 @@ async def append_chunk(
         raise HTTPException(404, str(exc)) from exc
     except chunked_uploads.UploadTooLarge as exc:
         raise HTTPException(413, str(exc)) from exc
+    except chunked_uploads.UploadOffsetMismatch as exc:
+        # The true offset rides along so the client can resync instead of
+        # abandoning a multi-GB transfer over one lost acknowledgement.
+        raise HTTPException(
+            409,
+            {"detail": str(exc), "received_bytes": exc.received_bytes},
+        ) from exc
     except chunked_uploads.UploadConflict as exc:
         # "Offset mismatch" / "already finalized" are conflicts on the
         # upload state, not bad input — 409 lets clients distinguish.

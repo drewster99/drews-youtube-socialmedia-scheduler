@@ -89,6 +89,23 @@ class UploadNotFound(LookupError):
     """Upload id is unknown, expired, or already consumed."""
 
 
+class UploadOffsetMismatch(ValueError):
+    """The client sent a chunk at the wrong offset.
+
+    Carries ``received_bytes`` so the caller can tell the client where to
+    resume. Without it, a chunk that committed but whose acknowledgement was
+    lost kills a 10 GB upload — the retry re-sends at the old offset, gets a
+    flat 409, and the client has no way to learn the true position.
+    """
+
+    def __init__(self, offset: int, received_bytes: int) -> None:
+        self.offset = offset
+        self.received_bytes = received_bytes
+        super().__init__(
+            f"Out-of-order chunk: offset={offset}, expected={received_bytes}"
+        )
+
+
 class UploadConflict(ValueError):
     """Chunk offset doesn't match expected, or upload state is wrong
     for the requested operation."""
@@ -193,10 +210,7 @@ async def append_chunk(
                 )
 
         if offset != entry["received_bytes"]:
-            raise UploadConflict(
-                f"Out-of-order chunk: offset={offset}, expected="
-                f"{entry['received_bytes']}",
-            )
+            raise UploadOffsetMismatch(offset, int(entry["received_bytes"]))
         if entry["received_bytes"] + len(data) > entry["size"]:
             raise UploadTooLarge(
                 f"Chunk would exceed declared size: "

@@ -2521,11 +2521,19 @@ class ThreadsPoster(SocialPoster):
     def _token_is_due(self, creds: dict, window_secs: int) -> bool:
         """Whether this token is close enough to expiry to be worth renewing.
 
-        An absent ``expires_at`` means the bundle predates expiry tracking, so
-        it is treated as due: refreshing once backfills the field and every
-        later sweep can reason properly. Not knowing is not the same as being
-        fine — that assumption is what let this token die.
+        An absent ``expires_at`` means either a bundle predating expiry
+        tracking or a token Meta issued without an ``expires_in`` — we record
+        NULL rather than inventing 60 days. Both are treated as due, because
+        not knowing is not the same as being fine; that assumption is what let
+        this token die.
+
+        Except inside Meta's 24-hour refresh minimum, where a request is a
+        guaranteed refusal. Checking it here rather than in the error handler
+        means an unknown-expiry token costs one API call a day instead of one
+        every sweep.
         """
+        if _threads_token_is_too_new(creds):
+            return False
         expires_at = int(creds.get("expires_at") or 0)
         if not expires_at:
             return True

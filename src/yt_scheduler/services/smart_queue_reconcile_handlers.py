@@ -116,11 +116,23 @@ async def _default_ai_system_for_queue(queue_id: int) -> str | None:
             "ai_block_default_system_prompt", project_id=int(queue["project_id"])
         )
         return resolved["system"]
-    except Exception:
-        # A missing default is not a reason to abandon the reconciliation; the
-        # template's own prompts still render.
+    except prompt_service.RetiredPromptKey:
+        raise
+    except KeyError:
+        # Genuinely absent: no row, no seed. The template's own prompts still
+        # render, so this is not a reason to abandon the reconciliation.
         logger.warning("reconcile: no default AI system prompt for queue %s", queue_id)
         return None
+    except Exception:
+        # Anything else — a blank saved prompt, a DB error — must NOT degrade
+        # to None. Re-rendering with a different {{ai:}} system prompt than
+        # Accept used produces silently different post text, which is worse
+        # than a failed job the user can see and retry.
+        logger.exception(
+            "reconcile: could not resolve the default AI system prompt for "
+            "queue %s; refusing to re-render against a different one", queue_id,
+        )
+        raise
 
 
 async def add_slots(queue_id: int, slot_ids: list[int], progress: Progress) -> str:

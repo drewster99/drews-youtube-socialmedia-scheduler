@@ -55,12 +55,6 @@ LINKEDIN_SCOPES = "openid profile w_member_social"
 THREADS_REDIRECT_PATH = "/api/oauth/threads/callback"
 THREADS_SCOPES = "threads_basic,threads_content_publish"
 
-# Meta issues 60-day Threads tokens. Used only when a token response omits
-# expires_in, so the refresh sweep still has a date to work from rather than
-# treating "unknown" as "fine" — that assumption is what let a token die.
-_THREADS_DEFAULT_TTL_SECONDS = 60 * 24 * 3600
-
-
 def _stamp_threads_expiry(bundle: dict, token_data: dict | None) -> None:
     """Record when this Threads token dies, so the sweep can renew it in time.
 
@@ -68,12 +62,20 @@ def _stamp_threads_expiry(bundle: dict, token_data: dict | None) -> None:
     itself, and only works while it is still valid. Knowing the expiry is
     therefore the difference between renewing forever and needing a manual
     reconnect every 60 days.
+
+    When Meta omits ``expires_in`` we record NOTHING rather than assuming its
+    usual 60 days. ``token_expires_at`` NULL means "unknown" — the contract
+    stated in CLAUDE.md — and a fabricated date is worse than an absent one:
+    if Meta ever shortens the lifetime, the sweep waits confidently past the
+    token's death. ``acquired_at`` is always stamped, and the sweep treats an
+    unknown expiry as due once the token clears Meta's 24-hour refresh
+    minimum, so renewal still happens without inventing a due date.
     """
     expires_in = (token_data or {}).get("expires_in")
     try:
-        seconds = int(expires_in) if expires_in is not None else _THREADS_DEFAULT_TTL_SECONDS
+        seconds = int(expires_in) if expires_in is not None else None
     except (TypeError, ValueError):
-        seconds = _THREADS_DEFAULT_TTL_SECONDS
+        seconds = None
     stamp_token_metadata(bundle, expires_in_seconds=seconds)
 
 TWITTER_REDIRECT_PATH = "/api/oauth/twitter/callback"

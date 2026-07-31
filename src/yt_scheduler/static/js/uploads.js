@@ -133,6 +133,14 @@
                 // 4xx are not retriable (offset mismatch, oversize,
                 // unknown upload) — surface immediately so the caller
                 // can decide what to do.
+                // A 409 offset mismatch is recoverable: the server tells us
+                // where it actually is. This is precisely the case the retry
+                // loop exists for — a chunk that committed but whose reply was
+                // lost — and treating it as fatal killed the whole upload.
+                if (result.status === 409) {
+                    const known = result.body && result.body.received_bytes;
+                    if (typeof known === 'number') return known;
+                }
                 if (result.status >= 400 && result.status < 500) {
                     throw new ChunkedUploadError(
                         `chunk failed: ${(result.body && result.body.detail) || result.status}`,

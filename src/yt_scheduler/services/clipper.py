@@ -1170,22 +1170,34 @@ async def propose_clips_for_kind_indexed(
 # created on the running event loop — avoids "bound to a different loop"
 # errors when tests spin up a fresh loop per test or a server restart
 # creates a new loop in-process.
-_SOFTWARE_CUT_SEMAPHORE: asyncio.Semaphore | None = None
-_HARDWARE_CUT_SEMAPHORE: asyncio.Semaphore | None = None
+
+
+# An asyncio.Semaphore binds to the loop that first awaits it, so caching one
+# across a loop swap makes a *contended* acquire raise "attached to a different
+# loop" — rare, load-dependent, and exactly the failure the lazy construction
+# was supposed to avoid. Key the cache by loop instead.
+_CUT_SEMAPHORES: dict[tuple[int, str], asyncio.Semaphore] = {}
+_SOFTWARE_CUT_CONCURRENCY: int = 8
+_HARDWARE_CUT_CONCURRENCY: int = 2
+
+
+def _cut_semaphore(lane: str, size: int) -> asyncio.Semaphore:
+    key = (id(asyncio.get_running_loop()), lane)
+    sem = _CUT_SEMAPHORES.get(key)
+    if sem is None:
+        sem = asyncio.Semaphore(size)
+        # Bounded: one entry per (loop, lane), and loops are not created in a
+        # hot path. Stale entries from a dead loop are a few objects.
+        _CUT_SEMAPHORES[key] = sem
+    return sem
 
 
 def _get_software_cut_semaphore() -> asyncio.Semaphore:
-    global _SOFTWARE_CUT_SEMAPHORE
-    if _SOFTWARE_CUT_SEMAPHORE is None:
-        _SOFTWARE_CUT_SEMAPHORE = asyncio.Semaphore(8)
-    return _SOFTWARE_CUT_SEMAPHORE
+    return _cut_semaphore("software", _SOFTWARE_CUT_CONCURRENCY)
 
 
 def _get_hardware_cut_semaphore() -> asyncio.Semaphore:
-    global _HARDWARE_CUT_SEMAPHORE
-    if _HARDWARE_CUT_SEMAPHORE is None:
-        _HARDWARE_CUT_SEMAPHORE = asyncio.Semaphore(2)
-    return _HARDWARE_CUT_SEMAPHORE
+    return _cut_semaphore("hardware", _HARDWARE_CUT_CONCURRENCY)
 
 
 # In-flight Generate-from-source preview jobs. Same pattern as
@@ -1370,9 +1382,9 @@ async def cut_clip_from_parent(
     Encoder selection + concurrency:
 
     * Hardware (videotoolbox) is preferred when ffmpeg was built with
-      it; the cut is gated by :data:`_HARDWARE_CUT_SEMAPHORE`.
+      it; the cut is gated by :func:`_get_hardware_cut_semaphore`.
     * Software (libx264) is the fallback; gated by
-      :data:`_SOFTWARE_CUT_SEMAPHORE`.
+      :func:`_get_software_cut_semaphore`.
 
     The two semaphores are independent, so a mixed batch (some hardware
     cuts, some software) fills both lanes at once. Output extension is

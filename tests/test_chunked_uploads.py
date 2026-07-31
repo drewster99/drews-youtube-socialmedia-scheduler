@@ -111,9 +111,15 @@ async def test_append_rejects_out_of_order_offset(client: TestClient):
     info = await cu.init_upload("x.bin", size=10)
     uid = info["upload_id"]
     await cu.append_chunk(uid, 0, b"AAAAA")
-    with pytest.raises(cu.UploadConflict):
+    with pytest.raises(cu.UploadOffsetMismatch) as caught:
         # offset should be 5, not 0 — would overlap.
         await cu.append_chunk(uid, 0, b"BBBBB")
+    # It carries the true offset so the client can resync rather than
+    # abandoning a multi-GB transfer over one lost acknowledgement.
+    assert caught.value.received_bytes == 5
+    assert caught.value.offset == 0
+    # Still a conflict to any caller catching the base class.
+    assert isinstance(caught.value, ValueError)
 
 
 async def test_append_rejects_overflow(client: TestClient):
