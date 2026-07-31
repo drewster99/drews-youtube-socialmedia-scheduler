@@ -391,6 +391,12 @@ _INDEX_PROPOSAL_TOOL = {
         "properties": {
             "proposals": {
                 "type": "array",
+                "description": (
+                    "A JSON array of clip objects, one per clip you are "
+                    "submitting. Provide it as a native array value — NOT a "
+                    "string containing JSON, and not the array serialized as "
+                    "text. Each element is an object with the fields below."
+                ),
                 "items": {
                     "type": "object",
                     "properties": {
