@@ -61,7 +61,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal
 
-from yt_scheduler.config import UPLOAD_DIR
+from yt_scheduler.config import CLIP_PROPOSAL_TIMEOUT_SECONDS, UPLOAD_DIR
 from yt_scheduler.services import ai, clip_edges, media as media_service
 from yt_scheduler.services.background import spawn_background
 from yt_scheduler.services.clip_edges import ClipEdges, ClipUnit
@@ -97,19 +97,20 @@ _DEFAULT_MAX_PER_KIND: dict[ClipKind, int] = {"hook": 20, "short": 15, "segment"
 
 # Output budget for one proposal call, derived rather than picked: a proposal
 # costs ~120 output tokens (measured), so a full batch at the cap needs ~6k.
+# 500 apiece is deliberate slack — roughly 4x measured — so a batch of longer
+# reasons and titles still can't run into the ceiling.
 #
-# The ceiling is not ours to choose freely. The Anthropic SDK refuses a
-# NON-STREAMING request whose max_tokens implies more than ten minutes of
-# generation — ``3600 * max_tokens / 128_000 > 600``, i.e. anything above
-# ~21,333 — and it raises locally, so the request never leaves the machine.
-# Its per-model table is stricter still, capping some Opus models at 8,192.
-# We stay under the tighter of the two so the call keeps working whatever
-# model Settings points at. A 25,000 budget broke every generate run this way.
-_OUTPUT_TOKENS_PER_PROPOSAL: int = 200
-_MAX_NONSTREAMING_OUTPUT_TOKENS: int = 8_000
-PROPOSAL_MAX_OUTPUT_TOKENS: int = min(
-    MAX_PROPOSALS_PER_KIND_CAP * _OUTPUT_TOKENS_PER_PROPOSAL,
-    _MAX_NONSTREAMING_OUTPUT_TOKENS,
+# This is a CEILING, not an expectation — real responses land at 1-6k. The
+# Anthropic SDK conflates the two: for a non-streaming call it estimates
+# duration as ``3600 * max_tokens / 128_000`` and refuses above ~21,333,
+# which punishes exactly the generous ceiling you want in order to never
+# truncate. That guess is skipped entirely when the caller supplies its own
+# timeout, which ``propose_clips_for_kind_indexed`` does
+# (``config.CLIP_PROPOSAL_TIMEOUT_SECONDS``), so the number below answers to
+# our needs rather than to the SDK's heuristic.
+_OUTPUT_TOKENS_PER_PROPOSAL: int = 500
+PROPOSAL_MAX_OUTPUT_TOKENS: int = (
+    MAX_PROPOSALS_PER_KIND_CAP * _OUTPUT_TOKENS_PER_PROPOSAL
 )
 # When a kind already has cut clips on this parent, we ask Claude for a few
 # extra candidates so that after post-LLM dedup/overlap removal we still have a
@@ -815,6 +816,9 @@ async def propose_clips_for_kind_indexed(
     kwargs: dict[str, object] = {
         "model": model,
         "max_tokens": PROPOSAL_MAX_OUTPUT_TOKENS,
+        # Explicit, so the SDK uses our budget instead of guessing one from
+        # max_tokens and refusing the call before it leaves the machine.
+        "timeout": CLIP_PROPOSAL_TIMEOUT_SECONDS,
         "system": system_text,
         "messages": [{"role": "user", "content": user_text}],
         "tools": [_INDEX_PROPOSAL_TOOL],

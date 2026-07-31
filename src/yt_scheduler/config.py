@@ -412,6 +412,19 @@ OAUTH_EXCHANGE_TIMEOUT_SECONDS = DEFAULT_API_CALL_TIMEOUT_SECONDS
 # The resolve_username identity fetches behind Settings' ↻ button.
 USERNAME_RESOLVE_TIMEOUT_SECONDS = DEFAULT_API_CALL_TIMEOUT_SECONDS
 
+# Clip-proposal calls to Claude. Not on the default: this one is a generation,
+# not a fetch, so the budget has to cover the model writing its whole answer.
+#
+# Passing it explicitly ALSO matters for a second reason. The Anthropic SDK
+# guesses a timeout for non-streaming calls from max_tokens
+# (``3600 * max_tokens / 128_000``) and refuses outright above ~21,333 — it
+# treats a ceiling as a prediction, at a flat ~35 tokens/sec. That guess only
+# runs when the caller passed no timeout of its own (see
+# ``messages.py``: ``not is_given(timeout) and client.timeout == DEFAULT``),
+# so naming the budget here is what lets us set an honest ceiling instead of
+# one bent around the SDK's heuristic.
+CLIP_PROPOSAL_TIMEOUT_SECONDS = 900
+
 # Per-call values in force before consolidation onto the default (2026-07-28),
 # kept for reference and easy rollback:
 # TWITTER_BEARER_REFRESH_TIMEOUT_SECONDS = 20

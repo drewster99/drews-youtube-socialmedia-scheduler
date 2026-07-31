@@ -578,30 +578,66 @@ def test_generate_job_payload_omits_private_fields():
         assert key in public, f"{key} must reach the browser"
 
 
-def test_proposal_budget_is_accepted_by_the_sdk_without_streaming():
-    """max_tokens must clear the SDK's own non-streaming guard.
+def test_proposal_call_passes_an_explicit_timeout():
+    """The SDK only guesses a timeout when the caller supplies none.
 
-    Regression: a 25,000-token budget raised `ValueError: Streaming is
-    required for operations that may take longer than 10 minutes` locally —
-    the request never left the machine, and every kind of every generate run
-    failed. The SDK's rule is `3600 * max_tokens / 128_000 > 600` (~21,333),
-    with a stricter per-model table on top.
+    Regression: with no timeout it estimates duration from max_tokens
+    (`3600 * max_tokens / 128_000`) and refuses above ~21,333 — plus a
+    stricter per-model table — so a 25,000 ceiling raised locally and every
+    kind of every generate run failed before a request was sent. Supplying
+    our own budget skips that guess entirely, which is what lets max_tokens
+    answer to how much output we actually want.
+    """
+    import inspect
 
-    Asserted by calling the SDK's own calculation rather than restating the
-    arithmetic, so a tightened rule fails here instead of in production.
+    from yt_scheduler.services import clipper
+
+    src = inspect.getsource(clipper.propose_clips_for_kind_indexed)
+    assert '"timeout": CLIP_PROPOSAL_TIMEOUT_SECONDS' in src, (
+        "the proposal call must pass an explicit timeout, or the SDK's "
+        "max_tokens heuristic comes back"
+    )
+
+
+def test_explicit_timeout_disables_the_sdk_max_tokens_heuristic():
+    """Pin the SDK behaviour this design depends on.
+
+    If a future SDK applies its guess even when a timeout is given, our
+    ceiling silently becomes illegal again — this fails instead.
     """
     import anthropic
-    from anthropic._constants import MODEL_NONSTREAMING_TOKENS
+    from anthropic._constants import DEFAULT_TIMEOUT
+    from anthropic._types import not_given
+    from anthropic._utils import is_given
 
-    from yt_scheduler.services.clipper import PROPOSAL_MAX_OUTPUT_TOKENS
+    from yt_scheduler.config import CLIP_PROPOSAL_TIMEOUT_SECONDS
 
     client = anthropic.Anthropic(api_key="test-key-never-used-no-network")
-    # Every model the SDK special-cases, plus the unlisted (default) case.
-    for model in [None, *MODEL_NONSTREAMING_TOKENS]:
-        client._calculate_nonstreaming_timeout(
-            PROPOSAL_MAX_OUTPUT_TOKENS,
-            MODEL_NONSTREAMING_TOKENS.get(model) if model else None,
-        )
+    # The exact condition from anthropic/resources/messages/messages.py.
+    def guard_runs(timeout):
+        return not is_given(timeout) and client.timeout == DEFAULT_TIMEOUT
+
+    assert guard_runs(not_given), "SDK no longer guards the no-timeout path"
+    assert not guard_runs(CLIP_PROPOSAL_TIMEOUT_SECONDS), (
+        "an explicit timeout no longer bypasses the SDK's max_tokens heuristic"
+    )
+
+
+def test_proposal_timeout_covers_the_full_output_budget():
+    """The budget we name has to be able to produce the ceiling we ask for.
+
+    Uses the SDK's own ~35 tokens/sec assumption (128_000 tokens per hour) —
+    conservative, since real generation is far faster.
+    """
+    from yt_scheduler.config import CLIP_PROPOSAL_TIMEOUT_SECONDS
+    from yt_scheduler.services.clipper import PROPOSAL_MAX_OUTPUT_TOKENS
+
+    slowest_expected_seconds = 3600 * PROPOSAL_MAX_OUTPUT_TOKENS / 128_000
+    assert CLIP_PROPOSAL_TIMEOUT_SECONDS >= slowest_expected_seconds, (
+        f"{PROPOSAL_MAX_OUTPUT_TOKENS} tokens could take "
+        f"{slowest_expected_seconds:.0f}s but the budget is only "
+        f"{CLIP_PROPOSAL_TIMEOUT_SECONDS}s"
+    )
 
 
 def test_proposal_budget_covers_a_full_batch_at_the_cap():
