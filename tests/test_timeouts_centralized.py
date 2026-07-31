@@ -20,6 +20,9 @@ CENTRALIZED_FILES = [
     SRC / "services" / "media_hosting.py",
     SRC / "services" / "social_identity.py",
     SRC / "routers" / "oauth_routes.py",
+    # The clip-proposal call passes its own timeout so the Anthropic SDK
+    # doesn't guess one from max_tokens and refuse the request outright.
+    SRC / "services" / "clipper.py",
 ]
 
 
@@ -70,3 +73,7 @@ def test_bulk_transfer_budgets_keep_their_own_values() -> None:
     assert config.TWITTER_VIDEO_UPLOAD_CHUNK_BYTES == 4 * 1024 * 1024
     assert config.MEDIA_HOSTING_UPLOAD_TIMEOUT_SECONDS == 30 * 60
     assert config.MEDIA_HOSTING_UPLOAD_CHUNK_BYTES == 64 * 1024 * 1024
+    # A generation, not a fetch: the budget has to cover the model writing its
+    # whole answer, and it must clear the SDK's own worst-case estimate for
+    # PROPOSAL_MAX_OUTPUT_TOKENS or we'd be back to a locally-refused call.
+    assert config.CLIP_PROPOSAL_TIMEOUT_SECONDS == 900
