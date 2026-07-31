@@ -188,3 +188,27 @@ async def test_error_detail_renders_rfc6749_description(social) -> None:
     )
     detail = social._http_error_detail(resp)
     assert "invalid_grant" in detail and "revoked" in detail
+
+
+async def test_a_due_token_with_no_refresh_token_is_surfaced(social, stored) -> None:
+    """An OAuth credential that lost its refresh token but has a known, near
+    expiry must not silently no-op until every post 401s — it demands reauth."""
+    creds = {
+        "bearer_token": "old-bearer",
+        "uuid": "cred-uuid",
+        "expires_at": int(time.time()) - 10,  # known and expired
+        # no refresh_token, no client_id
+    }
+    with pytest.raises(social.CredentialAuthError) as exc_info:
+        await social.TwitterPoster(bundle=creds).refresh_if_stale()
+    assert exc_info.value.uuid == "cred-uuid"
+    assert "reconnect" in str(exc_info.value).lower()
+
+
+async def test_a_manual_bearer_with_unknown_expiry_stays_silent(social, stored) -> None:
+    """A hand-pasted bearer (no expiry, no refresh token) is legitimately
+    un-refreshable — nothing is wrong and nothing can be done, so it must not
+    raise reauth on every sweep."""
+    creds = {"bearer_token": "manual", "uuid": "cred-uuid", "expires_at": 0}
+    assert await social.TwitterPoster(bundle=creds).refresh_if_stale() is False
+    assert "bundle" not in stored

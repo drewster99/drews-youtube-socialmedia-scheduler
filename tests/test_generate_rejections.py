@@ -286,3 +286,39 @@ def test_review_page_renders_meta_without_youtube_id_for_non11(
     # quoted but the empty-string value is.
     assert "PARENT_META" in body
     assert 'parent_youtube_id: ""' in body
+
+
+def test_audio_fades_round_trip_so_a_restored_clip_keeps_its_ramps(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """A dismissed clip's audio edge-ramp lengths must survive to Restore, or
+    the re-cut pops at the boundaries (migration 041)."""
+    from yt_scheduler.services import auto_actions
+
+    async def fake_start(**kwargs):
+        return "job_fake_fades"
+
+    monkeypatch.setattr(auto_actions, "start_promo_from_cut", fake_start)
+    _insert_parent("PARENTRJFADE")
+
+    resp = client.post(
+        "/api/projects/default/videos/PARENTRJFADE/promos/generate/confirm",
+        json={
+            "accepted": [
+                {"kind": "hook", "start_seconds": 5, "end_seconds": 20,
+                 "title": "kept"},
+            ],
+            "rejected": [
+                {"kind": "hook", "start_seconds": 100, "end_seconds": 118,
+                 "title": "faded", "audio_fade_in": 0.42, "audio_fade_out": 0.31},
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    rejections = client.get(
+        "/api/projects/default/videos/PARENTRJFADE/promos/generate/rejections",
+    ).json()["rejections"]
+    assert len(rejections) == 1
+    assert rejections[0]["audio_fade_in"] == pytest.approx(0.42)
+    assert rejections[0]["audio_fade_out"] == pytest.approx(0.31)

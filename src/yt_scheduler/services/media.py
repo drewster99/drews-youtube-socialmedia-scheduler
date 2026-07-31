@@ -1171,6 +1171,28 @@ def violates_limits(probe: VideoProbe, limits: PlatformMediaLimits) -> list[str]
     return reasons
 
 
+def _should_retry_on_software(
+    *,
+    used_hardware: bool,
+    max_bytes: int | None,
+    measured_size_bytes: int,
+) -> bool:
+    """Whether a failed encode should be retried on ``libx264`` (software).
+
+    videotoolbox controls output size only through an explicit ``-b:v`` bitrate
+    target and overshoots it, so it can breach a byte cap that libx264's rate
+    control would have met. A software retry is warranted only when the failing
+    encode actually ran on the hardware encoder AND a byte cap exists that the
+    output exceeded — switching encoders repairs no other kind of violation, and
+    re-running the identical hardware path would fail identically. When the
+    encode already ran on libx264 (or no byte cap applies) this returns ``False``
+    so the caller fails loudly instead of looping or shipping an oversized file.
+    """
+    if not used_hardware or max_bytes is None:
+        return False
+    return measured_size_bytes > max_bytes
+
+
 def transcode_for_platform(
     source: str | Path,
     output: str | Path,
@@ -1185,9 +1207,13 @@ def transcode_for_platform(
     :class:`TranscodeVerificationError` when the finished file still breaches
     a limit — never returns a file we know will be rejected.
 
-    ``libx264`` is used whenever a byte ceiling applies: videotoolbox honours
-    an exact bitrate target poorly, and overshooting the cap is the one
-    failure this function exists to prevent.
+    Encoding starts on videotoolbox for speed when a byte ceiling doesn't have
+    to bind. Because videotoolbox honours an exact bitrate target poorly and can
+    overshoot a byte cap it cleared on paper, a hardware encode that verifies
+    over the cap is retried once on ``libx264`` — whose rate control meets the
+    budget where videotoolbox's ``-b:v`` target does not. If that retry (or a
+    plain software encode) still overshoots, the function raises rather than
+    return a file the platform will reject.
     """
     source_path, output_path = Path(source), Path(output)
     duration = probe.duration_seconds
@@ -1235,7 +1261,9 @@ def transcode_for_platform(
             target_bps = budget_bps
             byte_ceiling_binds = True
 
-    cmd: list[str] = [
+    # Arguments shared by both encoder lanes. The video-codec block is appended
+    # per attempt so a hardware overshoot can be retried on libx264 (below).
+    base_cmd: list[str] = [
         "ffmpeg", "-y", "-i", str(source_path),
         "-vf", f"scale={out_w}:{out_h}",
         "-pix_fmt", "yuv420p",
@@ -1244,43 +1272,75 @@ def transcode_for_platform(
         "-c:a", "aac", "-b:a", str(_AUDIO_BITRATE_BPS), "-ar", "48000", "-ac", "2",
     ]
 
-    # libx264 whenever an exact size has to be hit — videotoolbox honours a
-    # bitrate target too loosely to trust against a hard cap.
-    if byte_ceiling_binds or not hardware_encoder_available("h264"):
-        cmd += [
-            "-c:v", "libx264", "-profile:v", "high", "-preset", "medium",
-            "-b:v", str(target_bps),
-            "-maxrate", str(int(target_bps * 1.2)),
-            "-bufsize", str(target_bps * 2),
-        ]
-    else:
-        cmd += [
-            "-c:v", "h264_videotoolbox", "-profile:v", "high",
-            "-b:v", str(target_bps),
-        ]
-
     # A frame-rate limit is a CEILING. Only resample when the source actually
     # exceeds it — passing it unconditionally would upsample 24fps content to
     # the cap, inflating both encode time and file size for no gain.
+    frame_rate_args: list[str] = []
     if (
         limits.max_frame_rate is not None
         and probe.frame_rate is not None
         and probe.frame_rate > limits.max_frame_rate
     ):
-        cmd += ["-r", str(int(limits.max_frame_rate))]
+        frame_rate_args = ["-r", str(int(limits.max_frame_rate))]
 
-    cmd.append(str(output_path))
+    def _encode(*, use_hardware: bool) -> None:
+        """Run one ffmpeg encode into ``output_path`` on the chosen H.264 lane.
 
-    try:
-        subprocess.run(
-            cmd, check=True, capture_output=True, timeout=_FFMPEG_TIMEOUT_SECONDS
-        )
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
-        output_path.unlink(missing_ok=True)
-        raise
+        Cleans up its own partial output and re-raises on an ffmpeg failure so a
+        half-written file never masquerades as a finished encode.
+        """
+        if use_hardware:
+            codec_args = [
+                "-c:v", "h264_videotoolbox", "-profile:v", "high",
+                "-b:v", str(target_bps),
+            ]
+        else:
+            codec_args = [
+                "-c:v", "libx264", "-profile:v", "high", "-preset", "medium",
+                "-b:v", str(target_bps),
+                "-maxrate", str(int(target_bps * 1.2)),
+                "-bufsize", str(target_bps * 2),
+            ]
+        cmd = base_cmd + codec_args + frame_rate_args + [str(output_path)]
+        try:
+            subprocess.run(
+                cmd, check=True, capture_output=True, timeout=_FFMPEG_TIMEOUT_SECONDS
+            )
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+            output_path.unlink(missing_ok=True)
+            raise
+
+    # Start on videotoolbox for speed, but only when the byte ceiling didn't
+    # already have to bind: once the target was lowered to fit a hard cap,
+    # videotoolbox honours -b:v too loosely to trust and libx264 is used up
+    # front. When no ceiling binds, a hardware overshoot is still caught and
+    # repaired by the software retry below.
+    started_on_hardware = hardware_encoder_available("h264") and not byte_ceiling_binds
+    _encode(use_hardware=started_on_hardware)
 
     # Never leave a file we know a platform will reject where a caller could
     # pick it up: one unlink site covers every way verification can fail.
+    try:
+        _verify_output_within_limits(output_path, limits)
+        return output_path
+    except Exception:
+        measured_size = output_path.stat().st_size if output_path.exists() else 0
+        output_path.unlink(missing_ok=True)
+        # Why: videotoolbox controls output size only through -b:v and overshoots
+        # it, so a marginal byte cap it cleared on paper can still be breached in
+        # the bytes. libx264's rate control meets that budget where videotoolbox
+        # cannot; the identical hardware path would fail identically, so only a
+        # lane switch helps. Any other violation — or a software encode that
+        # already overshot — re-raises loudly rather than looping or shipping an
+        # oversized file.
+        if not _should_retry_on_software(
+            used_hardware=started_on_hardware,
+            max_bytes=limits.max_bytes,
+            measured_size_bytes=measured_size,
+        ):
+            raise
+
+    _encode(use_hardware=False)
     try:
         _verify_output_within_limits(output_path, limits)
     except Exception:

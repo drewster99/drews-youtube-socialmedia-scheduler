@@ -738,7 +738,9 @@ async def update_video(video_id: str, data: dict):
 
     # A row with no YouTube video has nothing to update there, and calling
     # YouTube for one raises ValueError("not found") and 500s the whole edit.
-    is_youtube_backed = video_model.is_youtube_backed(before)
+    # NULL for a non-YouTube row; otherwise the id the YouTube API is addressed
+    # by — never the row PK (the id/PK conflation migration 037 banned).
+    youtube_id = video_model.youtube_video_id_of(before)
 
     def _youtube_field_changed() -> bool:
         """Has any YouTube-facing field actually changed?
@@ -765,7 +767,7 @@ async def update_video(video_id: str, data: dict):
         return False
 
     confirmed = None
-    if is_youtube_backed and _youtube_field_changed():
+    if youtube_id and _youtube_field_changed():
         await _bind_project_for_video(video_id)
         # Update on YouTube, then read back from YouTube to confirm. The
         # API can silently coerce values (privacy clamped on managed
@@ -775,7 +777,7 @@ async def update_video(video_id: str, data: dict):
         try:
             await asyncio.to_thread(
                 youtube.update_video_metadata,
-                video_id=video_id,
+                video_id=youtube_id,
                 title=data.get("title"),
                 description=data.get("description"),
                 tags=data.get("tags"),
@@ -786,7 +788,7 @@ async def update_video(video_id: str, data: dict):
             raise HTTPException(500, f"YouTube update failed: {e}")
 
         try:
-            fresh = await asyncio.to_thread(youtube.get_video, video_id)
+            fresh = await asyncio.to_thread(youtube.get_video, youtube_id)
             if fresh:
                 snippet = fresh.get("snippet") or {}
                 status = fresh.get("status") or {}
@@ -1423,8 +1425,11 @@ async def apply_description(video_id: str):
     if youtube_id:
         await _bind_project_for_video(video_id)
         try:
+            # Why: the YouTube API is addressed by the YouTube video id, never the
+            # row PK. Today they coincide for YouTube-backed rows, but the id/PK
+            # conflation is exactly what migration 037 banned — pass youtube_id.
             await asyncio.to_thread(
-                youtube.update_video_metadata, video_id, description=desc
+                youtube.update_video_metadata, youtube_id, description=desc
             )
         except Exception as e:
             raise HTTPException(500, f"YouTube update failed: {e}") from e

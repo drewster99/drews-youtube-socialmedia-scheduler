@@ -219,11 +219,12 @@ async def status_summary() -> dict:
     rows = await db.execute_fetchall(
         """
         SELECT j.id, j.queue_id, j.kind, j.status, j.progress_done,
-               j.progress_total, j.detail, j.last_error, q.name AS queue_name
+               j.progress_total, j.detail, j.last_error, q.name AS queue_name,
+               p.slug AS project_slug
           FROM smart_queue_reconcile_jobs j
           LEFT JOIN smart_queues q ON q.id = j.queue_id
-         WHERE j.status IN (?,?)
-            OR (j.status = ? AND j.finished_at > datetime('now','-1 day'))
+          LEFT JOIN projects p ON p.id = q.project_id
+         WHERE j.status IN (?,?,?)
          ORDER BY j.id
         """,
         (*_UNFINISHED, STATUS_FAILED),
@@ -233,6 +234,10 @@ async def status_summary() -> dict:
         entry = {
             "id": int(row["id"]),
             "queue_id": int(row["queue_id"]),
+            # The banner is app-wide, so a job carries its OWN project slug —
+            # the dismiss button used to guess it from the current URL and
+            # silently no-op when the user wasn't on that project's page.
+            "project_slug": row["project_slug"],
             "queue_name": row["queue_name"] or f"queue {row['queue_id']}",
             "kind": row["kind"],
             "label": KIND_LABELS.get(row["kind"], row["kind"]),
@@ -250,13 +255,21 @@ async def status_summary() -> dict:
     }
 
 
-async def dismiss_failed(job_id: int) -> None:
-    """Acknowledge a failed job so it stops occupying the banner."""
+async def dismiss_failed(job_id: int, queue_id: int) -> bool:
+    """Acknowledge a failed job so it stops occupying the banner.
+
+    Scoped to ``queue_id``: the caller has verified that queue belongs to the
+    project, so scoping the UPDATE here stops a job id from one queue being
+    dismissed through another queue's endpoint. Returns True when a row was
+    actually dismissed, so the route can 404 an id that isn't this queue's.
+    """
     async with write_transaction() as db:
-        await db.execute(
-            "UPDATE smart_queue_reconcile_jobs SET status = ? WHERE id = ? AND status = ?",
-            (STATUS_DONE, job_id, STATUS_FAILED),
+        cursor = await db.execute(
+            "UPDATE smart_queue_reconcile_jobs SET status = ? "
+            "WHERE id = ? AND queue_id = ? AND status = ?",
+            (STATUS_DONE, job_id, queue_id, STATUS_FAILED),
         )
+    return bool(cursor.rowcount)
 
 
 async def _claim_next_job() -> dict | None:

@@ -115,3 +115,46 @@ def test_a_threads_token_is_due_inside_a_week_not_outside() -> None:
     eight_days = {"expires_at": int(time.time()) + 8 * 24 * 3600}
     assert poster._token_is_due(six_days, window) is True
     assert poster._token_is_due(eight_days, window) is False
+
+
+async def test_sweep_skips_credentials_awaiting_reconnect(sweep_env) -> None:
+    """A credential already flagged needs_reauth cannot be fixed by refresh —
+    only a re-OAuth clears it — so the sweep must not retry it every 20 minutes
+    forever."""
+    monkeypatch = sweep_env
+    scheduler = importlib.import_module("yt_scheduler.services.scheduler")
+    social = importlib.import_module("yt_scheduler.services.social")
+    creds_mod = importlib.import_module("yt_scheduler.services.social_credentials")
+
+    attempted: list[str] = []
+
+    class _StubPoster:
+        token_refresh_window_secs = 0
+
+        async def refresh_if_stale(self, *, window_secs: int = 0) -> bool:
+            attempted.append("called")
+            return False
+
+    async def fake_list_credentials(**_kw):
+        return [
+            {"uuid": "u-live", "platform": "twitter", "label": "live",
+             "needs_reauth": False},
+            {"uuid": "u-dead", "platform": "twitter", "label": "dead",
+             "needs_reauth": True},
+        ]
+
+    got_uuids: list[str] = []
+
+    async def fake_get_poster(platform, uuid):
+        got_uuids.append(uuid)
+        return _StubPoster()
+
+    monkeypatch.setattr(creds_mod, "list_credentials", fake_list_credentials)
+    monkeypatch.setattr(social, "get_poster_for_uuid", fake_get_poster)
+
+    await scheduler.refresh_social_tokens_job()
+
+    # Only the live credential was even resolved to a poster; the dead one was
+    # skipped before any work.
+    assert got_uuids == ["u-live"]
+    assert attempted == ["called"]

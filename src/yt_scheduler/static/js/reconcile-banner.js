@@ -61,7 +61,8 @@
                 + ` — ${escapeText(job.queue_name)}: ${escapeText(job.label)}.`
                 + ` ${escapeText(job.error || 'no detail')}`
                 + ` <button type="button" class="btn btn-sm" data-dismiss-job="${job.id}"`
-                + ` data-queue="${job.queue_id}">Dismiss</button></span>`
+                + ` data-queue="${job.queue_id}"`
+                + ` data-project="${escapeText(job.project_slug || '')}">Dismiss</button></span>`
             );
         }
         banner.innerHTML = parts.join('<br>');
@@ -103,7 +104,7 @@
         if (!button) return;
         const jobId = button.getAttribute('data-dismiss-job');
         const queueId = button.getAttribute('data-queue');
-        const slug = (window.location.pathname.match(/\/projects\/([^/]+)/) || [])[1];
+        const slug = button.getAttribute('data-project');
         if (!slug) return;
         button.disabled = true;
         try {

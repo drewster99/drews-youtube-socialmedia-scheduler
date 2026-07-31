@@ -788,15 +788,30 @@ class TwitterPoster(SocialPoster):
     async def refresh_if_stale(self, *, window_secs: int = 0) -> bool:
         creds = await self._get_creds()
         uuid = creds.get("uuid")
-        # Need the rotating refresh token + the OAuth client id to refresh.
-        if not (uuid and creds.get("refresh_token") and creds.get("client_id")):
+        if not uuid:
             return False
         expires_at = int(creds.get("expires_at") or 0)
         # Skip only when we *know* it's still fresh. If the bundle predates the
-        # expires_at field (it's 0), refresh once anyway — that backfills the
-        # expiry so future sweeps behave normally and the bearer doesn't drift
-        # stale while waiting for a 401.
+        # expires_at field (it's 0), treat it as due: refreshing once backfills
+        # the expiry so future sweeps behave normally and the bearer doesn't
+        # drift stale while waiting for a 401.
         if expires_at and expires_at - window_secs > int(time.time()):
+            return False
+        # It IS due (or unknown). Renewal needs the rotating refresh token + the
+        # OAuth client id.
+        if not (creds.get("refresh_token") and creds.get("client_id")):
+            if expires_at:
+                # We KNOW it's at/near expiry and cannot renew — a manual bearer
+                # would have unknown (0) expiry, so this is an OAuth credential
+                # that lost its refresh token. Surface it instead of silently
+                # no-oping until every post starts failing with a 401.
+                raise CredentialAuthError(
+                    uuid,
+                    "Twitter access token is expiring and has no usable refresh "
+                    "token — reconnect Twitter in Settings.",
+                )
+            # Unknown expiry + no refresh capability = a manually-pasted bearer.
+            # Nothing is wrong and nothing can be refreshed; stay silent.
             return False
         from yt_scheduler.services.social_credentials import (
             clear_needs_reauth,
@@ -2338,15 +2353,32 @@ class ThreadsPoster(SocialPoster):
                     "Threads refresh returned no access_token. Reconnect Threads "
                     "in Settings.",
                 )
-            expires_in = int(data.get("expires_in") or self._TOKEN_TTL_FALLBACK_SECONDS)
+            raw_expires_in = data.get("expires_in")
+            try:
+                expires_in = int(raw_expires_in) if raw_expires_in is not None else None
+            except (TypeError, ValueError):
+                expires_in = None
             updated = dict(current)
             updated["access_token"] = new_token
+            if expires_in is None:
+                # The NEW token must not inherit the OLD token's expiry.
+                # stamp_token_metadata leaves a pre-existing expires_at untouched
+                # when given None, so clear it explicitly: unknown means unknown.
+                updated.pop("expires_at", None)
+            # None => record unknown, not a fabricated 60 days. A wrong long
+            # expiry is exactly what let a token die silently; _token_is_due
+            # treats unknown as due (bounded by Meta's 24h minimum), so renewal
+            # still happens on the next sweep.
             stamp_token_metadata(updated, expires_in_seconds=expires_in)
             await save_bundle("threads", uuid, updated)
             await clear_needs_reauth(uuid)
             _threads_refresh_dual_failures.pop(uuid, None)
-            logger.info("Threads token refreshed; valid for %.0f more days",
-                        expires_in / 86400)
+            if expires_in is not None:
+                logger.info("Threads token refreshed; valid for %.0f more days",
+                            expires_in / 86400)
+            else:
+                logger.info("Threads token refreshed; Meta reported no lifetime "
+                            "(expiry recorded as unknown).")
             return True
 
     async def _resolve_ambiguous_publish(

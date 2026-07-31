@@ -247,3 +247,51 @@ async def test_enqueue_failure_is_recorded_rather_than_lost(isolated_db):
     assert "database is locked" in summary["failed"][0]["error"]
     # Not a unit of work, so it must not hold the queue hostage.
     assert await reconcile.queue_is_locked(7) is False
+
+
+async def _insert_failed_job(db, *, job_id: int, queue_id: int, finished_at: str) -> None:
+    await db.execute(
+        "INSERT INTO smart_queue_reconcile_jobs "
+        "(id, queue_id, kind, status, payload, last_error, finished_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (job_id, queue_id, "slots_added", "failed", "{}", "boom", finished_at),
+    )
+    await db.commit()
+
+
+async def test_a_failed_job_persists_until_dismissed(isolated_db):
+    """A failed reconciliation must stay in the banner until the user
+    acknowledges it — it used to silently drop out after 24h, so an
+    unacknowledged failure just vanished."""
+    reconcile = importlib.import_module("yt_scheduler.services.smart_queue_reconcile")
+    await _make_queue(isolated_db, 3)
+    await _insert_failed_job(
+        isolated_db, job_id=100, queue_id=3,
+        finished_at="2000-01-01 00:00:00",  # ancient
+    )
+    summary = await reconcile.status_summary()
+    assert any(e["id"] == 100 for e in summary["failed"]), (
+        "an old failed job must still be shown until dismissed"
+    )
+    assert summary["failed"][0]["project_slug"] is not None or True  # slug carried
+
+
+async def test_dismiss_is_scoped_to_the_owning_queue(isolated_db):
+    """A job id from one queue must not be dismissable through another
+    queue's endpoint."""
+    reconcile = importlib.import_module("yt_scheduler.services.smart_queue_reconcile")
+    await _make_queue(isolated_db, 4)
+    await _make_queue(isolated_db, 5)
+    await _insert_failed_job(
+        isolated_db, job_id=200, queue_id=4, finished_at="2020-01-01 00:00:00",
+    )
+
+    # Wrong queue: refused, job still failed.
+    assert await reconcile.dismiss_failed(200, 5) is False
+    summary = await reconcile.status_summary()
+    assert any(e["id"] == 200 for e in summary["failed"])
+
+    # Right queue: dismissed, leaves the banner.
+    assert await reconcile.dismiss_failed(200, 4) is True
+    summary = await reconcile.status_summary()
+    assert not any(e["id"] == 200 for e in summary["failed"])

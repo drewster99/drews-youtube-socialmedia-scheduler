@@ -1585,7 +1585,14 @@ async def bluesky_callback(
         private_key_pem=pending.private_key_pem,
         access_token=tokens["access_token"],
         refresh_token=tokens.get("refresh_token", ""),
-        expires_in=int(tokens.get("expires_in") or 7200),
+        # Pass the issuer value straight through — no fabricated 7200. When
+        # Bluesky omits expires_in, credentialed_bundle records the expiry as
+        # unknown (NULL), and the staleness gate treats unknown as due, so the
+        # refresh-token-backed renewal still runs. A guessed lifetime is what
+        # let tokens die silently elsewhere.
+        expires_in=(
+            int(tokens["expires_in"]) if tokens.get("expires_in") is not None else None
+        ),
         dpop_nonce_as=pending.dpop_nonce_as,
     )
     cred = await _persist_oauth_credential(

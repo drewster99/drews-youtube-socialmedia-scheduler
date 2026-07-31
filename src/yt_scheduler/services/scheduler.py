@@ -1589,11 +1589,19 @@ async def refresh_social_tokens_job() -> None:
         return
 
     renewed = 0
+    skipped_reauth = 0
     for cred in creds:
         uuid = cred.get("uuid")
         platform = cred.get("platform")
         label = cred.get("label") or f"{platform}:{(uuid or '')[:8]}"
         if not uuid or not platform:
+            continue
+        # A credential already flagged needs_reauth is waiting on the user to
+        # reconnect — refresh cannot clear that flag, only a re-OAuth can. Left
+        # in, it was re-attempted every sweep forever, spending an API call on a
+        # dead credential each time and burying live work in the log.
+        if cred.get("needs_reauth"):
+            skipped_reauth += 1
             continue
         try:
             poster = await get_poster_for_uuid(platform, uuid)
@@ -1616,6 +1624,11 @@ async def refresh_social_tokens_job() -> None:
             logger.warning("Token refresh sweep: transient error on %s — %s", label, exc)
     if renewed:
         logger.info("Token refresh sweep: renewed %d credential(s)", renewed)
+    if skipped_reauth:
+        logger.info(
+            "Token refresh sweep: skipped %d credential(s) awaiting reconnect",
+            skipped_reauth,
+        )
 
 
 # F2: per-social-post debug traces (templates.render output) are kept

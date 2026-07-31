@@ -652,7 +652,12 @@ async function dismissProposal(kind, idx, p) {
         showError(body.detail || `Could not save dismissal (HTTP ${resp.status}).`);
         return;
     }
-    (activeProposals[kind] || []).splice(idx, 1);
+    // Remove by identity, not the idx captured at click time: another
+    // dismiss (or a re-render) may have reordered the array while this POST
+    // was in flight, and a stale index splices the wrong card.
+    const list = activeProposals[kind] || [];
+    const at = list.indexOf(p);
+    if (at >= 0) list.splice(at, 1);
     renderProposals();
     await loadRejections();
 }

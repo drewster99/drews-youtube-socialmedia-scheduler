@@ -1598,8 +1598,9 @@ async def store_rejections(
                 """INSERT INTO generate_rejections (
                     parent_id, project_id, kind, start_seconds, end_seconds,
                     title, reason, x_shift_normalized,
-                    crop_classification, crop_confidence
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    crop_classification, crop_confidence,
+                    audio_fade_in, audio_fade_out
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(parent_id, project_id, kind, start_seconds, end_seconds)
                 DO UPDATE SET
                     title = excluded.title,
@@ -1607,6 +1608,8 @@ async def store_rejections(
                     x_shift_normalized = excluded.x_shift_normalized,
                     crop_classification = excluded.crop_classification,
                     crop_confidence = excluded.crop_confidence,
+                    audio_fade_in = excluded.audio_fade_in,
+                    audio_fade_out = excluded.audio_fade_out,
                     rejected_at = datetime('now')""",
                 (
                     parent_id, project_id, kind, start, end,
@@ -1615,6 +1618,8 @@ async def store_rejections(
                     _maybe_float(entry.get("x_shift_normalized")),
                     _maybe_str(entry.get("crop_classification")),
                     _maybe_float(entry.get("crop_confidence")),
+                    _maybe_float(entry.get("audio_fade_in")),
+                    _maybe_float(entry.get("audio_fade_out")),
                 ),
             )
             written += 1
@@ -1641,6 +1646,7 @@ async def list_rejections(
     rows = await db.execute_fetchall(
         "SELECT id, kind, start_seconds, end_seconds, title, reason, "
         "x_shift_normalized, crop_classification, crop_confidence, "
+        "audio_fade_in, audio_fade_out, "
         "rejected_at "
         "FROM generate_rejections "
         "WHERE parent_id = ? AND project_id = ? "

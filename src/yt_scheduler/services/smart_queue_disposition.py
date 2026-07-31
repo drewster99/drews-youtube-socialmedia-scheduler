@@ -154,19 +154,21 @@ async def _reschedule_to_end(queue_id: int, item_id: int, post_id: int) -> dict:
     from yt_scheduler.services.scheduler import schedule_social_post
 
     queue = await queue_service.get_queue(queue_id)
-    db = await get_db()
     when = (await queue_service.next_free_posting_times(queue, 1))[0]
 
-    positions = await db.execute_fetchall(
-        "SELECT COALESCE(MAX(position), -1) AS last FROM smart_queue_items "
-        "WHERE queue_id = ?",
-        (queue_id,),
-    )
     async with write_transaction() as write_db:
+        # Position is computed INSIDE the write transaction (BEGIN IMMEDIATE),
+        # not read beforehand: reading MAX(position) first let auto-add insert a
+        # new tail between the read and the write, so both landed on the same
+        # position. Auto-add already computes its position in-statement for the
+        # same reason; this matches it, without a UNIQUE constraint that would
+        # turn a duplicate into a hard failure.
         await write_db.execute(
-            "UPDATE smart_queue_items SET scheduled_at = ?, position = ?, "
+            "UPDATE smart_queue_items SET scheduled_at = ?, "
+            "position = (SELECT COALESCE(MAX(position), -1) + 1 "
+            "            FROM smart_queue_items WHERE queue_id = ?), "
             "state = 'scheduled', reason = NULL WHERE id = ?",
-            (when.isoformat(), int(positions[0]["last"]) + 1, item_id),
+            (when.isoformat(), queue_id, item_id),
         )
         # Status predicate is load-bearing. The missed screen is stale by
         # definition — it lists overdue posts, which is exactly what restart

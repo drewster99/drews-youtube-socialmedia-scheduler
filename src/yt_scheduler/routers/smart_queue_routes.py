@@ -363,7 +363,12 @@ async def dismiss_reconcile_failure(slug: str, queue_id: int, job_id: int):
     **Response 200** — ``{"status": "ok"}``.
     """
     await _queue_in_project_or_404(slug, queue_id)
-    await smart_queue_reconcile.dismiss_failed(job_id)
+    dismissed = await smart_queue_reconcile.dismiss_failed(job_id, queue_id)
+    if not dismissed:
+        raise HTTPException(
+            404,
+            f"No failed reconcile job {job_id} on this schedule to dismiss.",
+        )
     return {"status": "ok"}
 
 
@@ -491,7 +496,10 @@ async def queue_activity(slug: str, queue_id: int, limit: int = 10):
          WHERE i.queue_id = ?
     """
     upcoming = await db.execute_fetchall(
-        base + " AND p.status NOT IN ('posted','skipped')"
+        # 'failed' is recent activity, not upcoming work — it won't auto-post
+        # from here (it lives in the failed-sends banner for manual action), so
+        # excluding it stops a failed post showing in BOTH buckets at once.
+        base + " AND p.status NOT IN ('posted','skipped','failed')"
         " ORDER BY p.scheduled_at IS NULL, p.scheduled_at LIMIT ?",
         (queue_id, limit),
     )

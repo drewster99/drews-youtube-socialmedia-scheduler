@@ -334,3 +334,20 @@ async def test_refresh_needs_a_token_to_refresh(social, meta, stored):
     calls, _ = meta
     assert await social.ThreadsPoster(bundle={"uuid": "u"}).refresh_if_stale() is False
     assert calls == []
+
+
+async def test_a_refresh_without_a_stated_lifetime_records_unknown(social, meta, stored):
+    """Meta omitting expires_in on refresh must record NO expiry (unknown),
+    not a fabricated 60 days — and the fresh token must not inherit the old
+    token's expiry either."""
+    calls, state = meta
+    state["payload"] = {"access_token": "new-token"}  # no expires_in
+    creds = dict(CREDS, expires_at=int(time.time()) + 60)  # a real, soon-to-die expiry
+
+    assert await social.ThreadsPoster(bundle=creds).refresh_if_stale(
+        window_secs=7 * 24 * 3600) is True
+
+    assert stored["bundle"]["access_token"] == "new-token"
+    assert stored["bundle"]["acquired_at"] <= int(time.time())
+    # No fabricated expiry, and the old one is gone — unknown means unknown.
+    assert stored["bundle"].get("expires_at") is None

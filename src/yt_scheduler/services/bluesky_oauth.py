@@ -597,7 +597,7 @@ def credentialed_bundle(
     private_key_pem: str,
     access_token: str,
     refresh_token: str,
-    expires_in: int,
+    expires_in: int | None,
     dpop_nonce_as: str | None = None,
 ) -> dict:
     """Shape the bundle written into Keychain after a successful OAuth.
@@ -610,8 +610,13 @@ def credentialed_bundle(
     token, refresh) and ``dpop_nonce_pds`` for the PDS (uploadBlob,
     createRecord). Reusing one server's nonce against the other forces
     an extra round-trip per request.
+
+    ``expires_in`` is the issuer-reported token lifetime in seconds, or
+    ``None``/``0`` when the issuer omitted it. A missing lifetime records NO
+    ``expires_at`` (unknown) rather than a fabricated one — see the stamping
+    call below.
     """
-    return {
+    bundle = {
         "auth_method": "oauth",
         "handle": handle,
         "did": did,
@@ -622,11 +627,26 @@ def credentialed_bundle(
         "private_key_pem": private_key_pem,
         "access_token": access_token,
         "refresh_token": refresh_token,
-        "acquired_at": int(time.time()),
-        "expires_at": int(time.time()) + int(expires_in or 7200),
         "dpop_nonce_as": dpop_nonce_as,
         "dpop_nonce_pds": None,
     }
+    # Why: route token-metadata stamping through the single source of mutation
+    # (``stamp_token_metadata``) instead of hand-computing ``expires_at``. When
+    # the issuer omits ``expires_in`` we record NOTHING — ``expires_at`` stays
+    # absent, meaning "unknown" — rather than inventing a 2-hour lifetime. A
+    # fabricated expiry is worse than an absent one: the refresh sweep would
+    # then wait confidently past a token that actually died sooner. This is safe
+    # for Bluesky specifically because ``BlueskyPoster.refresh_if_stale`` treats
+    # an absent/0 ``expires_at`` as due, and Bluesky refresh is non-destructive
+    # (it holds a refresh token), so unknown-as-due costs at most one extra
+    # refresh — never a stranded credential.
+    from yt_scheduler.services.social_credentials import stamp_token_metadata
+
+    stamp_token_metadata(
+        bundle,
+        expires_in_seconds=int(expires_in) if expires_in else None,
+    )
+    return bundle
 
 
 def parse_handle_from_redirect_uri(redirect_uri: str) -> str | None:
