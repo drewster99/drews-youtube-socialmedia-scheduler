@@ -68,14 +68,14 @@ _GENERATE_MAX_PARENT_SECONDS: float = 4 * 60 * 60  # 4 hours
 async def _existing_promo_dedup_info(
     parent_id: str, project_id: int,
 ) -> tuple[dict[str, list[tuple[float, float]]], dict[str, list[str]]]:
-    """Per-kind cut ranges AND titles of clips already on this parent.
+    """Per-kind ranges + titles that Generate must not re-propose.
 
-    Ranges feed Generate's overlap filter. Titles feed its duplicate-title
-    filter, which exists because imported clips (e.g. re-imported from
-    YouTube) have NULL cut ranges — their boundaries within the parent are
-    unknowable — making them invisible to the range check. Without the title
-    signal, Generate happily re-proposes the exact moment an imported clip
-    already covers."""
+    Ranges feed the overlap filter and come from clips actually CUT onto this
+    parent. Titles feed the duplicate-title filter and the prompt's "already
+    covered" list, and come from two sources: cut clips (imported clips carry
+    NULL ranges, so the title is their only dedup signal), AND previously
+    DISMISSED proposals (generate_rejections) — so re-running Generate doesn't
+    hand back a clip the user already rejected."""
     db = await get_db()
     rows = await db.execute_fetchall(
         "SELECT item_type, cut_start_seconds, cut_end_seconds, title "
@@ -95,6 +95,26 @@ async def _existing_promo_dedup_info(
         title = (r["title"] or "").strip()
         if title:
             titles[kind].append(title)
+
+    # Previously-dismissed proposals count as "already covered" too: their
+    # TITLES join the do-not-repeat list so a re-run doesn't re-propose a clip
+    # the user already threw away. Only titles, not ranges — a rejection is a
+    # verdict on one framing of a moment, not a permanent ban on the region
+    # (hard-blocking every dismissed range would let "dismiss all + re-run"
+    # produce zero proposals). Ranges stay sourced from cut clips alone.
+    rejections = await db.execute_fetchall(
+        "SELECT kind, title FROM generate_rejections "
+        "WHERE parent_id = ? AND project_id = ?",
+        (parent_id, project_id),
+    )
+    for r in rejections:
+        kind = r["kind"]
+        if kind not in titles:
+            continue
+        title = (r["title"] or "").strip()
+        if title:
+            titles[kind].append(title)
+
     return ranges, titles
 
 

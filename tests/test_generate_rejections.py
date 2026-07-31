@@ -322,3 +322,33 @@ def test_audio_fades_round_trip_so_a_restored_clip_keeps_its_ramps(
     assert len(rejections) == 1
     assert rejections[0]["audio_fade_in"] == pytest.approx(0.42)
     assert rejections[0]["audio_fade_out"] == pytest.approx(0.31)
+
+@pytest.mark.asyncio
+async def test_dismissed_titles_feed_the_do_not_repeat_list(isolated_db):
+    """A dismissed clip's title must reach the next Generate's dedup titles, so
+    a re-run doesn't re-propose a clip the user already threw away. Ranges are
+    deliberately NOT hard-blocked — only titles."""
+    import importlib
+
+    clipper = importlib.import_module("yt_scheduler.services.clipper")
+    promo_routes = importlib.import_module("yt_scheduler.routers.promo_routes")
+
+    await isolated_db.execute(
+        "INSERT INTO videos (id, project_id, title, status) "
+        "VALUES ('PARENTDEDUP1', 1, 'Parent', 'ready')"
+    )
+    await isolated_db.commit()
+
+    await clipper.store_rejections(
+        parent_id="PARENTDEDUP1", project_id=1,
+        rejected=[{"kind": "hook", "start_seconds": 100.0, "end_seconds": 118.0,
+                   "title": "A Dismissed Hook"}],
+    )
+
+    ranges, titles = await promo_routes._existing_promo_dedup_info("PARENTDEDUP1", 1)
+    assert "A Dismissed Hook" in titles["hook"], (
+        "a dismissed title must be in the do-not-repeat list for the next run"
+    )
+    # Ranges are NOT sourced from rejections — no hard region block.
+    assert ranges["hook"] == []
+
