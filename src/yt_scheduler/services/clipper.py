@@ -94,6 +94,23 @@ MAX_PROPOSALS_PER_KIND_CAP: int = 50
 # How many proposals to request per kind when the caller didn't say. Read it
 # through ``default_max_proposals_for_kind``, never directly.
 _DEFAULT_MAX_PER_KIND: dict[ClipKind, int] = {"hook": 20, "short": 15, "segment": 8}
+
+# Output budget for one proposal call, derived rather than picked: a proposal
+# costs ~120 output tokens (measured), so a full batch at the cap needs ~6k.
+#
+# The ceiling is not ours to choose freely. The Anthropic SDK refuses a
+# NON-STREAMING request whose max_tokens implies more than ten minutes of
+# generation — ``3600 * max_tokens / 128_000 > 600``, i.e. anything above
+# ~21,333 — and it raises locally, so the request never leaves the machine.
+# Its per-model table is stricter still, capping some Opus models at 8,192.
+# We stay under the tighter of the two so the call keeps working whatever
+# model Settings points at. A 25,000 budget broke every generate run this way.
+_OUTPUT_TOKENS_PER_PROPOSAL: int = 200
+_MAX_NONSTREAMING_OUTPUT_TOKENS: int = 8_000
+PROPOSAL_MAX_OUTPUT_TOKENS: int = min(
+    MAX_PROPOSALS_PER_KIND_CAP * _OUTPUT_TOKENS_PER_PROPOSAL,
+    _MAX_NONSTREAMING_OUTPUT_TOKENS,
+)
 # When a kind already has cut clips on this parent, we ask Claude for a few
 # extra candidates so that after post-LLM dedup/overlap removal we still have a
 # full set of fresh ones. The final output is still capped at the base max.
@@ -797,10 +814,7 @@ async def propose_clips_for_kind_indexed(
     model = await ai._resolve_model()
     kwargs: dict[str, object] = {
         "model": model,
-        # Headroom, not a target: at the observed ~120 output tokens per
-        # proposal even MAX_PROPOSALS_PER_KIND_CAP lands nowhere near this, so a
-        # full set can never be truncated mid-JSON.
-        "max_tokens": 25000,
+        "max_tokens": PROPOSAL_MAX_OUTPUT_TOKENS,
         "system": system_text,
         "messages": [{"role": "user", "content": user_text}],
         "tools": [_INDEX_PROPOSAL_TOOL],

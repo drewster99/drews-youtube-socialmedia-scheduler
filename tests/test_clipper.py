@@ -576,3 +576,40 @@ def test_generate_job_payload_omits_private_fields():
     assert "cuts_total" not in public
     for key in ("rejected", "raw_counts", "kind_errors"):
         assert key in public, f"{key} must reach the browser"
+
+
+def test_proposal_budget_is_accepted_by_the_sdk_without_streaming():
+    """max_tokens must clear the SDK's own non-streaming guard.
+
+    Regression: a 25,000-token budget raised `ValueError: Streaming is
+    required for operations that may take longer than 10 minutes` locally —
+    the request never left the machine, and every kind of every generate run
+    failed. The SDK's rule is `3600 * max_tokens / 128_000 > 600` (~21,333),
+    with a stricter per-model table on top.
+
+    Asserted by calling the SDK's own calculation rather than restating the
+    arithmetic, so a tightened rule fails here instead of in production.
+    """
+    import anthropic
+    from anthropic._constants import MODEL_NONSTREAMING_TOKENS
+
+    from yt_scheduler.services.clipper import PROPOSAL_MAX_OUTPUT_TOKENS
+
+    client = anthropic.Anthropic(api_key="test-key-never-used-no-network")
+    # Every model the SDK special-cases, plus the unlisted (default) case.
+    for model in [None, *MODEL_NONSTREAMING_TOKENS]:
+        client._calculate_nonstreaming_timeout(
+            PROPOSAL_MAX_OUTPUT_TOKENS,
+            MODEL_NONSTREAMING_TOKENS.get(model) if model else None,
+        )
+
+
+def test_proposal_budget_covers_a_full_batch_at_the_cap():
+    """~120 output tokens per proposal measured; the budget must hold a full
+    batch or a maxed-out run silently comes back short."""
+    from yt_scheduler.services.clipper import (
+        MAX_PROPOSALS_PER_KIND_CAP,
+        PROPOSAL_MAX_OUTPUT_TOKENS,
+    )
+
+    assert PROPOSAL_MAX_OUTPUT_TOKENS >= MAX_PROPOSALS_PER_KIND_CAP * 120
