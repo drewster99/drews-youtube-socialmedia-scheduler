@@ -1114,10 +1114,11 @@ async def propose_clips_for_kind_indexed(
         # Answer every check in ONE user turn, so a batch of parallel checks
         # costs a single round-trip rather than one apiece.
         results = []
+        passed = 0
         for block in check_blocks:
             args = getattr(block, "input", None) or {}
             try:
-                verdict = check_clip_range(
+                rc = check_clip_range(
                     kind=kind, units=units,
                     first_index=int(args["first_index"]),
                     last_index=int(args["last_index"]),
@@ -1125,7 +1126,9 @@ async def propose_clips_for_kind_indexed(
                     parent_duration_seconds=parent_duration_seconds,
                     existing_ranges=existing_ranges,
                     existing_titles=list(existing_titles or []),
-                ).text
+                )
+                verdict = rc.text
+                passed += 1 if rc.passed else 0
             except (KeyError, TypeError, ValueError) as exc:
                 verdict = (
                     f"Check - result:\n  FAIL: could not read the range you sent "
@@ -1156,8 +1159,10 @@ async def propose_clips_for_kind_indexed(
             {"role": "user", "content": content},
         ]
         logger.info(
-            "Clip-proposal (index) %s round %d: answered %d check_range call%s",
+            "Clip-proposal (index) %s round %d: answered %d check_range call%s "
+            "(%d passed, %d failed)",
             kind, round_number, len(results), "" if len(results) == 1 else "s",
+            passed, len(results) - passed,
         )
 
     if entries is None:
