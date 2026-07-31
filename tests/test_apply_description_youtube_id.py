@@ -135,3 +135,61 @@ async def test_update_video_metadata_targets_youtube_id_not_row_pk(
         "The post-update read-back must also query by youtube_video_id, not the "
         f"row PK; got {read_back_from!r}"
     )
+
+
+# --- L13: the same rule applied to every other youtube.* call site ---
+
+@pytest.mark.asyncio
+async def test_list_captions_targets_youtube_id(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row_pk = "ROWPK_CAP01_22charlong"
+    youtube_id = "YTCAP00001"
+    await _seed_video(id=row_pk, project_id=1, title="T", status="ready",
+                      youtube_video_id=youtube_id)
+    called_with: list[object] = []
+    from yt_scheduler.routers import video_routes
+    monkeypatch.setattr(video_routes.youtube, "list_captions",
+                        lambda vid, *a, **k: called_with.append(vid) or [])
+    resp = client.get(f"/api/videos/{row_pk}/captions")
+    assert resp.status_code == 200, resp.text
+    assert called_with == [youtube_id]
+
+
+@pytest.mark.asyncio
+async def test_list_captions_refuses_a_non_youtube_row(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local-only item has no YouTube video — the call must 400, not fire a
+    YouTube request against the row PK."""
+    row_pk = "LOCALONLY01_22charlong"
+    await _seed_video(id=row_pk, project_id=1, title="T", status="ready")  # no youtube_video_id
+    fired: list[object] = []
+    from yt_scheduler.routers import video_routes
+    monkeypatch.setattr(video_routes.youtube, "list_captions",
+                        lambda vid, *a, **k: fired.append(vid) or [])
+    resp = client.get(f"/api/videos/{row_pk}/captions")
+    assert resp.status_code == 400
+    assert fired == [], "must not call YouTube for a local-only item"
+
+
+@pytest.mark.asyncio
+async def test_video_detail_fetches_youtube_by_id_and_skips_local_only(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from yt_scheduler.routers import video_routes
+    got: list[object] = []
+    monkeypatch.setattr(video_routes.youtube, "get_video",
+                        lambda vid, *a, **k: got.append(vid) or {"id": vid})
+
+    yt_pk, yt_id = "ROWPK_DET01_22charlong", "YTDET00001"
+    await _seed_video(id=yt_pk, project_id=1, title="T", status="ready",
+                      youtube_video_id=yt_id)
+    assert client.get(f"/api/videos/{yt_pk}").status_code == 200
+    assert got == [yt_id], "youtube-backed detail must fetch by youtube_video_id"
+
+    got.clear()
+    local_pk = "LOCALDET01_22charlong"
+    await _seed_video(id=local_pk, project_id=1, title="T", status="ready")
+    assert client.get(f"/api/videos/{local_pk}").status_code == 200
+    assert got == [], "a local-only item must not fire a YouTube fetch at all"

@@ -55,6 +55,28 @@ async def _bind_project_for_video(video_id: str) -> None:
         set_active_project(project["slug"])
 
 
+async def _youtube_id_for(video_id: str) -> str | None:
+    """The YouTube video id for a row, or None when the row isn't YouTube-backed.
+
+    The YouTube Data API is addressed by the YouTube video id, which lives in
+    ``videos.youtube_video_id`` (migration 037) — NOT the row's primary key.
+    They hold the same value for rows created by a YouTube upload, so passing
+    the PK works today; but a row's kind is stored, never inferred from the
+    shape of its id, and the day the two diverge the PK would target the wrong
+    video on the channel. Resolve through here so every YouTube call reads the
+    id from the column. 404s a missing row; returns None for a local-only item.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT youtube_video_id FROM videos WHERE id = ?", (video_id,)
+    )
+    if not rows:
+        raise HTTPException(404, "Video not found")
+    # dict(): youtube_video_id_of does a key-membership check, and `in` on an
+    # aiosqlite Row tests values, not column names.
+    return video_model.youtube_video_id_of(dict(rows[0]))
+
+
 _BACKEND_TO_SOURCE = {
     "mlx-whisper": "mlx_whisper",
     "whisper.cpp": "whispercpp",
@@ -256,10 +278,12 @@ async def get_video(video_id: str):
     # blocking inline meant every other concurrent request paused).
     yt_data = None
     yt_error: str | None = None
-    try:
-        yt_data = await asyncio.to_thread(youtube.get_video, video_id)
-    except Exception as e:
-        yt_error = str(e)
+    yt_id = video_model.youtube_video_id_of(row)
+    if yt_id:
+        try:
+            yt_data = await asyncio.to_thread(youtube.get_video, yt_id)
+        except Exception as e:
+            yt_error = str(e)
 
     # Auto-sync local DB from YouTube. Whenever the canonical fields
     # (title, description, tags, privacy_status) drift on YouTube — the
@@ -518,8 +542,11 @@ async def upload_video(payload: dict = Body(...)):
     # Set thumbnail if provided
     thumbnail_error = None
     if thumbnail_path:
+        yt_id = await _youtube_id_for(video_id)
         try:
-            await asyncio.to_thread(youtube.set_thumbnail, video_id, thumbnail_path)
+            if not yt_id:
+                raise ValueError("this item has no YouTube video to set a thumbnail on")
+            await asyncio.to_thread(youtube.set_thumbnail, yt_id, thumbnail_path)
         except Exception as e:
             thumbnail_error = str(e)
 
@@ -976,13 +1003,14 @@ async def transcribe_video(
             )
 
         if confirm_unlist:
+            yt_id = video_model.youtube_video_id_of(video)
             try:
                 await asyncio.to_thread(
-                    youtube.set_video_privacy, video_id, "unlisted"
+                    youtube.set_video_privacy, yt_id, "unlisted"
                 )
             except Exception as exc:
                 raise HTTPException(
-                    400, f"Could not flip {video_id} to unlisted: {exc}"
+                    400, f"Could not flip {yt_id} to unlisted: {exc}"
                 ) from exc
             # Match the metadata-edit path: when privacy drops away from
             # public, the lifecycle ``status`` column must follow or the
@@ -1004,7 +1032,8 @@ async def transcribe_video(
 
         try:
             downloaded = await asyncio.to_thread(
-                youtube.download_video_file, video_id, UPLOAD_DIR
+                youtube.download_video_file,
+                video_model.youtube_video_id_of(video), UPLOAD_DIR,
             )
         except youtube.PrivateVideoError as exc:
             raise HTTPException(
@@ -1626,8 +1655,11 @@ async def cancel_schedule_social(video_id: str):
 async def list_captions(video_id: str):
     """List available caption tracks."""
     await _bind_project_for_video(video_id)
+    yt_id = await _youtube_id_for(video_id)
+    if not yt_id:
+        raise HTTPException(400, "This item has no YouTube video, so it has no captions.")
     try:
-        return await asyncio.to_thread(youtube.list_captions, video_id)
+        return await asyncio.to_thread(youtube.list_captions, yt_id)
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -1672,8 +1704,14 @@ async def set_thumbnail(video_id: str, file: UploadFile = File(...)):
     await asyncio.to_thread(_copy_thumbnail, file.file, tmp_path)
 
     await _bind_project_for_video(video_id)
+    yt_id = await _youtube_id_for(video_id)
+    if not yt_id:
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(
+            400, "This item has no YouTube video to set a thumbnail on."
+        )
     try:
-        await asyncio.to_thread(youtube.set_thumbnail, video_id, tmp_path)
+        await asyncio.to_thread(youtube.set_thumbnail, yt_id, tmp_path)
     except Exception as e:
         tmp_path.unlink(missing_ok=True)
         raise HTTPException(500, f"Failed to set thumbnail: {e}")
@@ -1750,8 +1788,13 @@ async def push_thumbnail_to_youtube(video_id: str):
         raise HTTPException(400, "No local thumbnail to push.")
 
     await _bind_project_for_video(video_id)
+    yt_id = await _youtube_id_for(video_id)
+    if not yt_id:
+        raise HTTPException(
+            400, "This item has no YouTube video to push a thumbnail to."
+        )
     try:
-        await asyncio.to_thread(youtube.set_thumbnail, video_id, Path(local))
+        await asyncio.to_thread(youtube.set_thumbnail, yt_id, Path(local))
     except Exception as exc:
         raise HTTPException(500, f"Failed to push thumbnail: {exc}") from exc
 
