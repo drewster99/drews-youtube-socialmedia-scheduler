@@ -300,7 +300,7 @@ async def test_propose_all_clips_dispatches_each_kind(monkeypatch: pytest.Monkey
 
     async def fake_propose(*, kind, **kw):
         calls.append(kind)
-        return []
+        return clipper.KindProposals(kind=kind, accepted=[], rejected=[], raw_count=0)
 
     monkeypatch.setattr(clipper, "propose_clips_for_kind_indexed", fake_propose)
     await clipper.propose_all_clips(

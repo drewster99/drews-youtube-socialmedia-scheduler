@@ -138,13 +138,20 @@ def test_preview_returns_job_id_and_eligibility(
     from yt_scheduler.services import clipper
 
     async def fake_propose(**kwargs):
+        hook = clipper.ProposedClip(
+            kind="hook", start_seconds=10.0, end_seconds=25.0,
+            title="A great hook", reason="because",
+        )
         return {
-            "hook": [clipper.ProposedClip(
-                kind="hook", start_seconds=10.0, end_seconds=25.0,
-                title="A great hook", reason="because",
-            )],
-            "short": [],
-            "segment": [],
+            "hook": clipper.KindProposals(
+                kind="hook", accepted=[hook], rejected=[], raw_count=1,
+            ),
+            "short": clipper.KindProposals(
+                kind="short", accepted=[], rejected=[], raw_count=0,
+            ),
+            "segment": clipper.KindProposals(
+                kind="segment", accepted=[], rejected=[], raw_count=0,
+            ),
         }
     monkeypatch.setattr(clipper, "propose_all_clips", fake_propose)
 
