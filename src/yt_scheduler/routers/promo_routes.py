@@ -441,7 +441,7 @@ async def _sweep_missing_thumbnails(parent_id: str, project_id: int) -> None:
     rows = await db.execute_fetchall(
         "SELECT id FROM videos "
         "WHERE parent_item_id = ? AND project_id = ? "
-        "AND thumbnail_path IS NULL AND LENGTH(id) = 11 "
+        "AND thumbnail_path IS NULL AND youtube_video_id IS NOT NULL "
         "AND COALESCE(youtube_deleted, 0) = 0 "
         "AND COALESCE(LOWER(status), '') != 'published'",
         (parent_id, project_id),

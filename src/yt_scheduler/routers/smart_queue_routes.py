@@ -18,6 +18,7 @@ from yt_scheduler.services import projects as project_service
 from yt_scheduler.services import smart_queue as smart_queue_service
 from yt_scheduler.services import smart_queue_accept
 from yt_scheduler.services import smart_queue_disposition
+from yt_scheduler.services.smart_queue_accept import accept_lock
 from yt_scheduler.services import smart_queue_reconcile
 from yt_scheduler.services.smart_queue import SmartQueueError
 
@@ -44,6 +45,30 @@ async def _queue_in_project_or_404(slug: str, queue_id: int) -> dict:
         # another project should not be confirmed to exist by the error.
         raise HTTPException(404, f"Smart queue {queue_id} not found in {slug!r}")
     return queue
+
+
+def _integrity_message(exc: sqlite3.IntegrityError, data: dict) -> str:
+    """Turn a constraint violation into the message that actually applies.
+
+    Every IntegrityError used to render as "already has a schedule named X",
+    which is wrong for a NOT NULL violation and wrong for a duplicate slot —
+    and sends the user to fix a field that isn't the problem.
+    """
+    text = str(exc)
+    if "NOT NULL" in text and "max_duration_seconds" in text:
+        return (
+            "Maximum clip length is required — enter a number of seconds. "
+            "(Leaving it blank to mean \"no maximum\" isn't supported yet.)"
+        )
+    if "NOT NULL" in text:
+        column = text.rsplit(".", 1)[-1].strip()
+        return f"{column} is required."
+    if "UNIQUE" in text and "smart_queue_slots" in text:
+        return "That weekday and time is already a slot on this schedule."
+    if "UNIQUE" in text:
+        name = (data.get("name") or "").strip()
+        return f"This project already has a smart schedule named {name!r}."
+    return f"That change conflicts with an existing record: {exc}"
 
 
 async def _require_not_reconciling(queue_id: int) -> None:
@@ -135,12 +160,7 @@ async def create_smart_queue(slug: str, data: dict):
     except SmartQueueError as exc:
         raise HTTPException(400, str(exc)) from exc
     except sqlite3.IntegrityError as exc:
-        # The only uniqueness constraint here is (project_id, name).
-        raise HTTPException(
-            400,
-            f"This project already has a smart schedule named "
-            f"{(data.get('name') or '').strip()!r}.",
-        ) from exc
+        raise HTTPException(400, _integrity_message(exc, data)) from exc
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(400, f"Invalid smart queue payload: {exc}") from exc
     return await smart_queue_service.get_queue(queue_id)
@@ -155,6 +175,10 @@ async def update_smart_queue(slug: str, queue_id: int, data: dict):
         await smart_queue_service.update_queue(queue_id, data)
     except SmartQueueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    except sqlite3.IntegrityError as exc:
+        # Previously absent entirely, so clearing "max duration" (NOT NULL in
+        # the schema, None everywhere above it) produced a raw 500.
+        raise HTTPException(400, _integrity_message(exc, data)) from exc
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(400, f"Invalid smart queue payload: {exc}") from exc
     return await smart_queue_service.get_queue(queue_id)
@@ -431,10 +455,18 @@ async def dispose_missed(slug: str, queue_id: int, post_id: int, data: dict):
     others with it, and the right answer can differ per platform.
     """
     await _queue_in_project_or_404(slug, queue_id)
+    # Guarded like every other queue mutation: reschedule-to-end reads
+    # MAX(position) and the next free slot, so running it beside an Accept or
+    # a reconcile sweep double-books.
+    await _require_not_reconciling(queue_id)
     try:
-        return await smart_queue_disposition.dispose(
-            queue_id, post_id, (data or {}).get("action") or ""
-        )
+        async with accept_lock(queue_id):
+            return await smart_queue_disposition.dispose(
+                queue_id, post_id, (data or {}).get("action") or ""
+            )
+    except smart_queue_disposition.PostNoLongerDisposable as exc:
+        # 409, not 400: the request was valid when the page rendered.
+        raise HTTPException(409, str(exc)) from exc
     except SmartQueueError as exc:
         raise HTTPException(400, str(exc)) from exc
 

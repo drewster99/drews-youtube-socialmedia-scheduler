@@ -1060,12 +1060,46 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
             400, f"{post['platform']} is not configured. Add credentials in Settings."
         )
 
+    # Claim atomically, exactly as the scheduler side does. Without it, a manual
+    # Send racing a firing DateTrigger for the same post publishes twice: both
+    # read status='approved', both post, both write 'posted' — one row, two live
+    # posts. The claim machinery existed and was used on one side only.
+    from yt_scheduler.services.scheduler import _claim_post_for_send
+
+    if not await _claim_post_for_send(post_id):
+        raise HTTPException(
+            409,
+            "That post is already being sent, or has been. Refresh to see its "
+            "current state.",
+        )
+
     try:
         result = await poster.post(
             post["content"],
             media_paths=_decode_media_paths(post),
         )
-        await mark_posted(post_id, post_url=result.get("url", ""))
+        # Its own handler: if recording raises, the post is ALREADY live. The
+        # outer handler would write status='failed' with a database error,
+        # inviting a re-send that the duplicate guard cannot catch (the row is
+        # then neither 'posted' nor 'sending').
+        try:
+            await mark_posted(post_id, post_url=result.get("url", ""))
+        except Exception as record_exc:
+            logger.exception(
+                "Post %s went out on %s but could not be recorded",
+                post_id, post["platform"],
+            )
+            async with write_transaction() as _db:
+                await _db.execute(
+                    "UPDATE social_posts SET status = 'posted', error = ? WHERE id = ?",
+                    ("Sent, but recording the result failed — the post IS live. "
+                     "Do not send it again.", post_id),
+                )
+            raise HTTPException(
+                500,
+                f"The {post['platform']} post went out, but recording it failed. "
+                "It is marked posted — do not send it again.",
+            ) from record_exc
         from datetime import datetime as _dt, timezone as _tz
         await events.record_event(
             post["video_id"],
@@ -1097,8 +1131,14 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
             f"{post['platform']} credential needs re-authentication. "
             "Reconnect from Settings.",
         ) from e
+    except HTTPException:
+        # Already shaped for the client (including the posted-but-unrecorded
+        # case above, which must NOT be rewritten to 'failed').
+        raise
     except Exception as e:
         logger.exception("Send failed for post %s", post_id)
+        # Also releases the claim taken above; otherwise the row sits 'sending'
+        # forever with nothing able to retry it.
         async with write_transaction() as db:
             await db.execute(
                 "UPDATE social_posts SET status = 'failed', error = ?, "
@@ -1106,6 +1146,26 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
                 (str(e), post_id),
             )
         raise HTTPException(500, str(e))
+
+
+async def _refuse_if_queue_owned(post_id: int, action: str) -> None:
+    """Queue-owned posts are scheduled by Accept, and only by Accept.
+
+    Letting the generic per-post routes move one desynchronizes
+    ``social_posts.scheduled_at`` from its ``smart_queue_items`` row, which is
+    what every "when does this go out" read consults. ``remove_post`` already
+    refuses queue posts for exactly this reason; these two didn't.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT smart_queue_item_id FROM social_posts WHERE id = ?", (post_id,),
+    )
+    if rows and rows[0]["smart_queue_item_id"] is not None:
+        raise HTTPException(
+            409,
+            f"This post is scheduled by a smart queue — {action} it from the "
+            "queue's screen instead, so the item and the post stay in step.",
+        )
 
 
 @router.post("/posts/{post_id}/schedule")
@@ -1121,6 +1181,8 @@ async def schedule_post(
     """
     from datetime import datetime as dt, timezone
     from yt_scheduler.services.scheduler import schedule_social_post
+
+    await _refuse_if_queue_owned(post_id, "reschedule")
 
     raw = data.get("scheduled_at")
     if not raw:
@@ -1164,6 +1226,7 @@ async def unschedule_post(post_id: int):
     """Cancel a scheduled per-post job."""
     from yt_scheduler.services.scheduler import cancel_scheduled_post
 
+    await _refuse_if_queue_owned(post_id, "unschedule")
     cancelled = await cancel_scheduled_post(post_id)
     return {"status": "ok", "cancelled": cancelled}
 

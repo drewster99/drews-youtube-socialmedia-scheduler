@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 import time
 from pathlib import Path
@@ -140,11 +141,22 @@ async def init_upload(filename: str, size: int) -> dict:
     return {"upload_id": upload_id, "chunk_size": CHUNK_SIZE_BYTES}
 
 
-def _append_to_file(path: str, data: bytes) -> None:
+def _append_to_file(path: str | Path, data: bytes, offset: int) -> None:
     """Open-append-close. Synchronous; runs inside ``asyncio.to_thread``
     so the event loop isn't blocked on the syscall."""
-    with open(path, "ab") as fh:
+    # r+b + seek + truncate, not plain append. `received_bytes` is a counter,
+    # and a failed append can leave partially-flushed bytes on disk that the
+    # counter never saw. The client's designed retry then re-sends that chunk,
+    # the offset matches the counter, and the bytes land AFTER the garbage —
+    # silently baking corruption into a multi-GB master that finalize would
+    # accept. Truncating to the authoritative offset first makes the retry
+    # idempotent.
+    with open(path, "r+b") as fh:
+        fh.seek(offset)
+        fh.truncate()
         fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 async def append_chunk(
@@ -196,7 +208,7 @@ async def append_chunk(
                 "cap announced by /init",
             )
 
-        await asyncio.to_thread(_append_to_file, entry["path"], data)
+        await asyncio.to_thread(_append_to_file, entry["path"], data, offset)
         entry["received_bytes"] += len(data)
         entry["expires_at"] = time.monotonic() + _UPLOAD_TTL_SECONDS
         return entry["received_bytes"]
@@ -212,6 +224,10 @@ async def finalize_upload(upload_id: str) -> dict:
     :func:`consume_upload` so the entry leaves the in-memory table.
 
     Idempotent on already-finalized uploads — returns the same dict.
+
+    The size check is against the FILE, not the running counter: the counter
+    is what a partial flush would have desynchronized, so validating it
+    against itself proves nothing.
     """
     async with _DICT_LOCK:
         _evict_stale_locked()
@@ -241,6 +257,16 @@ async def finalize_upload(upload_id: str) -> dict:
             )
 
         partial = Path(entry["path"])
+        # And the file itself must agree. The counter is exactly what a
+        # partially-flushed write would have desynchronized, so checking it
+        # against itself proves nothing — this is the check that catches a
+        # corrupt multi-GB master before it is accepted as a source.
+        on_disk = partial.stat().st_size if partial.exists() else -1
+        if on_disk != entry["size"]:
+            raise UploadConflict(
+                f"Upload file is {on_disk} bytes but {entry['size']} were "
+                "announced — the transfer was corrupted; finalize refused",
+            )
         final = partial.with_name(f"upload_{upload_id}{entry['ext']}")
         # Rename overwrites on POSIX, but ``final`` shouldn't already
         # exist — upload_id is a fresh 16-byte hex per init.

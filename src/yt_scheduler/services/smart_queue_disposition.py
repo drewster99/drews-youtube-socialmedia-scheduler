@@ -132,6 +132,23 @@ async def _post_now(post_id: int) -> dict:
             "post_url": row["post_url"]}
 
 
+class PostNoLongerDisposable(RuntimeError):
+    """The post moved on before the user's choice reached it.
+
+    The missed-postings screen lists overdue posts, and overdue posts are
+    exactly what restart auto-recovery sends. Between render and click, a row
+    can go out. Refusing loudly is the only honest answer — silently rewriting
+    a published row re-sends it.
+    """
+
+    def __init__(self, post_id: int) -> None:
+        self.post_id = post_id
+        super().__init__(
+            f"Post {post_id} is no longer pending — it has already been sent "
+            "or removed. Refresh the missed-postings list."
+        )
+
+
 async def _reschedule_to_end(queue_id: int, item_id: int, post_id: int) -> dict:
     """Move this item behind everything else, at the next free posting time."""
     from yt_scheduler.services.scheduler import schedule_social_post
@@ -151,10 +168,19 @@ async def _reschedule_to_end(queue_id: int, item_id: int, post_id: int) -> dict:
             "state = 'scheduled', reason = NULL WHERE id = ?",
             (when.isoformat(), int(positions[0]["last"]) + 1, item_id),
         )
-        await write_db.execute(
-            "UPDATE social_posts SET status = 'approved', error = NULL WHERE id = ?",
+        # Status predicate is load-bearing. The missed screen is stale by
+        # definition — it lists overdue posts, which is exactly what restart
+        # auto-recovery is sending in parallel. Without this, a post that went
+        # out a second ago is rewritten to 'approved' with a fresh timer and
+        # sent again, and the duplicate guard cannot see it: the only record of
+        # the first send IS this row.
+        cursor = await write_db.execute(
+            "UPDATE social_posts SET status = 'approved', error = NULL "
+            "WHERE id = ? AND status IN ('approved', 'failed')",
             (post_id,),
         )
+        if not cursor.rowcount:
+            raise PostNoLongerDisposable(post_id)
     await schedule_social_post(post_id, when)
     return {"action": "reschedule_end", "scheduled_at": when.isoformat()}
 
@@ -168,6 +194,18 @@ async def _remove(item_id: int, post_id: int) -> dict:
     """
     from yt_scheduler.services.scheduler import cancel_scheduled_post
 
+    db_read = await get_db()
+    # Cancel EVERY pending sibling, not just this one. Retiring the item makes
+    # the video immediately re-selectable, so a second Accept builds a second
+    # occurrence — and the first item's surviving timers still fire, posting
+    # the same clip twice.
+    siblings = await db_read.execute_fetchall(
+        "SELECT id FROM social_posts "
+        "WHERE smart_queue_item_id = ? AND status = 'approved' AND id != ?",
+        (item_id, post_id),
+    )
+    for row in siblings:
+        await cancel_scheduled_post(int(row["id"]))
     await cancel_scheduled_post(post_id)
     async with write_transaction() as db:
         await db.execute(
@@ -175,10 +213,23 @@ async def _remove(item_id: int, post_id: int) -> dict:
             "reason = 'removed by the user after a missed posting' WHERE id = ?",
             (item_id,),
         )
+        # Same guard: marking a post 'skipped' after it published would make
+        # history claim it never went out.
+        cursor = await db.execute(
+            "UPDATE social_posts SET status = 'skipped', "
+            "error = 'removed from the smart queue by the user', "
+            "scheduled_at = NULL, scheduler_job_id = NULL "
+            "WHERE id = ? AND status IN ('approved', 'failed')",
+            (post_id,),
+        )
+        if not cursor.rowcount:
+            raise PostNoLongerDisposable(post_id)
+        # Siblings go with it, for the same reason their timers were cancelled.
         await db.execute(
             "UPDATE social_posts SET status = 'skipped', "
             "error = 'removed from the smart queue by the user', "
-            "scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
-            (post_id,),
+            "scheduled_at = NULL, scheduler_job_id = NULL "
+            "WHERE smart_queue_item_id = ? AND status = 'approved'",
+            (item_id,),
         )
     return {"action": "remove"}

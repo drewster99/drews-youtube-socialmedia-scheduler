@@ -338,7 +338,16 @@ async def publish_video_job(video_id: str) -> dict:
                 on_video_became_live,
             )
 
-            await on_video_became_live(video_id)
+            try:
+                await on_video_became_live(video_id)
+            except Exception:
+                # Same guard as the YouTube branch above: a queue problem must
+                # never make a successful publish look failed — and must not
+                # abort the social fan-out below, which would strand every
+                # approved post in 'approved' forever with no event written.
+                logger.exception(
+                    "on_video_became_live failed after publishing %s", video_id,
+                )
 
             await events.record_event(
                 video_id,
@@ -1639,14 +1648,15 @@ async def backfill_thumbnails_job() -> None:
     readiness check. This sweep downloads YouTube's thumbnail and sets
     thumbnail_source='youtube', the same end state an import produces.
     YouTube video ids are 11 chars; the app's own standalone-item ids
-    are 22, so LENGTH(id)=11 selects only real YouTube-backed rows.
+    are 22 — but length is not a type. ``youtube_video_id`` (migration 037)
+    is the discriminator; a row's kind is stored, never measured.
     """
     from yt_scheduler.services import thumbnail_sync
 
     db = await get_db()
     rows = await db.execute_fetchall(
         "SELECT id FROM videos "
-        "WHERE thumbnail_path IS NULL AND LENGTH(id) = 11 "
+        "WHERE thumbnail_path IS NULL AND youtube_video_id IS NOT NULL "
         "AND COALESCE(youtube_deleted, 0) = 0"
     )
     filled = 0

@@ -125,15 +125,33 @@ def build_units(words: list[TranscriptWord]) -> list[ClipUnit]:
     return units
 
 
-def numbered_units_block(units: list[ClipUnit]) -> str:
-    """The transcript as the LLM sees it: ``<index>\\t(<dur>s)\\t<text>`` per line.
+def numbered_units_block(
+    units: list[ClipUnit],
+    covered_ranges: list[tuple[float, float]] | None = None,
+) -> str:
+    """The transcript as the LLM sees it, one unit per line.
 
     The duration is a length (not an absolute position) so the model can keep a
     clip inside its kind's window without doing timestamp math.
+
+    ``covered_ranges`` are cut ranges of the SAME kind that already exist on
+    this parent. Units overlapping one are tagged ``[IN-CLIP]``, which puts
+    "you have already been here" into the coordinate system the model is
+    actually reasoning in. A list of existing titles cannot do that — it asks
+    the model to map a title back to a place in the transcript.
+
+    Same-kind only, deliberately: a hook living inside an existing segment is
+    legitimate, so marking segment-covered lines would warn the model off
+    ground it should still be using.
     """
-    return "\n".join(
-        f"{u.index}\t({round(u.duration)}s)\t{u.text}" for u in units
-    )
+    ranges = covered_ranges or []
+    out = []
+    for u in units:
+        covered = any(u.start < end and u.end > start for start, end in ranges)
+        out.append(
+            f"{u.index}\t({round(u.duration)}s){' [IN-CLIP]' if covered else ''}\t{u.text}"
+        )
+    return "\n".join(out)
 
 
 @dataclass

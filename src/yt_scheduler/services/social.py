@@ -1988,6 +1988,45 @@ _threads_refresh_dual_failures: dict[str, int] = {}
 _THREADS_DUAL_FAILURE_FLAG_THRESHOLD = 9
 
 
+# Meta error codes that mean "try again later", not "this credential is dead".
+# 4 = application request limit, 17 = user request limit, 32 = page rate limit,
+# 341 = temporarily blocked for policies, 613 = calls-per-second limit.
+_META_TRANSIENT_ERROR_CODES: frozenset[int] = frozenset({4, 17, 32, 341, 613})
+
+
+def _is_transient_meta_error(status_code: int, payload: dict | None) -> bool:
+    """True when Meta is throttling rather than rejecting the credential.
+
+    Rate limits come back as ordinary 4xx with a code in the body, so status
+    alone can't tell them apart from a genuinely dead token. 429 is included
+    for the same reason Twitter's refresh handles it.
+    """
+    if status_code == 429:
+        return True
+    error = (payload or {}).get("error") or {}
+    try:
+        code = int(error.get("code"))
+    except (TypeError, ValueError):
+        return False
+    return code in _META_TRANSIENT_ERROR_CODES
+
+
+def _threads_token_is_too_new(bundle: dict) -> bool:
+    """True when the token is inside Meta's 24-hour refresh minimum.
+
+    The bundle already stamps ``acquired_at``; asking it is sturdier than
+    matching the words Meta happens to use in the error.
+    """
+    acquired = bundle.get("acquired_at")
+    if not acquired:
+        return False
+    try:
+        age = time.time() - float(acquired)
+    except (TypeError, ValueError):
+        return False
+    return 0 <= age < 24 * 60 * 60
+
+
 class ThreadsPoster(SocialPoster):
     # Threads fetches media from a URL rather than accepting an upload, for
     # images and video alike. media_hosting puts the file in a private R2
@@ -2255,10 +2294,34 @@ class ThreadsPoster(SocialPoster):
                         "Reconnect Threads in Settings — an expired token can "
                         "only be replaced, not renewed.",
                     )
-                # Meta refuses a token younger than 24h. Also "come back
-                # later" rather than a dead credential.
+                # Transient, NOT a dead credential. Two shapes:
+                #
+                # 1. Too new — Meta refuses to refresh a token younger than
+                #    24h. The bundle records acquired_at, so ask that rather
+                #    than pattern-matching English that Meta can reword.
+                # 2. Throttled — Meta rate limits arrive as ordinary 4xx, so
+                #    without this a single throttled sweep flips a perfectly
+                #    healthy token to needs_reauth and every send then
+                #    fast-fails "reconnect".
+                if _threads_token_is_too_new(current):
+                    logger.info(
+                        "Threads token is younger than Meta's 24h refresh "
+                        "minimum; will retry later.",
+                    )
+                    return False
                 if "24 hours" in detail or "too early" in detail.lower():
                     logger.info("Threads token too new to refresh yet: %s", detail)
+                    return False
+                try:
+                    error_payload = resp.json() or {}
+                except ValueError:
+                    error_payload = {}
+                if _is_transient_meta_error(resp.status_code, error_payload):
+                    logger.warning(
+                        "Threads token refresh throttled or transiently "
+                        "rejected (%s): %s — will retry.",
+                        resp.status_code, detail,
+                    )
                     return False
                 raise CredentialAuthError(
                     uuid,

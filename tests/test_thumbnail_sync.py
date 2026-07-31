@@ -307,21 +307,25 @@ async def test_backfill_thumbnail_sets_youtube_source(
 async def test_backfill_job_targets_only_youtube_rows_without_thumbnail(
     client: TestClient, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """backfill_thumbnails_job processes only YouTube-backed rows
-    (11-char id) that lack a thumbnail — skips 22-char standalone-item
-    ids and rows that already have a thumbnail."""
+    """backfill_thumbnails_job processes only YouTube-backed rows that lack a
+    thumbnail — skipping standalone items and rows that already have one.
+
+    "YouTube-backed" is ``youtube_video_id IS NOT NULL``, the column migration
+    037 added. It used to be ``LENGTH(id) = 11``, which measured the primary
+    key to infer a row's kind — the pattern this project bans."""
     from yt_scheduler.database import get_db
     db = await get_db()
     await db.execute(
-        "INSERT INTO videos (id, title, status) VALUES ('YTVIDEO0001','t','ready')"
+        "INSERT INTO videos (id, title, status, youtube_video_id) "
+        "VALUES ('YTVIDEO0001','t','ready','YTVIDEO0001')"
     )
     await db.execute(
         "INSERT INTO videos (id, title, status) "
         "VALUES ('STANDALONExxxxxxxxxxxx','t','ready')"
     )
     await db.execute(
-        "INSERT INTO videos (id, title, status, thumbnail_path) "
-        "VALUES ('HASTHUMB001','t','ready','/tmp/x.jpg')"
+        "INSERT INTO videos (id, title, status, thumbnail_path, youtube_video_id) "
+        "VALUES ('HASTHUMB001','t','ready','/tmp/x.jpg','HASTHUMB001')"
     )
     await db.commit()
 

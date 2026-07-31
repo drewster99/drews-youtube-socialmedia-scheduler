@@ -298,12 +298,26 @@ async def _finish(job_id: int, *, status: str, detail: str = "",
 
 
 async def run_job(job: dict) -> str:
-    """Execute one job, returning a human-readable summary of what changed."""
+    """Execute one job, returning a human-readable summary of what changed.
+
+    Runs under the queue's Accept lock. The HTTP 409 guard only blocks
+    *inbound* mutations while jobs exist; nothing stopped this worker from
+    executing a slot sweep in the middle of an Accept that legitimately runs
+    for minutes, at which point Accept commits posts carrying a slot_id the
+    sweep just deleted. Both sides now take the same lock.
+    """
     from yt_scheduler.services import smart_queue_reconcile_handlers as handlers
+    from yt_scheduler.services.smart_queue_accept import accept_lock
 
     payload = json.loads(job["payload"] or "{}")
     queue_id = int(job["queue_id"])
     job_id = int(job["id"])
+
+    async with accept_lock(queue_id):
+        return await _run_job_locked(job, payload, queue_id, job_id, handlers)
+
+
+async def _run_job_locked(job, payload, queue_id, job_id, handlers) -> str:
 
     async def progress(done: int, total: int) -> None:
         await _set_progress(job_id, done, total)
@@ -340,8 +354,18 @@ async def _worker_loop() -> None:
             raise
         except Exception as exc:
             logger.exception("reconcile: job %s (%s) failed", job_id, job["kind"])
-            await _finish(job_id, status=STATUS_FAILED,
-                          error=f"{type(exc).__name__}: {exc}")
+            try:
+                await _finish(job_id, status=STATUS_FAILED,
+                              error=f"{type(exc).__name__}: {exc}")
+            except Exception:
+                # If recording the failure ALSO fails, the loop must not die:
+                # the worker is process-wide, and its death would leave the job
+                # 'running' forever and 409 every mutation on that queue until
+                # a restart. Losing one status write is the smaller harm.
+                logger.exception(
+                    "reconcile: could not record failure of job %s; worker "
+                    "continues", job_id,
+                )
 
 
 async def start_worker() -> None:

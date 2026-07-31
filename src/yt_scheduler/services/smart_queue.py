@@ -697,9 +697,24 @@ async def delete_queue(queue_id: int) -> int:
         "WHERE i.queue_id = ? AND p.status != 'posted'",
         (queue_id,),
     )
-    for row in pending:
-        await cancel_scheduled_post(int(row["id"]))
+    post_ids = [int(row["id"]) for row in pending]
+    for post_id in post_ids:
+        await cancel_scheduled_post(post_id)
     async with write_transaction() as db:
+        # Clear the scheduling columns ourselves. cancel_scheduled_post returns
+        # early when scheduler_job_id is NULL without touching scheduled_at —
+        # and that is exactly the state Accept leaves when timer registration
+        # failed ("picked up on next restart"). Once the FK nulls
+        # smart_queue_item_id, restore_scheduled_posts would dutifully send a
+        # post for a queue that no longer exists.
+        if post_ids:
+            placeholders = ",".join("?" * len(post_ids))
+            await db.execute(
+                f"UPDATE social_posts SET scheduled_at = NULL, "
+                f"scheduler_job_id = NULL WHERE id IN ({placeholders}) "
+                "AND status != 'posted'",
+                post_ids,
+            )
         await db.execute("DELETE FROM smart_queues WHERE id = ?", (queue_id,))
     return len(pending)
 

@@ -86,9 +86,14 @@ async def _retire_emptied_items(item_ids: list[int], reason: str) -> int:
                SET state = 'removed', reason = ?
              WHERE id IN ({placeholders})
                AND state = 'scheduled'
+               -- "Emptied" means no post that could EVER send. A 'skipped'
+               -- leftover (empty content) blocked retirement, so the item sat
+               -- 'scheduled' forever and permanently blocked its video from
+               -- being queued again — the exact zombie this function prevents.
                AND NOT EXISTS (
                    SELECT 1 FROM social_posts p
                     WHERE p.smart_queue_item_id = smart_queue_items.id
+                      AND p.status != 'skipped'
                )
             """,
             (reason, *item_ids),
@@ -272,7 +277,15 @@ async def remove_slots(queue_id: int, slot_ids: list[int], progress: Progress) -
             logger.exception("reconcile remove_slots: could not cancel timer for %s",
                              post_id)
         async with write_transaction() as write_db:
-            await write_db.execute("DELETE FROM social_posts WHERE id = ?", (post_id,))
+            # Conditional, like remove_post: a row that turned 'sending' or
+            # 'posted' between the SELECT and here is a real public send, and
+            # deleting it leaves no DB record for history or duplicate
+            # detection while mark_posted silently updates zero rows.
+            await write_db.execute(
+                "DELETE FROM social_posts WHERE id = ? "
+                "AND status NOT IN ('posted', 'sending')",
+                (post_id,),
+            )
         await progress(index, total)
 
     retired = await _retire_emptied_items(
@@ -400,8 +413,11 @@ async def drop_excluded_videos(queue_id: int, progress: Progress) -> str:
             except Exception:
                 logger.exception("reconcile drop_excluded: timer for %s", post_id)
             async with write_transaction() as write_db:
-                await write_db.execute("DELETE FROM social_posts WHERE id = ?",
-                                       (post_id,))
+                await write_db.execute(
+                    "DELETE FROM social_posts WHERE id = ? "
+                    "AND status NOT IN ('posted', 'sending')",
+                    (post_id,),
+                )
             removed_posts += 1
         if posts:
             emptied_items.append(int(item["id"]))

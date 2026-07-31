@@ -503,6 +503,18 @@ def _provider_id_from_paste(platform: str, data: dict) -> tuple[str | None, str 
     return None, None
 
 
+# Field names that mean "the user pasted a new credential", as opposed to
+# tweaking a non-secret setting on the same form.
+_TOKEN_FIELDS: frozenset[str] = frozenset({
+    "access_token", "refresh_token", "bearer_token", "api_key", "api_secret",
+    "access_token_secret", "client_secret", "app_password", "password",
+})
+
+
+def _carries_a_token(values: dict) -> bool:
+    return any(k in _TOKEN_FIELDS for k in values)
+
+
 @router.put("/social/{platform}")
 async def update_social_config(platform: str, data: dict):
     """Update social media credentials for a platform.
@@ -529,9 +541,28 @@ async def update_social_config(platform: str, data: dict):
 
     cred = await get_first_active_credential(platform)
     if cred is not None:
-        bundle = (await load_bundle(platform, cred["uuid"])) or {}
-        bundle.update(fresh_values)
-        await save_bundle(platform, cred["uuid"], bundle)
+        from yt_scheduler.services.social_credentials import (
+            clear_needs_reauth,
+            get_credential_lock,
+            stamp_token_metadata,
+        )
+
+        # Under the credential lock: this is a read-merge-write, and a refresh
+        # sweep rotating the same bundle in parallel would be clobbered — which
+        # for X means the rotated single-use refresh token is lost and the user
+        # is forced back through OAuth.
+        async with get_credential_lock(cred["uuid"]):
+            bundle = (await load_bundle(platform, cred["uuid"])) or {}
+            bundle.update(fresh_values)
+            # A pasted token is a NEW token: stamp it, so Settings shows its
+            # real age rather than the replaced one's, and clear the reauth
+            # flag, or a credential the user just fixed keeps the badge and
+            # every send keeps fast-failing "reconnect".
+            if _carries_a_token(fresh_values):
+                stamp_token_metadata(bundle)
+            await save_bundle(platform, cred["uuid"], bundle)
+        if _carries_a_token(fresh_values):
+            await clear_needs_reauth(cred["uuid"])
         return {
             "status": "ok",
             "storage": get_storage_type(),

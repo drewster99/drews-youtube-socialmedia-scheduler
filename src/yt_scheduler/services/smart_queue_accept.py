@@ -51,6 +51,19 @@ logger = logging.getLogger(__name__)
 _accept_locks: KeyedLocks[int] = KeyedLocks()
 
 
+def accept_lock(queue_id: int):
+    """The per-queue lock that serializes everything mutating a queue's plan.
+
+    Accept legitimately runs for minutes (one Anthropic call per slot per
+    video). The HTTP 409 guard only blocks *inbound* mutations while jobs
+    exist — it does nothing to stop the reconcile worker executing a job
+    mid-Accept, at which point a slot sweep can delete pending posts that
+    Accept then re-creates carrying the deleted slot_id. The worker, reflow
+    and the missed-posting dispositions all take this same lock.
+    """
+    return _accept_locks.get(queue_id)
+
+
 @dataclass(frozen=True)
 class SlotVerdict:
     """Whether one template slot can carry one video."""
@@ -715,6 +728,12 @@ async def reflow_pending(queue_id: int) -> dict:
     Answering no simply doesn't call this: the new times then apply to items
     added from now on, and what is already on the books stays put.
     """
+    # Serialized against Accept: reflow rewrites the same posting times.
+    async with accept_lock(queue_id):
+        return await _reflow_pending_locked(queue_id)
+
+
+async def _reflow_pending_locked(queue_id: int) -> dict:
     from yt_scheduler.services.scheduler import schedule_social_post
 
     queue = await queue_service.get_queue(queue_id)
@@ -750,8 +769,13 @@ async def reflow_pending(queue_id: int) -> dict:
                 (when.isoformat(), int(item["id"])),
             )
         posts = await db.execute_fetchall(
+            # 'approved' ONLY. NOT IN ('posted','sending') also catches
+            # 'skipped' (empty content — e.g. Threads with no hosting) and
+            # 'failed'. Re-flow would schedule the empty one, and would lift
+            # the failed one out of the app-wide failed-sends banner without
+            # anything ever retrying it — a surfaced failure disappearing.
             "SELECT id FROM social_posts "
-            "WHERE smart_queue_item_id = ? AND status NOT IN ('posted', 'sending')",
+            "WHERE smart_queue_item_id = ? AND status = 'approved'",
             (int(item["id"]),),
         )
         for post in posts:

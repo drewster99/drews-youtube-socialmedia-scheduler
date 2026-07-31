@@ -208,11 +208,37 @@ def stamp_token_metadata(bundle: dict, *, expires_in_seconds: int | None = None)
         bundle["expires_at"] = now + int(expires_in_seconds)
 
 
+# A refresh has already consumed the provider's single-use refresh token by the
+# time we try to store the result, so losing this write loses the credential —
+# the next sweep presents the spent token and the user is forced back through
+# OAuth. Worth retrying a transient Keychain failure rather than accepting that.
+_SECRET_WRITE_ATTEMPTS: int = 3
+_SECRET_WRITE_RETRY_SECONDS: float = 0.25
+
+
 async def save_bundle(platform: str, uuid: str, bundle: dict) -> None:
     bundle["uuid"] = uuid
-    await store_secret_async(
-        platform, f"{CREDENTIAL_KEY_PREFIX}{uuid}", json.dumps(bundle),
-    )
+    payload = json.dumps(bundle)
+    for attempt in range(1, _SECRET_WRITE_ATTEMPTS + 1):
+        try:
+            await store_secret_async(
+                platform, f"{CREDENTIAL_KEY_PREFIX}{uuid}", payload,
+            )
+            break
+        except Exception:
+            if attempt == _SECRET_WRITE_ATTEMPTS:
+                logger.exception(
+                    "Could not store the %s credential bundle for %s after %d "
+                    "attempts — a rotated refresh token may have been lost, and "
+                    "this credential will need reconnecting.",
+                    platform, uuid, _SECRET_WRITE_ATTEMPTS,
+                )
+                raise
+            logger.warning(
+                "Keychain write for %s/%s failed (attempt %d of %d); retrying.",
+                platform, uuid, attempt, _SECRET_WRITE_ATTEMPTS,
+            )
+            await asyncio.sleep(_SECRET_WRITE_RETRY_SECONDS)
     # The bundle is the source of truth for token metadata; the row is its
     # non-secret mirror, refreshed on every bundle write so refresh flows
     # never have to remember a second call. A brand-new credential's row
@@ -246,7 +272,21 @@ async def _mirror_token_metadata(uuid: str, bundle: dict) -> None:
     acquired_iso = _unix_seconds_iso(bundle.get("acquired_at"))
     if expires_iso is None and acquired_iso is None:
         return
+    # A NEW token with no stated lifetime must CLEAR the old expiry, not
+    # inherit it. Pasting a fresh Threads token stamps acquired_at only; with a
+    # blanket COALESCE the previous token's past expiry survived, so Settings
+    # showed "expired — reconnect" for a token that had just passed /me, and
+    # Meta's 24-hour refresh minimum made it unfixable for a day.
+    replacing_token = acquired_iso is not None
     async with write_transaction() as db:
+        if replacing_token and expires_iso is None:
+            await db.execute(
+                "UPDATE social_accounts "
+                "SET token_expires_at = NULL, token_acquired_at = ? "
+                "WHERE uuid = ?",
+                (acquired_iso, uuid),
+            )
+            return
         await db.execute(
             "UPDATE social_accounts "
             "SET token_expires_at = COALESCE(?, token_expires_at), "
