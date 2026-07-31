@@ -51,11 +51,15 @@ async def _seed_video(monkeypatch, *, video_id: str, title: str, description: st
                        tags: list[str], privacy: str) -> None:
     from yt_scheduler.database import get_db
     db = await get_db()
+    # youtube_video_id is set (migration 037): these ARE YouTube-backed rows,
+    # and the detail endpoint now addresses YouTube by that column, not the PK.
+    # Real uploads populate it; the test row must too, or the drift sync has no
+    # YouTube video to sync from.
     await db.execute(
         "INSERT INTO videos (id, project_id, title, description, tags, "
-        " privacy_status, status, imported_from_youtube) "
-        "VALUES (?, 1, ?, ?, ?, ?, 'uploaded', 1)",
-        (video_id, title, description, json.dumps(tags), privacy),
+        " privacy_status, status, imported_from_youtube, youtube_video_id) "
+        "VALUES (?, 1, ?, ?, ?, ?, 'uploaded', 1, ?)",
+        (video_id, title, description, json.dumps(tags), privacy, video_id),
     )
     await db.commit()
 

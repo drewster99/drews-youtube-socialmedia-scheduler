@@ -13,12 +13,15 @@ the reason. Skipped means "known in advance, not attempted"; ``failed`` means
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime
 
 from yt_scheduler.database import get_db, write_transaction
+from yt_scheduler.services import ai
 from yt_scheduler.services._keyed_locks import KeyedLocks
 from yt_scheduler.services import media_hosting
 from yt_scheduler.services import smart_queue as queue_service
@@ -800,6 +803,95 @@ async def _template_by_id(template_id: int) -> dict:
     return template
 
 
+def _render_input_hash(
+    *,
+    video_id: str,
+    slot_id: int,
+    cleaned_body: str,
+    variables: dict[str, object],
+    default_ai_system: str | None,
+    media_paths: list[str],
+    model: str,
+) -> str:
+    """Fingerprint everything that decides one slot's rendered output.
+
+    A checkpoint is reused only when the current inputs hash to the stored
+    value, so this must cover EVERY input the render depends on — miss on any
+    change, never a false hit that ships text rendered from since-edited
+    inputs. Variable values are coerced to text exactly as the renderer coerces
+    them (``str(value)``; ``None`` distinct from ``""``) so two contexts that
+    render identically fingerprint identically. ``media_paths`` is positional,
+    so its order is part of the key. ``model`` is the effective Anthropic model
+    (see :func:`_render_slot`): a model change alters ``{{ai:}}`` output, so it
+    must not read as unchanged.
+    """
+    payload = {
+        "video_id": video_id,
+        "slot_id": slot_id,
+        "cleaned_body": cleaned_body,
+        "variables": {
+            key: (None if value is None else str(value))
+            for key, value in variables.items()
+        },
+        "default_ai_system": default_ai_system,
+        "media_paths": list(media_paths),
+        "model": model,
+    }
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+async def _load_render_checkpoint(
+    db, video_id: str, slot_id: int
+) -> dict | None:
+    """The stored render for this (video, slot), or None if none exists yet."""
+    rows = await db.execute_fetchall(
+        "SELECT input_hash, content, media_paths_json FROM render_checkpoint "
+        "WHERE video_id = ? AND slot_id = ?",
+        (video_id, slot_id),
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    return {
+        "input_hash": row["input_hash"],
+        "content": row["content"],
+        "media_paths": json.loads(row["media_paths_json"]),
+    }
+
+
+async def _save_render_checkpoint(
+    video_id: str, slot_id: int, input_hash: str, content: str,
+    media_paths: list[str],
+) -> None:
+    """Record (or replace) the render for this (video, slot) as one unit.
+
+    One row per (video, slot): a re-render for changed inputs overwrites the
+    prior fingerprint rather than accumulating rows, so the checkpoint can only
+    ever hand back the most recent successful render for the current slot.
+    """
+    async with write_transaction() as db:
+        await db.execute(
+            "INSERT INTO render_checkpoint "
+            "(video_id, slot_id, input_hash, content, media_paths_json) "
+            "VALUES (?,?,?,?,?) "
+            "ON CONFLICT(video_id, slot_id) DO UPDATE SET "
+            "input_hash = excluded.input_hash, content = excluded.content, "
+            "media_paths_json = excluded.media_paths_json, "
+            "created_at = datetime('now')",
+            (video_id, slot_id, input_hash, content, json.dumps(media_paths)),
+        )
+
+
+def _all_media_present(media_paths: list[str]) -> bool:
+    """Whether every media file a cached render referenced still exists.
+
+    A render cached with a media path whose file was since cleaned up must miss
+    — reusing it would schedule a post pointing at a file that has gone.
+    """
+    return all(os.path.exists(path) for path in media_paths)
+
+
 async def _render_slot(
     db, video: dict, slot: dict, *, default_ai_system: str | None
 ) -> tuple[str, list[str]]:
@@ -809,6 +901,14 @@ async def _render_slot(
     ``{{video}}`` and friends are media directives, not variables, so they
     have to come out of the body before the strict renderer sees it — left in,
     they read as undefined variables and the render fails.
+
+    A render can fire a paid Anthropic ``{{ai:}}`` round-trip, so a per-slot
+    checkpoint lets a retry reuse a prior success instead of re-paying: this is
+    the ONE place every render path (Accept, backfill, re-render, and the
+    reconcile handlers) flows through, so the checkpoint sits here and covers
+    all of them. Reuse is gated on the inputs hashing to the stored value AND
+    the referenced media still existing — never a stale or dangling reuse. On a
+    miss the render happens normally and its result replaces the checkpoint.
     """
     context = await build_render_context(db, video)
     body = slot.get("body") or ""
@@ -818,7 +918,40 @@ async def _render_slot(
         thumbnail_path=context["thumb_path"],
         images=context["images"],
     )
+
+    video_id = video["id"]
+    raw_slot_id = slot.get("id")
+    # slot_id is half the checkpoint key. A slot with no id can't be cached
+    # without two such slots colliding on one row and serving each other's
+    # text, so it simply re-renders — costs a call, never wrong.
+    slot_id = int(raw_slot_id) if raw_slot_id is not None else None
+
+    input_hash: str | None = None
+    if slot_id is not None:
+        # The effective model resolved the same way call_ai_block resolves it,
+        # so the fingerprint reflects the model the render would actually use
+        # rather than a second, possibly-disagreeing source.
+        model = await ai._resolve_model()
+        input_hash = _render_input_hash(
+            video_id=video_id, slot_id=slot_id, cleaned_body=cleaned_body,
+            variables=context["variables"], default_ai_system=default_ai_system,
+            media_paths=media_paths, model=model,
+        )
+        cached = await _load_render_checkpoint(db, video_id, slot_id)
+        if (
+            cached is not None
+            and cached["input_hash"] == input_hash
+            and _all_media_present(media_paths)
+        ):
+            return cached["content"], media_paths
+
     rendered = await tmpl.async_render(
         cleaned_body, context["variables"], default_system_prompt=default_ai_system
     )
-    return rendered.strip(), media_paths
+    result_text = rendered.strip()
+
+    if slot_id is not None and input_hash is not None:
+        await _save_render_checkpoint(
+            video_id, slot_id, input_hash, result_text, media_paths
+        )
+    return result_text, media_paths
