@@ -18,13 +18,13 @@ def make_units(n: int, dur: float = 10.0, gap: float = 1.0) -> list[ClipUnit]:
 
 def test_accepts_valid_hook_with_edges_and_rating():
     units = make_units(5, dur=10.0, gap=1.0)  # each unit 10s -> in the 5-30 hook window
-    raw = [{"first_index": 2, "last_index": 2, "title": "Hi", "reason": "r", "rating": 4}]
+    raw = [{"first_index": 2, "last_index": 2, "title": "Hi There", "reason": "r", "rating": 4}]
     accepted, rejected = clipper._validate_indexed_proposals(
         raw, kind="hook", units=units, existing_ranges=[], max_proposals=8,
         parent_duration_seconds=PARENT_DURATION)
     assert len(accepted) == 1 and rejected == []
     p = accepted[0]
-    assert p.kind == "hook" and p.title == "Hi" and p.rating == 4
+    assert p.kind == "hook" and p.title == "Hi There" and p.rating == 4
     # gap-ramp edges: cut at prior word end / next word onset, fade across the 1s gaps
     assert p.audio_fade_in > 0 and p.audio_fade_out > 0
     assert p.start_seconds < units[1].start and p.end_seconds > units[1].end
@@ -33,9 +33,9 @@ def test_accepts_valid_hook_with_edges_and_rating():
 def test_drops_out_of_range_indices():
     units = make_units(3)
     raw = [
-        {"first_index": 0, "last_index": 1, "title": "a", "reason": "r", "rating": 1},
-        {"first_index": 2, "last_index": 99, "title": "b", "reason": "r", "rating": 1},
-        {"first_index": 3, "last_index": 2, "title": "c", "reason": "r", "rating": 1},
+        {"first_index": 0, "last_index": 1, "title": "Title A", "reason": "r", "rating": 1},
+        {"first_index": 2, "last_index": 99, "title": "Title B", "reason": "r", "rating": 1},
+        {"first_index": 3, "last_index": 2, "title": "Title C", "reason": "r", "rating": 1},
     ]
     accepted, rejected = clipper._validate_indexed_proposals(
         raw, kind="hook", units=units, existing_ranges=[], max_proposals=8,
@@ -49,7 +49,7 @@ def test_drops_out_of_range_indices():
 def test_drops_clip_outside_duration_window():
     units = make_units(9, dur=10.0)
     # hook window is 5-60s; 1..7 spans 7 units (~76s content) -> too long
-    raw = [{"first_index": 1, "last_index": 7, "title": "long", "reason": "r", "rating": 2}]
+    raw = [{"first_index": 1, "last_index": 7, "title": "Far Too Long", "reason": "r", "rating": 2}]
     accepted, rejected = clipper._validate_indexed_proposals(
         raw, kind="hook", units=units, existing_ranges=[], max_proposals=8,
         parent_duration_seconds=PARENT_DURATION)
@@ -64,7 +64,7 @@ def test_drops_clip_outside_duration_window():
 def test_drops_overlap_with_existing_and_within_batch():
     units = make_units(5, dur=10.0, gap=1.0)
     # unit 2 resolves to ~[10,20]; an existing clip covering it should drop it
-    raw = [{"first_index": 2, "last_index": 2, "title": "x", "reason": "r", "rating": 3}]
+    raw = [{"first_index": 2, "last_index": 2, "title": "Some Clip X", "reason": "r", "rating": 3}]
     accepted, rejected = clipper._validate_indexed_proposals(
         raw, kind="hook", units=units, existing_ranges=[(9.0, 21.0)], max_proposals=8,
         parent_duration_seconds=PARENT_DURATION)
@@ -75,7 +75,7 @@ def test_drops_overlap_with_existing_and_within_batch():
 
 def test_max_proposals_cap():
     units = make_units(5, dur=10.0)
-    raw = [{"first_index": i, "last_index": i, "title": f"t{i}", "reason": "r", "rating": 3}
+    raw = [{"first_index": i, "last_index": i, "title": f"Clip Number {i}", "reason": "r", "rating": 3}
            for i in range(1, 5)]
     accepted, rejected = clipper._validate_indexed_proposals(
         raw, kind="hook", units=units, existing_ranges=[], max_proposals=2,
@@ -93,15 +93,15 @@ def test_max_proposals_cap_keeps_the_best_rated():
     4-star clip listed last lost to a 1-star clip listed first."""
     units = make_units(5, dur=10.0)
     raw = [
-        {"first_index": 1, "last_index": 1, "title": "meh", "reason": "r", "rating": 1},
-        {"first_index": 2, "last_index": 2, "title": "ok", "reason": "r", "rating": 2},
-        {"first_index": 3, "last_index": 3, "title": "best", "reason": "r", "rating": 4},
+        {"first_index": 1, "last_index": 1, "title": "Middling One", "reason": "r", "rating": 1},
+        {"first_index": 2, "last_index": 2, "title": "Acceptable One", "reason": "r", "rating": 2},
+        {"first_index": 3, "last_index": 3, "title": "The Best One", "reason": "r", "rating": 4},
     ]
     accepted, rejected = clipper._validate_indexed_proposals(
         raw, kind="hook", units=units, existing_ranges=[], max_proposals=1,
         parent_duration_seconds=PARENT_DURATION)
-    assert [p.title for p in accepted] == ["best"]
-    assert {r.title for r in rejected} == {"meh", "ok"}
+    assert [p.title for p in accepted] == ["The Best One"]
+    assert {r.title for r in rejected} == {"Middling One", "Acceptable One"}
 
 
 def test_overlapping_pair_resolved_by_rating_not_position():
@@ -109,15 +109,15 @@ def test_overlapping_pair_resolved_by_rating_not_position():
     model listed it second."""
     units = make_units(6, dur=10.0, gap=1.0)
     raw = [
-        {"first_index": 2, "last_index": 3, "title": "listed first",
+        {"first_index": 2, "last_index": 3, "title": "Listed First Clip",
          "reason": "r", "rating": 1},
-        {"first_index": 2, "last_index": 3, "title": "listed second",
+        {"first_index": 2, "last_index": 3, "title": "Listed Second Clip",
          "reason": "r", "rating": 4},
     ]
     accepted, rejected = clipper._validate_indexed_proposals(
         raw, kind="hook", units=units, existing_ranges=[], max_proposals=8,
         parent_duration_seconds=PARENT_DURATION)
-    assert [p.title for p in accepted] == ["listed second"]
+    assert [p.title for p in accepted] == ["Listed Second Clip"]
     assert rejected[0].reason is clipper.RejectionReason.OVERLAPS_EXISTING
 
 
@@ -129,7 +129,7 @@ def test_symmetric_overlap_drops_long_proposal_containing_short_existing():
     units = make_units(5, dur=10.0, gap=1.0)
     # units 2..3 span ~[11, 32] (~21s of content) — inside the 5-60s hook
     # window once gap-ramp edges land; existing (12, 18) sits fully inside.
-    raw = [{"first_index": 2, "last_index": 3, "title": "x", "reason": "r", "rating": 3}]
+    raw = [{"first_index": 2, "last_index": 3, "title": "Some Clip X", "reason": "r", "rating": 3}]
     accepted, rejected = clipper._validate_indexed_proposals(
         raw, kind="hook", units=units, existing_ranges=[(12.0, 18.0)], max_proposals=8,
         parent_duration_seconds=PARENT_DURATION)
@@ -250,12 +250,12 @@ def test_non_object_entries_are_rejected_not_filtered_away():
     units = make_units(4, dur=10.0)
     raw = [
         "not an object",
-        {"first_index": 1, "last_index": 1, "title": "fine", "reason": "r", "rating": 3},
+        {"first_index": 1, "last_index": 1, "title": "Perfectly Fine", "reason": "r", "rating": 3},
     ]
     accepted, rejected = clipper._validate_indexed_proposals(
         raw, kind="hook", units=units, existing_ranges=[], max_proposals=8,
         parent_duration_seconds=PARENT_DURATION)
-    assert [p.title for p in accepted] == ["fine"]
+    assert [p.title for p in accepted] == ["Perfectly Fine"]
     assert len(rejected) == 1
     assert rejected[0].reason is clipper.RejectionReason.INVALID_INDICES
     assert "not an object" in rejected[0].detail
@@ -267,13 +267,13 @@ def test_cap_rejection_never_masks_the_real_reason():
     not have surfaced it."""
     units = make_units(6, dur=10.0, gap=1.0)
     raw = [
-        {"first_index": 2, "last_index": 2, "title": "keeper", "reason": "r", "rating": 4},
-        {"first_index": 2, "last_index": 2, "title": "same range", "reason": "r", "rating": 1},
+        {"first_index": 2, "last_index": 2, "title": "The Keeper", "reason": "r", "rating": 4},
+        {"first_index": 2, "last_index": 2, "title": "Same Range Clip", "reason": "r", "rating": 1},
     ]
     accepted, rejected = clipper._validate_indexed_proposals(
         raw, kind="hook", units=units, existing_ranges=[], max_proposals=1,
         parent_duration_seconds=PARENT_DURATION)
-    assert [p.title for p in accepted] == ["keeper"]
+    assert [p.title for p in accepted] == ["The Keeper"]
     assert rejected[0].reason is clipper.RejectionReason.OVERLAPS_EXISTING, (
         "an overlapping clip must be told it overlapped, not that it hit the cap"
     )

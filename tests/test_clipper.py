@@ -159,12 +159,12 @@ def test_editorial_block_is_spliced_between_the_code_sections():
         "hook", "## What makes a good hook\n- Be brief and surprising.",
     )
     assert "## Input format" in system
-    assert "## Output format" in system
+    assert "## How to answer" in system
     assert "- Be brief and surprising." in system
     assert (
         system.index("## Input format")
         < system.index("- Be brief and surprising.")
-        < system.index("## Output format")
+        < system.index("## How to answer")
     )
 
 
@@ -331,7 +331,7 @@ async def test_index_over_requests_when_existing_then_caps_output(
     captured: dict = {}
     props = [
         {"first_index": i + 1, "last_index": i + 1, "start_echo": "", "end_echo": "",
-         "title": f"t{i}", "reason": "r", "rating": 4}
+         "title": f"Clip Number {i}", "reason": "r", "rating": 4}
         for i in range(9)
     ]
 

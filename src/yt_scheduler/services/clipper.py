@@ -145,6 +145,7 @@ class RejectionReason(str, Enum):
     INDEX_OUT_OF_BOUNDS = "index_out_of_bounds"
     DURATION_OUT_OF_BAND = "duration_out_of_band"
     DUPLICATE_TITLE = "duplicate_title"
+    TITLE_LENGTH = "title_length"
     OVERLAPS_EXISTING = "overlaps_existing"
     OVER_OUTPUT_CAP = "over_output_cap"
 
@@ -461,6 +462,45 @@ async def editorial_block_for_kind(kind: ClipKind, *, project_id: int) -> str:
     return await template_service.async_render(body, {"kind": kind})
 
 
+_CHECK_RANGE_TOOL = {
+    "name": "check_range",
+    "description": (
+        "Check ONE candidate clip before proposing it. Returns the clip's real "
+        "length in seconds, whether the title and length are inside the limits "
+        "for this kind, whether the title duplicates a clip that already "
+        "exists, and whether the range overlaps one. Issue as many of these as "
+        "you like in parallel — one call per candidate — then call "
+        "propose_clips once with the ones that passed. It cannot see your "
+        "other candidates in the same turn, so two candidates that overlap "
+        "each other will both pass here; do not propose overlapping ranges."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "first_index": {
+                "type": "integer",
+                "description": "1-based index of the unit where the clip STARTS.",
+            },
+            "last_index": {
+                "type": "integer",
+                "description": "1-based index of the unit where the clip ENDS (inclusive).",
+            },
+            "title": {
+                "type": "string",
+                "description": "The title you intend to give this clip.",
+            },
+        },
+        "required": ["first_index", "last_index", "title"],
+    },
+}
+
+# How many assistant turns a single kind may take before we stop. Each round is
+# one API call: the model fires a batch of check_range calls, we answer them
+# all in one user turn, it revises. Bounded because a model that never calls
+# propose_clips would otherwise loop forever on our money.
+MAX_PROPOSAL_ROUNDS: int = 6
+
+
 def _build_index_system_text(kind: ClipKind, editorial_block: str) -> str:
     """The per-kind instruction: role, the transcript's line format, the
     editorial guidance, and how to answer.
@@ -486,10 +526,21 @@ def _build_index_system_text(kind: ClipKind, editorial_block: str) -> str:
         "contiguous run of units from first_index through last_index "
         "inclusive.\n\n"
         f"{editorial_block.strip()}\n\n"
-        "## Output format\n"
-        "Answer only by calling the propose_clips tool. Reference units by "
-        "INDEX NUMBER only — never write timestamps and never retype the "
-        "transcript text. For each clip supply:\n"
+        "## How to answer\n"
+        "Check every candidate before you commit to it. Call check_range with "
+        "one candidate per call — issue them all in parallel in a single turn, "
+        "up to 30 at once. Each reply gives you the clip's real length, whether "
+        "the title and length are inside the limits, and whether it duplicates "
+        "or overlaps a clip that already exists, ending in PASS or FAIL.\n"
+        "Fix what comes back FAIL and check again, or drop it. Prefer moving to "
+        "a different moment over trimming a clip until it fits — a clip cut to "
+        "length that no longer makes sense on its own is worse than one fewer "
+        "clip. check_range cannot see your other candidates, so it will not "
+        "tell you when two of yours overlap each other; keep them apart "
+        "yourself.\n\n"
+        "Then call propose_clips ONCE with the candidates that passed. "
+        "Reference units by INDEX NUMBER only — never write timestamps and "
+        "never retype the transcript text. For each clip supply:\n"
         "- first_index and last_index.\n"
         "- start_echo and end_echo: the first / last ~6 words of those two "
         "units, verbatim. A sanity check only — the indices are "
@@ -552,6 +603,180 @@ def _echo_matches(echo: str, unit_text: str) -> bool:
     return e in u or u in e
 
 
+# --- Shared range checks -----------------------------------------------
+#
+# ONE implementation, used by both the check_range tool the model calls before
+# submitting AND the server-side validator that has the final say. If those
+# two ever disagreed, the model would be told a range passes and then watch it
+# be refused — so they are not allowed to be separate code.
+#
+# check_range is an AID, never the enforcement: the model can ignore a FAIL,
+# and _validate_indexed_proposals still decides.
+
+# Title word bounds. The proposal's title IS the published title — the promo
+# chain skips its AI-title step when one is supplied — so a title outside
+# these bounds ships as-is if nothing checks it.
+TITLE_WORD_BOUNDS: tuple[int, int] = (2, 12)
+
+
+def _resolved_max_seconds(kind: ClipKind, parent_duration_seconds: float) -> float | None:
+    """This kind's upper bound, with segment's parent-relative cap resolved."""
+    max_s = _PER_KIND_BOUNDS[kind][1]
+    if max_s is None and parent_duration_seconds > 0:
+        return _SEGMENT_MAX_FRACTION_OF_PARENT_DURATION * parent_duration_seconds
+    return max_s
+
+
+def check_title(title: str) -> tuple[RejectionReason, str] | None:
+    """Word-count bounds on a proposed title, or None when it's fine."""
+    words = len(title.split())
+    lo, hi = TITLE_WORD_BOUNDS
+    if not title.strip():
+        return (RejectionReason.TITLE_LENGTH, "title is empty")
+    if words < lo:
+        return (RejectionReason.TITLE_LENGTH,
+                f"title is {words} word{'' if words == 1 else 's'}, minimum is {lo}")
+    if words > hi:
+        return (RejectionReason.TITLE_LENGTH,
+                f"title is {words} words, maximum is {hi}")
+    return None
+
+
+def check_duration(
+    kind: ClipKind, duration: float, parent_duration_seconds: float,
+) -> tuple[RejectionReason, str] | None:
+    """Duration against this kind's band, or None when it's inside."""
+    min_s = _PER_KIND_BOUNDS[kind][0]
+    max_s = _resolved_max_seconds(kind, parent_duration_seconds)
+    if duration < min_s:
+        return (RejectionReason.DURATION_OUT_OF_BAND,
+                f"{duration:.1f}s is under the {kind} window [{min_s:g}s, {max_s:g}s]")
+    if max_s is not None and duration > max_s:
+        return (RejectionReason.DURATION_OUT_OF_BAND,
+                f"{duration:.1f}s is over the {kind} window [{min_s:g}s, {max_s:g}s]")
+    return None
+
+
+def check_title_duplicate(
+    title: str, existing_titles: list[str],
+) -> tuple[RejectionReason, str] | None:
+    """Near-match against titles already on the parent, or None."""
+    match = next(
+        (t for t in existing_titles if title.strip() and _titles_similar(title, t)),
+        None,
+    )
+    if match is None:
+        return None
+    return (RejectionReason.DUPLICATE_TITLE,
+            f"title duplicates an existing clip, {match!r}")
+
+
+def check_overlap(
+    start: float, end: float, ranges: list[tuple[float, float]],
+) -> tuple[RejectionReason, str] | None:
+    """Overlap against already-cut ranges, measured symmetrically against the
+    SHORTER of the two clips so full containment counts. None when clear."""
+    length = end - start
+    for s, e in ranges:
+        shorter = min(length, e - s)
+        if shorter <= 0:
+            continue
+        if _overlap_seconds(start, end, s, e) > _MAX_OVERLAP_FRACTION * shorter:
+            return (RejectionReason.OVERLAPS_EXISTING,
+                    f"overlaps {s:.1f}s-{e:.1f}s by more than "
+                    f"{_MAX_OVERLAP_FRACTION:.0%} of the shorter clip")
+    return None
+
+
+@dataclass(frozen=True)
+class RangeCheck:
+    """One check_range verdict, rendered for the model."""
+
+    passed: bool
+    text: str
+
+
+def check_clip_range(
+    *, kind: ClipKind, units: list[ClipUnit], first_index: int, last_index: int,
+    title: str, parent_duration_seconds: float,
+    existing_ranges: list[tuple[float, float]],
+    existing_titles: list[str],
+) -> RangeCheck:
+    """Evaluate one candidate range and render the verdict the model reads.
+
+    Reports EVERY line, pass or fail, so the model can see what it got right
+    as well as what it didn't — a bare FAIL teaches it less.
+
+    Deliberately stateless: it cannot see the other candidates in the same
+    batch, so within-batch overlap and duplicate titles are still resolved
+    server-side. The tool description says so.
+    """
+    lines: list[str] = []
+    failures: list[str] = []
+
+    def line(label: str, measured: str, problem: tuple[RejectionReason, str] | None) -> None:
+        if problem is None:
+            lines.append(f"  {label}: {measured} - OK")
+        else:
+            lines.append(f"  {label}: {measured} - FAIL: {problem[1]}")
+            failures.append(problem[1])
+
+    resolved = clip_edges.resolve_unit_range(units, first_index, last_index)
+    if resolved is None:
+        lines.append(
+            f"  index range: units {first_index}-{last_index} - FAIL: out of "
+            f"bounds, the transcript has {len(units)} units"
+        )
+        return RangeCheck(passed=False, text=_render_check(
+            kind, first_index, last_index, title, lines, ok=False))
+
+    lines.append(f"  index range: units {first_index}-{last_index} of {len(units)} - OK")
+    word_count = len(title.split())
+    line(
+        "title",
+        f"{word_count} word{'' if word_count == 1 else 's'} / "
+        f"{len(title)} char{'' if len(title) == 1 else 's'}",
+        check_title(title),
+    )
+    line(
+        "title duplicate",
+        f"checked against {len(existing_titles)} existing {kind} title"
+        f"{'' if len(existing_titles) == 1 else 's'}",
+        check_title_duplicate(title, existing_titles),
+    )
+    line(
+        "clip length", f"{resolved.duration:.1f} seconds",
+        check_duration(kind, resolved.duration, parent_duration_seconds),
+    )
+    edges = clip_edges.compute_edges(units, first_index, last_index)
+    line(
+        "overlap check",
+        f"checked against {len(existing_ranges)} existing clip"
+        f"{'' if len(existing_ranges) == 1 else 's'}",
+        check_overlap(edges.final_start, edges.final_end, existing_ranges),
+    )
+    return RangeCheck(
+        passed=not failures,
+        text=_render_check(kind, first_index, last_index, title, lines, ok=not failures),
+    )
+
+
+def _render_check(
+    kind: ClipKind, first_index: int, last_index: int, title: str,
+    lines: list[str], *, ok: bool,
+) -> str:
+    return (
+        "Check - inputs:\n"
+        f"  kind: {kind}\n"
+        f"  title: \"{title}\"\n"
+        f"  first_index: {first_index}\n"
+        f"  last_index: {last_index}\n\n"
+        "Check - result:\n"
+        + "\n".join(lines)
+        + f"\n\nOverall result: {'PASS' if ok else 'FAIL'}"
+    )
+
+
 def _validate_indexed_proposals(
     raw_proposals: list[dict], *, kind: ClipKind, units: list[ClipUnit],
     existing_ranges: list[tuple[float, float]], max_proposals: int,
@@ -578,12 +803,6 @@ def _validate_indexed_proposals(
     The only duplicate signal available for imported clips, which carry no
     cut range for the overlap check to see.
     """
-    min_s, max_s = _PER_KIND_BOUNDS[kind]
-    # Segments have no fixed upper bound — cap at a fraction of the parent so a
-    # "segment" can run long but can't just be (nearly) the whole video.
-    if max_s is None and parent_duration_seconds > 0:
-        max_s = _SEGMENT_MAX_FRACTION_OF_PARENT_DURATION * parent_duration_seconds
-
     rejected: list[RejectedProposal] = []
 
     def _reject(
@@ -633,28 +852,19 @@ def _validate_indexed_proposals(
             )
             continue
 
-        if resolved.duration < min_s or (max_s is not None and resolved.duration > max_s):
-            side = "under" if resolved.duration < min_s else "over"
-            _reject(
-                RejectionReason.DURATION_OUT_OF_BAND,
-                f"{resolved.duration:.1f}s is {side} the {kind} window "
-                f"[{min_s:g}s, {max_s:g}s]",
-                title=title, first_index=first_index, last_index=last_index,
-                duration_seconds=resolved.duration,
-            )
-            continue
-
-        # Only REAL titles dedup: the synthetic "Untitled <kind>" fallback must
-        # not collide two distinct untitled clips.
-        duplicate_of = next(
-            (t for t in (existing_titles or [])
-             if raw_title and _titles_similar(raw_title, t)),
-            None,
+        # Same primitives check_range renders for the model, so a range it was
+        # told passes cannot be refused here for a reason it never saw.
+        problem = (
+            check_duration(kind, resolved.duration, parent_duration_seconds)
+            or check_title(raw_title)
+            # Only REAL titles dedup: the synthetic "Untitled <kind>" fallback
+            # must not collide two distinct untitled clips.
+            or (check_title_duplicate(raw_title, list(existing_titles or []))
+                if raw_title else None)
         )
-        if duplicate_of is not None:
+        if problem is not None:
             _reject(
-                RejectionReason.DUPLICATE_TITLE,
-                f"title duplicates an existing {kind} clip, {duplicate_of!r}",
+                problem[0], problem[1],
                 title=title, first_index=first_index, last_index=last_index,
                 duration_seconds=resolved.duration,
             )
@@ -716,20 +926,12 @@ def _validate_indexed_proposals(
         # from this batch. Symmetric: measured against the SHORTER of the two
         # clips, so a long proposal that fully contains a short existing clip is
         # also dropped (against its own length alone, containment would pass).
-        conflict: tuple[float, float] | None = None
-        for s, e in existing_ranges + accepted_ranges:
-            shorter_length = min(duration, e - s)
-            if shorter_length <= 0:
-                continue
-            overlap = _overlap_seconds(edges.final_start, edges.final_end, s, e)
-            if overlap > _MAX_OVERLAP_FRACTION * shorter_length:
-                conflict = (s, e)
-                break
+        conflict = check_overlap(
+            edges.final_start, edges.final_end, existing_ranges + accepted_ranges,
+        )
         if conflict is not None:
             _reject(
-                RejectionReason.OVERLAPS_EXISTING,
-                f"overlaps {conflict[0]:.1f}s-{conflict[1]:.1f}s by more than "
-                f"{_MAX_OVERLAP_FRACTION:.0%} of the shorter clip",
+                conflict[0], conflict[1],
                 title=title, first_index=first_index, last_index=last_index,
                 duration_seconds=duration,
             )
@@ -821,45 +1023,107 @@ async def propose_clips_for_kind_indexed(
         "timeout": CLIP_PROPOSAL_TIMEOUT_SECONDS,
         "system": system_text,
         "messages": [{"role": "user", "content": user_text}],
-        "tools": [_INDEX_PROPOSAL_TOOL],
-        "tool_choice": {"type": "tool", "name": "propose_clips"},
+        "tools": [_CHECK_RANGE_TOOL, _INDEX_PROPOSAL_TOOL],
+        # "any" not a named tool: the model must use A tool, but it picks which,
+        # so it can check candidates before committing. Pinning propose_clips
+        # would make check_range unreachable no matter what the prompt says.
+        "tool_choice": {"type": "any"},
     }
     logger.info("Clip-proposal (index) request: kind=%s units=%d model=%s",
                 kind, len(units), model)
 
     client = ai.get_client()
-    try:
-        message = await ai.create_message_async(
-            client, label=f"clip-proposal:{kind}", **kwargs,
-        )
-    except Exception as exc:
-        # Carried, not swallowed: returning an empty list here would render
-        # identically to "Claude found nothing good", which is a different
-        # fact and one the user cannot act on.
-        logger.exception("Claude clip-proposal (index) call failed for %s", kind)
-        return KindProposals.failed(kind, f"{type(exc).__name__}: {exc}")
+    messages: list[dict] = list(kwargs["messages"])  # type: ignore[arg-type]
+    checks_answered = 0
+    entries: list | None = None
+    stop_reason = None
 
-    # A response that carries no usable tool call is a FAILURE, not an empty
-    # result. Claude hitting max_tokens mid-JSON arrives as an ordinary 200,
-    # and reporting that as "no proposals" is the same lie this whole return
-    # type exists to prevent.
-    stop_reason = getattr(message, "stop_reason", None)
-    tool_block = None
-    for block in getattr(message, "content", []) or []:
-        if getattr(block, "type", None) == "tool_use" and getattr(block, "name", "") == "propose_clips":
-            tool_block = block
+    for round_number in range(1, MAX_PROPOSAL_ROUNDS + 1):
+        try:
+            message = await ai.create_message_async(
+                client, label=f"clip-proposal:{kind}:r{round_number}",
+                **{**kwargs, "messages": messages},
+            )
+        except Exception as exc:
+            # Carried, not swallowed: returning an empty list here would render
+            # identically to "Claude found nothing good", which is a different
+            # fact and one the user cannot act on.
+            logger.exception("Claude clip-proposal (index) call failed for %s", kind)
+            return KindProposals.failed(kind, f"{type(exc).__name__}: {exc}")
+
+        stop_reason = getattr(message, "stop_reason", None)
+        blocks = list(getattr(message, "content", []) or [])
+        proposal_block = next(
+            (b for b in blocks
+             if getattr(b, "type", None) == "tool_use"
+             and getattr(b, "name", "") == "propose_clips"),
+            None,
+        )
+        if proposal_block is not None:
+            candidate = (getattr(proposal_block, "input", None) or {}).get("proposals")
+            if not isinstance(candidate, list):
+                return KindProposals.failed(kind, (
+                    f"propose_clips carried no 'proposals' array (got "
+                    f"{type(candidate).__name__}, stop_reason={stop_reason!r})."
+                ))
+            entries = candidate
             break
-    if tool_block is None:
+
+        check_blocks = [
+            b for b in blocks
+            if getattr(b, "type", None) == "tool_use"
+            and getattr(b, "name", "") == "check_range"
+        ]
+        if not check_blocks:
+            # Neither tool, despite tool_choice="any" — a truncated response or
+            # a prose answer. A failure, not an empty result.
+            return KindProposals.failed(kind, (
+                f"Claude called neither check_range nor propose_clips in round "
+                f"{round_number} (stop_reason={stop_reason!r}) — the response "
+                "was truncated or answered in prose."
+            ))
+
+        # Answer every check in ONE user turn, so a batch of parallel checks
+        # costs a single round-trip rather than one apiece.
+        results = []
+        for block in check_blocks:
+            args = getattr(block, "input", None) or {}
+            try:
+                verdict = check_clip_range(
+                    kind=kind, units=units,
+                    first_index=int(args["first_index"]),
+                    last_index=int(args["last_index"]),
+                    title=str(args.get("title") or ""),
+                    parent_duration_seconds=parent_duration_seconds,
+                    existing_ranges=existing_ranges,
+                    existing_titles=list(existing_titles or []),
+                ).text
+            except (KeyError, TypeError, ValueError) as exc:
+                verdict = (
+                    f"Check - result:\n  FAIL: could not read the range you sent "
+                    f"({type(exc).__name__}: {exc}).\n\nOverall result: FAIL"
+                )
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": getattr(block, "id", ""),
+                "content": verdict,
+            })
+        checks_answered += len(results)
+        messages = messages + [
+            {"role": "assistant", "content": blocks},
+            {"role": "user", "content": results},
+        ]
+        logger.info(
+            "Clip-proposal (index) %s round %d: answered %d check_range call%s",
+            kind, round_number, len(results), "" if len(results) == 1 else "s",
+        )
+
+    if entries is None:
         return KindProposals.failed(kind, (
-            f"Claude returned no propose_clips tool call (stop_reason="
-            f"{stop_reason!r}) — the response was truncated or answered in prose."
+            f"Claude used {checks_answered} check_range calls across "
+            f"{MAX_PROPOSAL_ROUNDS} rounds without ever calling propose_clips."
         ))
-    entries = (getattr(tool_block, "input", None) or {}).get("proposals")
-    if not isinstance(entries, list):
-        return KindProposals.failed(kind, (
-            f"propose_clips carried no 'proposals' array (got "
-            f"{type(entries).__name__}, stop_reason={stop_reason!r})."
-        ))
+
     raw_proposals = list(entries)
 
     accepted, rejected = _validate_indexed_proposals(
@@ -870,8 +1134,9 @@ async def propose_clips_for_kind_indexed(
     )
     logger.info(
         "Clip-proposal (index) for %s: %d raw -> %d accepted, %d rejected "
-        "(asked up to %d)",
+        "(asked up to %d, %d check_range calls answered)",
         kind, len(raw_proposals), len(accepted), len(rejected), ask_max,
+        checks_answered,
     )
     return KindProposals(
         kind=kind, accepted=accepted, rejected=rejected,
