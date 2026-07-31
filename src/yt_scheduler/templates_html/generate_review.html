@@ -789,7 +789,15 @@ document.getElementById('gen-confirm').addEventListener('click', async () => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 accepted, rejected,
-                job_id: previewData ? previewData.job_id : null,
+                // Fall back to the URL's job_id. On the supported ?job_id=
+                // reload path previewData is null, so sending null told the
+                // server "no job", which skips its crop cross-check AND
+                // forfeits preview adoption — the user's crop choices
+                // silently reverted to the picker defaults and every clip
+                // was re-encoded from scratch.
+                job_id: (previewData && previewData.job_id)
+                    || new URLSearchParams(window.location.search).get('job_id')
+                    || null,
             }),
         });
         body = await resp.json();

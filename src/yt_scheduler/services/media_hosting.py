@@ -256,7 +256,10 @@ async def verify_round_trip() -> dict:
             )
         except httpx.HTTPError as exc:
             raise MediaHostingError(f"Could not reach R2: {exc}") from exc
-        if put.status_code >= 400:
+        # Not `>= 400`: an S3-compatible PUT succeeds with 200 (or 201). A 3xx
+        # is a redirect this client does not follow, so treating it as success
+        # would report an object stored that isn't there.
+        if put.status_code not in (200, 201):
             raise MediaHostingError(
                 f"Upload rejected: HTTP {put.status_code} {put.text[:300]}"
             )

@@ -59,7 +59,13 @@ async def get_template(name: str, project_slug: str | None = None):
 
 @router.post("")
 async def create_template(data: dict, project_slug: str | None = None):
-    """Create or update a template."""
+    """Create or update a template.
+
+    Wrapped like every other template mutation: this endpoint is an UPSERT, so
+    it can edit an existing template's slots and bodies. The UI happens to use
+    PUT, which left this an API-contract hole in "every template mutation
+    reconciles".
+    """
     project_id = await _resolve_project_id(project_slug)
     name = (data.get("name") or "").strip()
     if not name:
@@ -67,16 +73,17 @@ async def create_template(data: dict, project_slug: str | None = None):
     if not _TEMPLATE_NAME_RE.match(name):
         raise HTTPException(400, _BAD_NAME_MSG)
 
-    try:
-        await tmpl.save_template(
-            name=name,
-            description=data.get("description", ""),
-            platforms=data.get("platforms", {}),
-            applies_to=data.get("applies_to"),
-            project_id=project_id,
-        )
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
+    async with _reconciling(name, project_id):
+        try:
+            await tmpl.save_template(
+                name=name,
+                description=data.get("description", ""),
+                platforms=data.get("platforms", {}),
+                applies_to=data.get("applies_to"),
+                project_id=project_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     return {"status": "ok"}
 
 

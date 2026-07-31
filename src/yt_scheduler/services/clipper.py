@@ -792,7 +792,8 @@ def _validate_indexed_proposals(
        own and are evaluated for every entry.
     2. **Mutual** — overlap and within-batch title duplication. These are
        contests between candidates, so the survivors are ranked first
-       (rating, then length, then the model's own order) and taken greedily.
+       (rating, then length, then earliest in the transcript) and taken
+       greedily.
        Ranking is what makes the output cap keep the BEST N rather than the
        first N, and what decides which of two overlapping clips wins.
 

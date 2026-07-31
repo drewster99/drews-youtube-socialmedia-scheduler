@@ -2610,7 +2610,14 @@ class ThreadsPoster(SocialPoster):
     # container to give our server enough time to fully process the upload."
     # Meta downloads the file from our signed URL during this window, so the
     # budget has to cover their fetch as well as their transcode.
-    _MEDIA_CONTAINER_POLL_ATTEMPTS = 150
+    # Meta downloads the file from R2 and transcodes it inside this window, so
+    # the budget is a transcode budget, not a handshake. 150 x 1s undershot a
+    # near-envelope video, failing the post terminally — and each retry re-pays
+    # the probe, transcode, R2 upload and container.
+    _MEDIA_CONTAINER_POLL_ATTEMPTS = 600
+    # Consecutive failed STATUS READS tolerated before giving up. A blip while
+    # Meta is still working is not a failed post.
+    _CONTAINER_POLL_READ_FAILURE_TOLERANCE = 4
 
     _CONTAINER_POLL_DELAY_SECONDS = 1.0
 
@@ -2633,6 +2640,7 @@ class ThreadsPoster(SocialPoster):
         """
         budget = attempts if attempts is not None else self._TEXT_CONTAINER_POLL_ATTEMPTS
         last_status = "UNKNOWN"
+        consecutive_read_failures = 0
         for attempt in range(budget):
             status_resp = await client.get(
                 f"https://graph.threads.net/v1.0/{container_id}",
@@ -2643,10 +2651,28 @@ class ThreadsPoster(SocialPoster):
                     cred_uuid, "Threads rejected the access token — re-OAuth.",
                 )
             if status_resp.status_code >= 400:
-                raise RuntimeError(
-                    f"Threads container status check failed: "
-                    f"{_http_error_detail(status_resp)}"
+                # A blip on a STATUS READ is not a failed post: the container
+                # is still processing on Meta's side. Aborting here throws away
+                # the probe, transcode, R2 upload and container we already paid
+                # for, and every retry re-pays all of it. The publish-resolver
+                # next door tolerates 4 consecutive failures for this reason.
+                consecutive_read_failures += 1
+                if consecutive_read_failures > self._CONTAINER_POLL_READ_FAILURE_TOLERANCE:
+                    raise RuntimeError(
+                        f"Threads container status check failed "
+                        f"{consecutive_read_failures} times in a row: "
+                        f"{_http_error_detail(status_resp)}"
+                    )
+                logger.warning(
+                    "Threads container status read failed (%d of %d tolerated): %s",
+                    consecutive_read_failures,
+                    self._CONTAINER_POLL_READ_FAILURE_TOLERANCE,
+                    _http_error_detail(status_resp),
                 )
+                if attempt < budget - 1:
+                    await asyncio.sleep(self._CONTAINER_POLL_DELAY_SECONDS)
+                continue
+            consecutive_read_failures = 0
             data = status_resp.json()
             # Graph can answer 200 with an error object (and no status) rather
             # than a 4xx; surface that immediately instead of polling to timeout
