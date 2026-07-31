@@ -503,9 +503,12 @@ _CHECK_RANGE_TOOL = {
 
 # How many assistant turns a single kind may take before we stop. Each round is
 # one API call: the model fires a batch of check_range calls, we answer them
-# all in one user turn, it revises. Bounded because a model that never calls
-# propose_clips would otherwise loop forever on our money.
-MAX_PROPOSAL_ROUNDS: int = 6
+# all in one user turn, it revises. The final round FORCES propose_clips (see
+# the loop), so this is the ceiling on check-and-revise turns, not a failure
+# point — a model that keeps checking is made to submit on the last turn
+# rather than losing the batch. Still bounded so a pathological loop can't run
+# up the bill indefinitely.
+MAX_PROPOSAL_ROUNDS: int = 20
 
 
 def _build_index_system_text(kind: ClipKind, editorial_block: str) -> str:
