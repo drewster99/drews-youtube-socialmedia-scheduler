@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import json
 import logging
 import math
 import re
@@ -1062,9 +1063,20 @@ async def propose_clips_for_kind_indexed(
         )
         if proposal_block is not None:
             candidate = (getattr(proposal_block, "input", None) or {}).get("proposals")
+            # Coerce a JSON-STRINGIFIED array. After several check_range rounds
+            # the model sometimes submits proposals as a string containing the
+            # JSON ("[\n {...}]") rather than a native array — a known tool-use
+            # quirk. Rejecting it outright threw away a whole kind's worth of
+            # already-validated candidates; parse it instead, and only fail if
+            # it still isn't a list of objects.
+            if isinstance(candidate, str):
+                try:
+                    candidate = json.loads(candidate)
+                except (ValueError, TypeError):
+                    candidate = None
             if not isinstance(candidate, list):
                 return KindProposals.failed(kind, (
-                    f"propose_clips carried no 'proposals' array (got "
+                    f"propose_clips carried no usable 'proposals' array (got "
                     f"{type(candidate).__name__}, stop_reason={stop_reason!r})."
                 ))
             entries = candidate

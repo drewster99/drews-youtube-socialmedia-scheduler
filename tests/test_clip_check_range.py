@@ -288,3 +288,38 @@ async def test_neither_tool_is_a_failure_not_an_empty_result(monkeypatch):
     )
     assert out.error is not None
     assert "max_tokens" in out.error and "neither check_range nor propose_clips" in out.error
+
+
+@pytest.mark.asyncio
+async def test_a_json_stringified_proposals_array_is_coerced(monkeypatch):
+    """After several check_range rounds the model sometimes submits proposals
+    as a JSON STRING ("[{...}]") instead of a native array. Rejecting it threw
+    away a whole kind's validated candidates; it must be parsed instead."""
+    import json as _json
+    units = make_units(30)
+    scripted = [
+        _Msg([_Block("propose_clips", {"proposals": _json.dumps([
+            {"first_index": 2, "last_index": 4, "title": "A Real Clip",
+             "reason": "r", "rating": 4},
+        ])})]),
+    ]
+    _install_fake_claude(monkeypatch, scripted)
+    out = await _clipper().propose_clips_for_kind_indexed(
+        kind="hook", units=units, parent_title="P", parent_duration_seconds=2000.0,
+        existing_ranges=[], project_id=1, max_proposals=5,
+    )
+    assert out.error is None, out.error
+    assert [p.title for p in out.accepted] == ["A Real Clip"]
+
+
+@pytest.mark.asyncio
+async def test_a_non_json_string_proposals_still_fails_loudly(monkeypatch):
+    """A string that isn't a JSON array is a real malformed submission — fail,
+    don't silently return nothing."""
+    scripted = [_Msg([_Block("propose_clips", {"proposals": "sorry, none good"})])]
+    _install_fake_claude(monkeypatch, scripted)
+    out = await _clipper().propose_clips_for_kind_indexed(
+        kind="hook", units=make_units(30), parent_title="P",
+        parent_duration_seconds=2000.0, existing_ranges=[], project_id=1,
+    )
+    assert out.error is not None and "no usable 'proposals'" in out.error
