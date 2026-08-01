@@ -1364,7 +1364,7 @@ def get_generate_job(job_id: str) -> dict | None:
         # Deny-by-default: the job dict also holds parent_video_path, an
         # absolute filesystem path the browser must never see. Add new fields
         # here deliberately — a field not listed is silently dropped.
-        "rejected", "raw_counts", "kind_errors",
+        "rejected", "raw_counts", "kind_errors", "warnings",
     }
     return {k: v for k, v in job.items() if k in public_keys}
 
@@ -2003,6 +2003,21 @@ async def _run_generate_job(job_id: str) -> None:
         logger.info("Generate-from-source: %d word-stream units (%s).",
                     len(units), result.backend)
         _debug_dump_word_stream(job["parent_id"], result.backend, result.all_words, units)
+
+        # Surface a UI warning if the transcription timing grid isn't Apple's
+        # expected 60ms — the detect_quantum heuristic misfiring, or Apple
+        # changing the grid. Either way the edge math assumes 60ms, so the user
+        # sees it on the review page and we can judge reliability over time.
+        # Guarded like the debug dump above: a diagnostic must never fail the
+        # generate run it describes.
+        try:
+            grid_warning = clip_edges.timing_grid_warning(clip_edges.detect_quantum(units))
+        except Exception:
+            logger.exception("Timing-grid check failed; continuing without it")
+            grid_warning = None
+        if grid_warning is not None:
+            job["warnings"] = [grid_warning]
+            logger.warning("Generate-from-source: %s", grid_warning["message"])
 
         # Proposing — fan out the per-kind index calls.
         job["state"] = "proposing"

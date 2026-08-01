@@ -207,3 +207,18 @@ def test_snap_end_no_pause_within_window_stays():
     # every gap is 0.06 (contiguous) -> nothing to snap to within the window
     units = [_u(i, i * 1.0, i * 1.0 + 0.94) for i in range(1, 20)]
     assert snap_clip_end_to_pause(units, 1) == 1
+
+
+# --- timing_grid_warning ---
+
+def test_timing_grid_warning_none_on_apple_grid():
+    from yt_scheduler.services.clip_edges import timing_grid_warning
+    assert timing_grid_warning(0.06) is None
+    assert timing_grid_warning(0.05999999999994543) is None   # float residual still OK
+
+
+def test_timing_grid_warning_flags_unexpected_grid():
+    from yt_scheduler.services.clip_edges import timing_grid_warning
+    w = timing_grid_warning(0.04)
+    assert w is not None and w["code"] == "unexpected_timing_grid"
+    assert "40ms" in w["message"] and "60ms" in w["message"]

@@ -562,6 +562,7 @@ def test_generate_job_payload_omits_private_fields():
         "job_id": "gen_x", "parent_id": "p", "project_id": 1, "state": "done",
         "last_error": None, "kinds": ["hook"], "crop_vertical": {}, "proposals": {},
         "progress_message": "", "rejected": {}, "raw_counts": {}, "kind_errors": {},
+        "warnings": [{"code": "unexpected_timing_grid", "message": "grid off"}],
         "parent_video_path": "/Users/someone/secret/master.mov",
         "existing_titles_per_kind": {}, "cuts_total": 3,
     }
@@ -574,7 +575,10 @@ def test_generate_job_payload_omits_private_fields():
             clipper._GENERATE_JOBS.pop("gen_x", None)
     assert "parent_video_path" not in public
     assert "cuts_total" not in public
-    for key in ("rejected", "raw_counts", "kind_errors"):
+    # ``warnings`` must survive the deny-by-default allowlist: it was added to the
+    # job dict but left out of the whitelist once, which silently dropped the
+    # timing-grid warning before it ever reached the review page (rule C).
+    for key in ("rejected", "raw_counts", "kind_errors", "warnings"):
         assert key in public, f"{key} must reach the browser"
 
 

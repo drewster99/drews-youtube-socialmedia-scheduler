@@ -479,6 +479,14 @@ async function pollJob(jobId, myToken) {
     document.getElementById('gen-progress-text').textContent =
         body.progress_message || labels[body.state] || body.state;
 
+    // Source-quality warnings (from the initial submit) plus any the job itself
+    // surfaced — e.g. an unexpected transcription timing grid. Re-rendered each
+    // poll (idempotent) so the grid warning appears once the job detects it.
+    renderWarnings([
+        ...((previewData && previewData.parent_warnings) || []),
+        ...(body.warnings || []),
+    ]);
+
     if (body.state === 'done') {
         // Seed activeProposals from the new job (preserve any restored
         // items the user already added in this session).

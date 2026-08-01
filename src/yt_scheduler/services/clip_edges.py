@@ -40,6 +40,7 @@ _SENTENCE_END = re.compile(r'[.!?]["”]?$')
 HEAD_PAD_SECONDS = 0.12       # max lead-in silence kept before the first word
 QUANTUM_FLOOR_SECONDS = 0.02  # Whisper grid; also the floor when word timings are absent
 QUANTUM_CEIL_SECONDS = 0.08   # clamp so a sparse transcript can't over-detect the grid
+APPLE_TIMING_GRID_SECONDS = 0.06  # the grid Apple SpeechAnalyzer is expected to emit
 
 # Cosine-S (raised-cosine) fade applied at each cut edge, decoupled from the pad.
 # The pad only puts the cut in the inter-word INTERVAL, which is not guaranteed
@@ -233,6 +234,30 @@ def detect_quantum(units: list[ClipUnit]) -> float:
     if not durations:
         return QUANTUM_FLOOR_SECONDS
     return min(QUANTUM_CEIL_SECONDS, max(QUANTUM_FLOOR_SECONDS, min(durations)))
+
+
+def timing_grid_warning(quantum: float) -> dict | None:
+    """A UI warning dict when the detected transcription grid isn't Apple's
+    expected 60ms — else ``None``.
+
+    detect_quantum is a heuristic (smallest word duration), so an off-grid value
+    means either the heuristic misfired or Apple changed the grid. The edge math
+    assumes 60ms, so this must SURFACE (per rule C — never a silent "fine"),
+    letting us judge later whether the heuristic is always reliable.
+    """
+    if abs(quantum - APPLE_TIMING_GRID_SECONDS) <= 0.005:
+        return None
+    detected_ms = round(quantum * 1000)
+    expected_ms = round(APPLE_TIMING_GRID_SECONDS * 1000)
+    return {
+        "code": "unexpected_timing_grid",
+        "message": (
+            f"Transcription timing grid detected as {detected_ms}ms, not the "
+            f"expected {expected_ms}ms (Apple SpeechAnalyzer). Clip edge timing "
+            f"assumes {expected_ms}ms — double-check these clips' cut boundaries, "
+            "and flag it if this keeps happening."
+        ),
+    }
 
 
 def gap_after_unit(units: list[ClipUnit], index: int) -> float:
