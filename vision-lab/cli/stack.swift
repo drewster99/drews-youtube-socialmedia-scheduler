@@ -463,15 +463,38 @@ func renderClipCrop(parent: String, segments: [StackSegment], start: Double, end
     let audioTracks = try await asset.loadTracks(withMediaType: .audio)
     if let aTrack = audioTracks.first, fadeIn > 0 || fadeOut > 0 {
         let params = AVMutableAudioMixInputParameters(track: aTrack)
+        // Cosine-S (raised-cosine) fade to match the ffmpeg `curve=hsin` path
+        // used for the non-cropped kinds. AVFoundation volume ramps are
+        // linear-only, so approximate g(x) = (1 - cos(pi*x)) / 2 with short
+        // linear sub-ramps (24 over a ~75ms fade ≈ 3ms each — indistinguishable
+        // from the true curve).
+        func addCosineRamp(fadingIn: Bool, startSeconds: Double, duration: Double) {
+            let steps = 24
+            func gain(_ x: Double) -> Float {
+                let raised = (1.0 - cos(Double.pi * x)) / 2.0
+                return Float(fadingIn ? raised : 1.0 - raised)
+            }
+            // Precompute the boundary CMTimes ONCE so each sub-ramp starts on the
+            // exact CMTime the previous one ended on. Deriving start and duration
+            // independently would round separately and could leave a 1-sample
+            // seam between sub-ramps where the volume glitches — an audible click.
+            let bounds: [CMTime] = (0...steps).map {
+                CMTime(seconds: startSeconds + Double($0) / Double(steps) * duration,
+                       preferredTimescale: ts)
+            }
+            for k in 0..<steps {
+                params.setVolumeRamp(
+                    fromStartVolume: gain(Double(k) / Double(steps)),
+                    toEndVolume: gain(Double(k + 1) / Double(steps)),
+                    timeRange: CMTimeRange(start: bounds[k],
+                                           duration: CMTimeSubtract(bounds[k + 1], bounds[k])))
+            }
+        }
         if fadeIn > 0 {
-            params.setVolumeRamp(fromStartVolume: 0, toEndVolume: 1,
-                timeRange: CMTimeRange(start: CMTime(seconds: start, preferredTimescale: ts),
-                                       duration: CMTime(seconds: fadeIn, preferredTimescale: ts)))
+            addCosineRamp(fadingIn: true, startSeconds: start, duration: fadeIn)
         }
         if fadeOut > 0 {
-            params.setVolumeRamp(fromStartVolume: 1, toEndVolume: 0,
-                timeRange: CMTimeRange(start: CMTime(seconds: clampedEnd - fadeOut, preferredTimescale: ts),
-                                       duration: CMTime(seconds: fadeOut, preferredTimescale: ts)))
+            addCosineRamp(fadingIn: false, startSeconds: clampedEnd - fadeOut, duration: fadeOut)
         }
         let mix = AVMutableAudioMix()
         mix.inputParameters = [params]

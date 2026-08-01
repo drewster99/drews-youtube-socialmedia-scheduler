@@ -31,9 +31,33 @@ _HARD_WORD_CAP = 32           # force a break even mid-clause (continuous speech
 _SENTENCE_END = re.compile(r'[.!?]["”]?$')
 
 # --- Edge-ramp tuning ---
+#
+# Quantum-aware, derived from clip_proto/pipeline.snap_edges + detect_quantum.
+# Apple SpeechAnalyzer quantizes word timestamps to a 60ms grid (Whisper 20ms), so
+# a boundary word's stamped start can land up to one quantum after its true onset;
+# the HEAD floor guarantees a quantum of lead-in so the first word isn't shaved.
 
-MAX_RAMP_SECONDS = 0.50       # cap so a long pause doesn't become dead air
-MIN_RAMP_SECONDS = 0.02       # fallback when a neighbour word is contiguous/absent
+HEAD_PAD_SECONDS = 0.12       # max lead-in silence kept before the first word
+QUANTUM_FLOOR_SECONDS = 0.02  # Whisper grid; also the floor when word timings are absent
+QUANTUM_CEIL_SECONDS = 0.08   # clamp so a sparse transcript can't over-detect the grid
+
+# Cosine-S (raised-cosine) fade applied at each cut edge, decoupled from the pad.
+# The pad only puts the cut in the inter-word INTERVAL, which is not guaranteed
+# silent (our word's decay, the next word's onset on a late grid stamp, or a
+# breath can sit there), so a fixed short fade smooths each boundary as insurance.
+EDGE_FADE_SECONDS = 0.20  # 200ms cosine fade on both edges
+
+# Tail extension + (a) end-snap. The tail takes the ACTUAL inter-word pause,
+# floored at TAIL_MIN and capped at TAIL_MAX: a real pause is used in full up to
+# the cap; a contiguous tail (no pause) falls back to the floor, bleeding into the
+# next word (the cosine fade covers it). (a) end-snap first moves the clip's END
+# forward to the nearest unit whose trailing gap is a real pause, so it stops on a
+# beat rather than mid-breath — bounded by END_SNAP_MAX_UNITS, and (in the
+# validator) never past the kind's duration band.
+PAUSE_THRESHOLD_SECONDS = 0.12   # trailing silence that counts as a real pause (for (a))
+END_SNAP_MAX_UNITS = 10          # how far (a) may search forward for a pause
+TAIL_MIN_SECONDS = 0.30          # minimum tail extension (floor)
+TAIL_MAX_SECONDS = 0.50          # take the full pause up to here (cap)
 
 
 @dataclass
@@ -191,39 +215,91 @@ class ClipEdges:
     fade_out: float
 
 
-def compute_edges(units: list[ClipUnit], first_index: int, last_index: int) -> ClipEdges:
-    """Place the cut edges in the inter-word gaps with short ramps.
+def detect_quantum(units: list[ClipUnit]) -> float:
+    """Infer the transcriber's timing grid from the data: ~0.06s for Apple
+    SpeechAnalyzer, ~0.02s for Whisper.
 
-    START: cut at the prior word's end and ramp UP across the gap, reaching full
-    gain at our first word's onset. END: ramp DOWN from our last word's end across
-    the gap and cut at the next word's onset. Ramp length is the gap itself,
-    capped at ``MAX_RAMP_SECONDS``. Anchoring on the neighbouring words' boundaries
-    means a neighbouring phrase is naturally excluded (it belongs to the adjacent
-    unit, which ends before our cut point).
+    A word cannot be narrower than one grid cell, so the smallest word duration
+    is the quantum. Clamped to a safe band and falling back to the floor when no
+    word timings are available (e.g. cue-only units). Stable across the whole
+    transcript, so every clip on a given parent snaps to the same grid.
     """
+    durations = [
+        w.end - w.start
+        for u in units
+        for w in u.words
+        if (w.end - w.start) > 1e-4
+    ]
+    if not durations:
+        return QUANTUM_FLOOR_SECONDS
+    return min(QUANTUM_CEIL_SECONDS, max(QUANTUM_FLOOR_SECONDS, min(durations)))
+
+
+def gap_after_unit(units: list[ClipUnit], index: int) -> float:
+    """Silence (seconds) after the 1-based unit ``index``. The transcript's end
+    counts as an infinite pause — there is no next word to run into."""
+    if index >= len(units):
+        return float("inf")
+    return units[index].start - units[index - 1].end
+
+
+def snap_clip_end_to_pause(
+    units: list[ClipUnit], last_index: int,
+    *, max_extra_units: int = END_SNAP_MAX_UNITS,
+    threshold: float = PAUSE_THRESHOLD_SECONDS,
+) -> int:
+    """(a) Move a clip's END forward to the nearest unit followed by a real
+    pause, so it stops on a beat rather than mid-breath.
+
+    Bounded search: at most ``max_extra_units`` units forward. Returns the
+    original ``last_index`` unchanged if it already ends on a pause, or if no
+    pause is within reach (better an imperfect end than an unbounded overrun).
+    """
+    n = len(units)
+    for idx in range(last_index, min(last_index + max_extra_units, n) + 1):
+        if gap_after_unit(units, idx) >= threshold:
+            return idx
+    return last_index
+
+
+def compute_edges(
+    units: list[ClipUnit], first_index: int, last_index: int,
+    *, quantum: float | None = None,
+) -> ClipEdges:
+    """Place the cut edges around the boundary words.
+
+    HEAD: reach back into the lead-in silence up to ``HEAD_PAD``, floored at one
+    quantum — Apple's 60ms grid means a word's stamped start can sit a quantum
+    late, so the floor keeps the first word's onset from being shaved.
+
+    TAIL: extend by the ACTUAL inter-word pause, floored at ``TAIL_MIN`` and
+    capped at ``TAIL_MAX``. A real pause is used in full up to the cap; a
+    contiguous tail (no pause) falls back to the floor, which bleeds into the
+    next word — the cosine fade covers that. The transcript end is an unlimited
+    pause (takes the cap). (End-snapping the last unit to a real pause is done
+    upstream in the validator; this just computes the cut for whatever end it is
+    handed.)
+
+    The fade is a fixed ``EDGE_FADE_SECONDS`` cosine ramp, decoupled from the
+    room — the room decides where the cut lands, the fade smooths it. Pass
+    ``quantum`` to reuse a grid already detected for this transcript.
+    """
+    q = detect_quantum(units) if quantum is None else quantum
     a, b = units[first_index - 1], units[last_index - 1]
+
+    # Room to the nearest neighbouring word. A missing neighbour means the clip
+    # touches the transcript edge (unlimited room).
     prev_end = units[first_index - 2].end if first_index > 1 else None
     next_start = units[last_index].start if last_index < len(units) else None
+    head_gap = (a.start - prev_end) if prev_end is not None else a.start
+    tail_gap = (next_start - b.end) if next_start is not None else TAIL_MAX_SECONDS
 
-    head_gap = (a.start - prev_end) if prev_end is not None else 0.0
-    if head_gap > 0:
-        fade_in = min(head_gap, MAX_RAMP_SECONDS)
-        final_start = a.start - fade_in
-    else:
-        fade_in = MIN_RAMP_SECONDS
-        final_start = a.start - MIN_RAMP_SECONDS
-
-    tail_gap = (next_start - b.end) if next_start is not None else 0.0
-    if tail_gap > 0:
-        fade_out = min(tail_gap, MAX_RAMP_SECONDS)
-        final_end = b.end + fade_out
-    else:
-        fade_out = MIN_RAMP_SECONDS
-        final_end = b.end + MIN_RAMP_SECONDS
+    head_room = min(HEAD_PAD_SECONDS, max(q, head_gap))
+    tail_room = min(TAIL_MAX_SECONDS, max(TAIL_MIN_SECONDS, tail_gap))
 
     return ClipEdges(
-        final_start=round(max(0.0, final_start), 3),
-        final_end=round(final_end, 3),
-        fade_in=round(fade_in, 3),
-        fade_out=round(fade_out, 3),
+        final_start=round(max(0.0, a.start - head_room), 3),
+        final_end=round(b.end + tail_room, 3),
+        fade_in=EDGE_FADE_SECONDS,
+        fade_out=EDGE_FADE_SECONDS,
     )

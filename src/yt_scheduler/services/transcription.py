@@ -448,7 +448,9 @@ def _parse_whisper_cpp_time(ts: str) -> float:
     return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
 
 
-# --- Backend: macOS SFSpeechRecognizer ---
+# --- Backend: macOS SpeechAnalyzer / SpeechTranscriber ---
+# (SFSpeechRecognizer appears below only to request Speech-Recognition
+#  authorization; the transcription itself is SpeechAnalyzer/SpeechTranscriber.)
 
 
 def _macos_speech_timeout_seconds(audio_path: Path) -> int:

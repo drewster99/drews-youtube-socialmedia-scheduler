@@ -43,3 +43,7 @@ scripts/_whisper_outputs/
 
 # Clip-generation prototype scratch dir (large media/log artifacts, source-of-truth lives in plan docs)
 clip_proto/
+
+# Generated clip-previewer data (regenerate with scripts/gen_preview_clips.py)
+scripts/preview_clips.json
+scripts/preview_selections.json

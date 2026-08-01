@@ -277,3 +277,41 @@ def test_cap_rejection_never_masks_the_real_reason():
     assert rejected[0].reason is clipper.RejectionReason.OVERLAPS_EXISTING, (
         "an overlapping clip must be told it overlapped, not that it hit the cap"
     )
+
+
+# --- (a) end-snap wiring in the validator ---
+
+def _U(i: int, start: float, end: float) -> ClipUnit:
+    return ClipUnit(index=i, text=f"u{i}.", start=start, end=end, words=[])
+
+
+def test_validator_snaps_end_forward_to_a_pause_within_band():
+    # unit 2 ends contiguous; a real 0.5s pause follows unit 4. A hook proposed
+    # to end at unit 2 (10s) should snap forward to unit 4 (20s) -- in band.
+    units = [
+        _U(1, 0.0, 5.0),
+        _U(2, 5.06, 10.0),    # gap after 1 = 0.06 (contiguous)
+        _U(3, 10.06, 15.0),   # gap after 2 = 0.06
+        _U(4, 15.06, 20.0),   # gap after 3 = 0.06
+        _U(5, 20.5, 25.0),    # gap after 4 = 0.5 (a real pause)
+    ]
+    raw = [{"first_index": 1, "last_index": 2, "title": "Snap Me", "reason": "r", "rating": 4}]
+    accepted, _ = clipper._validate_indexed_proposals(
+        raw, kind="hook", units=units, existing_ranges=[], max_proposals=8,
+        parent_duration_seconds=PARENT_DURATION)
+    assert len(accepted) == 1
+    assert abs(accepted[0].end_seconds - units[3].end) < 1.0   # ended at unit 4, not 2
+
+
+def test_validator_does_not_snap_past_the_duration_band():
+    # 18s contiguous units; the only pause is far enough that snapping there would
+    # blow the 60s hook cap -> keep the model's end (never grow a clip out of a
+    # band check_range already approved).
+    units = [_U(i, (i - 1) * 18.06, (i - 1) * 18.06 + 18.0) for i in range(1, 7)]
+    units.append(_U(7, 6 * 18.06 + 0.5, 6 * 18.06 + 5.5))   # a pause, then one more unit
+    raw = [{"first_index": 1, "last_index": 2, "title": "No Snap", "reason": "r", "rating": 4}]
+    accepted, _ = clipper._validate_indexed_proposals(
+        raw, kind="hook", units=units, existing_ranges=[], max_proposals=8,
+        parent_duration_seconds=PARENT_DURATION)
+    assert len(accepted) == 1
+    assert abs(accepted[0].end_seconds - units[1].end) < 1.0   # stayed at unit 2 (~36s)

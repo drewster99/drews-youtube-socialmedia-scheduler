@@ -853,6 +853,21 @@ def _validate_indexed_proposals(
         raw_title = str(entry.get("title") or "").strip()
         title = raw_title or f"Untitled {kind}"
 
+        # (a) end-snap: move the end forward to a nearby real pause so the clip
+        # stops on a beat, not mid-breath. BOUNDED by the duration band — only
+        # adopt the snap if the resulting (longer) clip is still in-band, so a
+        # snap can NEVER push a clip out of a band check_range already approved on
+        # the model's own range (the "told it passes -> never refused" invariant
+        # enforced just below). If the nearest pause would overshoot the band, we
+        # keep the model's end and the tail falls to its floor.
+        snapped_last = clip_edges.snap_clip_end_to_pause(units, last_index)
+        if snapped_last != last_index:
+            snapped_resolved = clip_edges.resolve_unit_range(units, first_index, snapped_last)
+            if (snapped_resolved is not None
+                    and check_duration(kind, snapped_resolved.duration,
+                                       parent_duration_seconds) is None):
+                last_index = snapped_last
+
         resolved = clip_edges.resolve_unit_range(units, first_index, last_index)
         if resolved is None:
             _reject(
@@ -901,9 +916,12 @@ def _validate_indexed_proposals(
         edges = clip_edges.compute_edges(units, first_index, last_index)
         candidates.append((
             # Sort key first: best rating, then longest, then earliest in the
-            # transcript — never random, so a rerun is reproducible.
+            # transcript — never random, so a rerun is reproducible. The length
+            # is rounded to the millisecond so two genuinely equal-length clips
+            # tie on length and fall to first_index, rather than having float
+            # noise in the 15th digit decide the winner.
             -(rating if rating is not None else 0),
-            -(edges.final_end - edges.final_start),
+            -round(edges.final_end - edges.final_start, 3),
             float(first_index),
             title, raw_title, str(entry.get("reason") or "").strip(),
             rating, edges, first_index, last_index,
@@ -961,6 +979,20 @@ def _validate_indexed_proposals(
             )
             continue
 
+        # Per-accepted-clip cut geometry, so a tail/head that sounds clipped can
+        # be traced to the exact numbers: how far the cut extends past the last
+        # word (tail) / before the first word (head), and the ramp lengths. A
+        # near-zero tail here is the cut-off-at-the-end symptom.
+        a_start = units[first_index - 1].start
+        b_end = units[last_index - 1].end
+        logger.info(
+            "Clip edge geometry [%s] %r: units %d-%d | "
+            "first_word_start=%.3f -> final_start=%.3f (head +%.3f, fade_in %.3f) | "
+            "last_word_end=%.3f -> final_end=%.3f (tail +%.3f, fade_out %.3f)",
+            kind, title, first_index, last_index,
+            a_start, edges.final_start, a_start - edges.final_start, edges.fade_in,
+            b_end, edges.final_end, edges.final_end - b_end, edges.fade_out,
+        )
         out.append(ProposedClip(
             kind=kind,
             start_seconds=edges.final_start,
@@ -1819,6 +1851,88 @@ async def start_generate_job(
     return job_id
 
 
+def _debug_dump_word_stream(
+    parent_id: str, backend: str, words: list, units: list[ClipUnit],
+) -> None:
+    """Persist a generate run's word-level timing + unit segmentation to both
+    the server log and a temp file.
+
+    The generate path re-transcribes to memory and discards the word stream, so
+    when a cut sounds wrong (e.g. a hook clipped at the tail) there is otherwise
+    nothing to inspect after the fact. This captures the raw word timings, the
+    unit boundaries, and each unit's inter-word gaps — the exact inputs the cut
+    math consumes. Never raises: a debug dump must not fail the run it observes.
+    """
+    try:
+        import json
+        import tempfile
+        from datetime import datetime
+        from pathlib import Path
+
+        word_rows = [
+            {
+                "i": i + 1,
+                "start": round(float(w.start), 3),
+                "end": round(float(w.end), 3),
+                "word": w.word,
+                "probability": getattr(w, "probability", None),
+            }
+            for i, w in enumerate(words)
+        ]
+        unit_rows = []
+        for j, u in enumerate(units):
+            gap_before = round(u.start - units[j - 1].end, 3) if j > 0 else None
+            gap_after = round(units[j + 1].start - u.end, 3) if j + 1 < len(units) else None
+            unit_rows.append({
+                "index": u.index,
+                "start": round(u.start, 3),
+                "end": round(u.end, 3),
+                "duration": round(u.end - u.start, 3),
+                "gap_before": gap_before,
+                "gap_after": gap_after,
+                "word_count": len(u.words),
+                "text": u.text,
+            })
+
+        quantum = clip_edges.detect_quantum(units)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = Path(tempfile.gettempdir()) / f"dys_wordstream_{parent_id}_{stamp}.json"
+        out_path.write_text(
+            json.dumps({
+                "parent_id": parent_id,
+                "backend": backend,
+                "word_count": len(word_rows),
+                "unit_count": len(unit_rows),
+                "detected_quantum_seconds": quantum,
+                "head_pad_seconds": clip_edges.HEAD_PAD_SECONDS,
+                "tail_min_seconds": clip_edges.TAIL_MIN_SECONDS,
+                "tail_max_seconds": clip_edges.TAIL_MAX_SECONDS,
+                "pause_threshold_seconds": clip_edges.PAUSE_THRESHOLD_SECONDS,
+                "words": word_rows,
+                "units": unit_rows,
+            }, indent=2),
+            encoding="utf-8",
+        )
+
+        # Units whose trailing gap is below one quantum: a clip ending on one has
+        # no real post-word silence, so the cut relies entirely on the quantum
+        # floor (it bleeds a single inaudible frame into the neighbour). These are
+        # exactly the boundaries the 60ms-grid tail floor protects from a shave.
+        tight = [
+            u["index"] for u in unit_rows
+            if u["gap_after"] is not None and u["gap_after"] < quantum
+        ]
+        tight_str = ", ".join(str(i) for i in tight[:50]) + (" …" if len(tight) > 50 else "")
+        logger.info(
+            "Word-stream debug dump for %s (%s): %d words, %d units, quantum=%.3fs -> %s | "
+            "%d unit(s) with gap_after < quantum [rely on the floor]: %s",
+            parent_id, backend, len(word_rows), len(unit_rows), quantum, out_path,
+            len(tight), tight_str or "none",
+        )
+    except Exception:
+        logger.exception("Word-stream debug dump failed for %s (non-fatal)", parent_id)
+
+
 async def _run_generate_job(job_id: str) -> None:
     """Background task: transcribe the parent on-device for fresh word timing,
     fan out per-kind index proposals, cut previews, and write the result onto
@@ -1888,6 +2002,7 @@ async def _run_generate_job(job_id: str) -> None:
             return
         logger.info("Generate-from-source: %d word-stream units (%s).",
                     len(units), result.backend)
+        _debug_dump_word_stream(job["parent_id"], result.backend, result.all_words, units)
 
         # Proposing — fan out the per-kind index calls.
         job["state"] = "proposing"

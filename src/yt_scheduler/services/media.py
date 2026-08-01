@@ -592,10 +592,11 @@ def extract_clip(
     needs_probe = use_hardware or (audio_fade_in > 0 or audio_fade_out > 0)
     probe: VideoProbe | None = probe_video_file(video_path) if needs_probe else None
 
-    # Audio edge ramps. Cubic IN (sharp attack pops up at the first word) and a
-    # gentler linear OUT (the word's natural decay / room-tone tail rings out
-    # rather than being slammed). Positions are relative to the OUTPUT (``-ss``
-    # before ``-i`` resets timestamps to 0). No video fade by design.
+    # Audio edge ramps. Cosine-S (raised-cosine) on BOTH ends — ``curve=hsin``
+    # is (1-cos(pi*t))/2, smooth (zero-slope) at both endpoints, so neither the
+    # first word's attack nor the last word's decay is slammed. Positions are
+    # relative to the OUTPUT (``-ss`` before ``-i`` resets timestamps to 0). No
+    # video fade by design.
     #
     # Guard: only emit -af when the source has an audio stream. Applying
     # afade to a video-only input makes ffmpeg fail the filter graph
@@ -626,10 +627,10 @@ def extract_clip(
             max_out_duration = clip_duration
         audio_filters: list[str] = ["asetpts=PTS-STARTPTS"]
         if audio_fade_in > 0:
-            audio_filters.append(f"afade=t=in:curve=cub:st=0:d={audio_fade_in:.4f}")
+            audio_filters.append(f"afade=t=in:curve=hsin:st=0:d={audio_fade_in:.4f}")
         if audio_fade_out > 0:
             out_st = max(0.0, max_out_duration - audio_fade_out)
-            audio_filters.append(f"afade=t=out:curve=tri:st={out_st:.4f}:d={audio_fade_out:.4f}")
+            audio_filters.append(f"afade=t=out:curve=hsin:st={out_st:.4f}:d={audio_fade_out:.4f}")
         cmd.extend(["-af", ",".join(audio_filters)])
 
     if use_hardware:
