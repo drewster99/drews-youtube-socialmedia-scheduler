@@ -2210,7 +2210,7 @@ Terminal jobs (`done` / `failed`) are evicted from the in-memory job dict 30 min
 
 **Errors** — `404` (project / parent missing).
 
-**Response 200** — `{"jobs": [{"job_id", "kind", "title"}, ...]}`. Each `job_id` is polled via the existing `/upload-jobs/{job_id}` endpoint; the initial state is `cutting`.
+**Response 200** — `{"jobs": [{"job_id", "kind", "title"}, ...]}`. Each `job_id` is polled via the existing `/upload-jobs/{job_id}` endpoint; the initial state is `pending` ("Queued…"). The chain stamps `cutting` only while an actual cut runs — confirm-created jobs adopt the already-cut preview file, so they normally go straight from `pending` to `uploading` without ever showing `cutting`.
 
 **Errors** — `400` (empty `accepted`, no usable entries after defensive filtering, parent has no local file, or supplied `job_id` is unknown / expired — the in-memory generate-job dict TTL-evicts 30 minutes past terminal), `404` (project / parent missing). Defensive filter drops entries with non-finite `start_seconds` / `end_seconds`, wrong kind, end before start, range outside parent bounds, or empty title.
 

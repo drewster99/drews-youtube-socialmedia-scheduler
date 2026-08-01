@@ -974,7 +974,11 @@ async def start_promo_from_cut(
         "project_id": project_id,
         "forced_item_type": item_type,
         "video_id": None,
-        "state": PROMO_STATE_CUTTING,
+        # Queued, not "cutting": with the 4-wide chain semaphore a 30-clip
+        # confirm leaves most jobs waiting for minutes, and Generate-confirm
+        # jobs adopt the preview cut so they never cut at all. The chain
+        # stamps `cutting` itself, only when it actually runs a cut.
+        "state": PROMO_STATE_PENDING,
         "last_error": None,
         "title": title,
         "pre_supplied_title": title,
@@ -1054,7 +1058,9 @@ async def resume_pending_promo_jobs(*, window_hours: int) -> int:
             "project_id": int(record["project_id"]),
             "forced_item_type": record.get("forced_item_type"),
             "video_id": None,
-            "state": PROMO_STATE_CUTTING if record.get("parent_video_path") else PROMO_STATE_PENDING,
+            # Queued until the chain actually starts work — same reasoning as
+            # start_promo_from_cut; the chain stamps `cutting` when it cuts.
+            "state": PROMO_STATE_PENDING,
             "last_error": None,
             "title": record.get("title"),
             "pre_supplied_title": record.get("title"),
@@ -1409,6 +1415,11 @@ async def _run_promo_chain_inner(job_id: str) -> None:
     # pure ffmpeg subprocess call and doesn't need the OAuth token.
     if job.get("parent_video_path") and not job.get("local_path"):
         from yt_scheduler.services import clipper
+
+        # Only now is "Cutting clip from parent…" true — jobs sit in
+        # `pending` while queued on the chain semaphore, and adopted-preview
+        # jobs (Generate confirm) skip this block entirely.
+        job["state"] = PROMO_STATE_CUTTING
 
         try:
             proposal = clipper.ProposedClip(

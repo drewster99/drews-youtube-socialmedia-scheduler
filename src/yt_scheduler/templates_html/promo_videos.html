@@ -365,7 +365,9 @@ async function loadPromos() {
         } else {
             activeJobs.set(j.job_id, {
                 job_id: j.job_id,
-                state: j.state || 'cutting',
+                // "Queued…" is the honest unknown — 'cutting' claimed active
+                // work for jobs that were only waiting on the chain semaphore.
+                state: j.state || 'pending',
                 video_id: j.video_id || null,
                 title: j.title || 'New promo',
                 last_error: j.last_error || null,
