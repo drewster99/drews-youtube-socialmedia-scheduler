@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -92,7 +93,12 @@ async def test_duplicate_scheduled_post_is_terminal_and_not_rearmed(
 ) -> None:
     scheduler, db = app_db
     await _seed_video(db)
-    await _seed_post(db, status="posted", posted_at="2026-07-01T00:00:00+00:00")
+    # Relative, not a hardcoded absolute date: find_recent_duplicate_post only
+    # matches within the last 30 days, so a fixed past date silently ages out of
+    # the window and the dup stops being detected (this test began failing once
+    # real time passed the old 2026-07-01 + 30d).
+    recent = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    await _seed_post(db, status="posted", posted_at=recent)
     target = await _seed_post(db, status="approved")
 
     rearmed: list[int] = []
