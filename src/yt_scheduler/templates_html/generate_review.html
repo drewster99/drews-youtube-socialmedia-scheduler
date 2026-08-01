@@ -536,6 +536,7 @@ function renderProposals() {
     }
     renderKindErrors(container);
     renderRejected(container);
+    pumpPreviewLoads();
 
     // The zero-state used to say "Claude returned no proposals" even when
     // Claude returned 23 and the server refused all of them — a statement
@@ -726,6 +727,92 @@ function buildProposalCard(id, p, kind, idx) {
     return card;
 }
 
+// Preview load pump ------------------------------------------------------
+// Why this exists: with 33 <video preload="auto"> mounted in one render,
+// Safari's media loader starved the tail element — it issued a single range
+// request 1.3s after its 32 siblings and then wedged forever (readyState 0,
+// no error event, click-to-play produced zero network). Server logs showed
+// every request answered 206 in <30ms, and the file itself played fine when
+// loaded alone, so the fix is to never pile every load on at once: cards
+// mount with preload="none" and this pump runs the loads through a small
+// window, one retry for a stall, and a VISIBLE per-card failure after that.
+const PREVIEW_LOAD_CONCURRENCY = 4;
+const PREVIEW_LOAD_TIMEOUT_MS = 15000;
+let previewPumpToken = 0;
+
+function pumpPreviewLoads() {
+    const myToken = ++previewPumpToken;
+    const videos = Array.from(
+        document.querySelectorAll('#gen-proposals video.gen-preview-video'));
+    let next = 0;
+    async function worker() {
+        while (next < videos.length) {
+            if (myToken !== previewPumpToken) return;   // superseded by a re-render
+            const el = videos[next++];
+            // Skip elements a re-render removed, or that the user already
+            // started loading themselves by pressing play.
+            if (!el.isConnected || el.readyState > 0) continue;
+            let ok = await startPreviewLoad(el);
+            if (myToken !== previewPumpToken) return;
+            if (!el.isConnected) continue;
+            if (!ok) ok = await startPreviewLoad(el);   // one retry for a stall
+            if (!ok && myToken === previewPumpToken && el.isConnected) {
+                showPreviewLoadError(el);
+            }
+        }
+    }
+    for (let i = 0; i < PREVIEW_LOAD_CONCURRENCY && i < videos.length; i++) {
+        worker();
+    }
+}
+
+function startPreviewLoad(el) {
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = (ok) => {
+            if (settled) return;
+            settled = true;
+            el.removeEventListener('loadeddata', onLoaded);
+            el.removeEventListener('error', onError);
+            clearTimeout(timer);
+            resolve(ok);
+        };
+        const onLoaded = () => finish(true);
+        const onError = () => finish(false);
+        // A slow-but-alive element (metadata arrived, first frame still
+        // coming) is fine — only readyState 0 after the timeout is the
+        // wedge signature worth a retry.
+        const timer = setTimeout(() => finish(el.readyState > 0), PREVIEW_LOAD_TIMEOUT_MS);
+        el.addEventListener('loadeddata', onLoaded);
+        el.addEventListener('error', onError);
+        el.preload = 'auto';
+        el.load();
+        if (el.readyState >= 2) finish(true);
+    });
+}
+
+function showPreviewLoadError(el) {
+    // A blank tile with no message is exactly how the original failure hid.
+    const wrap = el.parentElement;
+    if (!wrap || wrap.querySelector('.gen-preview-load-error')) return;
+    const note = document.createElement('div');
+    note.className = 'gen-preview-load-error';
+    note.style.cssText = 'margin-top:0.3rem; font-size:0.85rem; color:var(--danger);';
+    note.textContent = 'Preview did not load — the browser stalled fetching it (the cut file itself is fine).';
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'btn';
+    retry.style.cssText = 'padding:1px 8px; font-size:0.8rem; margin-left:0.4rem;';
+    retry.textContent = 'Retry';
+    retry.addEventListener('click', async () => {
+        note.remove();
+        const ok = await startPreviewLoad(el);
+        if (!ok) showPreviewLoadError(el);
+    });
+    note.appendChild(retry);
+    wrap.appendChild(note);
+}
+
 function buildProposalPreview(p) {
     // Order: explicit error from the server > per-proposal preview
     // file > parent-with-#t= fallback > YouTube embed. We do NOT
@@ -745,17 +832,20 @@ function buildProposalPreview(p) {
              + `</div>`;
     }
     if (p.preview_url) {
-        // preload="auto" so Safari/Chrome fetch enough of the freshly-
-        // cut mp4 to render a first-frame poster. With "metadata" the
-        // segment preview tiles came up as black boxes.
-        return `<video src="${escapeAttr(p.preview_url)}" controls preload="auto" `
-             + `style="width:100%; max-height:360px;"></video>`;
+        // preload="none" + the load pump (pumpPreviewLoads). Mounting dozens of
+        // auto-loading 4K videos at once wedged Safari's media loader: the LAST
+        // element in the load queue made one range request and then went
+        // permanently silent — no poster, no error event, play() dead. The pump
+        // drives loads a few at a time so no element starves, and surfaces a
+        // visible failure instead of a blank tile.
+        return `<video src="${escapeAttr(p.preview_url)}" controls preload="none" `
+             + `class="gen-preview-video" style="width:100%; max-height:360px;"></video>`;
     }
     const data = previewData || PARENT_META;
     if (!data) return '';
     if (data.parent_browser_playable && data.parent_video_file_url) {
         const url = `${data.parent_video_file_url}#t=${p.start_seconds},${p.end_seconds}`;
-        return `<video src="${escapeAttr(url)}" controls preload="auto" style="width:100%; max-height:300px;"></video>`;
+        return `<video src="${escapeAttr(url)}" controls preload="none" class="gen-preview-video" style="width:100%; max-height:300px;"></video>`;
     }
     if (data.parent_youtube_id) {
         const start = Math.floor(p.start_seconds);
