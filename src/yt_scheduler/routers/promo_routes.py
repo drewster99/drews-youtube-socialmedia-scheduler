@@ -282,7 +282,7 @@ async def list_promos(
     # In-flight promo-chain jobs (e.g. just-inserted Generate clips still
     # cutting / uploading / transcribing) so the page can render live
     # placeholder cards before a DB row exists. Survives reloads / new tabs.
-    pending_jobs = auto_actions.inflight_promo_jobs(parent_id, int(project["id"]))
+    pending_jobs = await auto_actions.inflight_promo_jobs(parent_id, int(project["id"]))
     return {
         "summary": summary,
         "children": buckets,
@@ -417,6 +417,41 @@ async def get_upload_job(slug: str, parent_id: str, job_id: str) -> dict:
     if job is None:
         raise HTTPException(404, "Upload job not found or already completed")
     return job
+
+
+@router.post("/upload-jobs/{job_id}/retry")
+async def retry_upload_job(slug: str, parent_id: str, job_id: str) -> dict:
+    """Re-run a persisted failed promo job — the recovery path for uploads
+    that died on the YouTube daily quota (or any pre-videos-row failure).
+    Uses the job's intact cut file when it still exists, else re-cuts from
+    the stored parent params. Returns the fresh job dict for polling."""
+    project, _parent = await _ensure_primary(slug, parent_id)
+    try:
+        return await auto_actions.retry_failed_promo_job(
+            job_id, parent_id=parent_id, project_id=int(project["id"]),
+        )
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.post("/upload-jobs/{job_id}/dismiss")
+async def dismiss_upload_job(slug: str, parent_id: str, job_id: str) -> dict:
+    """Permanently dismiss a persisted failed promo job: the row stops
+    surfacing on the promos page and its cut file is deleted (unless a videos
+    row references it). The row keeps the cut params, so the material remains
+    re-creatable from the parent."""
+    project, _parent = await _ensure_primary(slug, parent_id)
+    try:
+        await auto_actions.dismiss_failed_promo_job(
+            job_id, parent_id=parent_id, project_id=int(project["id"]),
+        )
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"dismissed": True}
 
 
 async def _resolve_batch_delays(

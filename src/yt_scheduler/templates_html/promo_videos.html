@@ -289,23 +289,33 @@ function renderChildCard(child) {
 }
 
 function renderUploadJobCard(job) {
-    // Upload-job failures are pre-video-row, so there's nothing to
-    // retry against in the DB — render Dismiss instead of Retry so the
-    // card doesn't silently vanish on failure (it used to be auto-evicted
-    // from activeJobs, which left the user with no clue what went wrong).
-    const failed = typeof job.state === 'string' && job.state.startsWith('failed:');
+    // Failed upload jobs persist in pending_promo_jobs with their cut file
+    // and params, so they are retryable — e.g. the day after a YouTube
+    // daily-quota blow-up. Live in-memory failures carry 'failed:<step>';
+    // rows re-read from the DB carry plain 'failed' (the step isn't
+    // persisted), so the label only names a step when it truly knows it.
+    const failed = typeof job.state === 'string'
+        && (job.state === 'failed' || job.state.startsWith('failed:'));
     let strip;
     if (failed) {
-        const failedStep = job.state.slice('failed:'.length);
-        const stepLabel = PROMO_STATE_LABELS[failedStep] || failedStep;
+        const failedStep = job.state.startsWith('failed:')
+            ? job.state.slice('failed:'.length) : null;
+        const heading = failedStep
+            ? `Failed at: ${escapeHtml(PROMO_STATE_LABELS[failedStep] || failedStep)}`
+            : 'Failed';
         const errorMsg = job.last_error
             ? `<div class="promo-error-msg">${escapeHtml(job.last_error)}</div>` : '';
         strip = `
             <div class="promo-progress promo-progress-failed">
-                Failed at: ${escapeHtml(stepLabel)}
+                ${heading}
                 ${errorMsg}
+                <button class="btn btn-sm promo-retry-btn"
+                        data-retry-job="${escapeHtml(job.job_id)}">
+                    Retry
+                </button>
                 <button class="btn btn-sm btn-secondary promo-dismiss-btn"
-                        data-dismiss-job="${escapeHtml(job.job_id)}">
+                        data-dismiss-job="${escapeHtml(job.job_id)}"
+                        title="Remove this failed job and delete its cut file. The clip can be re-generated from the parent later.">
                     Dismiss
                 </button>
             </div>`;
@@ -425,11 +435,58 @@ function bindRetryButtons() {
             await startDescriptionUpdate({video_ids: [videoId]});
         });
     }
+    for (const btn of document.querySelectorAll('[data-retry-job]')) {
+        btn.addEventListener('click', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const jid = btn.getAttribute('data-retry-job');
+            btn.disabled = true;
+            btn.textContent = 'Retrying…';
+            const resp = await fetch(
+                `/api/projects/${projectSlug}/videos/${parentId}/promos/upload-jobs/${encodeURIComponent(jid)}/retry`,
+                {method: 'POST'});
+            if (!resp.ok) {
+                const body = await resp.json().catch(() => null);
+                btn.disabled = false;
+                btn.textContent = 'Retry';
+                const banner = document.getElementById('upload-error-banner');
+                banner.style.display = '';
+                banner.textContent = (body && body.detail)
+                    ? `Retry failed: ${body.detail}` : 'Retry failed.';
+                return;
+            }
+            const job = activeJobs.get(jid);
+            if (job) {
+                job.state = 'pending';
+                job.last_error = null;
+            }
+            loadPromos();
+        });
+    }
     for (const btn of document.querySelectorAll('[data-dismiss-job]')) {
-        btn.addEventListener('click', (e) => {
+        btn.addEventListener('click', async (e) => {
             e.preventDefault();
             e.stopPropagation();
             const jid = btn.getAttribute('data-dismiss-job');
+            btn.disabled = true;
+            btn.textContent = 'Dismissing…';
+            // Server-side dismissal: marks the persisted row so the card
+            // stays gone across reloads/restarts, and deletes the cut file.
+            // The old client-only Set hid the card for one session and the
+            // job came back on the next visit.
+            const resp = await fetch(
+                `/api/projects/${projectSlug}/videos/${parentId}/promos/upload-jobs/${encodeURIComponent(jid)}/dismiss`,
+                {method: 'POST'});
+            if (!resp.ok) {
+                const body = await resp.json().catch(() => null);
+                btn.disabled = false;
+                btn.textContent = 'Dismiss';
+                const banner = document.getElementById('upload-error-banner');
+                banner.style.display = '';
+                banner.textContent = (body && body.detail)
+                    ? `Dismiss failed: ${body.detail}` : 'Dismiss failed.';
+                return;
+            }
             dismissedJobs.add(jid);
             activeJobs.delete(jid);
             loadPromos();
@@ -470,8 +527,11 @@ async function pollUploadJobs() {
         // about them yet, so polling /upload-jobs/<tmp> would 404 and
         // erase the card before the real POST resolves.
         if (job._placeholder) continue;
-        // Failed jobs don't change server-side — no point re-fetching.
-        if (typeof job.state === 'string' && job.state.startsWith('failed:')) {
+        // Failed jobs don't change server-side — no point re-fetching. Plain
+        // 'failed' is a DB-persisted row with no in-memory entry; polling it
+        // would 404 and wrongly delete the card.
+        if (typeof job.state === 'string'
+            && (job.state === 'failed' || job.state.startsWith('failed:'))) {
             continue;
         }
         try {

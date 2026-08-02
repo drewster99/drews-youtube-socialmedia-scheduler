@@ -761,7 +761,13 @@ def _evict_stale_upload_jobs() -> None:
         _UPLOAD_JOBS.pop(job_id, None)
 
 
-def inflight_promo_jobs(parent_id: str, project_id: int) -> list[dict]:
+# How long a persisted failed job keeps appearing on the promos page. Long
+# enough to ride out a weekend away from the desk after a quota blow-up;
+# bounded so a page from months ago doesn't open onto a wall of stale cards.
+_FAILED_PROMO_JOB_SURFACE_DAYS: int = 7
+
+
+async def inflight_promo_jobs(parent_id: str, project_id: int) -> list[dict]:
     """Public snapshot of in-flight promo-chain jobs for a parent.
 
     Returns every upload/promo-chain job for this parent+project that hasn't
@@ -769,9 +775,17 @@ def inflight_promo_jobs(parent_id: str, project_id: int) -> list[dict]:
     page can render a live placeholder card *before* the YouTube upload creates
     a DB row, and keep showing progress through the (slow) post-upload steps.
     ``ready`` jobs are omitted because the DB row already covers them.
+
+    Failed jobs are ALSO read from ``pending_promo_jobs`` (recent window, not
+    live in memory): the in-memory copy evicts minutes after failure, and 11
+    quota-failed uploads once vanished from the page with their cut files
+    intact on disk and no way to retry them. ``status='failed'`` rows carry a
+    plain ``state == "failed"`` (the per-step ``failed:<step>`` detail isn't
+    persisted); dismissed rows never resurface.
     """
     _evict_stale_upload_jobs()
     out: list[dict] = []
+    live_job_ids: set[str] = set()
     for job in _UPLOAD_JOBS.values():
         if job.get("parent_id") != parent_id:
             continue
@@ -780,6 +794,7 @@ def inflight_promo_jobs(parent_id: str, project_id: int) -> list[dict]:
                 continue
         except (TypeError, ValueError):
             continue
+        live_job_ids.add(str(job.get("job_id")))
         state = str(job.get("state") or "")
         if state == PROMO_STATE_READY:
             continue
@@ -790,6 +805,27 @@ def inflight_promo_jobs(parent_id: str, project_id: int) -> list[dict]:
             "state": state,
             "title": job.get("title") or job.get("pre_supplied_title") or job.get("filename"),
             "last_error": job.get("last_error"),
+        })
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        """SELECT job_id, forced_item_type, title, original_filename, last_error
+           FROM pending_promo_jobs
+           WHERE parent_id = ? AND project_id = ? AND status = 'failed'
+             AND created_at >= datetime('now', ?)
+           ORDER BY created_at""",
+        (parent_id, int(project_id), f"-{_FAILED_PROMO_JOB_SURFACE_DAYS} days"),
+    )
+    for row in rows:
+        record = dict(row)
+        if str(record["job_id"]) in live_job_ids:
+            continue  # the live entry above already covers it (fresher state)
+        out.append({
+            "job_id": record["job_id"],
+            "video_id": None,
+            "item_type": record.get("forced_item_type"),
+            "state": "failed",
+            "title": record.get("title") or record.get("original_filename"),
+            "last_error": record.get("last_error"),
         })
     return out
 
@@ -854,6 +890,7 @@ async def _persist_pending_promo_job(job: dict) -> None:
 async def _mark_pending_promo_job(
     job_id: str, *, status: str | None = None,
     youtube_video_id: str | None = None, last_error: str | None = None,
+    clear_last_error: bool = False,
     critical: bool = False,
 ) -> None:
     """Update a persisted promo job's progress/terminal fields. Normally
@@ -873,6 +910,11 @@ async def _mark_pending_promo_job(
     if last_error is not None:
         assignments.append("last_error = ?")
         params.append(last_error[:500])
+    elif clear_last_error:
+        # ``last_error=None`` means "don't touch"; retrying a failed job must
+        # drop the stale failure text explicitly or a pending row keeps
+        # claiming last run's error.
+        assignments.append("last_error = NULL")
     params.append(job_id)
     attempts = 4 if critical else 1
     for attempt in range(attempts):
@@ -995,6 +1037,200 @@ async def start_promo_from_cut(
     return job_id
 
 
+async def _respawn_promo_job_from_record(record: dict, *, task_name: str) -> str | None:
+    """Rebuild the in-memory job from a ``pending_promo_jobs`` row and spawn
+    the chain. Shared by the startup resume and the failed-card Retry so there
+    is exactly one reconstruction of a persisted job.
+
+    Returns the job_id on spawn, or ``None`` when the record can't safely run —
+    in which case the row has been marked failed with the reason:
+
+    * ``youtube_video_id`` set — the upload finished but the videos-row INSERT
+      didn't; re-running would duplicate the YouTube video. Left for manual
+      import from the dashboard.
+    * cut file gone AND no parent cut params — nothing to upload or re-cut.
+    """
+    job_id = record["job_id"]
+    if job_id in _UPLOAD_JOBS:
+        # Callers guard this; a double-spawn would run two chains over the
+        # same job dict, so refuse rather than trust the caller.
+        logger.error("Refusing to respawn %s: already live in this process", job_id)
+        return None
+
+    youtube_video_id = record.get("youtube_video_id")
+    if youtube_video_id:
+        await _mark_pending_promo_job(
+            job_id, status="failed",
+            last_error=(
+                f"uploaded to YouTube as {youtube_video_id} but the row INSERT "
+                "did not complete before restart; import it from the dashboard"
+            ),
+        )
+        logger.warning(
+            "Promo job %s uploaded as %s but never inserted a row; left for "
+            "manual import (NOT re-uploaded).", job_id, youtube_video_id,
+        )
+        return None
+
+    local_path = record.get("local_path")
+    if local_path and not Path(local_path).exists():
+        local_path = None  # cut file gone — fall back to re-cutting
+    can_recut = bool(record.get("parent_video_path")) and (
+        record.get("cut_start_seconds") is not None
+    )
+    if not local_path and not can_recut:
+        await _mark_pending_promo_job(
+            job_id, status="failed",
+            last_error="cut file missing and no parent cut params to re-cut",
+        )
+        return None
+
+    _UPLOAD_JOBS[job_id] = {
+        "job_id": job_id,
+        "filename": record.get("original_filename"),
+        "local_path": local_path,
+        "parent_id": record.get("parent_id"),
+        "project_id": int(record["project_id"]),
+        "forced_item_type": record.get("forced_item_type"),
+        "video_id": None,
+        # Queued until the chain actually starts work — same reasoning as
+        # start_promo_from_cut; the chain stamps `cutting` when it cuts.
+        "state": PROMO_STATE_PENDING,
+        "last_error": None,
+        "title": record.get("title"),
+        "pre_supplied_title": record.get("title"),
+        "cut_start_seconds": record.get("cut_start_seconds"),
+        "cut_end_seconds": record.get("cut_end_seconds"),
+        "parent_video_path": record.get("parent_video_path"),
+        "vertical_crop": bool(record.get("vertical_crop")),
+        "x_shift_normalized": float(record.get("x_shift_normalized") or 0.0),
+        "audio_fade_in": float(record.get("audio_fade_in") or 0.0),
+        "audio_fade_out": float(record.get("audio_fade_out") or 0.0),
+    }
+    spawn_background(_run_promo_chain(job_id), name=f"{task_name}:{job_id}")
+    return job_id
+
+
+async def _get_failed_promo_job_row(
+    job_id: str, *, parent_id: str, project_id: int,
+) -> dict | None:
+    """The persisted row for a failed job, scoped to its parent+project so a
+    URL from one parent's page can't act on another parent's job."""
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        """SELECT * FROM pending_promo_jobs
+           WHERE job_id = ? AND parent_id = ? AND project_id = ?
+             AND status = 'failed'""",
+        (job_id, parent_id, int(project_id)),
+    )
+    return dict(rows[0]) if rows else None
+
+
+async def retry_failed_promo_job(
+    job_id: str, *, parent_id: str, project_id: int,
+) -> dict:
+    """Re-run a persisted failed promo job (e.g. after the YouTube daily upload
+    quota reset). Uses the intact cut file when it still exists, else re-cuts
+    from the stored parent params.
+
+    Raises ``LookupError`` when there is no failed row for this job under this
+    parent, and ``RuntimeError`` when the job is currently running or can't be
+    reconstructed (the row's ``last_error`` then says why).
+    """
+    live = _UPLOAD_JOBS.get(job_id)
+    if live is not None:
+        state = str(live.get("state") or "")
+        if not state.startswith("failed:"):
+            raise RuntimeError("Job is already running — nothing to retry.")
+        # Stale in-memory copy of the same failure; the DB row is the truth.
+        _UPLOAD_JOBS.pop(job_id, None)
+
+    record = await _get_failed_promo_job_row(
+        job_id, parent_id=parent_id, project_id=project_id,
+    )
+    if record is None:
+        raise LookupError("No failed job with this id under this parent.")
+
+    # Flip the row back to pending BEFORE spawning: if the process dies
+    # mid-spawn, the startup resume finds a pending row and picks it up —
+    # a failed row would be invisible again, which is the bug this fixes.
+    # ``critical`` because this write carries the user's retry decision.
+    await _mark_pending_promo_job(
+        job_id, status="pending", clear_last_error=True, critical=True,
+    )
+    record["status"] = "pending"
+
+    spawned = await _respawn_promo_job_from_record(record, task_name="promo-retry")
+    if spawned is None:
+        # The helper marked the row failed again with the concrete reason.
+        refreshed = await _get_failed_promo_job_row(
+            job_id, parent_id=parent_id, project_id=project_id,
+        )
+        reason = (refreshed or {}).get("last_error") or "job could not be reconstructed"
+        raise RuntimeError(reason)
+
+    public = get_upload_job(job_id)
+    if public is None:  # the chain finished implausibly fast; report queued
+        raise RuntimeError("Job spawned but is no longer visible — reload the page.")
+    return public
+
+
+async def dismiss_failed_promo_job(
+    job_id: str, *, parent_id: str, project_id: int,
+) -> None:
+    """Permanently dismiss a failed promo job: mark the row ``dismissed`` so it
+    stops surfacing, and delete its cut file (derived data — re-creatable from
+    the parent + stored cut params, which the row keeps).
+
+    Raises ``LookupError`` / ``RuntimeError`` like :func:`retry_failed_promo_job`.
+    """
+    live = _UPLOAD_JOBS.get(job_id)
+    if live is not None:
+        state = str(live.get("state") or "")
+        if not state.startswith("failed:"):
+            raise RuntimeError("Job is running — it can only be dismissed after it fails.")
+        _UPLOAD_JOBS.pop(job_id, None)
+
+    record = await _get_failed_promo_job_row(
+        job_id, parent_id=parent_id, project_id=project_id,
+    )
+    if record is None:
+        raise LookupError("No failed job with this id under this parent.")
+
+    local_path = record.get("local_path")
+    if local_path:
+        path = Path(local_path)
+        db = await get_db()
+        referenced = await db.execute_fetchall(
+            "SELECT 1 FROM videos WHERE video_file_path = ? LIMIT 1", (local_path,),
+        )
+        try:
+            inside_uploads = path.resolve().is_relative_to(UPLOAD_DIR.resolve())
+        except OSError:
+            inside_uploads = False
+        if referenced:
+            # A videos row owns this file now (e.g. the job was retried and
+            # succeeded between page loads) — deleting it would break that
+            # video. The dismiss still proceeds; only the file stays.
+            logger.warning(
+                "Dismiss %s: NOT deleting %s — a videos row references it.",
+                job_id, local_path,
+            )
+        elif not inside_uploads:
+            logger.error(
+                "Dismiss %s: NOT deleting %s — outside the uploads dir.",
+                job_id, local_path,
+            )
+        else:
+            path.unlink(missing_ok=True)
+            logger.info("Dismiss %s: deleted cut file %s", job_id, local_path)
+
+    # ``critical``: the file may already be gone — losing this write would
+    # resurface a card whose Retry can only re-cut, silently forgetting the
+    # user's decision.
+    await _mark_pending_promo_job(job_id, status="dismissed", critical=True)
+
+
 async def resume_pending_promo_jobs(*, window_hours: int) -> int:
     """Re-spawn promo chains that were persisted before the last restart but
     never inserted a videos row. Called at startup, after the videos-row-based
@@ -1022,58 +1258,8 @@ async def resume_pending_promo_jobs(*, window_hours: int) -> int:
         if job_id in _UPLOAD_JOBS:
             continue  # already live this process — don't double-spawn
 
-        youtube_video_id = record.get("youtube_video_id")
-        if youtube_video_id:
-            await _mark_pending_promo_job(
-                job_id, status="failed",
-                last_error=(
-                    f"uploaded to YouTube as {youtube_video_id} but the row INSERT "
-                    "did not complete before restart; import it from the dashboard"
-                ),
-            )
-            logger.warning(
-                "Promo job %s uploaded as %s but never inserted a row; left for "
-                "manual import (NOT re-uploaded).", job_id, youtube_video_id,
-            )
-            continue
-
-        local_path = record.get("local_path")
-        if local_path and not Path(local_path).exists():
-            local_path = None  # cut file gone — fall back to re-cutting
-        can_recut = bool(record.get("parent_video_path")) and (
-            record.get("cut_start_seconds") is not None
-        )
-        if not local_path and not can_recut:
-            await _mark_pending_promo_job(
-                job_id, status="failed",
-                last_error="cut file missing and no parent cut params to re-cut",
-            )
-            continue
-
-        _UPLOAD_JOBS[job_id] = {
-            "job_id": job_id,
-            "filename": record.get("original_filename"),
-            "local_path": local_path,
-            "parent_id": record.get("parent_id"),
-            "project_id": int(record["project_id"]),
-            "forced_item_type": record.get("forced_item_type"),
-            "video_id": None,
-            # Queued until the chain actually starts work — same reasoning as
-            # start_promo_from_cut; the chain stamps `cutting` when it cuts.
-            "state": PROMO_STATE_PENDING,
-            "last_error": None,
-            "title": record.get("title"),
-            "pre_supplied_title": record.get("title"),
-            "cut_start_seconds": record.get("cut_start_seconds"),
-            "cut_end_seconds": record.get("cut_end_seconds"),
-            "parent_video_path": record.get("parent_video_path"),
-            "vertical_crop": bool(record.get("vertical_crop")),
-            "x_shift_normalized": float(record.get("x_shift_normalized") or 0.0),
-            "audio_fade_in": float(record.get("audio_fade_in") or 0.0),
-            "audio_fade_out": float(record.get("audio_fade_out") or 0.0),
-        }
-        spawn_background(_run_promo_chain(job_id), name=f"promo-resume:{job_id}")
-        resumed += 1
+        if await _respawn_promo_job_from_record(record, task_name="promo-resume"):
+            resumed += 1
 
     if resumed:
         logger.info(
