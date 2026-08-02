@@ -111,6 +111,22 @@ def _capture_cmd(monkeypatch, media_module):
     return captured
 
 
+def _stub_output_probe(monkeypatch, media_module, duration_seconds: float):
+    """Make probe_video_file report a healthy clip of the given length.
+
+    The cut paths now validate their output before the atomic rename
+    (exit 0 alone stopped being trusted), so tests that fake the encoder
+    with junk bytes must also fake the probe — these tests are about argv
+    construction and lane selection, not validation."""
+    monkeypatch.setattr(
+        media_module, "probe_video_file",
+        lambda _p: media_module.VideoProbe(
+            duration_seconds=duration_seconds, width=1920, height=1080,
+            bitrate_bps=None, size_bytes=None, has_audio=True,
+        ),
+    )
+
+
 def test_extract_clip_software_no_crop(
     monkeypatch: pytest.MonkeyPatch, tmp_path,
 ):
@@ -118,6 +134,7 @@ def test_extract_clip_software_no_crop(
 
     monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
     captured = _capture_cmd(monkeypatch, media)
+    _stub_output_probe(monkeypatch, media, 10.0)
 
     src = tmp_path / "src.mp4"
     src.write_bytes(b"\x00")
@@ -173,6 +190,7 @@ def test_extract_clip_uses_hardware_decode_and_fast_seek(
 
     monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
     captured = _capture_cmd(monkeypatch, media)
+    _stub_output_probe(monkeypatch, media, 30.0)
 
     src = tmp_path / "src.mp4"
     src.write_bytes(b"\x00")
@@ -203,6 +221,7 @@ def test_extract_clip_software_when_auto_and_unavailable(
     monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(media, "_HARDWARE_ENCODERS", frozenset())
     captured = _capture_cmd(monkeypatch, media)
+    _stub_output_probe(monkeypatch, media, 10.0)
 
     src = tmp_path / "src.mp4"
     src.write_bytes(b"\x00")
@@ -250,6 +269,7 @@ def test_extract_clip_stacked_builds_clipcrop_argv(
     from yt_scheduler.services import media
 
     binary, model = _fake_clipcrop(monkeypatch, tmp_path)
+    _stub_output_probe(monkeypatch, media, 15.0)
     captured: dict[str, list[str]] = {}
 
     class _R:
@@ -287,6 +307,7 @@ def test_extract_clip_stacked_flags_uncertain_from_stderr(
     from yt_scheduler.services import media
 
     _fake_clipcrop(monkeypatch, tmp_path)
+    _stub_output_probe(monkeypatch, media, 15.0)
 
     class _R:
         returncode = 0

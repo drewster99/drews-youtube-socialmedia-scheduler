@@ -33,6 +33,15 @@ def test_extract_clip_publishes_atomically(tmp_path, monkeypatch):
     monkeypatch.setattr(media, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(media, "hardware_encoder_available", lambda codec: False)
     monkeypatch.setattr(media.subprocess, "run", _fake_success)
+    # The publish path now validates the output before the rename; this test
+    # is about the atomic-temp discipline, so report a healthy 5s clip.
+    monkeypatch.setattr(
+        media, "probe_video_file",
+        lambda _p: media.VideoProbe(
+            duration_seconds=5.0, width=1920, height=1080,
+            bitrate_bps=None, size_bytes=None, has_audio=True,
+        ),
+    )
     src = tmp_path / "src.mp4"
     src.write_bytes(b"fake")
 

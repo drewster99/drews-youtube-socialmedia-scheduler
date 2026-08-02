@@ -463,6 +463,67 @@ def _ffmpeg_timestamp_to_seconds(ts: str) -> float:
         raise ValueError(f"malformed ffmpeg timestamp: {ts!r}") from exc
 
 
+def _validate_encoded_clip(
+    tmp_output: Path,
+    *,
+    expected_duration_seconds: float,
+    source_has_audio: bool | None,
+    describe: str,
+) -> None:
+    """Probe a freshly-encoded temp file and raise if it isn't the clip that
+    was asked for. An encoder exiting 0 proves only that it didn't error —
+    an empty videotoolbox encode, a seek landing at EOF (zero frames,
+    "success"), or a filter graph silently dropping the audio stream all
+    exit 0 and would otherwise be published as-is: a blank preview with no
+    error anywhere, or worse, an upload to YouTube. Runs on the temp BEFORE
+    the atomic rename, so a final filename only ever holds a verified clip.
+
+    ``source_has_audio=None`` means the caller couldn't probe the source;
+    unknown is not the same as confirmed-absent, so the audio check is
+    skipped rather than guessed.
+
+    Raises ``RuntimeError`` naming every failed check. Deletes the temp
+    first — a file that failed validation must not survive to masquerade
+    as a usable clip.
+    """
+    probe = probe_video_file(tmp_output)
+    if probe is None:
+        # ffprobe missing or timed out — we can't validate, but the encode
+        # itself succeeded. Blocking every cut on a probe-tooling gap would
+        # fail the feature over something the encoder didn't do; log loudly
+        # instead (probe_video_file's documented "can't validate" contract).
+        logger.warning(
+            "Skipping output validation for %s — ffprobe unavailable.", describe,
+        )
+        return
+
+    problems: list[str] = []
+    has_video_stream = not (
+        probe.width is None and probe.height is None and probe.duration_seconds is None
+    )
+    if not has_video_stream:
+        problems.append("no readable video stream")
+    elif probe.duration_seconds is None:
+        problems.append("container reports no duration")
+    else:
+        # ±0.5s absolute or ±2% — precise cuts land within a frame or two;
+        # either bound failing means the output is not the requested range.
+        tolerance = max(0.5, expected_duration_seconds * 0.02)
+        if abs(probe.duration_seconds - expected_duration_seconds) > tolerance:
+            problems.append(
+                f"duration {probe.duration_seconds:.2f}s vs expected "
+                f"{expected_duration_seconds:.2f}s (tolerance ±{tolerance:.2f}s)"
+            )
+    if source_has_audio is True and probe.has_audio is False:
+        problems.append("source has audio but the output has no audio stream")
+
+    if problems:
+        tmp_output.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"cut validation failed ({describe}): {'; '.join(problems)}"
+        )
+
+
 def extract_clip(
     video_path: str | Path,
     start: str,
@@ -686,8 +747,19 @@ def extract_clip(
             f"ffmpeg exit {exc.returncode}: {tail or 'no stderr captured'}"
         ) from exc
 
-    # ffmpeg fully succeeded (including faststart) — atomically publish the
-    # finished file under its final name. os.replace is atomic within a dir.
+    # ffmpeg exited 0 — but that only means the encoder didn't error.
+    # Verify the temp actually holds the requested clip before publishing.
+    _validate_encoded_clip(
+        tmp_output,
+        expected_duration_seconds=(
+            _ffmpeg_timestamp_to_seconds(end) - _ffmpeg_timestamp_to_seconds(start)
+        ),
+        source_has_audio=probe.has_audio if probe is not None else None,
+        describe=f"ffmpeg cut {output_name}",
+    )
+
+    # Validated — atomically publish the finished file under its final name.
+    # os.replace is atomic within a dir.
     try:
         tmp_output.replace(output)
     except OSError:
@@ -780,6 +852,19 @@ def extract_clip_stacked(
         ) from exc
 
     uncertain = b"CROPPABILITY=low" in (result.stderr or b"")
+
+    # clipcrop exited 0 — verify the temp holds the requested clip before
+    # publishing, exactly like extract_clip. The source probe (for the
+    # has-audio check) runs here rather than pre-encode so a probe hiccup
+    # can't delay the cut it validates.
+    source_probe = probe_video_file(video_path)
+    _validate_encoded_clip(
+        tmp_output,
+        expected_duration_seconds=float(end_seconds) - float(start_seconds),
+        source_has_audio=source_probe.has_audio if source_probe is not None else None,
+        describe=f"clipcrop cut {output.name}",
+    )
+
     try:
         tmp_output.replace(output)
     except OSError:
