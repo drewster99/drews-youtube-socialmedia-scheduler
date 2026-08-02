@@ -843,9 +843,10 @@ async def generate_confirm(
                     / clipper._preview_filename(str(job_id_in), kind, idx)
                 )
                 if candidate.exists():
-                    # Move to a fresh name so the trailing
-                    # cleanup_generate_previews() (rejected-files
-                    # sweep) doesn't catch the file we just adopted.
+                    # Move to a fresh name so cleanup_generate_previews()
+                    # (now deferred to the job's TTL eviction / startup
+                    # sweep) can never catch the file we just adopted —
+                    # the chain, and eventually the videos row, own it.
                     final_name = f"clip_{kind}_{secrets.token_hex(6)}.mp4"
                     final_path = UPLOAD_DIR / final_name
                     try:
@@ -895,12 +896,15 @@ async def generate_confirm(
                 parent_id, exc,
             )
 
-    # Preview files were only useful for the review screen; the final
-    # cuts go through the regular promo chain which writes its own
-    # files. Drop the previews so they don't linger in UPLOAD_DIR.
-    if job_id_in:
-        clipper.cleanup_generate_previews(str(job_id_in))
-
+    # Preview files are NOT deleted here anymore, on purpose. Any review tab
+    # still open (a second tab, back-button restore) has <video> elements
+    # pointing at these URLs, and a WebKit element whose source starts
+    # 404-ing retries with no backoff — measured at ~450 req/s against this
+    # server. The existing lifecycle already reclaims the files without that
+    # cliff: the generate job's 30-minute TTL eviction runs
+    # cleanup_generate_previews, and the startup orphan sweep catches
+    # anything a crash leaves behind. Unadopted previews therefore linger at
+    # most one eviction cycle instead of vanishing under a live page.
     return {"jobs": jobs_out}
 
 

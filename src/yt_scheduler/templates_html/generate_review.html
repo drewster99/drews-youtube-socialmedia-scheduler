@@ -813,6 +813,26 @@ function showPreviewLoadError(el) {
     wrap.appendChild(note);
 }
 
+function teardownPreviewVideos() {
+    // Confirm deletes/renames every preview file server-side, and a WebKit
+    // <video> left holding a dead URL retries the 404 aggressively — measured
+    // at ~450 requests/second against our own server, with no backoff and no
+    // give-up. Detaching src makes further fetches impossible. Bumping the
+    // pump token stops staged loads from re-arming an element afterwards.
+    previewPumpToken += 1;
+    for (const el of document.querySelectorAll('#gen-proposals video')) {
+        try {
+            el.pause();
+            el.removeAttribute('src');
+            el.load();
+        } catch (e) { /* teardown is best-effort */ }
+    }
+}
+
+// Covers every way off the page that isn't the Confirm redirect: the Cancel
+// links, browser back, tab close. Harmless when nothing is mounted.
+window.addEventListener('pagehide', teardownPreviewVideos);
+
 function buildProposalPreview(p) {
     // Order: explicit error from the server > per-proposal preview
     // file > parent-with-#t= fallback > YouTube embed. We do NOT
@@ -925,6 +945,10 @@ document.getElementById('gen-confirm').addEventListener('click', async () => {
         btn.textContent = 'Insert selected';
         return;
     }
+    // Detach every preview src BEFORE navigating: the previews' files are
+    // renamed/deleted server-side from here on, and an element still holding
+    // a dead URL can 404-storm (see teardownPreviewVideos).
+    teardownPreviewVideos();
     // Back to the Promos page so the user sees the new placeholder cards.
     window.location.href = `/projects/${projectSlug}/videos/${parentId}/promos`;
 });
