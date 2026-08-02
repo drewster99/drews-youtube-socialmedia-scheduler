@@ -257,6 +257,9 @@ func renderStacked(path: String, segments: [StackSegment], outURL: URL, renderHe
     guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
         throw StackExportError(message: "Could not create export session.")
     }
+    // Same faststart flag as the production renderClipCrop path below —
+    // this lab exporter's output gets played over HTTP the same way.
+    session.shouldOptimizeForNetworkUse = true
     session.videoComposition = comp
     session.timeRange = CMTimeRange(start: .zero, duration: CMTime(seconds: duration, preferredTimescale: 600))
     if FileManager.default.fileExists(atPath: outURL.path) { try FileManager.default.removeItem(at: outURL) }
@@ -507,6 +510,11 @@ func renderClipCrop(parent: String, segments: [StackSegment], start: Double, end
     guard session.supportedFileTypes.contains(.mp4) else {
         throw StackExportError(message: "Export session does not support .mp4 output.")
     }
+    // Faststart: relocate the moov atom (the index) to the front of the file,
+    // matching the ffmpeg cuts' `-movflags +faststart`. Without it the browser
+    // must range-fetch the tail before frame one — extra round-trips on every
+    // 100–250 MB preview.
+    session.shouldOptimizeForNetworkUse = true
     session.videoComposition = comp
     session.audioMix = audioMix
     session.timeRange = CMTimeRange(start: CMTime(seconds: start, preferredTimescale: ts),
