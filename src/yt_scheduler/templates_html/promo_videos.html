@@ -146,19 +146,9 @@ function escapeHtml(s) {
         .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-// SQLite stores timestamps without a timezone marker; treat them as UTC
-// so Date() doesn't apply the browser's local offset to a naive string.
-function _ensureUtc(iso) {
-    if (typeof iso !== 'string') return iso;
-    if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(iso) && !/(?:Z|[+-]\d\d:?\d\d)$/.test(iso)) {
-        return iso.replace(' ', 'T') + 'Z';
-    }
-    return iso;
-}
-
 // Matches the dashboard's scheduled-time format: "Mon 4/27 2:30pm".
 function fmtScheduledWhen(iso) {
-    const d = new Date(_ensureUtc(iso));
+    const d = new Date(dysDateTime.ensureUtc(iso));
     if (Number.isNaN(d.getTime())) return iso;
     const dow = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()];
     const sameYear = d.getFullYear() === new Date().getFullYear();

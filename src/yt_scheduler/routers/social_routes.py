@@ -16,7 +16,7 @@ from yt_scheduler.config import (
     require_managed_media_paths,
 )
 from yt_scheduler.database import get_db, write_transaction
-from yt_scheduler.models.social_post import mark_posted
+from yt_scheduler.models.social_post import mark_failed, mark_posted
 from yt_scheduler.services import events, social, templates as tmpl
 from yt_scheduler.services.social import decode_media_paths as _decode_media_paths
 from yt_scheduler.services.scheduler import cancel_scheduled_post, get_publish_lock
@@ -617,7 +617,7 @@ async def list_failed_posts():
     """
     db = await get_db()
     rows = await db.execute_fetchall(
-        """SELECT sp.id, sp.video_id, sp.platform, sp.error,
+        """SELECT sp.id, sp.video_id, sp.platform, sp.error, sp.failed_at,
                   sp.social_account_id, v.title AS video_title,
                   p.slug AS project_slug
            FROM social_posts sp
@@ -1120,12 +1120,7 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
         uuid_to_flag = e.uuid or (cred.get("uuid") if cred else None)
         if uuid_to_flag:
             await mark_needs_reauth(uuid_to_flag)
-        async with write_transaction() as db:
-            await db.execute(
-                "UPDATE social_posts SET status = 'failed', error = ?, "
-                "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
-                (f"Credential needs re-auth: {e}", post_id),
-            )
+        await mark_failed(post_id, error=f"Credential needs re-auth: {e}")
         raise HTTPException(
             401,
             f"{post['platform']} credential needs re-authentication. "
@@ -1139,12 +1134,7 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
         logger.exception("Send failed for post %s", post_id)
         # Also releases the claim taken above; otherwise the row sits 'sending'
         # forever with nothing able to retry it.
-        async with write_transaction() as db:
-            await db.execute(
-                "UPDATE social_posts SET status = 'failed', error = ?, "
-                "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
-                (str(e), post_id),
-            )
+        await mark_failed(post_id, error=str(e))
         raise HTTPException(500, str(e))
 
 
@@ -1334,12 +1324,7 @@ async def send_all_posts(
             uuid_to_flag = e.uuid or (cred.get("uuid") if cred else None)
             if uuid_to_flag:
                 await mark_needs_reauth(uuid_to_flag)
-            async with write_transaction() as db:
-                await db.execute(
-                    "UPDATE social_posts SET status = 'failed', error = ?, "
-                    "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
-                    (f"Credential needs re-auth: {e}", post["id"]),
-                )
+            await mark_failed(post["id"], error=f"Credential needs re-auth: {e}")
             results.append(_entry(
                 post, cred,
                 status="needs_reauth",
@@ -1347,12 +1332,7 @@ async def send_all_posts(
             ))
         except Exception as e:
             logger.exception("Send failed for post %s", post["id"])
-            async with write_transaction() as db:
-                await db.execute(
-                    "UPDATE social_posts SET status = 'failed', error = ?, "
-                    "scheduler_job_id = NULL, scheduled_at = NULL WHERE id = ?",
-                    (str(e), post["id"]),
-                )
+            await mark_failed(post["id"], error=str(e))
             results.append(_entry(post, cred, status="failed", error=str(e)))
 
     return results

@@ -677,7 +677,7 @@ async def get_moderation_status():
     APScheduler tracks ``next_run_time`` directly. The job uses a fixed
     interval, so ``last_run = next_run - interval`` gives us "when did
     it last fire" without needing to persist any state. Returns ISO 8601
-    UTC strings; the UI formats them via the standard _ensureUtc shim.
+    UTC strings; the UI formats them via ``window.dysDateTime``.
     """
     from datetime import datetime, timezone
     from yt_scheduler.config import COMMENT_CHECK_INTERVAL_MINUTES

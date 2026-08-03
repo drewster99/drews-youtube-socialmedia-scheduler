@@ -39,7 +39,7 @@ async def missed_items(queue_id: int) -> list[dict]:
     rows = await db.execute_fetchall(
         """
         SELECT p.id AS post_id, p.platform, p.status, p.scheduled_at, p.error,
-               i.id AS item_id, i.video_id, v.title
+               p.failed_at, i.id AS item_id, i.video_id, v.title
           FROM social_posts p
           JOIN smart_queue_items i ON i.id = p.smart_queue_item_id
           JOIN videos v ON v.id = i.video_id

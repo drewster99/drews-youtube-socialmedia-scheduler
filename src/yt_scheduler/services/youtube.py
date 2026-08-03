@@ -608,6 +608,74 @@ def list_comment_threads(
     return items[:max_results]
 
 
+def list_channel_comment_threads(
+    channel_id: str,
+    *,
+    max_pages: int,
+    per_page: int = 100,
+) -> tuple[list[dict], bool]:
+    """Every comment thread on a channel — its videos and the channel itself.
+
+    One page is 1 quota unit and covers up to ``per_page`` threads across the
+    whole channel, so this is the cheap way to answer "what's new anywhere?".
+    The per-video :func:`list_comment_threads` would need one call per video.
+
+    Ordered newest-first by the top-level comment's publish time. A *reply* to
+    an old thread does NOT move its thread up that ordering, which is why the
+    sweep above this walks pages rather than stopping at the first thread it
+    has already stored.
+
+    Returns ``(threads, hit_page_cap)``. ``hit_page_cap`` is True when YouTube
+    still had pages left at the cap — the caller must report that rather than
+    present a truncated sweep as a complete one.
+    """
+    if max_pages < 1:
+        raise ValueError(f"max_pages must be at least 1, got {max_pages}")
+
+    youtube = get_youtube_service()
+
+    request = youtube.commentThreads().list(
+        part="snippet,replies",
+        allThreadsRelatedToChannelId=channel_id,
+        maxResults=min(per_page, 100),
+        order="time",
+        textFormat="plainText",
+    )
+
+    threads: list[dict] = []
+    pages = 0
+    while request is not None and pages < max_pages:
+        result = request.execute()
+        threads.extend(result.get("items", []))
+        pages += 1
+        request = youtube.commentThreads().list_next(request, result)
+
+    return threads, request is not None
+
+
+def list_comment_replies(parent_comment_id: str, *, max_results: int = 100) -> list[dict]:
+    """Replies to one top-level comment.
+
+    A thread resource carries only a preview of its replies (about five), so
+    this is how a busy thread's remaining replies are read. 1 quota unit.
+    """
+    youtube = get_youtube_service()
+
+    items: list[dict] = []
+    request = youtube.comments().list(
+        part="snippet",
+        parentId=parent_comment_id,
+        maxResults=min(max_results, 100),
+        textFormat="plainText",
+    )
+    while request is not None and len(items) < max_results:
+        result = request.execute()
+        items.extend(result.get("items", []))
+        request = youtube.comments().list_next(request, result)
+
+    return items[:max_results]
+
+
 def reply_to_comment(parent_comment_id: str, text: str) -> dict:
     """Reply to a comment."""
     youtube = get_youtube_service()

@@ -8,6 +8,7 @@ Generated from the router source. When endpoints change, update this file. (CLAU
 
 - [Application-level routes (`app.py`)](#application-level-routes-apppy) — HTML pages, static mounts, build identity
 - [Projects (`/api/projects`)](#projects-apiprojects) — `project_routes.py`
+- [Comments (`/api/projects/{slug}/comments`)](#comments-apiprojectsslugcomments) — `comment_routes.py`
 - [YouTube auth (`/auth`)](#youtube-auth-auth) — `auth_routes.py`
 - [Videos (`/api/videos`)](#videos-apivideos) — `video_routes.py`
 - [Transcripts (`/api/videos/{video_id}/transcripts`)](#transcripts-apivideosvideo_idtranscripts) — `transcript_routes.py`
@@ -486,6 +487,96 @@ A platform is `null` when no default is set or when the referenced credential wa
 **Side effects** — Calls `youtube.channels().list(mine=True)` (1 quota unit) on each call when authenticated.
 
 **Errors** — `404` (unknown slug).
+
+---
+
+## Comments (`/api/projects/{slug}/comments`)
+
+Source: `src/yt_scheduler/routers/comment_routes.py`
+
+Reads come from the local `youtube_comments` mirror, which a background job
+refreshes (`DYS_COMMENT_SYNC_MINUTES`, default 240). Only `/sync` talks to
+YouTube.
+
+### `GET /api/projects/{slug}/comments`
+
+**Purpose** — Newest stored comments for the whole project, for the dashboard's Recent comments section.
+
+**Query params** — `limit` (int, default `10`, 1–200), `offset` (int, default `0`).
+
+**Response 200**:
+
+```json
+{
+  "comments": [
+    {
+      "comment_id": "Ugx...",
+      "youtube_video_id": "dQw4w9WgXcQ",
+      "parent_comment_id": null,
+      "author_display_name": "@viewer",
+      "author_channel_id": "UC...",
+      "author_profile_image_url": "https://yt3.ggpht.com/...",
+      "text_display": "great episode",
+      "like_count": 3,
+      "total_reply_count": 1,
+      "published_at": "2026-08-01T10:00:00Z",
+      "youtube_updated_at": "2026-08-01T10:00:00Z",
+      "first_seen_at": "2026-08-01 14:00:00",
+      "is_channel_owner": false,
+      "is_reply": false,
+      "local_video_id": "dQw4w9WgXcQ",
+      "video_title": "Ep 42 — Shipping Relay",
+      "episode_number": 42
+    }
+  ],
+  "total": 137,
+  "last_synced_at": "2026-08-02 08:00:00",
+  "channel_connected": true
+}
+```
+
+Newest first (`published_at DESC`). Comments the blocklist already rejected on
+YouTube (a `moderation_log` row with `action = 'deleted'`) are excluded, and
+`total` counts the same filtered set — YouTube keeps returning rejected comments,
+so without this the feed would show the spam moderation removed. A **failed**
+rejection (`action = 'error'`) is *not* excluded: that comment is still live.
+`youtube_video_id` is `null` for a comment
+posted on the channel rather than on a video. `local_video_id` / `video_title` /
+`episode_number` are `null` when the comment is on a channel video this app never
+imported — the comment is still listed. `is_channel_owner` is true when the
+author is the project's own channel, which is how an already-answered thread
+reads as answered. `last_synced_at` is `null` when no sweep has ever stored a
+comment — "never synced", which is not the same as "no comments".
+
+**Errors** — `400` (`limit` outside 1–200, or negative `offset` — refused, not clamped); `404` (unknown slug).
+
+### `POST /api/projects/{slug}/comments/sync`
+
+**Purpose** — Sweep the project's channel now and upsert what comes back. The background job does the same thing on its own schedule; this is the user asking for it immediately.
+
+**Response 200**:
+
+```json
+{
+  "project_slug": "drew-and-dan",
+  "threads": 214,
+  "comments_seen": 288,
+  "new": 6,
+  "updated": 282,
+  "pages_truncated": false,
+  "reply_fetches": 3,
+  "threads_with_unfetched_replies": 0
+}
+```
+
+`pages_truncated` is true when the sweep stopped at `COMMENT_SYNC_MAX_PAGES` with
+pages still available; `threads_with_unfetched_replies` counts threads left over
+by `COMMENT_SYNC_MAX_REPLY_FETCHES`. Both are reported so a partial sweep can't
+present itself as a complete one; the next sweep picks up the remainder.
+
+**Side effects** — `commentThreads.list(allThreadsRelatedToChannelId=…)`, 1 quota unit per page (up to 20), plus 1 unit per reply follow-up (up to 50). Upserts `youtube_comments`.
+
+**Errors** — `400` (project has no YouTube channel bound); `404` (unknown slug); `500` (YouTube error, with the real error text).
 
 ---
 
@@ -1116,7 +1207,9 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 
 **Purpose** — All social posts whose most recent send attempt failed, newest first. Powers the app-wide failed-sends banner (`static/js/failed-sends-banner.js`, loaded by `base.html` on every page), which stays up until each post is retried successfully or deleted — `social_posts.status` is the single source of truth, with no separate acknowledged/dismissed state.
 
-**Response 200** — Array of `{"id": int, "video_id": str, "platform": str, "error": str, "social_account_id": int|null, "video_title": str, "page_url": str}`. `page_url` is the ready link to the owning project's video-detail page — the server vends it because the detail route 404s unless the slug actually owns the video.
+**Response 200** — Array of `{"id": int, "video_id": str, "platform": str, "error": str, "failed_at": "<naive UTC>"|null, "social_account_id": int|null, "video_title": str, "page_url": str}`. `page_url` is the ready link to the owning project's video-detail page — the server vends it because the detail route 404s unless the slug actually owns the video.
+
+`failed_at` (migration 044) is when the most recent send attempt failed, stamped by `models.social_post.mark_failed` — the single writer of the `'failed'` state. NULL means unknown: the row failed before the column existed. Nothing substitutes `created_at`, which is when the post row was *written* and for a smart-queue post predates the attempt by days or weeks. Note that the other two time columns are useless here by construction: `posted_at` is only set on success, and marking a post failed *clears* `scheduled_at`.
 
 ### `GET /api/social/posts/{video_id}`
 
@@ -2359,7 +2452,9 @@ Order and rendered text are preserved; only *when* each item goes out moves. The
 
 **Purpose** — Posts this queue owns that didn't go out and need a decision.
 
-**Response 200** — `{"missed": [{"post_id", "platform", "status", "scheduled_at", "error", "item_id", "video_id", "title", "missed_reason", "within_grace"}], "missed_policy": ..., "missed_grace_hours": ...}`.
+**Response 200** — `{"missed": [{"post_id", "platform", "status", "scheduled_at", "error", "failed_at", "item_id", "video_id", "title", "missed_reason", "within_grace"}], "missed_policy": ..., "missed_grace_hours": ...}`.
+
+The two time fields are mutually exclusive in practice and the UI labels them differently. An overdue-but-never-attempted post still holds `scheduled_at` and renders as "due …"; a failed one had `scheduled_at` cleared when it was marked failed and renders as "failed …" from `failed_at` (migration 044). Both NULL means a pre-migration failure — the row shows no time rather than a wrong one.
 
 **Missed is derived, not stored** — a post whose `scheduled_at` is in the past and which hasn't been sent. There is no `missed` flag and no background sweeper, so the state can't go stale and nothing has to keep it up to date. A `failed` post is included regardless of time: from the user's point of view "it didn't go out and needs a decision" is the same situation.
 

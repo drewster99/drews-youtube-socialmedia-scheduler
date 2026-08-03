@@ -768,18 +768,22 @@ async function loadMissed() {
         document.getElementById('sq-missed-section').style.display =
             missed.length ? '' : 'none';
         document.getElementById('sq-missed-list').innerHTML = missed.map(row => {
+            // Two different facts share this column, so each is labelled.
+            // Marking a post failed clears scheduled_at, so a failure used to
+            // land here as a bare "unscheduled" with no time at all — which
+            // is how a five-day-old failure read the same as a fresh one.
             const when = row.scheduled_at
-                ? new Date(row.scheduled_at).toLocaleString(undefined,
-                    {weekday:'short', month:'numeric', day:'numeric',
-                     hour:'numeric', minute:'2-digit'})
-                : 'unscheduled';
+                ? `due ${window.dysDateTime.formatWhen(row.scheduled_at)}`
+                : (row.failed_at
+                    ? `failed ${window.dysDateTime.formatWhenWithAge(row.failed_at)}`
+                    : 'unscheduled');
             // Within the post-late window, posting now is the expected action
             // rather than an override — say so instead of leaving it ambiguous.
             const grace = row.within_grace
                 ? '<span class="form-hint"> (still inside the post-late window)</span>'
                 : '';
             return `<div style="display:flex; gap:0.6rem; align-items:center; padding:0.25rem 0; flex-wrap:wrap;">
-                <span style="color: var(--text-dim); min-width:11rem;">${escapeHtml(when)}</span>
+                <span style="color: var(--text-dim); min-width:16rem;">${escapeHtml(when)}</span>
                 <span style="min-width:5rem;">${escapeHtml(row.platform)}</span>
                 <span>${escapeHtml(row.title)}</span>
                 <span style="color: var(--danger);">${escapeHtml(row.missed_reason)}</span>${grace}

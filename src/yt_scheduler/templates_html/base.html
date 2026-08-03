@@ -6,6 +6,14 @@
     <title>{% block title %}Drew's Video + Socials Scheduler{% endblock %}</title>
     <link rel="icon" type="image/png" href="/static/img/favicon.png">
     <link rel="stylesheet" href="/static/css/style.css">
+    <!-- In <head>, not with the scripts at the end of body: two different
+         kinds of caller need window.dysDateTime before that point. The
+         banners format timestamps during a fetch they start at parse time,
+         and a page's own JS lives in the content block — which the parser
+         reaches BEFORE the end-of-body tags. It is a few hundred bytes of
+         pure functions with no dependencies, so ordering should not be a
+         question anyone has to answer again. -->
+    <script src="/static/js/datetime.js"></script>
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
 </head>
 <body>

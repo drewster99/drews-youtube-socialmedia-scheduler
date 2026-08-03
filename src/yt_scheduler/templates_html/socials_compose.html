@@ -69,16 +69,6 @@
 <script>
 const params = new URLSearchParams(window.location.search);
 const videoId = params.get('video_id');
-
-// SQLite's datetime('now') returns naive UTC. Safari parses those as
-// local time; coerce to ISO-with-Z so they parse as UTC.
-function _ensureUtc(iso) {
-    if (typeof iso !== 'string') return iso;
-    if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(iso) && !/(?:Z|[+-]\d\d:?\d\d)$/.test(iso)) {
-        return iso.replace(' ', 'T') + 'Z';
-    }
-    return iso;
-}
 if (!videoId) {
     document.querySelector('.page-header h1').textContent = 'Socials from template — missing video_id';
 }
@@ -126,7 +116,7 @@ function applyPostFilter(all) {
         _postMatchesCompose(p) && p.status !== 'posted' && p.status !== 'sending'
     );
     priorPostsByPlatform = {};
-    const tOf = (p) => new Date(_ensureUtc(p.posted_at || p.updated_at || p.created_at)).getTime() || 0;
+    const tOf = (p) => new Date(dysDateTime.ensureUtc(p.posted_at || p.updated_at || p.created_at)).getTime() || 0;
     for (const p of list) {
         if (!_postMatchesCompose(p) || p.status !== 'posted') continue;
         const cur = priorPostsByPlatform[p.platform];
@@ -480,7 +470,7 @@ function renderPreviews() {
         const prior = priorPostsByPlatform[p.platform];
         let priorNote = '';
         if (prior) {
-            const when = new Date(_ensureUtc(prior.posted_at || prior.updated_at || prior.created_at)).toLocaleString();
+            const when = new Date(dysDateTime.ensureUtc(prior.posted_at || prior.updated_at || prior.created_at)).toLocaleString();
             const link = prior.post_url
                 ? ` — <a href="${escapeAttr(prior.post_url)}" target="_blank" rel="noopener">open</a>`
                 : '';

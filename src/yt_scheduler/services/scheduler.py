@@ -9,11 +9,16 @@ from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from yt_scheduler.config import CAPTION_CHECK_INTERVAL_MINUTES, COMMENT_CHECK_INTERVAL_MINUTES
+from yt_scheduler.config import (
+    CAPTION_CHECK_INTERVAL_MINUTES,
+    COMMENT_CHECK_INTERVAL_MINUTES,
+    COMMENT_SYNC_INTERVAL_MINUTES,
+)
 from yt_scheduler.database import get_db, write_transaction
-from yt_scheduler.models.social_post import mark_posted
+from yt_scheduler.models.social_post import mark_failed, mark_posted
 from yt_scheduler.models.video import is_youtube_backed
 from yt_scheduler.services import (
+    comments as comment_service,
     events,
     moderation,
     transcripts as transcript_service,
@@ -118,12 +123,7 @@ async def _fail_render_error_post(post: dict) -> str | None:
         "blocked: post content is a render-error placeholder, "
         "not real content — regenerate the post"
     )
-    async with write_transaction() as db:
-        await db.execute(
-            "UPDATE social_posts SET status = 'failed', error = ?, "
-            "scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
-            (reason, post["id"]),
-        )
+    await mark_failed(post["id"], error=reason)
     logger.error(
         "Blocked post %s — content is a render-error placeholder",
         post["id"],
@@ -482,12 +482,7 @@ async def publish_video_job(video_id: str) -> dict:
                     await mark_needs_reauth(e.uuid)
                 # Commit the terminal 'failed' state immediately so a stranded
                 # 'sending' row can't survive a mid-batch crash.
-                async with write_transaction() as db:
-                    await db.execute(
-                        "UPDATE social_posts SET status = 'failed', error = ?, "
-                        "scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
-                        (str(e), post_id),
-                    )
+                await mark_failed(post_id, error=str(e))
                 results["social_results"][platform].append(
                     {"post_id": post_id, "status": "failed", "error": str(e)}
                 )
@@ -571,12 +566,7 @@ async def _send_scheduled_post(post_id: int) -> None:
                     "Publish it and use Send to retry."
                 )
         if err is not None:
-            async with write_transaction() as db:
-                await db.execute(
-                    "UPDATE social_posts SET status = 'failed', error = ?, "
-                    "scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
-                    (err, post_id),
-                )
+            await mark_failed(post_id, error=err)
             await events.record_event(
                 video_id,
                 "social_post_failed_video_not_public",
@@ -631,12 +621,7 @@ async def _send_scheduled_post(post_id: int) -> None:
             f"{post['platform']} on {posted_when}. Use Send to override, "
             "or edit the content."
         )
-        async with write_transaction() as db:
-            await db.execute(
-                "UPDATE social_posts SET status = 'failed', error = ?, "
-                "scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
-                (err, post_id),
-            )
+        await mark_failed(post_id, error=err)
         logger.warning(
             "_send_scheduled_post: post %s terminal-skipped — duplicate of #%s",
             post_id, dup.get("id"),
@@ -754,12 +739,7 @@ async def _send_scheduled_post(post_id: int) -> None:
                 },
             )
         logger.error("Failed to send scheduled post %s: %s", post_id, exc)
-        async with write_transaction() as db:
-            await db.execute(
-                "UPDATE social_posts SET status = 'failed', error = ?, "
-                "scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
-                (str(exc), post_id),
-            )
+        await mark_failed(post_id, error=str(exc))
 
 
 async def schedule_social_post(post_id: int, when: datetime) -> str:
@@ -866,13 +846,11 @@ async def _refuse_missed_post_recovery(overdue: list[dict]) -> None:
         "Automatic recovery was refused so a backlog couldn't post itself all "
         "at once. Send this manually if it's still worth posting."
     )
-    async with write_transaction() as db:
+    # One enclosing transaction so the whole batch is refused atomically;
+    # mark_failed's own write_transaction joins it rather than nesting.
+    async with write_transaction():
         for row in overdue:
-            await db.execute(
-                "UPDATE social_posts SET status = 'failed', error = ?, "
-                "scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
-                (reason, row["id"]),
-            )
+            await mark_failed(row["id"], error=reason)
     logger.error(
         "Refused automatic recovery of %d overdue social post(s) (limit %d); "
         "each is marked failed and can be sent manually",
@@ -1559,6 +1537,28 @@ async def moderate_comments_job() -> None:
             )
 
 
+async def sync_comments_job() -> None:
+    """Mirror every project's channel comments into the local table.
+
+    Separate from ``moderate_comments_job``: that one enforces the blocklist
+    per video and keeps only what it acted on, this one keeps the whole
+    conversation so the dashboard can show it without calling YouTube. Each
+    project costs a handful of quota units per sweep, hence the lazy interval.
+    """
+    for summary in await comment_service.sync_all_projects():
+        if summary.get("error"):
+            # sync_all_projects already logged the failure with its cause; this
+            # is the per-tick roll-up so a persistently broken project is
+            # visible in the log without correlating across ticks.
+            continue
+        if summary["new"] or summary["updated"]:
+            logger.info(
+                "Comment sweep (project %s): %d new, %d updated, %d thread(s) read",
+                summary["project_slug"], summary["new"], summary["updated"],
+                summary["threads"],
+            )
+
+
 # How often to sweep social credentials looking for tokens to pre-emptively
 # refresh. The lookahead window is per-platform (a poster class attribute,
 # ``SocialPoster.token_refresh_window_secs``): 45 minutes suits ~2-hour
@@ -1709,6 +1709,23 @@ def start_scheduler(
         minutes=mod_mins,
         id="moderate_comments",
         replace_existing=True,
+    )
+    # First sweep 45s after startup so the dashboard's Recent comments section
+    # has content on the very first launch after this shipped, instead of
+    # sitting empty for four hours. Skipped under pytest for the same reason as
+    # every other network-touching job below: start_scheduler runs inside the
+    # app lifespan, which TestClient exercises, and next_run_time=None adds the
+    # job PAUSED so it never fires there.
+    comment_sync_first_run = None
+    if "pytest" not in sys.modules:
+        comment_sync_first_run = datetime.now(timezone.utc) + timedelta(seconds=45)
+    scheduler.add_job(
+        sync_comments_job,
+        "interval",
+        minutes=COMMENT_SYNC_INTERVAL_MINUTES,
+        id="sync_comments",
+        replace_existing=True,
+        next_run_time=comment_sync_first_run,
     )
     # Early first run so a laptop opened only briefly inside a token's final
     # refresh window still renews it — the default first fire would be a full

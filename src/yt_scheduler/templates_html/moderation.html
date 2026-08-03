@@ -55,16 +55,6 @@ function escapeHtml(s) {
         .replaceAll('"','&quot;');
 }
 
-// SQLite's datetime('now') returns naive UTC. Safari parses those as
-// local time; coerce to ISO-with-Z so they parse as UTC.
-function _ensureUtc(iso) {
-    if (typeof iso !== 'string') return iso;
-    if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(iso) && !/(?:Z|[+-]\d\d:?\d\d)$/.test(iso)) {
-        return iso.replace(' ', 'T') + 'Z';
-    }
-    return iso;
-}
-
 async function loadBlocklist() {
     const resp = await fetch(`/api/settings/blocklist?project_slug=${encodeURIComponent(projectSlug)}`, {_silent: true});
     const items = await resp.json();
@@ -107,7 +97,7 @@ async function removeKeyword(id) {
 }
 
 function fmtRelative(iso) {
-    const d = new Date(_ensureUtc(iso));
+    const d = new Date(dysDateTime.ensureUtc(iso));
     if (Number.isNaN(d.getTime())) return '?';
     const diffMs = d.getTime() - Date.now();
     const absMin = Math.round(Math.abs(diffMs) / 60_000);
@@ -145,7 +135,7 @@ async function loadLog() {
         <thead><tr><th>Date</th><th>Video</th><th>Author</th><th>Comment</th><th>Matched</th><th>Action</th></tr></thead>
         <tbody>${items.map(i => `
             <tr>
-                <td>${new Date(_ensureUtc(i.created_at)).toLocaleString()}</td>
+                <td>${new Date(dysDateTime.ensureUtc(i.created_at)).toLocaleString()}</td>
                 <td><a href="/projects/${projectSlug}/videos/${i.video_id}">${i.video_id}</a></td>
                 <td>${escapeHtml(i.author) || '—'}</td>
                 <td class="comment-preview">${escapeHtml((i.comment_text || '').slice(0, 80))}...</td>

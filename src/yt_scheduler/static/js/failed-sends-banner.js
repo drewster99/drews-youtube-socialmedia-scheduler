@@ -31,20 +31,45 @@
         return escapeText(value).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
-    // Platform and title carry the identity, the error carries the detail —
+    /**
+     * When the send attempt failed, or null.
+     *
+     * NULL failed_at means the row failed before migration 044 added the
+     * column — genuinely unknown, so the line omits the time rather than
+     * substituting created_at, which is when the post was *written* and can
+     * predate the attempt by weeks.
+     */
+    function whenText(post) {
+        if (!post.failed_at) return null;
+        return window.dysDateTime.formatWhenWithAge(post.failed_at);
+    }
+
+    // Platform and title carry the identity, the error carries the detail,
+    // the time says whether this is breaking now or is a leftover —
     // distinguishing them is what makes a list of eight scannable.
     function describe(post, errorText) {
+        const when = whenText(post);
         return `<span class="failed-sends-banner__platform">${escapeText(post.platform)}</span>`
             + ` — ${escapeText(post.video_title)}: `
             + `<span class="failed-sends-banner__error">${escapeText(errorText)}</span> `
+            + (when ? `<span class="failed-sends-banner__when">${escapeText(when)}</span> ` : '')
             + `<a href="${escapeAttribute(post.page_url)}">View →</a>`;
     }
 
-    /** Identifies what the banner is currently showing, so an unchanged poll is a no-op. */
+    /** Identifies what the banner is currently showing, so an unchanged poll is a no-op.
+     *
+     * Keyed on the *rendered* time text, not on failed_at: the age is relative,
+     * so "3 minutes ago" goes stale on its own with every field unchanged.
+     * Comparing the text is what lets a poll notice a minute boundary while
+     * still skipping the rebuild in the 29 seconds either side of it.
+     */
     function renderKey(posts) {
         return JSON.stringify([
             isExpanded,
-            posts.map((post) => [post.id, post.platform, post.video_title, post.error, post.page_url]),
+            posts.map((post) => [
+                post.id, post.platform, post.video_title, post.error,
+                post.page_url, whenText(post),
+            ]),
         ]);
     }
 

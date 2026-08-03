@@ -604,7 +604,7 @@ function renderSchedulePostPreview() {
         ? approved.filter(p => p.scheduled_at)
         : [];
     const firstScheduledMs = scheduledPosts.length
-        ? scheduledPosts.map(p => new Date(_ensureUtc(p.scheduled_at)).getTime())
+        ? scheduledPosts.map(p => new Date(dysDateTime.ensureUtc(p.scheduled_at)).getTime())
                         .reduce((a, b) => Math.min(a, b))
         : null;
     const isScheduled = isPublished
@@ -617,7 +617,7 @@ function renderSchedulePostPreview() {
             ? toLocalInputValue(new Date(firstScheduledMs))
             : null)
         : (isScheduled
-            ? toLocalInputValue(new Date(_ensureUtc(videoData.publish_at)))
+            ? toLocalInputValue(new Date(dysDateTime.ensureUtc(videoData.publish_at)))
             : null);
     const verb = isScheduled ? 'Reschedule' : 'Schedule';
     const subject = isPublished
@@ -946,7 +946,7 @@ async function loadVideo() {
     }
     _bindScheduleDatetimeUserTouched();
     if (video.status === 'scheduled' && video.publish_at && !ytIsPublic) {
-        const pubDate = new Date(_ensureUtc(video.publish_at));
+        const pubDate = new Date(dysDateTime.ensureUtc(video.publish_at));
         scheduleInfo.innerHTML = `<span class="badge badge-scheduled">Scheduled</span>
             <span style="margin-left: 0.5rem;">${pubDate.toLocaleString()}</span>`;
         cancelBtn.style.display = 'inline-flex';
@@ -965,7 +965,7 @@ async function loadVideo() {
         const ytPublishedAt = video.youtube_data?.status?.publishAt
                            || video.youtube_data?.snippet?.publishedAt
                            || video.publish_at;
-        const when = ytPublishedAt ? new Date(_ensureUtc(ytPublishedAt)).toLocaleString() : '';
+        const when = ytPublishedAt ? new Date(dysDateTime.ensureUtc(ytPublishedAt)).toLocaleString() : '';
         scheduleInfo.innerHTML = `<span class="badge badge-published">Published</span>`
                                + (when ? ` <span style="margin-left: 0.5rem;">${when}</span>` : '');
         // Surface any already-scheduled per-post jobs so the user knows
@@ -975,7 +975,7 @@ async function loadVideo() {
         );
         if (scheduledPosts.length) {
             const firstAt = scheduledPosts
-                .map(p => new Date(_ensureUtc(p.scheduled_at)).getTime())
+                .map(p => new Date(dysDateTime.ensureUtc(p.scheduled_at)).getTime())
                 .reduce((a, b) => Math.min(a, b));
             const firstLabel = new Date(firstAt).toLocaleString();
             scheduleInfo.innerHTML += ` · <span class="badge badge-scheduled">${scheduledPosts.length} post${scheduledPosts.length === 1 ? '' : 's'} scheduled</span> <span style="margin-left:0.5rem;">first at ${firstLabel}</span>`;
@@ -1158,20 +1158,8 @@ async function saveTranscriptSelection() {
 
 // --- Per-video log ---------------------------------------------------------
 
-// SQLite's datetime('now') returns naive UTC strings like
-// "2026-04-27 20:00:00" with no timezone marker. Safari parses those as
-// local time, which shifts every timestamp by the viewer's UTC offset.
-// Coerce to ISO-with-Z so the Date constructor treats it as UTC.
-function _ensureUtc(iso) {
-    if (typeof iso !== 'string') return iso;
-    if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(iso) && !/(?:Z|[+-]\d\d:?\d\d)$/.test(iso)) {
-        return iso.replace(' ', 'T') + 'Z';
-    }
-    return iso;
-}
-
 function fmtEventDate(iso) {
-    const date = new Date(_ensureUtc(iso));
+    const date = new Date(dysDateTime.ensureUtc(iso));
     if (Number.isNaN(date.getTime())) return iso;
     const dow = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][date.getDay()];
     const now = new Date();
@@ -2967,7 +2955,7 @@ async function schedulePublish() {
         if (isPublished) {
             const n = result.scheduled || 0;
             const errs = (result.errors || []).length;
-            const when = new Date(_ensureUtc(result.first_post_at)).toLocaleString();
+            const when = new Date(dysDateTime.ensureUtc(result.first_post_at)).toLocaleString();
             if (errs) {
                 // Partial failure: some posts didn't re-attach. The old
                 // schedule for those is already gone, so the user needs
@@ -2987,7 +2975,7 @@ async function schedulePublish() {
             }
         } else {
             const approved = socialPostsCache.filter(p => p.status === 'approved').length;
-            const when = new Date(_ensureUtc(result.publish_at)).toLocaleString();
+            const when = new Date(dysDateTime.ensureUtc(result.publish_at)).toLocaleString();
             showToast(
                 approved
                     ? `Scheduled video + ${approved} post${approved === 1 ? '' : 's'} for ${when}`

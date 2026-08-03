@@ -182,7 +182,7 @@ async function loadProjects() {
                             : ''}
                     </div>
                     <time>
-                        created ${new Date(_ensureUtc(p.created_at)).toLocaleDateString()}
+                        created ${new Date(dysDateTime.ensureUtc(p.created_at)).toLocaleDateString()}
                         ${p.last_activity_at
                             ? ` · last activity ${fmtRelativeShort(p.last_activity_at)}`
                             : ''}
@@ -230,22 +230,9 @@ function escapeHtml(s) {
         .replaceAll('"', '&quot;');
 }
 
-// SQLite's datetime('now') returns naive UTC strings like
-// "2026-04-27 20:00:00" with no timezone marker. Safari parses those as
-// local time, which shifts every timestamp by the viewer's UTC offset
-// (was producing "8:00pm" for a 20:00 UTC event when local was 4:00pm
-// EDT). Coerce to ISO-with-Z so the Date constructor treats it as UTC.
-function _ensureUtc(iso) {
-    if (typeof iso !== 'string') return iso;
-    if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(iso) && !/(?:Z|[+-]\d\d:?\d\d)$/.test(iso)) {
-        return iso.replace(' ', 'T') + 'Z';
-    }
-    return iso;
-}
-
 function fmtRelativeShort(iso) {
     /* Compact "2h ago" / "3d ago" / "just now" — used in card subtitles. */
-    const d = new Date(_ensureUtc(iso));
+    const d = new Date(dysDateTime.ensureUtc(iso));
     if (Number.isNaN(d.getTime())) return '';
     const diffMs = Date.now() - d.getTime();
     const sec = Math.round(diffMs / 1000);
@@ -262,7 +249,7 @@ function fmtRelativeShort(iso) {
 }
 
 function fmtWhen(iso) {
-    const d = new Date(_ensureUtc(iso));
+    const d = new Date(dysDateTime.ensureUtc(iso));
     if (Number.isNaN(d.getTime())) return iso;
     const dow = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()];
     const sameYear = d.getFullYear() === new Date().getFullYear();

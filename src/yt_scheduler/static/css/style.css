@@ -773,6 +773,82 @@ body {
 .comment .comment-date { font-size: 0.75rem; color: var(--text-muted); margin-left: 0.5rem; }
 .comment p { font-size: 0.85rem; color: var(--text-secondary); margin-top: 0.25rem; }
 
+/* Dashboard "Recent comments" — the project-wide feed, distinct from the
+   per-video .comment list above. Avatar column + body, so a long thread of
+   these stays scannable by author. */
+.comments-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 0.75rem;
+}
+.comments-header h2 { margin-bottom: 0; }
+.comments-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+.comments-synced { font-size: 0.8rem; color: var(--text-muted); }
+
+.comments-more-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-top: 0.75rem;
+}
+
+.comment-row {
+    display: flex;
+    gap: 0.75rem;
+    padding: 0.7rem 0;
+    border-bottom: 1px solid var(--border);
+}
+.comment-row:last-child { border-bottom: none; }
+
+.comment-avatar {
+    width: 32px;
+    height: 32px;
+    border-radius: 999px;
+    flex-shrink: 0;
+    object-fit: cover;
+}
+.comment-avatar-blank { background: var(--bg-hover); }
+
+.comment-body { min-width: 0; flex: 1; }
+.comment-line {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+}
+.comment-line strong { font-size: 0.85rem; }
+/* The .comment-date rule above is scoped to .comment (the per-video list), so
+   it does not reach this one — restate size and colour rather than widening
+   that selector and restyling the other page. */
+.comment-line .comment-date {
+    margin-left: 0;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+}
+.comment-on { font-size: 0.75rem; color: var(--text-muted); }
+.comment-on a { color: var(--accent); }
+.comment-text {
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+    margin-top: 0.2rem;
+    /* Comment bodies carry deliberate line breaks and long unbroken URLs;
+       preserve the former without letting the latter widen the page. */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+.comment-line-footer { margin-top: 0.3rem; }
+.comment-likes { font-size: 0.75rem; color: var(--text-muted); }
+.comment-yt-link { font-size: 0.75rem; color: var(--accent); }
+
+.badge-comment-owner { background: var(--accent); color: #000; }
+.badge-comment-reply { background: var(--bg-hover); color: var(--text-secondary); }
+
 /* Social posts */
 .social-post-card {
     background: var(--bg-input);
@@ -1989,6 +2065,17 @@ dialog.modal-xwide {
 
 .failed-sends-banner__error {
     color: var(--text-muted, #999);
+}
+
+/* Set apart from the error text it follows: the age is the field a reader
+   scans a list of eight by, and it disappears inside a wall of muted grey.
+   --text-secondary, one step brighter than the --text-muted the error uses.
+   (Deliberately not --text-dim, which several templates reference but no
+   stylesheet ever defines, so it resolves to inherit.) */
+.failed-sends-banner__when {
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
 }
 
 .failed-sends-banner__list a {

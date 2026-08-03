@@ -28,3 +28,28 @@ async def mark_posted(post_id: int, *, post_url: str) -> None:
             WHERE id = ?""",
             (post_url, post_id),
         )
+
+
+async def mark_failed(post_id: int, *, error: str) -> None:
+    """Record that this post's send attempt failed, and why.
+
+    The mirror of :func:`mark_posted`, and the ONLY writer of the ``'failed'``
+    state. This statement previously existed as ten byte-identical copies
+    across ``services/scheduler`` and ``routers/social_routes``; when
+    ``failed_at`` was added, every one of them would have had to be found and
+    edited, and the eleventh send path would have shipped without it. A
+    regression test greps for the raw UPDATE so a new copy can't reappear.
+
+    ``scheduled_at`` / ``scheduler_job_id`` clear for the same reason they do
+    on success, plus one specific to failure: a row left holding its scheduling
+    columns is resurrected and re-sent by the restore pass on the next restart,
+    which is exactly what a terminal failure must not do.
+    """
+    async with write_transaction() as db:
+        await db.execute(
+            """UPDATE social_posts
+            SET status = 'failed', error = ?, failed_at = datetime('now'),
+                scheduler_job_id = NULL, scheduled_at = NULL
+            WHERE id = ?""",
+            (error, post_id),
+        )

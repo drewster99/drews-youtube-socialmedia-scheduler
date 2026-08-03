@@ -19,6 +19,28 @@
     </div>
 </div>
 
+<!-- Top of the page: a comment is the only thing here that someone else is
+     waiting on. Previously comments were reachable one video at a time, from
+     the video detail page, so "has anyone said anything?" meant opening every
+     video in turn. Hidden outright when no channel is bound — there is then no
+     source of comments at all, and an empty box would just be a question mark. -->
+<div class="section" id="comments-section" {% if not current_project.youtube_channel_id %}style="display:none;"{% endif %}>
+    <div class="comments-header">
+        <h2>Recent comments</h2>
+        <div class="comments-header-actions">
+            <span id="comments-synced" class="comments-synced"></span>
+            <button class="btn btn-sm" id="comments-refresh-btn">Refresh</button>
+        </div>
+    </div>
+    <div id="comments-list">
+        <p class="loading">Loading comments...</p>
+    </div>
+    <div id="comments-more-row" class="comments-more-row" style="display:none;">
+        <button class="btn btn-sm" id="comments-more-btn">Load more</button>
+        <span id="comments-count" class="comments-synced"></span>
+    </div>
+</div>
+
 <!-- Above the videos: a queue is a project-wide thing, not a per-video one. -->
 <div class="section" id="smart-queue-section" style="display:none;">
     <h2>Smart schedules</h2>
@@ -100,17 +122,6 @@
 <script>
 const projectSlug = "{{ current_project.slug }}";
 
-// SQLite's datetime('now') returns naive UTC strings ("2026-04-27 20:00:00").
-// Safari parses those as local time, shifting timestamps by the viewer's
-// UTC offset. Coerce to ISO-with-Z so they parse as UTC.
-function _ensureUtc(iso) {
-    if (typeof iso !== 'string') return iso;
-    if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(iso) && !/(?:Z|[+-]\d\d:?\d\d)$/.test(iso)) {
-        return iso.replace(' ', 'T') + 'Z';
-    }
-    return iso;
-}
-
 function formatDuration(seconds) {
     /* Compact mm:ss for under an hour, h:mm:ss otherwise. Returns '' for
      * null / non-numeric so callers can omit the badge. */
@@ -128,7 +139,7 @@ function fmtScheduledWhen(iso) {
     /* Same shape as the Home page's fmtWhen — Mon 4/27 2:30pm — so the
      * dashboard scheduled-time line reads consistently with the Upcoming
      * panel users may have come from. */
-    const d = new Date(_ensureUtc(iso));
+    const d = new Date(dysDateTime.ensureUtc(iso));
     if (Number.isNaN(d.getTime())) return iso;
     const dow = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()];
     const sameYear = d.getFullYear() === new Date().getFullYear();
@@ -166,7 +177,7 @@ async function loadVideos() {
             // whether status is exactly 'scheduled' (covers the brief
             // window where the scheduler has the job pending but the
             // status hasn't been flipped yet).
-            const scheduledFuture = v.publish_at && new Date(_ensureUtc(v.publish_at)).getTime() > now;
+            const scheduledFuture = v.publish_at && new Date(dysDateTime.ensureUtc(v.publish_at)).getTime() > now;
             const scheduleLine = scheduledFuture
                 ? `<div class="video-schedule">⏰ Scheduled: <strong>${fmtScheduledWhen(v.publish_at)}</strong></div>`
                 : '';
@@ -200,7 +211,7 @@ async function loadVideos() {
                             ${v.privacy_status ? `<span class="badge badge-${v.privacy_status}">${v.privacy_status}</span>` : ''}
                             ${deletedBadge}
                         </div>
-                        <time>${new Date(_ensureUtc(v.created_at)).toLocaleDateString()}</time>
+                        <time>${new Date(dysDateTime.ensureUtc(v.created_at)).toLocaleDateString()}</time>
                     </div>
                 </a>
             `;
@@ -267,7 +278,7 @@ async function loadAvailableImports() {
                             <span class="badge badge-${v.privacy_status || 'unlisted'}">${v.privacy_status || 'unknown'}</span>
                             ${ytKindBadge}
                             ${durationBadge}
-                            <time>${v.published_at ? new Date(_ensureUtc(v.published_at)).toLocaleDateString() : ''}</time>
+                            <time>${v.published_at ? new Date(dysDateTime.ensureUtc(v.published_at)).toLocaleDateString() : ''}</time>
                         </div>
                         <div class="form-group" style="margin: 0.5rem 0;">
                             <label style="display:block; font-size: 0.85em; opacity:0.7;">Parent (optional)</label>
@@ -305,6 +316,175 @@ async function loadAvailableImports() {
     } catch (e) {
         container.innerHTML = '<p class="empty-state">Could not load imports.</p>';
     }
+}
+
+// --- Recent comments ----------------------------------------------------
+//
+// Renders the local mirror (youtube_comments), never YouTube directly: the
+// server sweeps the whole channel on its own schedule, so this section costs
+// one SQL query and cannot be slowed down or emptied by a bad API round trip.
+// "Refresh" is the user explicitly asking for a live sweep right now.
+
+const COMMENTS_PAGE_SIZE = 10;
+let commentsShown = 0;
+
+function fmtCommentAge(iso) {
+    /* Relative age — for a comment, "3 hours ago" is the fact you act on, not
+     * the calendar date. window.dysDateTime is the shared formatter (loaded in
+     * <head>); an unparseable stamp shows raw rather than blank, so bad data
+     * looks like bad data instead of like an empty field. */
+    return window.dysDateTime.formatAge(iso) || String(iso ?? '');
+}
+
+function commentRowHtml(c) {
+    // Author name and body come from arbitrary YouTube viewers. The server
+    // stores textDisplay fetched with textFormat=plainText, so escaping is
+    // both safe and faithful — there is no markup in it to lose.
+    const ownerBadge = c.is_channel_owner
+        ? '<span class="badge badge-comment-owner">you</span>'
+        : '';
+    const replyBadge = c.is_reply
+        ? '<span class="badge badge-comment-reply">reply</span>'
+        : '';
+    const likes = c.like_count > 0
+        ? `<span class="comment-likes">♥ ${c.like_count}</span>`
+        : '';
+
+    const episodePrefix = (c.episode_number != null && c.episode_number !== '')
+        ? `Ep ${c.episode_number} — `
+        : '';
+    let onWhat;
+    if (c.local_video_id) {
+        onWhat = `on <a href="/projects/${projectSlug}/videos/${encodeURIComponent(c.local_video_id)}">`
+               + `${escapeAttr(episodePrefix + c.video_title)}</a>`;
+    } else if (c.youtube_video_id) {
+        // A channel video this app never imported. Still a real comment, so it
+        // is listed — it just has no local page to point at.
+        onWhat = `on <a href="https://www.youtube.com/watch?v=${encodeURIComponent(c.youtube_video_id)}"`
+               + ` target="_blank" rel="noopener">a video not tracked here</a>`;
+    } else {
+        onWhat = 'on the channel';
+    }
+
+    const ytLink = c.youtube_video_id
+        ? `<a class="comment-yt-link" target="_blank" rel="noopener"`
+          + ` href="https://www.youtube.com/watch?v=${encodeURIComponent(c.youtube_video_id)}`
+          + `&lc=${encodeURIComponent(c.comment_id)}">Reply on YouTube →</a>`
+        : '';
+
+    const avatar = c.author_profile_image_url
+        ? `<img class="comment-avatar" src="${escapeAttr(c.author_profile_image_url)}" alt="">`
+        : '<div class="comment-avatar comment-avatar-blank"></div>';
+
+    return `
+        <div class="comment-row">
+            ${avatar}
+            <div class="comment-body">
+                <div class="comment-line">
+                    <strong>${escapeAttr(c.author_display_name)}</strong>
+                    ${ownerBadge}${replyBadge}
+                    <span class="comment-date">${fmtCommentAge(c.published_at)}</span>
+                    <span class="comment-on">${onWhat}</span>
+                </div>
+                <p class="comment-text">${escapeAttr(c.text_display)}</p>
+                <div class="comment-line comment-line-footer">
+                    ${likes}${ytLink}
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+async function loadComments(append = false) {
+    const list = document.getElementById('comments-list');
+    const moreRow = document.getElementById('comments-more-row');
+    const syncedEl = document.getElementById('comments-synced');
+    if (!append) {
+        commentsShown = 0;
+        list.innerHTML = '<p class="loading">Loading comments...</p>';
+    }
+    try {
+        const resp = await fetch(
+            `/api/projects/${encodeURIComponent(projectSlug)}/comments`
+            + `?limit=${COMMENTS_PAGE_SIZE}&offset=${commentsShown}`,
+            {_silent: true},
+        );
+        if (!resp.ok) {
+            const body = await resp.json().catch(() => ({}));
+            const detail = body.detail || `HTTP ${resp.status}`;
+            list.innerHTML = `<p class="error">Could not load comments: ${escapeAttr(detail)}</p>`;
+            moreRow.style.display = 'none';
+            return;
+        }
+        const data = await resp.json();
+
+        syncedEl.textContent = data.last_synced_at
+            ? `Synced ${fmtCommentAge(data.last_synced_at)}`
+            : 'Never synced';
+
+        if (data.total === 0) {
+            list.innerHTML = data.last_synced_at
+                ? '<p class="empty-state">No comments on this channel yet.</p>'
+                : '<p class="empty-state">No comments fetched yet. The server checks '
+                  + 'every few hours — or hit Refresh to check now.</p>';
+            moreRow.style.display = 'none';
+            return;
+        }
+
+        const rows = data.comments.map(commentRowHtml).join('');
+        if (append) {
+            list.insertAdjacentHTML('beforeend', rows);
+        } else {
+            list.innerHTML = rows;
+        }
+        commentsShown += data.comments.length;
+
+        // A page that comes back short means we have reached the end even if
+        // `total` disagrees — a sweep can land between two pages.
+        const more = commentsShown < data.total && data.comments.length > 0;
+        moreRow.style.display = more ? '' : 'none';
+        document.getElementById('comments-count').textContent =
+            `Showing ${commentsShown} of ${data.total}`;
+    } catch (e) {
+        list.innerHTML = `<p class="error">Could not load comments: ${escapeAttr(e.message)}</p>`;
+        moreRow.style.display = 'none';
+    }
+}
+
+document.getElementById('comments-more-btn').addEventListener('click', () => loadComments(true));
+
+document.getElementById('comments-refresh-btn').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.textContent = 'Refreshing...';
+    try {
+        // Not _silent: a failed sweep must say why, and the fetch wrapper
+        // already surfaces the server's `detail` verbatim.
+        const resp = await fetch(
+            `/api/projects/${encodeURIComponent(projectSlug)}/comments/sync`,
+            {method: 'POST'},
+        );
+        if (resp.ok) {
+            const s = await resp.json();
+            let msg = `${s.new} new, ${s.updated} updated`;
+            if (s.pages_truncated) {
+                msg += ' — stopped at the page cap, older threads not read';
+            }
+            if (s.threads_with_unfetched_replies) {
+                msg += ` — ${s.threads_with_unfetched_replies} thread(s) still have `
+                     + 'unread replies, next sweep picks them up';
+            }
+            showToast(msg, (s.pages_truncated || s.threads_with_unfetched_replies) ? 'info' : 'success');
+            await loadComments();
+        }
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Refresh';
+    }
+});
+
+if (document.getElementById('comments-section').style.display !== 'none') {
+    loadComments();
 }
 
 loadVideos();

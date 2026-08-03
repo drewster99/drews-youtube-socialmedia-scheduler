@@ -370,6 +370,26 @@ CAPTION_CHECK_INTERVAL_MINUTES = _parse_int_env(
     "DYS_CAPTION_CHECK_MINUTES", "YTP_CAPTION_CHECK_MINUTES", 15
 )
 
+# How often the channel-wide comment sweep mirrors YouTube into
+# youtube_comments. Distinct from COMMENT_CHECK_INTERVAL_MINUTES above, which
+# paces blocklist MODERATION — that one acts on hostile comments and wants to
+# be prompt; this one populates a reading list and is deliberately lazy.
+COMMENT_SYNC_INTERVAL_MINUTES = _parse_int_env(
+    "DYS_COMMENT_SYNC_MINUTES", "YTP_COMMENT_SYNC_MINUTES", 240
+)
+
+# Ceiling on one sweep. Each page is 100 threads for 1 quota unit, so a full
+# 20-page sweep costs 20 units — six times a day is ~0.1% of the 10,000/day
+# budget. The cap exists so a channel with a huge comment history can't turn one
+# tick into hundreds of sequential round trips; when it is hit, the sweep says so.
+COMMENT_SYNC_MAX_PAGES = 20
+
+# Ceiling on the follow-up calls that read a thread's replies past the ~5 the
+# thread preview carries. One unit each, and only threads that actually have
+# more replies than the preview showed cost anything. Hitting this cap is
+# reported, never silently swallowed.
+COMMENT_SYNC_MAX_REPLY_FETCHES = 50
+
 # Lookahead for the pre-emptive token-refresh sweep: a credential is renewed
 # once its token expires within this window. Per-poster, exposed as
 # SocialPoster.token_refresh_window_secs. 45 minutes suits ~2-hour tokens

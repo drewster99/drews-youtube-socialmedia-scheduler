@@ -23,6 +23,7 @@ from yt_scheduler.database import close_db, get_db
 from yt_scheduler.models import video as video_model
 from yt_scheduler.routers import (
     auth_routes,
+    comment_routes,
     expand_routes,
     global_variable_routes,
     import_routes,
@@ -433,6 +434,7 @@ async def api_reconcile_status():
 
 # API routes
 app.include_router(project_routes.router)
+app.include_router(comment_routes.router)
 app.include_router(auth_routes.router)
 app.include_router(video_routes.router)
 app.include_router(transcript_routes.router)
