@@ -1756,3 +1756,40 @@ async def test_thread_carries_item_type_for_the_tier_chip(
 
     thread = (await comments.list_recent_threads(1, limit=10))[0]
     assert thread["item_type"] == "short"
+
+
+async def test_marking_an_unknown_thread_handled_is_refused(
+    comments, project, monkeypatch
+) -> None:
+    """The state table is keyed by a string the caller supplies. Accepting an
+    unknown one writes a row that can never match anything and reports success
+    for work that did nothing."""
+    _install_fake_youtube(monkeypatch, threads=[_thread(_comment("t1"), video_id=None)])
+    await comments.sync_project_comments(project)
+
+    with pytest.raises(comments.ThreadNotFound):
+        await comments.mark_thread_handled(1, "no-such-thread")
+
+
+async def test_an_orphan_thread_can_still_be_marked_handled(
+    comments, project, isolated_db, monkeypatch
+) -> None:
+    """Its key names a comment the blocklist removed, so validation must match
+    the thread KEY as the listing computes it, not require a top-level row."""
+    _install_fake_youtube(
+        monkeypatch,
+        threads=[_thread(_comment("spam1"), video_id=None,
+                         replies=[_comment("r1", text="reported")])],
+    )
+    await comments.sync_project_comments(project)
+    await isolated_db.execute(
+        "INSERT INTO moderation_log (project_id, video_id, comment_id, action) "
+        "VALUES (1, 'v', 'spam1', 'deleted')"
+    )
+    await isolated_db.commit()
+
+    thread = (await comments.list_recent_threads(1, limit=10))[0]
+    assert thread["parent_unavailable"] is True
+
+    await comments.mark_thread_handled(1, thread["thread_key"])
+    assert await comments.count_needs_reply(1) == 0

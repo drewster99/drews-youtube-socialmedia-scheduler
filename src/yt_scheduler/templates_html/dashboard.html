@@ -337,25 +337,32 @@ let commentThreadsShown = 0;
    options overlap teaches people to distrust it. Filtering is server-side
    because paging and the running total are: deciding it in the browser would
    page over one population and count another. */
-let commentsNeedsReplyOnly = false;
+let commentsNeedsReplyOnly = true;
+/* The section exists to surface what someone else is waiting on, so it opens on
+   that. But a filtered view that is empty looks broken, so the first load falls
+   back to All when nothing is waiting — once, and never again after the user has
+   touched the toggle, or their choice would be overridden on every poll. */
+let commentsFilterChosen = false;
 
 function renderCommentsFilter(needsReplyTotal, allTotal) {
     const el = document.getElementById('comments-filter');
     if (!el) return;
-    const btn = (on, label, count) =>
-        `<button type="button" class="comments-filter-btn${on ? ' is-on' : ''}"`
-        + ` data-needs-reply="${on ? '1' : '0'}">${label}`
-        + (count === null ? '' : ` <span class="comments-filter-count">${count}</span>`)
-        + `</button>`;
+    // `isNeedsReply` is which button this is; `is-on` is whether it is the
+    // selected one. Conflating them rendered the wrong button as selected and
+    // relied on a second pass to correct it.
+    const btn = (isNeedsReply, label, count) =>
+        `<button type="button" class="comments-filter-btn`
+        + `${isNeedsReply === commentsNeedsReplyOnly ? ' is-on' : ''}"`
+        + ` data-needs-reply="${isNeedsReply ? '1' : '0'}">${label}`
+        + ` <span class="comments-filter-count">${count}</span></button>`;
     el.innerHTML = btn(true, 'Needs reply', needsReplyTotal)
                  + btn(false, 'All', allTotal);
     el.querySelectorAll('.comments-filter-btn').forEach((b) => {
-        b.classList.toggle(
-            'is-on', (b.dataset.needsReply === '1') === commentsNeedsReplyOnly);
         b.addEventListener('click', () => {
             const want = b.dataset.needsReply === '1';
             if (want === commentsNeedsReplyOnly) return;
             commentsNeedsReplyOnly = want;
+            commentsFilterChosen = true;
             loadComments();
         });
     });
@@ -719,6 +726,16 @@ async function loadComments(append = false) {
             ? `Synced ${fmtCommentAge(data.last_synced_at)}`
             : 'Never synced';
         renderSweepWarning(data.last_sweep);
+        // Opening on an empty Needs-reply list reads as a broken section, so
+        // fall back to All — but only before the user has expressed a
+        // preference, and only when there is something else to show.
+        if (!commentsFilterChosen && commentsNeedsReplyOnly
+            && data.needs_reply_total === 0 && data.all_threads_total > 0) {
+            commentsFilterChosen = true;
+            commentsNeedsReplyOnly = false;
+            await loadComments();
+            return;
+        }
         renderCommentsFilter(data.needs_reply_total, data.all_threads_total);
 
         if (data.total_threads === 0 && commentsNeedsReplyOnly) {

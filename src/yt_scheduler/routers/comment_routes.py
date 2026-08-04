@@ -90,9 +90,12 @@ async def mark_handled(slug: str, thread_key: str) -> dict:
     the conversation.
     """
     project = await _project_or_404(slug)
-    stamp = await comments_service.mark_thread_handled(
-        int(project["id"]), thread_key
-    )
+    try:
+        stamp = await comments_service.mark_thread_handled(
+            int(project["id"]), thread_key
+        )
+    except comments_service.ThreadNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
     return {"thread_key": thread_key, "handled_at": stamp}
 
 

@@ -684,7 +684,12 @@ to notice and reset a flag. This settles one exchange, never the conversation.
 
 `DELETE` on the same path undoes it.
 
-**Errors** — `404` (unknown slug).
+**Errors** — `404` (unknown slug, or no thread with that key in this project —
+the state table is keyed by a caller-supplied string, so accepting an unknown one
+would store a row that can never match anything and report success for work that
+did nothing). An **orphan** thread, whose top-level comment the blocklist
+removed, is a valid target: the key is matched as the listing computes it, not by
+requiring a top-level row.
 
 ### `POST /api/projects/{slug}/comments/sync`
 

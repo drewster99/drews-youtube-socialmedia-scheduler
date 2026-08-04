@@ -80,6 +80,15 @@ class SweepAlreadyRunning(RuntimeError):
     """
 
 
+class ThreadNotFound(LookupError):
+    """No thread in this project has that key.
+
+    Raised rather than writing the row anyway: the state table is keyed by a
+    string the caller supplies, so accepting an unknown one stores a row that
+    can never match anything and reports success for work that did nothing.
+    """
+
+
 class ChannelNotBound(RuntimeError):
     """The project has no YouTube channel, so there is nothing to sweep.
 
@@ -1450,6 +1459,17 @@ async def mark_thread_handled(project_id: int, thread_key: str) -> str:
     on its own — nothing has to notice and clear a flag. You can settle this
     exchange, never the next one.
     """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        f"SELECT 1 FROM youtube_comments c "
+        f"WHERE c.project_id = ? AND {_THREAD_KEY} = ? LIMIT 1",
+        (project_id, thread_key),
+    )
+    if not rows:
+        raise ThreadNotFound(
+            f"No comment thread {thread_key!r} in this project."
+        )
+
     stamp = _utc_now()
     async with write_transaction() as db:
         await db.execute(
