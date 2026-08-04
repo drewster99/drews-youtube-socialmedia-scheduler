@@ -823,7 +823,14 @@ function removeWarning(postId) {
             + 'queue — are marked skipped. The error text and history are kept.',
         '',
     ];
-    if (row && row.auto_add_considered_at) {
+    if (!row) {
+        // Unknown reads as unknown. Silently taking the less alarming of two
+        // claims is exactly what this dialog was rewritten to stop doing.
+        lines.push('This row is no longer loaded — refresh before removing, so '
+                 + 'you can see whether auto-add could bring it back.');
+        return lines.join('\n');
+    }
+    if (row.auto_add_considered_at) {
         lines.push(
             'It will NOT come back on its own. Auto-add considers each video '
             + 'once, and this one has already been considered.');

@@ -1,0 +1,40 @@
+-- What the last COMPLETE read of a thread's replies actually saw.
+--
+-- Two columns, one purpose: stop re-deriving "is this thread short?" from a
+-- comparison that some threads can never satisfy.
+--
+-- `replies_seen_total` — the `totalReplyCount` observed at that read.
+--
+--   The reply follow-up decides a thread is incomplete with `stored < total`,
+--   recomputed from scratch every sweep. Nothing recorded that we had already
+--   read a thread TO COMPLETION and still come up short, so any thread with a
+--   gap that more fetching cannot close stayed "incomplete" forever: it sorted
+--   ahead of every staleness candidate on every sweep and ate a slot, every
+--   sweep, permanently. At `COMMENT_SYNC_MAX_REPLY_FETCHES` such threads the
+--   refresh rotation never runs again; past that, `sweep_was_complete` is False
+--   forever, which suspends "gone from YouTube" detection project-wide.
+--
+--   Gaps that cannot close are ordinary: YouTube counts replies it will not
+--   return (deleted ones, and — pending verification — held ones), so
+--   `totalReplyCount` legitimately exceeds what `comments.list` hands back.
+--
+--   A thread is now incomplete only if it has never been read to completion, or
+--   if YouTube's count has CHANGED since that read — which is the real signal
+--   that there is something new to fetch.
+--
+-- `replies_read_truncated` — whether that read stopped at the page cap.
+--
+--   "At cap" was inferred as `stored >= pages × 100`, which assumes every page
+--   returns exactly 100 items; `maxResults` is documented as a maximum, not a
+--   guarantee. Meanwhile the authoritative signal was already computed by
+--   `list_comment_replies` and thrown away. Under-full pages therefore produced
+--   a thread that was truncated but not "at cap" — permanently incomplete,
+--   burning the full page budget every sweep to learn nothing, which is the
+--   exact bug migration 049 was written to fix, relocated. And because stored
+--   counts only ever grow, a thread that once reached the cap was frozen at it
+--   even after replies were deleted.
+--
+-- NULL in both means no complete read has happened yet, which reads as "due".
+
+ALTER TABLE youtube_comments ADD COLUMN replies_seen_total INTEGER;
+ALTER TABLE youtube_comments ADD COLUMN replies_read_truncated INTEGER;

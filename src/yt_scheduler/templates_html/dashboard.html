@@ -573,6 +573,15 @@ function sweepProblems(sweep) {
             problems.push(`The "${status}" moderation bucket stopped at the page cap.`);
         }
     }
+    if (d.threads_at_reply_cap) {
+        problems.push(`${d.threads_at_reply_cap} thread(s) have more replies than `
+                    + 'we will fetch. Those replies are not stored and their '
+                    + 'moderation state cannot be refreshed.');
+    }
+    if (d.threads_with_replies_truncated) {
+        problems.push(`${d.threads_with_replies_truncated} thread(s) hit the reply `
+                    + 'page cap during this sync.');
+    }
     if (d.mass_disappearance) {
         problems.push(`${d.mass_disappearance.absent} of `
                     + `${d.mass_disappearance.of} previously-seen comments were not `

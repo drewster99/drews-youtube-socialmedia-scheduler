@@ -320,12 +320,13 @@ async def test_thread_with_truncated_replies_is_fetched_then_left_alone(
 async def test_a_thread_too_big_to_fetch_is_not_re_requested_forever(
     comments, project, sweep_clock, monkeypatch
 ) -> None:
-    """The old gating was purely `stored < totalReplyCount`, and the fetch
-    stopped at 100 replies — so a thread with more than that could never satisfy
-    it. It was re-requested on every single sweep, returned the same replies, and
-    made no progress: pure quota burn, forever.
-    """
-    monkeypatch.setattr(comments, "_MAX_FETCHABLE_REPLIES", 3)
+    """The old gate was `stored < totalReplyCount` with a fetch that stopped at
+    100, so a busier thread could never satisfy it: re-requested every sweep,
+    same replies back, no progress, pure quota burn.
+
+    At-cap is now the RECORDED truncation flag from the read itself, not
+    `stored >= pages × 100` — that arithmetic assumed every page returns exactly
+    100 items, which `maxResults` does not promise."""
     preview = [_comment("r1"), _comment("r2")]
     fetched = preview + [_comment("r3")]
     threads = [_thread(_comment("c1"), video_id=None, replies=preview,
@@ -340,7 +341,7 @@ async def test_a_thread_too_big_to_fetch_is_not_re_requested_forever(
     assert calls["reply_parents"] == ["c1"], "the first fetch must still happen"
     assert first["threads_with_replies_truncated"] == 1
 
-    # Far past the refresh window — the ONE thing that could legitimately bring
+    # Far past the refresh window — the one thing that could legitimately bring
     # it back — and it still must not be asked about.
     sweep_clock(90_000)
     calls = _install_fake_youtube(
@@ -351,11 +352,62 @@ async def test_a_thread_too_big_to_fetch_is_not_re_requested_forever(
 
     assert calls["reply_parents"] == [], "a thread at the reply cap was re-requested"
     assert second["threads_at_reply_cap"] == 1
-    # It is at a cap we chose, not an unread backlog a later sweep will clear —
-    # counting it as pending would suspend "gone from YouTube" for the project
-    # permanently.
+    # A cap WE chose, not an unread backlog a later sweep clears — counting it
+    # as pending would suspend "gone from YouTube" for the project permanently.
     assert second["threads_with_unfetched_replies"] == 0
     assert second["sweep_was_complete"] is True
+
+
+async def test_a_gap_that_cannot_close_stops_being_top_priority(
+    comments, project, sweep_clock, monkeypatch
+) -> None:
+    """YouTube counts replies it will not return, so `stored < totalReplyCount`
+    is a gap some threads can NEVER close. Re-deriving it every sweep made those
+    threads permanently incomplete: they sorted ahead of every refresh candidate
+    and ate a slot forever, starving the rotation and — past the budget —
+    suspending the missing-comment inference project-wide.
+
+    A thread read to completion is only incomplete again once YouTube's count
+    CHANGES."""
+    # total says 5; the fetch only ever returns 2. The gap never closes.
+    threads = [_thread(_comment("c1"), video_id=None, replies=[_comment("r1")],
+                       total_reply_count=5)]
+    replies = {"c1": [_comment("r1"), _comment("r2")]}
+
+    _install_fake_youtube(monkeypatch, threads=threads, replies=replies)
+    first = await comments.sync_project_comments(project)
+    assert first["reply_fetches"] == 1, "the first read must happen"
+
+    # Next sweep, still inside the refresh window: nothing new to fetch, and the
+    # unclosable gap must not make it incomplete.
+    sweep_clock(60)
+    calls = _install_fake_youtube(monkeypatch, threads=threads, replies=replies)
+    second = await comments.sync_project_comments(project)
+
+    assert calls["reply_parents"] == [], "an unclosable gap was chased again"
+    assert second["threads_with_unfetched_replies"] == 0
+    assert second["sweep_was_complete"] is True
+
+
+async def test_a_changed_reply_count_makes_a_thread_incomplete_again(
+    comments, project, sweep_clock, monkeypatch
+) -> None:
+    """The counterpart: a real new reply must still be fetched. The signal is a
+    CHANGE in YouTube's count, not a shortfall against it."""
+    threads = [_thread(_comment("c1"), video_id=None, replies=[_comment("r1")],
+                       total_reply_count=5)]
+    replies = {"c1": [_comment("r1"), _comment("r2")]}
+    _install_fake_youtube(monkeypatch, threads=threads, replies=replies)
+    await comments.sync_project_comments(project)
+
+    # Someone replies: YouTube's count moves.
+    sweep_clock(60)
+    grown = [_thread(_comment("c1"), video_id=None, replies=[_comment("r1")],
+                     total_reply_count=6)]
+    calls = _install_fake_youtube(monkeypatch, threads=grown, replies=replies)
+    await comments.sync_project_comments(project)
+
+    assert calls["reply_parents"] == ["c1"], "a new reply was never fetched"
 
 
 async def test_a_reply_held_after_we_stored_it_is_corrected_on_refresh(

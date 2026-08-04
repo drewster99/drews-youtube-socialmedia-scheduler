@@ -415,7 +415,14 @@ COMMENT_SYNC_MAX_REPLY_FETCHES = 50
 # returning the same first 100 and making no progress. Paging fixes the common
 # case outright; the cap is only a backstop against a pathological thread, and
 # a thread already holding this many replies is no longer counted as short.
-COMMENT_SYNC_MAX_REPLY_PAGES = 10
+#
+# NOTE the real budget is MAX_REPLY_FETCHES x MAX_REPLY_PAGES, which nothing
+# else states: 50 threads x 10 pages = 500 units per project per sweep, and at
+# 4 projects x 6 sweeps that ceiling is 12,000/day against a 10,000/day quota
+# shared across the whole installation. 3 pages (300 replies) covers every
+# thread on these channels with room to spare, and the truncation flag is what
+# handles the pathological one.
+COMMENT_SYNC_MAX_REPLY_PAGES = 3
 
 # How stale a thread's replies may get before the sweep re-reads them even
 # though the stored count already matches YouTube's.

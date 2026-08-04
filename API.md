@@ -673,6 +673,7 @@ own channel. `last_synced_at` is `null` when no sweep has ever stored a comment 
   "threads_with_unfetched_replies": 0,
   "threads_at_reply_cap": 0,
   "refreshes_deferred": 0,
+  "refreshes_deferred": 0,
   "threads_with_replies_truncated": 0,
   "reply_fetch_errors": [],
   "suspicious_empty_sweep": false,

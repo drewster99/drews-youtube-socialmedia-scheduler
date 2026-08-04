@@ -360,21 +360,18 @@ async def _mark_seen_in_complete_sweep(
     return swept_at, recorded
 
 
-#: The most replies one thread's follow-up will ever hold. A thread already at
-#: this many is not "short" — it is as complete as we are willing to make it, and
-#: continuing to call it short is what made the old code re-request it forever.
-_MAX_FETCHABLE_REPLIES = COMMENT_SYNC_MAX_REPLY_PAGES * 100
-
-
 @dataclass(frozen=True)
 class ReplyFetchCandidate:
     """A thread whose replies this sweep should read, and why."""
 
     top_comment_id: str
     youtube_video_id: str | None
-    #: True when we hold fewer replies than YouTube reports; False when the
-    #: count already matches and this is a staleness refresh.
+    #: True when there is something new to fetch; False when this is a
+    #: staleness refresh of a thread already read to completion.
     is_incomplete: bool
+    #: ``totalReplyCount`` as this sweep saw it, recorded after the read so the
+    #: next sweep can detect a CHANGE rather than re-deriving a shortfall.
+    total_reply_count: int
 
 
 async def _threads_needing_reply_fetch(
@@ -398,11 +395,11 @@ async def _threads_needing_reply_fetch(
     so a limited budget rotates through the channel instead of starving the
     same threads every sweep.
 
-    A thread already holding :data:`_MAX_FETCHABLE_REPLIES` is never reported
-    incomplete: another fetch cannot return more, so calling it short is what
-    made the old gating re-request it on every sweep forever. Those are counted
-    separately and returned as the second element, because "we will not read
-    more of this" is a fact the sweep has to state rather than hide.
+    A thread whose last read hit the page cap is never reported incomplete:
+    another fetch cannot return more, so calling it short is what made the old
+    gating re-request it on every sweep forever. Those are counted separately
+    and returned as the second element, because "we will not read more of this"
+    is a fact the sweep has to state rather than hide.
     """
     if not threads:
         return [], 0
@@ -422,6 +419,7 @@ async def _threads_needing_reply_fetch(
 
     held: dict[str, int] = {}
     refreshed: dict[str, str | None] = {}
+    read_state: dict[str, tuple[int | None, int | None]] = {}
     ids = list(wanted)
     for start in range(0, len(ids), 500):
         chunk = ids[start:start + 500]
@@ -435,21 +433,45 @@ async def _threads_needing_reply_fetch(
         held.update({r["parent_comment_id"]: int(r["n"]) for r in rows})
 
         rows = await db.execute_fetchall(
-            f"SELECT comment_id, replies_refreshed_at FROM youtube_comments "
+            f"SELECT comment_id, replies_refreshed_at, replies_seen_total, "
+            f"replies_read_truncated FROM youtube_comments "
             f"WHERE project_id = ? AND comment_id IN ({placeholders})",
             (project_id, *chunk),
         )
-        refreshed.update({r["comment_id"]: r["replies_refreshed_at"] for r in rows})
+        for r in rows:
+            refreshed[r["comment_id"]] = r["replies_refreshed_at"]
+            read_state[r["comment_id"]] = (
+                r["replies_seen_total"], r["replies_read_truncated"],
+            )
 
     stale_before = _utc_minus_hours(COMMENT_REPLY_REFRESH_HOURS)
     candidates: list[tuple[bool, str, ReplyFetchCandidate]] = []
     at_cap = 0
     for top_id, (video_id, total) in wanted.items():
         stored = held.get(top_id, 0)
-        if stored >= _MAX_FETCHABLE_REPLIES:
+        seen_total, truncated = read_state.get(top_id, (None, None))
+
+        # At cap is the RECORDED truncation flag, not stored >= pages × 100.
+        # That arithmetic assumed every page returns exactly 100 items — a
+        # maximum, not a guarantee — so an under-full read was truncated but
+        # never "at cap", leaving it permanently incomplete and re-fetched every
+        # sweep for nothing. It also froze a thread at the cap forever once it
+        # had accumulated that many rows, since stored only grows.
+        if truncated:
             at_cap += 1
             continue
-        incomplete = stored < total
+
+        # Incomplete means "there is something new to fetch", which is NOT the
+        # same as stored < total. YouTube counts replies it will not return, so
+        # some threads can never close that gap — and re-deriving it every sweep
+        # made those threads permanently top-priority, starving the refresh
+        # rotation and, past the budget, suspending the missing-comment
+        # inference project-wide. A thread already read to completion is only
+        # incomplete again once YouTube's own count CHANGES.
+        if seen_total is None:
+            incomplete = stored < total
+        else:
+            incomplete = total != seen_total
         # NULL sorts first as "": never refreshed is the most due, not the least.
         last_refreshed = refreshed.get(top_id) or ""
         # Nothing to read and nothing that could have gone stale.
@@ -459,7 +481,7 @@ async def _threads_needing_reply_fetch(
             continue
         candidates.append((
             incomplete, last_refreshed,
-            ReplyFetchCandidate(top_id, video_id, incomplete),
+            ReplyFetchCandidate(top_id, video_id, incomplete, total),
         ))
 
     # Incomplete first (True > False), then least-recently-refreshed.
@@ -735,7 +757,7 @@ async def _sweep_project_comments(project: dict) -> dict:
         to_fetch = pending[:COMMENT_SYNC_MAX_REPLY_FETCHES]
         reply_records: list[CommentRecord] = []
         reply_fetch_errors: list[dict] = []
-        refreshed_thread_ids: list[str] = []
+        reply_reads: list[tuple[str, int, bool]] = []
         replies_truncated = 0
         for candidate in to_fetch:
             top_id = candidate.top_comment_id
@@ -767,10 +789,12 @@ async def _sweep_project_comments(project: dict) -> dict:
                     top_id, project["slug"], COMMENT_SYNC_MAX_REPLY_PAGES,
                     len(replies),
                 )
-            # Only a read that actually completed counts as a refresh. Marking a
-            # truncated one fresh would park the thread for a day holding replies
-            # we know are partial.
-            refreshed_thread_ids.append(top_id)
+            # Record what this read saw, truncation included. The observed
+            # total is what lets the next sweep ask "has YouTube's count
+            # changed?" rather than re-deriving "is stored < total?" — a
+            # comparison some threads can never satisfy, which pinned them at
+            # top priority forever and starved the refresh rotation.
+            reply_reads.append((top_id, candidate.total_reply_count, hit_reply_cap))
             reply_records.extend(
                 _record_from_comment(
                     reply,
@@ -813,7 +837,7 @@ async def _sweep_project_comments(project: dict) -> dict:
     reply_records = [r for r in reply_records if r.comment_id not in already_written]
 
     reply_new, reply_updated = await _store(project_id, reply_records)
-    await _mark_replies_refreshed(project_id, refreshed_thread_ids)
+    await _mark_replies_refreshed(project_id, reply_reads)
 
     # Only threads a future sweep can still make progress on. A thread at the
     # per-thread reply cap is excluded upstream: counting it here would keep the
@@ -1016,26 +1040,33 @@ _MASS_DISAPPEARANCE_MIN_COMMENTS = 10
 _MASS_DISAPPEARANCE_FRACTION = 0.25
 
 
-async def _mark_replies_refreshed(project_id: int, top_comment_ids: list[str]) -> None:
-    """Record that these threads' replies were just read in full.
+async def _mark_replies_refreshed(
+    project_id: int, reads: list[tuple[str, int, bool]]
+) -> None:
+    """Record what each completed reply read actually saw.
+
+    ``reads`` is ``(top_comment_id, total_reply_count_observed, truncated)``.
+    Storing the observed total is what lets the next sweep ask "has YouTube's
+    count changed?" instead of re-deriving "is stored < total?", which some
+    threads can never satisfy and which therefore pinned them at top priority
+    forever.
 
     Written only for threads the sweep actually re-read, so a thread it skipped
     stays due. This is what keeps the refresh cycle rotating through the channel
     instead of re-reading the same threads every sweep — and what stops a thread
     with more replies than one follow-up can hold from being asked about forever.
     """
-    if not top_comment_ids:
+    if not reads:
         return
 
     now = _utc_now()
     async with write_transaction() as wdb:
-        for start in range(0, len(top_comment_ids), 500):
-            chunk = top_comment_ids[start:start + 500]
-            placeholders = ",".join("?" * len(chunk))
+        for top_id, observed_total, truncated in reads:
             await wdb.execute(
-                f"UPDATE youtube_comments SET replies_refreshed_at = ? "
-                f"WHERE project_id = ? AND comment_id IN ({placeholders})",
-                (now, project_id, *chunk),
+                "UPDATE youtube_comments SET replies_refreshed_at = ?, "
+                "replies_seen_total = ?, replies_read_truncated = ? "
+                "WHERE project_id = ? AND comment_id = ?",
+                (now, observed_total, 1 if truncated else 0, project_id, top_id),
             )
 
 

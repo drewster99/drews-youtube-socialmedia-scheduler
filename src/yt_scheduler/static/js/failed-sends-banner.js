@@ -22,6 +22,11 @@
     let isExpanded = false;
     let latestPosts = [];
     let lastRenderedKey = null;
+    // Post ids with an action running. A 30s poll — or just a minute boundary
+    // changing the rendered age — rebuilds the banner, which would otherwise
+    // replace an in-flight row's disabled "Sending…" buttons with fresh enabled
+    // ones over a request that is still going.
+    const inFlight = new Set();
 
     function escapeText(value) {
         const div = document.createElement('div');
@@ -80,7 +85,14 @@
      * longer failing, not because it is filtered out. */
     function actions(post) {
         const id = escapeAttribute(String(post.id));
-        const retryHint = post.retryable
+        // retryable alone would lie: the job stops selecting a row once
+        // retry_until passes but never clears retryable, so an expired row
+        // would go on claiming it is being handled. Both have to hold.
+        const until = post.retry_until
+            ? Date.parse(window.dysDateTime.ensureUtc(post.retry_until))
+            : 0;
+        const autoRetrying = !!post.retryable && until > Date.now();
+        const retryHint = autoRetrying
             ? 'Send this again now. It is also being retried automatically.'
             : 'Send this again now.';
         return ` <button type="button" class="failed-sends-banner__action"`
@@ -126,7 +138,8 @@
             isExpanded,
             posts.map((post) => [
                 post.id, post.platform, post.video_title, post.error,
-                post.page_url, whenText(post),
+                post.page_url, post.retryable, post.retry_until,
+                whenText(post),
             ]),
         ]);
     }
@@ -166,7 +179,12 @@
             if (error.length > ERROR_PREVIEW_CHARS) {
                 error = error.slice(0, ERROR_PREVIEW_CHARS) + '…';
             }
-            summary += ` ${describe(newest, error)}`;
+            // Actions on the summary row too. They used to live only in the
+            // expanded list, which only exists when there are two or more —
+            // so with exactly one failed post, the most common case, Retry and
+            // Skip did not render at all. Skipping one of two did the same to
+            // the survivor.
+            summary += ` ${describe(newest, error)}${actions(newest)}`;
         }
         if (others) {
             // aria-controls only while the list exists: pointing it at an id
@@ -206,6 +224,8 @@
 
         banner.querySelectorAll('.failed-sends-banner__action').forEach((button) => {
             button.addEventListener('click', () => runAction(button));
+            // Re-apply the lock: the markup is new, the request is not.
+            if (inFlight.has(String(button.dataset.postId))) button.disabled = true;
         });
     }
 
@@ -219,7 +239,15 @@
         const action = button.dataset.action;
         if (action === 'skip') {
             const post = latestPosts.find((p) => String(p.id) === String(postId));
-            if (post && !confirm(skipWarning(post))) return;
+            if (!post) {
+                // Never drop the confirmation on a destructive action because a
+                // lookup missed. Unknown reads as unknown, not as consent.
+                showToast(
+                    `That post is no longer in the banner — refresh before skipping.`,
+                    'error');
+                return;
+            }
+            if (!confirm(skipWarning(post))) return;
         }
         const url = action === 'retry'
             ? `/api/social/posts/${encodeURIComponent(postId)}/send`
@@ -229,29 +257,44 @@
         // flight sends the post twice.
         const row = button.closest('li') || button.parentElement;
         const buttons = row ? row.querySelectorAll('.failed-sends-banner__action') : [button];
+        inFlight.add(String(postId));
         buttons.forEach((b) => { b.disabled = true; });
         button.textContent = action === 'retry' ? 'Sending…' : 'Skipping…';
 
         try {
-            const resp = await fetch(url, {method: 'POST'});
+            const resp = await fetch(url, {method: 'POST', _silent: true});
             if (resp.ok) {
-                if (typeof showToast === 'function') {
-                    showToast(action === 'retry' ? 'Sent.' : 'Skipped.', 'success');
-                }
+                showToast(action === 'retry' ? 'Sent.' : 'Skipped.', 'success');
             } else {
                 const body = await resp.json().catch(() => ({}));
-                // 409 on retry is the duplicate guard, whose detail is a payload
-                // rather than a string; say so instead of rendering [object].
-                const detail = typeof body.detail === 'string'
-                    ? body.detail
-                    : `HTTP ${resp.status}`;
-                if (typeof showToast === 'function') showToast(detail, 'error');
+                const detail = body.detail;
+                let message;
+                if (typeof detail === 'string') {
+                    message = detail;
+                } else if (detail && detail.duplicate) {
+                    // The duplicate guard's 409 is a payload, not a sentence.
+                    // Overriding it needs ?confirm_dup=true, which only the
+                    // post's own page offers — so name the conflict and point
+                    // there rather than printing JSON at the user.
+                    const when = detail.previous && detail.previous.posted_at
+                        ? window.dysDateTime.formatWhen(detail.previous.posted_at)
+                        : 'recently';
+                    message = `Not sent: the same ${detail.platform} post already `
+                            + `went out ${when}. Open the post to send it anyway.`;
+                } else {
+                    message = `HTTP ${resp.status}`;
+                }
+                showToast(message, 'error');
             }
         } catch (err) {
-            if (typeof showToast === 'function') {
-                showToast(`Could not ${action} the post: ${err.message}`, 'error');
-            }
+            showToast(`Could not ${action} the post: ${err.message}`, 'error');
         } finally {
+            inFlight.delete(String(postId));
+            // Re-enable before the re-read: check() returns early on a non-ok
+            // response or a network throw WITHOUT rendering, which would leave
+            // this row disabled and reading "Sending…" until the next poll.
+            buttons.forEach((b) => { b.disabled = false; });
+            button.textContent = action === 'retry' ? 'Retry' : 'Skip';
             // Re-read either way: on success the row is gone, and on failure the
             // error text has changed.
             lastRenderedKey = null;
