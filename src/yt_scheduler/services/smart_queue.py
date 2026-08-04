@@ -492,6 +492,7 @@ async def list_queues(project_id: int) -> list[dict]:
     slots_by_queue = await _slots_for_queues(queue_ids)
 
     counts_by_queue: dict[int, dict[str, int]] = {}
+    by_type_for_queue: dict[int, list[dict]] = {}
     if queue_ids:
         placeholders = ",".join("?" for _ in queue_ids)
         # Whether an item has posted is derived from its social_posts rows, not
@@ -521,9 +522,42 @@ async def list_queues(project_id: int) -> list[dict]:
         ):
             counts_by_queue.setdefault(row["queue_id"], {})[row["bucket"]] = row["n"]
 
+        # Per video type, and counted in POSTINGS rather than items — the
+        # headline counts items, so a video going to four platforms shows as
+        # one and "11 posted" sat next to 40 posted rows. The breakdown is
+        # where "how much is actually scheduled" gets answered honestly.
+        for row in await db.execute_fetchall(
+            f"""
+            SELECT i.queue_id AS queue_id,
+                   COALESCE(NULLIF(v.item_type, ''), 'unset') AS item_type,
+                   SUM(i.state = 'queued') AS unscheduled_items,
+                   SUM(CASE WHEN p.status NOT IN ('posted','failed','skipped')
+                            THEN 1 ELSE 0 END) AS posts_scheduled,
+                   SUM(p.status = 'posted') AS posts_posted,
+                   SUM(p.status = 'failed') AS posts_failed
+              FROM smart_queue_items i
+              JOIN videos v ON v.id = i.video_id
+              LEFT JOIN social_posts p ON p.smart_queue_item_id = i.id
+             WHERE i.queue_id IN ({placeholders}) AND i.state != 'removed'
+             GROUP BY i.queue_id, item_type
+             ORDER BY i.queue_id, item_type
+            """,
+            tuple(queue_ids),
+        ):
+            by_type_for_queue.setdefault(row["queue_id"], []).append({
+                "item_type": row["item_type"],
+                # An item counted once here even though it has several postings:
+                # a queued item has none yet, so postings cannot express it.
+                "unscheduled_items": int(row["unscheduled_items"] or 0),
+                "posts_scheduled": int(row["posts_scheduled"] or 0),
+                "posts_posted": int(row["posts_posted"] or 0),
+                "posts_failed": int(row["posts_failed"] or 0),
+            })
+
     for queue in queues:
         queue["slots"] = slots_by_queue[queue["id"]]
         queue["counts"] = counts_by_queue.get(queue["id"], {})
+        queue["by_type"] = by_type_for_queue.get(queue["id"], [])
     return queues
 
 

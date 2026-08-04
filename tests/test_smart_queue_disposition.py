@@ -224,3 +224,24 @@ async def test_post_from_another_queue_is_rejected(disposition_env):
     _item_id, post_id = await _make_missed(db, queue_id)
     with pytest.raises(Exception, match="not part of"):
         await disposition.dispose(queue_id + 999, post_id, "post_now")
+
+
+async def test_queue_list_breaks_counts_down_by_video_type(disposition_env):
+    """The headline counts ITEMS — one promo video however many platforms it
+    posts to — so "11 posted" sat next to 40 posted rows and read as though far
+    less had gone out. The breakdown counts POSTINGS, which is what "how much is
+    actually scheduled?" is asking. "Not scheduled" stays in videos, because a
+    queued item has no postings yet."""
+    _disposition, queue_service, db, queue_id, *_ = disposition_env
+
+    queues = await queue_service.list_queues(project_id=1)
+    row = next(q for q in queues if q["id"] == queue_id)
+
+    assert "by_type" in row, "the card cannot build the grid without this"
+    for entry in row["by_type"]:
+        assert set(entry) == {
+            "item_type", "unscheduled_items",
+            "posts_scheduled", "posts_posted", "posts_failed",
+        }
+        # Postings, not items — the whole point of the breakdown.
+        assert isinstance(entry["posts_scheduled"], int)

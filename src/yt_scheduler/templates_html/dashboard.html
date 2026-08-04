@@ -877,18 +877,27 @@ async function loadSmartQueues() {
             queues.length ? '' : 'none';
         document.getElementById('smart-queue-list').innerHTML = queues.map(queue => {
             const counts = queue.counts || {};
-            // `queued` is in the queue with no posting time yet (auto-added);
-            // `scheduled` has one. Both are pending, and counting only the
-            // latter would show 0 for a queue auto-add had been filling.
+            // These count ITEMS — one promo video, however many platforms it
+            // posts to. The old wording ("37 scheduled") read as a post count
+            // and sat next to 186 pending postings, so it is now explicit; the
+            // per-type grid below is where postings are counted.
             const waiting = counts.queued || 0;
             const pending = counts.scheduled || 0;
             const posted = counts.posted || 0;
             const failed = counts.failed || 0;
             const failedChip = failed
-                ? ` <span style="color: var(--danger);">${failed} failed</span>`
+                ? ` · <span style="color: var(--danger);">${failed} with a failed post</span>`
                 : '';
+            /* An unscheduled backlog is the one number here that needs an
+               action, and nothing said what that action was. Auto-add puts a
+               video in the queue when it goes live but never assigns a posting
+               time — only Accept does — so the card has to point at it. */
             const waitingChip = waiting
-                ? ` · ${waiting} waiting to be scheduled`
+                ? ` · <a href="/projects/${projectSlug}/smart-queues/${queue.id}"`
+                  + ` class="sq-needs-accept" title="Auto-add put these in the queue`
+                  + ` when the videos went live, but only Accept assigns posting`
+                  + ` times.">${waiting} promo video${waiting === 1 ? '' : 's'}`
+                  + ` not scheduled yet — Edit to Accept</a>`
                 : '';
             return `<div class="card" style="padding:0.6rem 0.8rem;">
                 <div style="display:flex; justify-content:space-between; align-items:center; gap:1rem;">
@@ -897,10 +906,11 @@ async function loadSmartQueues() {
                         <div class="form-hint">${_sqEscape(_cadenceSummary(queue))}</div>
                     </div>
                     <div style="display:flex; gap:1rem; align-items:center;">
-                        <span class="form-hint">${pending} scheduled${waitingChip} · ${posted} posted${failedChip}</span>
+                        <span class="form-hint">${pending} promo video${pending === 1 ? '' : 's'} scheduled · ${posted} posted${waitingChip}${failedChip}</span>
                         <a class="btn btn-sm" href="/projects/${projectSlug}/smart-queues/${queue.id}">Edit</a>
                     </div>
                 </div>
+                ${_sqTypeGrid(queue)}
                 <details class="sq-activity" data-queue-id="${queue.id}" style="margin-top:0.4rem;">
                     <summary class="form-hint">Upcoming and recent</summary>
                     <div class="sq-activity-body form-hint">Loading…</div>
@@ -912,6 +922,33 @@ async function loadSmartQueues() {
         // videos; the queue section simply stays hidden.
         console.error('Could not load smart schedules', err);
     }
+}
+
+/* Per video type, counted in POSTINGS rather than items — which is the
+ * distinction the headline cannot make. One promo video going to four
+ * platforms is one item and four postings, so "11 posted" sat next to 40
+ * posted rows and read as though far less had gone out than had.
+ * "Not scheduled" stays in videos, because a queued item has no postings yet. */
+function _sqTypeGrid(queue) {
+    const rows = queue.by_type || [];
+    if (!rows.length) return '';
+    const body = rows.map(r => `<tr>
+        <td>${_sqEscape(r.item_type)}</td>
+        <td class="sq-num">${r.unscheduled_items || 0}</td>
+        <td class="sq-num">${r.posts_scheduled || 0}</td>
+        <td class="sq-num">${r.posts_posted || 0}</td>
+        <td class="sq-num${r.posts_failed ? ' sq-num-bad' : ''}">${r.posts_failed || 0}</td>
+    </tr>`).join('');
+    return `<table class="sq-type-grid">
+        <thead><tr>
+            <th>Type</th>
+            <th class="sq-num">Videos not<br>scheduled</th>
+            <th class="sq-num">Posts<br>scheduled</th>
+            <th class="sq-num">Posts<br>sent</th>
+            <th class="sq-num">Posts<br>failed</th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+    </table>`;
 }
 
 // Loaded on expand rather than with the card: most dashboard visits don't

@@ -2218,3 +2218,38 @@ dialog.modal-xwide {
 .app-banners > div:not([style*="display:none"]):not([style*="display: none"]) {
     margin-bottom: 1.5rem;
 }
+
+
+/* Smart-schedule per-type breakdown. The headline counts promo VIDEOS (items);
+   this counts POSTINGS, which is the question "how much is actually scheduled?"
+   actually asks — one video going to four platforms is one item and four posts. */
+.sq-type-grid {
+    border-collapse: collapse;
+    margin-top: 0.5rem;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+.sq-type-grid th,
+.sq-type-grid td {
+    padding: 0.15rem 0.75rem 0.15rem 0;
+    text-align: left;
+    vertical-align: bottom;
+}
+.sq-type-grid th {
+    color: var(--text-muted);
+    font-weight: 500;
+    line-height: 1.15;
+}
+.sq-type-grid .sq-num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+.sq-type-grid .sq-num-bad { color: var(--danger); }
+
+/* The one number on the card that needs an action, so it looks like one. */
+.sq-needs-accept {
+    color: var(--warning);
+    text-decoration: none;
+    border-bottom: 1px dotted var(--warning);
+}
+.sq-needs-accept:hover { color: var(--warning); border-bottom-style: solid; }
