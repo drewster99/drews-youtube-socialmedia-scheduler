@@ -404,11 +404,33 @@ COMMENT_SYNC_MAX_PAGES = 20
 # project. Routine truncation would turn that feature off permanently.
 COMMENT_SYNC_MAX_PAGES_PER_MODERATION_BUCKET = 5
 
-# Ceiling on the follow-up calls that read a thread's replies past the ~5 the
-# thread preview carries. One unit each, and only threads that actually have
-# more replies than the preview showed cost anything. Hitting this cap is
-# reported, never silently swallowed.
+# Ceiling on how many THREADS one sweep will read replies for. Hitting this cap
+# is reported, never silently swallowed.
 COMMENT_SYNC_MAX_REPLY_FETCHES = 50
+
+# Ceiling on the pages read for ONE thread's replies (100 replies per page,
+# 1 quota unit each). This used to be a flat 100-reply limit, which meant a
+# thread with more replies than that could never satisfy "we hold as many as
+# YouTube reports" — so it was re-requested on every single sweep, forever,
+# returning the same first 100 and making no progress. Paging fixes the common
+# case outright; the cap is only a backstop against a pathological thread, and
+# a thread already holding this many replies is no longer counted as short.
+COMMENT_SYNC_MAX_REPLY_PAGES = 10
+
+# How stale a thread's replies may get before the sweep re-reads them even
+# though the stored count already matches YouTube's.
+#
+# Without this a reply's moderation status could never be corrected: the
+# held/likely-spam buckets list threads by their TOP-LEVEL comment, so a reply
+# held after we first stored it is never mentioned again, and the dashboard goes
+# on showing it as an ordinary live comment. Re-reading is the only path to the
+# per-reply `moderationStatus`, so it has to happen on a clock rather than only
+# when a shortfall is detected.
+#
+# A day is a deliberate compromise: at the default 4-hourly sweep it costs one
+# refresh slot per thread per six sweeps, and moderation state is not something
+# the user needs to see change within minutes.
+COMMENT_REPLY_REFRESH_HOURS = 24
 
 # Lookahead for the pre-emptive token-refresh sweep: a credential is renewed
 # once its token expires within this window. Per-poster, exposed as

@@ -21,9 +21,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from yt_scheduler.config import (
+    COMMENT_REPLY_REFRESH_HOURS,
     COMMENT_SYNC_MAX_PAGES,
     COMMENT_SYNC_MAX_PAGES_PER_MODERATION_BUCKET,
     COMMENT_SYNC_MAX_REPLY_FETCHES,
+    COMMENT_SYNC_MAX_REPLY_PAGES,
 )
 from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.services import youtube
@@ -358,36 +360,68 @@ async def _mark_seen_in_complete_sweep(
     return swept_at, recorded
 
 
-async def _threads_missing_replies(
-    project_id: int, threads: list[dict]
-) -> list[tuple[str, str | None]]:
-    """``(top_level_comment_id, video_id)`` for threads we hold fewer replies of
-    than YouTube says exist.
+#: The most replies one thread's follow-up will ever hold. A thread already at
+#: this many is not "short" — it is as complete as we are willing to make it, and
+#: continuing to call it short is what made the old code re-request it forever.
+_MAX_FETCHABLE_REPLIES = COMMENT_SYNC_MAX_REPLY_PAGES * 100
 
-    A thread resource carries only a preview of its replies, so a busy thread
-    arrives incomplete. Comparing YouTube's ``totalReplyCount`` against the rows
-    we already hold makes the follow-up self-limiting: once a thread is fully
-    stored it stops being asked about, and a thread that gains a reply next
-    month asks again by itself. Newest first, because that is the order the
-    reply-fetch budget should be spent in.
+
+@dataclass(frozen=True)
+class ReplyFetchCandidate:
+    """A thread whose replies this sweep should read, and why."""
+
+    top_comment_id: str
+    youtube_video_id: str | None
+    #: True when we hold fewer replies than YouTube reports; False when the
+    #: count already matches and this is a staleness refresh.
+    is_incomplete: bool
+
+
+async def _threads_needing_reply_fetch(
+    project_id: int, threads: list[dict]
+) -> tuple[list[ReplyFetchCandidate], int]:
+    """Threads whose replies are worth reading, best first, plus how many are
+    capped.
+
+    Two distinct reasons, deliberately not collapsed:
+
+    * **Incomplete** — we hold fewer replies than ``totalReplyCount``. A thread
+      resource carries only a preview, so a busy thread arrives short.
+    * **Stale** — the count already matches, but the replies have not been
+      re-read within ``COMMENT_REPLY_REFRESH_HOURS``. This is the ONLY way a
+      reply's ``moderationStatus`` can ever be corrected: the held and
+      likely-spam buckets list threads by their top-level comment, so a reply
+      held after we stored it is never mentioned again by any other call.
+
+    Incomplete threads sort ahead of stale ones — missing content beats stale
+    metadata — and within each group the least recently refreshed comes first,
+    so a limited budget rotates through the channel instead of starving the
+    same threads every sweep.
+
+    A thread already holding :data:`_MAX_FETCHABLE_REPLIES` is never reported
+    incomplete: another fetch cannot return more, so calling it short is what
+    made the old gating re-request it on every sweep forever. Those are counted
+    separately and returned as the second element, because "we will not read
+    more of this" is a fact the sweep has to state rather than hide.
     """
     if not threads:
-        return []
+        return [], 0
 
     db = await get_db()
     wanted: dict[str, tuple[str | None, int]] = {}
     for thread in threads:
         snippet = thread["snippet"]
-        total = int(snippet.get("totalReplyCount") or 0)
-        if total <= 0:
-            continue
         top_id = snippet["topLevelComment"]["id"]
-        wanted[top_id] = (snippet.get("videoId"), total)
+        wanted[top_id] = (
+            snippet.get("videoId"),
+            int(snippet.get("totalReplyCount") or 0),
+        )
 
     if not wanted:
-        return []
+        return [], 0
 
     held: dict[str, int] = {}
+    refreshed: dict[str, str | None] = {}
     ids = list(wanted)
     for start in range(0, len(ids), 500):
         chunk = ids[start:start + 500]
@@ -400,11 +434,37 @@ async def _threads_missing_replies(
         )
         held.update({r["parent_comment_id"]: int(r["n"]) for r in rows})
 
-    return [
-        (top_id, video_id)
-        for top_id, (video_id, total) in wanted.items()
-        if held.get(top_id, 0) < total
-    ]
+        rows = await db.execute_fetchall(
+            f"SELECT comment_id, replies_refreshed_at FROM youtube_comments "
+            f"WHERE project_id = ? AND comment_id IN ({placeholders})",
+            (project_id, *chunk),
+        )
+        refreshed.update({r["comment_id"]: r["replies_refreshed_at"] for r in rows})
+
+    stale_before = _utc_minus_hours(COMMENT_REPLY_REFRESH_HOURS)
+    candidates: list[tuple[bool, str, ReplyFetchCandidate]] = []
+    at_cap = 0
+    for top_id, (video_id, total) in wanted.items():
+        stored = held.get(top_id, 0)
+        if stored >= _MAX_FETCHABLE_REPLIES:
+            at_cap += 1
+            continue
+        incomplete = stored < total
+        # NULL sorts first as "": never refreshed is the most due, not the least.
+        last_refreshed = refreshed.get(top_id) or ""
+        # Nothing to read and nothing that could have gone stale.
+        if not incomplete and total == 0:
+            continue
+        if not incomplete and last_refreshed > stale_before:
+            continue
+        candidates.append((
+            incomplete, last_refreshed,
+            ReplyFetchCandidate(top_id, video_id, incomplete),
+        ))
+
+    # Incomplete first (True > False), then least-recently-refreshed.
+    candidates.sort(key=lambda c: (not c[0], c[1]))
+    return [c[2] for c in candidates], at_cap
 
 
 #: The bucket that IS the sweep. Its failure is the sweep's failure and
@@ -570,6 +630,19 @@ def _plus_one_second(stamp: str) -> str:
     return (parsed + timedelta(seconds=1)).strftime(_TIMESTAMP_FORMAT)
 
 
+def _utc_minus_hours(hours: int) -> str:
+    """A stamp ``hours`` in the past, for staleness comparisons.
+
+    Derived from :func:`_utc_now` rather than reading the clock again, so this
+    module has exactly one notion of "now" — a second one would drift from the
+    stamps it is being compared against.
+    """
+    parsed = datetime.strptime(_utc_now(), _TIMESTAMP_FORMAT).replace(
+        tzinfo=timezone.utc
+    )
+    return (parsed - timedelta(hours=hours)).strftime(_TIMESTAMP_FORMAT)
+
+
 async def sync_project_comments(project: dict) -> dict:
     """Mirror one project's channel comments into the local table, recording the
     outcome either way.
@@ -656,17 +729,26 @@ async def _sweep_project_comments(project: dict) -> dict:
 
         new_count, updated_count = await _store(project_id, thread_records)
 
-        pending = await _threads_missing_replies(project_id, threads)
+        pending, threads_at_reply_cap = await _threads_needing_reply_fetch(
+            project_id, threads
+        )
         to_fetch = pending[:COMMENT_SYNC_MAX_REPLY_FETCHES]
         reply_records: list[CommentRecord] = []
         reply_fetch_errors: list[dict] = []
-        for top_id, video_id in to_fetch:
+        refreshed_thread_ids: list[str] = []
+        replies_truncated = 0
+        for candidate in to_fetch:
+            top_id = candidate.top_comment_id
             # One unreadable thread must not cost the whole sweep: the threads
             # above are already stored, and aborting here would throw away a
             # good sweep over one bad follow-up. It does mean we did not see
             # everything, which `sweep_was_complete` accounts for below.
             try:
-                replies = await asyncio.to_thread(youtube.list_comment_replies, top_id)
+                replies, hit_reply_cap = await asyncio.to_thread(
+                    youtube.list_comment_replies,
+                    top_id,
+                    max_pages=COMMENT_SYNC_MAX_REPLY_PAGES,
+                )
             except Exception as exc:
                 reply_fetch_errors.append({
                     "parent_comment_id": top_id,
@@ -677,14 +759,28 @@ async def _sweep_project_comments(project: dict) -> dict:
                     top_id, project["slug"], exc,
                 )
                 continue
+            if hit_reply_cap:
+                replies_truncated += 1
+                logger.warning(
+                    "Thread %s (project %s) has more replies than the %d-page cap "
+                    "reads; storing the first %d and not asking again.",
+                    top_id, project["slug"], COMMENT_SYNC_MAX_REPLY_PAGES,
+                    len(replies),
+                )
+            # Only a read that actually completed counts as a refresh. Marking a
+            # truncated one fresh would park the thread for a day holding replies
+            # we know are partial.
+            refreshed_thread_ids.append(top_id)
             reply_records.extend(
                 _record_from_comment(
                     reply,
-                    video_id=video_id,
+                    video_id=candidate.youtube_video_id,
                     parent_comment_id=top_id,
                     total_reply_count=None,
                     # comments.list takes no moderationStatus filter, so the
-                    # resource's own field is the only source here.
+                    # resource's own field is the only source here — and it is
+                    # the only path by which a reply held AFTER we first stored
+                    # it ever gets corrected.
                     bucket_status=None,
                 )
                 for reply in replies
@@ -717,7 +813,13 @@ async def _sweep_project_comments(project: dict) -> dict:
     reply_records = [r for r in reply_records if r.comment_id not in already_written]
 
     reply_new, reply_updated = await _store(project_id, reply_records)
+    await _mark_replies_refreshed(project_id, refreshed_thread_ids)
 
+    # Only threads a future sweep can still make progress on. A thread at the
+    # per-thread reply cap is excluded upstream: counting it here would keep the
+    # sweep permanently incomplete and so permanently suspend "gone from
+    # YouTube" detection for the whole project, over replies that are never
+    # flagged missing anyway.
     unfetched_replies = max(0, len(pending) - len(to_fetch))
 
     # A sweep that returns nothing at all while the mirror holds comments would
@@ -807,6 +909,9 @@ async def _sweep_project_comments(project: dict) -> dict:
         "reply_fetches": len(to_fetch),
         "threads_with_unfetched_replies": unfetched_replies,
         "reply_fetch_errors": reply_fetch_errors,
+        "reply_refreshes": sum(1 for c in to_fetch if not c.is_incomplete),
+        "threads_at_reply_cap": threads_at_reply_cap,
+        "threads_with_replies_truncated": replies_truncated,
         "suspicious_empty_sweep": suspicious_empty_sweep,
         "mass_disappearance": (
             {"absent": would_condemn, "of": previously_stamped}
@@ -894,6 +999,29 @@ async def _resolve_local_videos(project_id: int, youtube_video_ids: set[str]) ->
 #: lose thousands quietly.
 _MASS_DISAPPEARANCE_MIN_COMMENTS = 10
 _MASS_DISAPPEARANCE_FRACTION = 0.25
+
+
+async def _mark_replies_refreshed(project_id: int, top_comment_ids: list[str]) -> None:
+    """Record that these threads' replies were just read in full.
+
+    Written only for threads the sweep actually re-read, so a thread it skipped
+    stays due. This is what keeps the refresh cycle rotating through the channel
+    instead of re-reading the same threads every sweep — and what stops a thread
+    with more replies than one follow-up can hold from being asked about forever.
+    """
+    if not top_comment_ids:
+        return
+
+    now = _utc_now()
+    async with write_transaction() as wdb:
+        for start in range(0, len(top_comment_ids), 500):
+            chunk = top_comment_ids[start:start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            await wdb.execute(
+                f"UPDATE youtube_comments SET replies_refreshed_at = ? "
+                f"WHERE project_id = ? AND comment_id IN ({placeholders})",
+                (now, project_id, *chunk),
+            )
 
 
 async def _count_stamped_top_level(project_id: int) -> int:

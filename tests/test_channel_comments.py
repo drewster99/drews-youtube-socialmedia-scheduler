@@ -107,6 +107,7 @@ def _install_fake_youtube(
     buckets: dict[str, list[dict]] | None = None,
     bucket_errors: dict[str, Exception] | None = None,
     bucket_hit_caps: dict[str, bool] | None = None,
+    reply_hit_caps: dict[str, bool] | None = None,
 ) -> dict:
     """Patch the YouTube wrappers the sweep calls; record what it asked for.
 
@@ -143,9 +144,13 @@ def _install_fake_youtube(
             (bucket_hit_caps or {}).get(moderation_status, False),
         )
 
-    def fake_replies(parent_comment_id: str, *, max_results: int = 100):
+    def fake_replies(parent_comment_id: str, *, max_pages: int):
         calls["reply_parents"].append(parent_comment_id)
-        return (replies or {}).get(parent_comment_id, [])
+        calls["reply_max_pages"] = max_pages
+        return (
+            (replies or {}).get(parent_comment_id, []),
+            (reply_hit_caps or {}).get(parent_comment_id, False),
+        )
 
     monkeypatch.setattr(youtube, "list_channel_comment_threads", fake_threads)
     monkeypatch.setattr(youtube, "list_comment_replies", fake_replies)
@@ -310,6 +315,120 @@ async def test_thread_with_truncated_replies_is_fetched_then_left_alone(
 
     assert calls["reply_parents"] == [], "a fully-stored thread was re-fetched"
     assert second["reply_fetches"] == 0
+
+
+async def test_a_thread_too_big_to_fetch_is_not_re_requested_forever(
+    comments, project, sweep_clock, monkeypatch
+) -> None:
+    """The old gating was purely `stored < totalReplyCount`, and the fetch
+    stopped at 100 replies — so a thread with more than that could never satisfy
+    it. It was re-requested on every single sweep, returned the same replies, and
+    made no progress: pure quota burn, forever.
+    """
+    monkeypatch.setattr(comments, "_MAX_FETCHABLE_REPLIES", 3)
+    preview = [_comment("r1"), _comment("r2")]
+    fetched = preview + [_comment("r3")]
+    threads = [_thread(_comment("c1"), video_id=None, replies=preview,
+                       total_reply_count=99)]
+
+    calls = _install_fake_youtube(
+        monkeypatch, threads=threads, replies={"c1": fetched},
+        reply_hit_caps={"c1": True},
+    )
+    first = await comments.sync_project_comments(project)
+
+    assert calls["reply_parents"] == ["c1"], "the first fetch must still happen"
+    assert first["threads_with_replies_truncated"] == 1
+
+    # Far past the refresh window — the ONE thing that could legitimately bring
+    # it back — and it still must not be asked about.
+    sweep_clock(90_000)
+    calls = _install_fake_youtube(
+        monkeypatch, threads=threads, replies={"c1": fetched},
+        reply_hit_caps={"c1": True},
+    )
+    second = await comments.sync_project_comments(project)
+
+    assert calls["reply_parents"] == [], "a thread at the reply cap was re-requested"
+    assert second["threads_at_reply_cap"] == 1
+    # It is at a cap we chose, not an unread backlog a later sweep will clear —
+    # counting it as pending would suspend "gone from YouTube" for the project
+    # permanently.
+    assert second["threads_with_unfetched_replies"] == 0
+    assert second["sweep_was_complete"] is True
+
+
+async def test_a_reply_held_after_we_stored_it_is_corrected_on_refresh(
+    comments, project, isolated_db, sweep_clock, monkeypatch
+) -> None:
+    """The held and likely-spam buckets list threads by their TOP-LEVEL comment,
+    so a reply held after we first stored it is never mentioned again by any
+    other call. Re-reading the thread's replies on a clock is the only path to
+    the per-reply moderationStatus — without it the dashboard shows a held reply
+    as an ordinary live comment forever."""
+    published_reply = _comment("r1", text="fine at first")
+    threads = [_thread(_comment("c1"), video_id=None, replies=[published_reply])]
+    _install_fake_youtube(monkeypatch, threads=threads)
+    await comments.sync_project_comments(project)
+
+    rows = await isolated_db.execute_fetchall(
+        "SELECT moderation_status FROM youtube_comments WHERE comment_id = 'r1'"
+    )
+    assert rows[0]["moderation_status"] == "published"
+
+    # YouTube now holds that reply. It vanishes from the thread preview and the
+    # thread's own bucket never mentions it.
+    held_reply = _comment("r1", text="fine at first")
+    held_reply["snippet"]["moderationStatus"] = "heldForReview"
+    threads_without_it = [_thread(_comment("c1"), video_id=None,
+                                  total_reply_count=1)]
+
+    sweep_clock(90_000)
+    calls = _install_fake_youtube(
+        monkeypatch, threads=threads_without_it, replies={"c1": [held_reply]}
+    )
+    summary = await comments.sync_project_comments(project)
+
+    assert calls["reply_parents"] == ["c1"], "the stale thread was never re-read"
+    assert summary["reply_refreshes"] + summary["reply_fetches"] >= 1
+    rows = await isolated_db.execute_fetchall(
+        "SELECT moderation_status FROM youtube_comments WHERE comment_id = 'r1'"
+    )
+    assert rows[0]["moderation_status"] == "heldForReview"
+
+
+async def test_a_fresh_thread_is_not_re_read_just_because_it_could_be(
+    comments, project, sweep_clock, monkeypatch
+) -> None:
+    """The refresh is on a clock, so it must not fire every sweep — that would
+    spend the whole reply budget re-reading the same threads."""
+    threads = [_thread(_comment("c1"), video_id=None, replies=[_comment("r1")])]
+    _install_fake_youtube(monkeypatch, threads=threads, replies={"c1": [_comment("r1")]})
+    await comments.sync_project_comments(project)
+
+    sweep_clock(60)
+    calls = _install_fake_youtube(
+        monkeypatch, threads=threads, replies={"c1": [_comment("r1")]}
+    )
+    await comments.sync_project_comments(project)
+
+    assert calls["reply_parents"] == []
+
+
+async def test_reply_fetch_uses_the_page_cap(comments, project, monkeypatch) -> None:
+    """A single-page fetch is what made a busy thread permanently short."""
+    config = importlib.import_module("yt_scheduler.config")
+    calls = _install_fake_youtube(
+        monkeypatch,
+        threads=[_thread(_comment("c1"), video_id=None, replies=[_comment("r1")],
+                         total_reply_count=9)],
+        replies={"c1": [_comment("r1")]},
+    )
+
+    await comments.sync_project_comments(project)
+
+    assert calls["reply_max_pages"] == config.COMMENT_SYNC_MAX_REPLY_PAGES
+    assert config.COMMENT_SYNC_MAX_REPLY_PAGES > 1
 
 
 async def test_reply_fetch_cap_is_reported_not_swallowed(
@@ -624,7 +743,7 @@ async def test_one_unreadable_reply_thread_does_not_cost_the_sweep(
                          total_reply_count=4)],
     )
 
-    def boom(parent_comment_id, *, max_results=100):
+    def boom(parent_comment_id, *, max_pages):
         raise RuntimeError("quotaExceeded")
 
     monkeypatch.setattr(youtube, "list_comment_replies", boom)

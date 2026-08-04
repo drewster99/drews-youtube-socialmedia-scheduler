@@ -1,0 +1,29 @@
+-- When we last read a thread's replies IN FULL, on the thread's top-level row.
+--
+-- Fixes two things that shared one cause: the reply follow-up was gated purely
+-- on `stored_count < totalReplyCount`, so it could only ever chase a shortfall.
+--
+-- 1. A reply's moderation status could never be corrected. A reply stored as
+--    `published` from a thread preview stays `published` if YouTube later holds
+--    it: the held/likely-spam buckets list threads by their TOP-LEVEL comment,
+--    and a fully-stored thread was never re-read, so nothing ever asked about
+--    that reply again. The dashboard then renders a held reply as an ordinary
+--    live comment — exactly what migration 045 exists to prevent.
+--
+--    `comments.list(parentId=…)` returns each reply's own `moderationStatus`
+--    for an owner-authorized request, so re-reading a thread is what corrects
+--    it. This column is what makes "re-read the stalest threads" possible
+--    without re-reading every thread every sweep.
+--
+-- 2. A thread with more replies than one follow-up can fetch was re-requested
+--    forever with zero progress. `list_comment_replies` stopped at 100, so
+--    `stored < total` stayed true on a 150-reply thread on every single sweep —
+--    up to the whole reply budget spent, every tick, to learn nothing. The
+--    follow-up now pages properly, and a thread already holding as many replies
+--    as we are willing to fetch is no longer treated as short.
+--
+-- NULL means the thread's replies have never been read in full: either it has
+-- none beyond the preview, or it has never been picked. It reads as "due", not
+-- as "fresh" — a thread we have never fully read is the one most worth reading.
+
+ALTER TABLE youtube_comments ADD COLUMN replies_refreshed_at TEXT;

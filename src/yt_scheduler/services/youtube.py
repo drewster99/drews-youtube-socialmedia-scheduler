@@ -679,27 +679,43 @@ def list_channel_comment_threads(
     return threads, request is not None
 
 
-def list_comment_replies(parent_comment_id: str, *, max_results: int = 100) -> list[dict]:
-    """Replies to one top-level comment.
+def list_comment_replies(
+    parent_comment_id: str, *, max_pages: int
+) -> tuple[list[dict], bool]:
+    """Replies to one top-level comment, paged. 1 quota unit per page.
 
     A thread resource carries only a preview of its replies (about five), so
-    this is how a busy thread's remaining replies are read. 1 quota unit.
+    this is how the rest are read — and, because each reply carries its own
+    ``moderationStatus`` for an owner-authorized request, it is also the only
+    way a reply's status can ever be corrected after it was first stored.
+
+    Returns ``(replies, hit_page_cap)``. The cap must be reported: a caller that
+    treats a truncated read as the whole set would keep asking for the same
+    thread forever. This previously took a ``max_results`` that defaulted to
+    100, which is exactly that bug — a 150-reply thread came back short on every
+    sweep, so "we hold fewer than YouTube says" stayed true and the follow-up
+    re-ran forever, learning nothing and spending the budget every tick.
     """
+    if max_pages < 1:
+        raise ValueError(f"max_pages must be at least 1, got {max_pages}")
+
     youtube = get_youtube_service()
 
     items: list[dict] = []
     request = youtube.comments().list(
         part="snippet",
         parentId=parent_comment_id,
-        maxResults=min(max_results, 100),
+        maxResults=100,
         textFormat="plainText",
     )
-    while request is not None and len(items) < max_results:
+    pages = 0
+    while request is not None and pages < max_pages:
         result = request.execute()
         items.extend(result.get("items", []))
+        pages += 1
         request = youtube.comments().list_next(request, result)
 
-    return items[:max_results]
+    return items, request is not None
 
 
 def reply_to_comment(parent_comment_id: str, text: str) -> dict:

@@ -669,7 +669,10 @@ own channel. `last_synced_at` is `null` when no sweep has ever stored a comment 
   "updated": 282,
   "pages_truncated": false,
   "reply_fetches": 3,
+  "reply_refreshes": 2,
   "threads_with_unfetched_replies": 0,
+  "threads_at_reply_cap": 0,
+  "threads_with_replies_truncated": 0,
   "reply_fetch_errors": [],
   "suspicious_empty_sweep": false,
   "moderation_buckets": {
@@ -695,6 +698,26 @@ sweep and must be asked for by name. Each carries `ok` separately from
 A bucket failure is recorded and skipped rather than aborting the sweep; a
 failure of the `published` bucket is the sweep's failure and still raises (a
 degraded one would turn a revoked token into a silently empty comments box).
+
+A thread's replies are re-read for two distinct reasons, counted separately.
+`reply_fetches` covers threads holding fewer replies than `totalReplyCount`;
+`reply_refreshes` covers threads whose counts already match but whose replies
+have not been re-read within `COMMENT_REPLY_REFRESH_HOURS`. The refresh exists
+because it is the **only** way a reply's `moderation_status` can ever be
+corrected: the held and likely-spam buckets list threads by their *top-level*
+comment, so a reply held after we first stored it is never mentioned again by
+any other call, and the dashboard would go on showing it as an ordinary live
+comment. Incomplete threads are served before stale ones, and within each group
+the least recently refreshed first, so a limited budget rotates through the
+channel rather than starving the same threads every sweep.
+
+`threads_at_reply_cap` counts threads already holding as many replies as we are
+willing to fetch (`COMMENT_SYNC_MAX_REPLY_PAGES` × 100). They are deliberately
+**not** counted as having unfetched replies: no future sweep can make progress
+on them, and treating them as pending would keep every sweep incomplete and so
+permanently suspend `is_missing_from_youtube` for the project.
+`threads_with_replies_truncated` counts threads whose reply read hit that page
+cap during this sweep.
 
 `reply_fetch_errors` lists threads whose reply follow-up failed. One unreadable
 thread does not abort the sweep — the threads are already stored by that point,
