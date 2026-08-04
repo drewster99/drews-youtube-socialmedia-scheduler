@@ -115,42 +115,38 @@ async def test_ordering_is_by_when_it_failed_not_by_row_id(client) -> None:
     assert [p["id"] for p in posts] == [1, 9, 12]
 
 
-async def test_dismissing_hides_a_failure_from_the_banner(client) -> None:
-    await _seed_posts()
+async def test_skipping_takes_a_failure_out_of_the_banner(client) -> None:
+    """Not by hiding it. The post becomes 'skipped' — the state this codebase
+    already uses for a post nobody is going to send — so it leaves the list
+    because it is genuinely no longer failing."""
+    from yt_scheduler.database import get_db
 
+    await _seed_posts()
     assert [p["id"] for p in client.get("/api/social/failed-posts").json()] == [4, 1]
 
-    assert client.post("/api/social/posts/4/dismiss").status_code == 200
+    assert client.post("/api/social/posts/4/skip").status_code == 200
 
     assert [p["id"] for p in client.get("/api/social/failed-posts").json()] == [1]
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT status, error, retryable, next_retry_at FROM social_posts WHERE id = 4"
+    )
+    assert rows[0]["status"] == "skipped"
+    # The record of what went wrong is kept; this is a decision, not a rewrite.
+    assert rows[0]["error"] == "boom two"
+    # And it must leave the retry path, or the job would send it a minute later.
+    assert not rows[0]["retryable"]
+    assert rows[0]["next_retry_at"] is None
 
 
-async def test_a_dismissed_post_that_fails_again_comes_back(client) -> None:
-    """The rule that makes dismissing safe. A dismissal hides the attempt the
-    user read, never the problem — so a retry that fails again must un-dismiss
-    the row. Without this, one click could permanently silence a recurring
-    failure, which is precisely what the no-dismissed-state design forbade."""
-    from yt_scheduler.models import social_post
-
-    await _seed_posts()
-    client.post("/api/social/posts/4/dismiss")
-    assert [p["id"] for p in client.get("/api/social/failed-posts").json()] == [1]
-
-    await social_post.mark_failed(4, error="failed again")
-
-    posts = client.get("/api/social/failed-posts").json()
-    assert [p["id"] for p in posts] == [4, 1]
-    assert posts[0]["error"] == "failed again"
-
-
-async def test_only_a_failed_post_can_be_dismissed(client) -> None:
-    """On any other status the field is dead weight, and the request is a
-    misunderstanding worth reporting rather than absorbing."""
+async def test_only_a_failed_post_can_be_skipped(client) -> None:
+    """On any other status this would silently change something the user is not
+    looking at."""
     await _seed_posts()
 
     # id 2 is 'posted', id 3 is 'draft'.
-    assert client.post("/api/social/posts/2/dismiss").status_code == 409
-    assert client.post("/api/social/posts/9999/dismiss").status_code == 404
+    assert client.post("/api/social/posts/2/skip").status_code == 409
+    assert client.post("/api/social/posts/9999/skip").status_code == 404
 
 
 async def test_empty_when_nothing_failed(client) -> None:

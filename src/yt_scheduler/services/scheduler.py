@@ -21,6 +21,7 @@ from yt_scheduler.services import (
     comments as comment_service,
     events,
     moderation,
+    send_failures,
     transcripts as transcript_service,
     video_dimensions,
     youtube,
@@ -85,6 +86,23 @@ async def _claim_post_for_send(post_id: int) -> bool:
         cursor = await db.execute(
             "UPDATE social_posts SET status = 'sending' "
             "WHERE id = ? AND status = 'approved'",
+            (post_id,),
+        )
+    return cursor.rowcount > 0
+
+
+async def _claim_failed_post_for_retry(post_id: int) -> bool:
+    """Atomically transition a failed post to ``sending`` for an auto-retry.
+
+    The same guard as :func:`_claim_post_for_send` and for the same reason, but
+    from ``'failed'``: the retry job and a user pressing Retry can fire at the
+    same instant, and both reading ``status='failed'`` would mean two posts on a
+    real audience for one row. Whoever wins the UPDATE owns the send.
+    """
+    async with write_transaction() as db:
+        cursor = await db.execute(
+            "UPDATE social_posts SET status = 'sending' "
+            "WHERE id = ? AND status = 'failed'",
             (post_id,),
         )
     return cursor.rowcount > 0
@@ -500,8 +518,16 @@ def _post_lock(post_id: int) -> asyncio.Lock:
     return _post_locks.get(post_id)
 
 
-async def _send_scheduled_post(post_id: int) -> None:
-    """APScheduler-fired worker for an individual scheduled post."""
+async def _send_scheduled_post(post_id: int, *, pre_claimed: bool = False) -> None:
+    """APScheduler-fired worker for an individual scheduled post.
+
+    ``pre_claimed`` is for the auto-retry job, which claims the row out of
+    ``'failed'`` itself and then reuses this whole path — the non-public-video
+    pre-flight, the render-error guard, the duplicate guard and the poster
+    resolution all have to apply to a retry exactly as they do to a first send,
+    and a second implementation of them would drift. The claim is NOT repeated
+    here: this caller already holds it, and the row is legitimately ``'sending'``.
+    """
     from yt_scheduler.services.social import (
         get_poster,
         get_poster_for_account,
@@ -515,7 +541,7 @@ async def _send_scheduled_post(post_id: int) -> None:
         logger.warning("Scheduled post %s vanished before firing", post_id)
         return
     post = dict(rows[0])
-    if post.get("status") in ("posted", "sending"):
+    if not pre_claimed and post.get("status") in ("posted", "sending"):
         # Already sent or another worker is sending right now — abort.
         return
 
@@ -583,7 +609,7 @@ async def _send_scheduled_post(post_id: int) -> None:
             )
             return
 
-    if not await _claim_post_for_send(post_id):
+    if not pre_claimed and not await _claim_post_for_send(post_id):
         # Either it wasn't 'approved' (e.g. user already manually sent
         # or unscheduled it) or another worker beat us to the claim.
         return
@@ -739,7 +765,10 @@ async def _send_scheduled_post(post_id: int) -> None:
                 },
             )
         logger.error("Failed to send scheduled post %s: %s", post_id, exc)
-        await mark_failed(post_id, error=str(exc))
+        await mark_failed(
+            post_id, error=str(exc),
+            **await send_failures.retry_plan(post_id, exc),
+        )
 
 
 async def schedule_social_post(post_id: int, when: datetime) -> str:
@@ -784,9 +813,14 @@ async def schedule_social_post(post_id: int, when: datetime) -> str:
 
         async with write_transaction() as db:
             await db.execute(
-                "UPDATE social_posts SET scheduled_at = ?, scheduler_job_id = ?, "
-                "status = 'approved' WHERE id = ?",
-                (when.isoformat(), job_id, post_id),
+                # intended_at mirrors scheduled_at and is never cleared. A
+                # failure wipes scheduled_at on purpose (the restore pass would
+                # otherwise resurrect the row), which left the post-late window
+                # with nothing to measure from — every failed post read as
+                # outside its grace window however recently it failed.
+                "UPDATE social_posts SET scheduled_at = ?, intended_at = ?, "
+                "scheduler_job_id = ?, status = 'approved' WHERE id = ?",
+                (when.isoformat(), when.isoformat(), job_id, post_id),
             )
         await events.record_event(
             rows[0]["video_id"],
@@ -1537,6 +1571,91 @@ async def moderate_comments_job() -> None:
             )
 
 
+async def retry_failed_sends_job() -> None:
+    """Re-send failures that provably never reached the platform.
+
+    Only rows :mod:`services.send_failures` classified as connect-phase are on
+    this path at all — the request never left, so re-sending cannot duplicate.
+    A read timeout is just as transient and is deliberately excluded: the post
+    may already exist and only the response was lost.
+
+    Three defences against a double-send, because the cost of getting this wrong
+    is spam on someone else's timeline:
+
+    1. ``_claim_failed_post_for_retry`` — the job and a user pressing Retry
+       cannot both own the same row.
+    2. ``find_recent_duplicate_post`` — catches the case this retry cannot see
+       from its own row: the smart queue re-adding a video creates NEW posts
+       with the same content, so a stale failure retrying afterwards would be
+       the second copy. Content+media+account matched over 30 days.
+    3. ``retry_until`` — a hard stop, stamped once, so a permanently broken
+       destination cannot be hammered forever.
+    """
+    from yt_scheduler.services.social import (
+        decode_media_paths,
+        find_recent_duplicate_post,
+    )
+
+    db = await get_db()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    rows = await db.execute_fetchall(
+        """SELECT id, platform, social_account_id, content, media_path,
+                  media_paths, retry_count
+             FROM social_posts
+            WHERE status = 'failed' AND retryable = 1
+              AND next_retry_at IS NOT NULL AND next_retry_at <= ?
+              AND (retry_until IS NULL OR retry_until > ?)
+            ORDER BY next_retry_at
+            LIMIT ?""",
+        (now, now, RETRY_BATCH_LIMIT),
+    )
+    if not rows:
+        return
+
+    for row in rows:
+        post_id = int(row["id"])
+        duplicate = await find_recent_duplicate_post(
+            platform=row["platform"],
+            social_account_id=row["social_account_id"],
+            content=row["content"] or "",
+            media_paths=decode_media_paths(dict(row)),
+            exclude_post_id=post_id,
+        )
+        if duplicate is not None:
+            # Something else already said this. Retrying would post it twice,
+            # so the row is retired as skipped with the reason recorded — not
+            # left 'failed', which would keep it on the retry path forever.
+            logger.warning(
+                "Not retrying post %s: identical content already went out as "
+                "post %s. Marking it skipped.",
+                post_id, duplicate["id"],
+            )
+            async with write_transaction() as wdb:
+                await wdb.execute(
+                    "UPDATE social_posts SET status = 'skipped', retryable = 0, "
+                    "next_retry_at = NULL, error = ? WHERE id = ? "
+                    "AND status = 'failed'",
+                    (
+                        f"Not retried: the same content already posted "
+                        f"(post {duplicate['id']}).",
+                        post_id,
+                    ),
+                )
+            continue
+
+        if not await _claim_failed_post_for_retry(post_id):
+            # Someone else took it between the SELECT and here.
+            continue
+
+        try:
+            await _send_scheduled_post(post_id, pre_claimed=True)
+        except Exception as exc:
+            # _send_claimed_post already recorded the failure and the next
+            # backoff step; this is the belt on top so one bad row cannot end
+            # the batch for the others.
+            logger.warning("Auto-retry of post %s failed again: %s", post_id, exc)
+
+
 async def sync_comments_job() -> None:
     """Mirror every project's channel comments into the local table.
 
@@ -1565,6 +1684,17 @@ async def sync_comments_job() -> None:
 # Twitter/Bluesky tokens, while a 60-day Threads token — unrefreshable once
 # expired — renews with a week of margin.
 _TOKEN_REFRESH_INTERVAL_MINUTES = 20
+
+# How often the auto-retry sweep looks for failures due another attempt. The
+# backoff in services.send_failures decides WHEN each post is next eligible;
+# this only bounds how late that can be noticed, so it is deliberately short
+# and cheap — the query is indexed and usually returns nothing.
+_RETRY_FAILED_SENDS_INTERVAL_MINUTES = 2
+
+# Posts one sweep will attempt. A cap, not a target: without it a channel-wide
+# outage that failed two hundred posts would try to re-send all of them in one
+# tick, against a platform that has just demonstrated it is unhappy.
+RETRY_BATCH_LIMIT = 10
 
 
 async def refresh_social_tokens_job() -> None:
@@ -1742,6 +1872,19 @@ def start_scheduler(
         id="refresh_social_tokens",
         replace_existing=True,
         next_run_time=token_refresh_first_run,
+    )
+    # next_run_time=None under pytest adds the job PAUSED, like the other
+    # network-touching jobs above — a test suite must never post to a platform.
+    retry_first_run = None
+    if "pytest" not in sys.modules:
+        retry_first_run = datetime.now(timezone.utc) + timedelta(seconds=90)
+    scheduler.add_job(
+        retry_failed_sends_job,
+        "interval",
+        minutes=_RETRY_FAILED_SENDS_INTERVAL_MINUTES,
+        id="retry_failed_sends",
+        replace_existing=True,
+        next_run_time=retry_first_run,
     )
     scheduler.add_job(
         prune_social_post_traces_job,

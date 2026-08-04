@@ -17,7 +17,7 @@ from yt_scheduler.config import (
 )
 from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.models.social_post import mark_failed, mark_posted
-from yt_scheduler.services import events, social, templates as tmpl
+from yt_scheduler.services import events, send_failures, social, templates as tmpl
 from yt_scheduler.services.social import decode_media_paths as _decode_media_paths
 from yt_scheduler.services.scheduler import cancel_scheduled_post, get_publish_lock
 from yt_scheduler.services.render_context import (
@@ -611,24 +611,25 @@ async def list_failed_posts():
 
     Powers the app-wide failed-sends banner (``static/js/failed-sends-banner.js``,
     loaded by ``base.html`` on every page): a failed send must stay visible from
-    wherever the user is standing until it is retried, dismissed or deleted, not
+    wherever the user is standing until it is retried, skipped or deleted, not
     flash once in a toast. The ``social_posts`` table is the single source of
-    truth.
-
-    Dismissed rows are excluded, and that is only safe because
-    :func:`models.social_post.mark_failed` clears ``dismissed_at``: a dismissal
-    hides the attempt the user read, never the problem. A retry that fails again
-    puts the row straight back.
+    truth — a post the user has given up on becomes ``'skipped'``, which leaves
+    this list because it is genuinely no longer failing, not because it is hidden.
     """
     db = await get_db()
     rows = await db.execute_fetchall(
         """SELECT sp.id, sp.video_id, sp.platform, sp.error, sp.failed_at,
-                  sp.social_account_id, v.title AS video_title,
+                  sp.social_account_id, sp.smart_queue_item_id,
+                  -- Both drive what the row can offer: whether the automatic
+                  -- retry is already working on it, and whether Skip needs to
+                  -- say that the schedule is a separate decision.
+                  sp.retryable, sp.retry_until,
+                  v.title AS video_title,
                   p.slug AS project_slug
            FROM social_posts sp
            JOIN videos v ON v.id = sp.video_id
            JOIN projects p ON p.id = v.project_id
-           WHERE sp.status = 'failed' AND sp.dismissed_at IS NULL
+           WHERE sp.status = 'failed'
            -- By when it FAILED, not by sp.id — id is creation order, so a post
            -- written weeks ago and a post written minutes ago sort by the wrong
            -- thing entirely. That is how a five-day-old failure came to head the
@@ -722,18 +723,22 @@ async def update_post(post_id: int, data: dict):
     return {"status": "ok"}
 
 
-@router.post("/posts/{post_id}/dismiss")
-async def dismiss_failed_post(post_id: int) -> dict:
-    """Hide one failed send from the app-wide banner.
+@router.post("/posts/{post_id}/skip")
+async def skip_failed_post(post_id: int) -> dict:
+    """Give up on a failed send: mark it ``'skipped'``.
 
-    Only a failed post can be dismissed: on any other status the field would be
-    dead weight, and a request to dismiss something that is not failing is a
-    misunderstanding worth reporting rather than absorbing.
+    Not a "dismissed" flag. A post the user is never sending is not a failed
+    post that happens to be hidden — it is a post that has been given up on, and
+    ``'skipped'`` is what this codebase already calls that
+    (``smart_queue_disposition``'s ``remove`` sets exactly this). It leaves the
+    failed-sends banner because it is genuinely no longer failing, not because
+    it is filtered out, so there is one state with one meaning.
 
-    The row is untouched otherwise — ``status`` stays ``'failed'`` and the error
-    text is kept, so nothing about the history is rewritten. And because
-    ``mark_failed`` clears ``dismissed_at``, a later retry that fails again
-    brings it back: this hides an attempt, never a problem.
+    The error text, ``failed_at`` and the content are all kept: this records a
+    decision, it does not rewrite what happened.
+
+    Only a failed post can be skipped here — on any other status this endpoint
+    would be silently changing something the user is not looking at.
     """
     db = await get_db()
     rows = await db.execute_fetchall(
@@ -744,16 +749,20 @@ async def dismiss_failed_post(post_id: int) -> dict:
     if rows[0]["status"] != "failed":
         raise HTTPException(
             409,
-            f"Post {post_id} is '{rows[0]['status']}', not 'failed' — only a "
-            f"failed send can be dismissed.",
+            f"Post {post_id} is '{rows[0]['status']}', not 'failed' \u2014 only a "
+            f"failed send can be skipped.",
         )
 
     async with write_transaction() as wdb:
         await wdb.execute(
-            "UPDATE social_posts SET dismissed_at = datetime('now') WHERE id = ?",
+            "UPDATE social_posts SET status = 'skipped', "
+            # Clearing the retry plan is the point: a skipped post must not be
+            # picked up by the retry job a minute later.
+            "retryable = 0, next_retry_at = NULL "
+            "WHERE id = ?",
             (post_id,),
         )
-    return {"id": post_id, "dismissed": True}
+    return {"id": post_id, "status": "skipped"}
 
 
 @router.delete("/posts/{post_id}")
@@ -1180,7 +1189,9 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
         logger.exception("Send failed for post %s", post_id)
         # Also releases the claim taken above; otherwise the row sits 'sending'
         # forever with nothing able to retry it.
-        await mark_failed(post_id, error=str(e))
+        await mark_failed(
+            post_id, error=str(e), **await send_failures.retry_plan(post_id, e)
+        )
         raise HTTPException(500, str(e))
 
 
@@ -1378,7 +1389,10 @@ async def send_all_posts(
             ))
         except Exception as e:
             logger.exception("Send failed for post %s", post["id"])
-            await mark_failed(post["id"], error=str(e))
+            await mark_failed(
+                post["id"], error=str(e),
+                **await send_failures.retry_plan(post["id"], e),
+            )
             results.append(_entry(post, cred, status="failed", error=str(e)))
 
     return results

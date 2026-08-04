@@ -1393,7 +1393,7 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 
 ### `GET /api/social/failed-posts`
 
-**Purpose** — All social posts whose most recent send attempt failed, newest first. Powers the app-wide failed-sends banner (`static/js/failed-sends-banner.js`, loaded by `base.html` on every page), which stays up until each post is retried successfully or deleted — `social_posts.status` is the single source of truth, with no separate acknowledged/dismissed state.
+**Purpose** — All social posts whose most recent send attempt failed, newest first. Powers the app-wide failed-sends banner (`static/js/failed-sends-banner.js`, loaded by `base.html` on every page), which stays up until each post is retried successfully, skipped, or deleted — `social_posts.status` is the single source of truth. Giving up on a post makes it `'skipped'`, so it leaves this list because it is genuinely no longer failing, not because it is filtered out.
 
 **Response 200** — Array of `{"id": int, "video_id": str, "platform": str, "error": str, "failed_at": "<naive UTC>"|null, "social_account_id": int|null, "video_title": str, "page_url": str}`. `page_url` is the ready link to the owning project's video-detail page — the server vends it because the detail route 404s unless the slug actually owns the video.
 
@@ -1433,23 +1433,25 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 
 **Errors** — `400` (a `media_path`/`media_paths` entry is outside `UPLOAD_DIR`, or an invalid `status`).
 
-### `POST /api/social/posts/{post_id}/dismiss`
+### `POST /api/social/posts/{post_id}/skip`
 
-**Purpose** — Hide one failed send from the app-wide failed-sends banner.
+**Purpose** — Give up on a failed send.
 
-**Response 200** — `{"id": 42, "dismissed": true}`
+**Response 200** — `{"id": 42, "status": "skipped"}`
 
-Sets `social_posts.dismissed_at`; `status` stays `'failed'` and the error text is
-kept, so nothing about the history is rewritten. `GET /api/social/failed-posts`
-excludes dismissed rows.
+Sets `status = 'skipped'` — the state this codebase already uses for a post
+nobody is going to send (`smart_queue_disposition`'s `remove` sets the same
+thing). The post leaves `GET /api/social/failed-posts` because it is genuinely no
+longer failing, not because it is filtered out: there is one state with one
+meaning, and no hidden-but-still-failed rows to drift.
 
-This hides an **attempt**, not a problem: `models.social_post.mark_failed`
-clears `dismissed_at`, so a retry that fails again puts the row straight back in
-the banner with the new error. A recurring failure cannot be permanently
-silenced.
+The error text, `failed_at` and the content are kept — this records a decision,
+it does not rewrite what happened. The retry columns are cleared so the
+automatic retry job cannot pick it up a minute later.
 
-**Errors** — `404` (unknown post); `409` (the post is not in status `failed` — on
-any other status the field is dead weight and the request is a misunderstanding).
+**Errors** — `404` (unknown post); `409` (the post is not in status `failed` —
+on any other status this would silently change something the user is not looking
+at).
 
 ### `DELETE /api/social/posts/{post_id}`
 

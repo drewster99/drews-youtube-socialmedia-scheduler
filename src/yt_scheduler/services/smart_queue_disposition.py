@@ -39,7 +39,8 @@ async def missed_items(queue_id: int) -> list[dict]:
     rows = await db.execute_fetchall(
         """
         SELECT p.id AS post_id, p.platform, p.status, p.scheduled_at, p.error,
-               p.failed_at, i.id AS item_id, i.video_id, v.title,
+               p.failed_at, p.intended_at,
+               i.id AS item_id, i.video_id, v.title,
                -- Carried so the Remove confirmation can state what actually
                -- happens next instead of guessing. Auto-add considers a video
                -- once; whether that has already happened is the difference
@@ -70,6 +71,12 @@ def within_grace(queue: dict, scheduled_at: str | None) -> bool:
 
     Only meaningful for the ``post_late`` policy; the other two never post
     late at all.
+
+    Pass ``intended_at`` when ``scheduled_at`` is gone: marking a post failed
+    clears the scheduling columns (the restore pass would otherwise resurrect
+    it), so measuring the window from ``scheduled_at`` alone reported EVERY
+    failed post as expired — including one that failed three hours into a
+    24-hour window. Callers use ``scheduled_at or intended_at``.
     """
     if queue.get("missed_policy") != "post_late" or not scheduled_at:
         return False

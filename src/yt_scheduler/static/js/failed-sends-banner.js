@@ -5,8 +5,10 @@
  * one page that owns the post — invisible from everywhere else, and invisible
  * for scheduled sends that fail with no page open at all. This loads from
  * base.html on every page and stays up until the failed posts are retried
- * successfully or deleted. The social_posts table is the single source of
- * truth, so there is no separate dismissed state to drift out of sync.
+ * successfully, skipped, or deleted. The social_posts table is the single
+ * source of truth: giving up on a post makes it 'skipped', so it leaves this
+ * list because it is genuinely no longer failing — there is no hidden-but-still-
+ * failed state to drift out of sync.
  */
 (function () {
     'use strict';
@@ -70,13 +72,46 @@
 
     /* Retry re-runs the ordinary send endpoint — the post row already carries
      * everything a send needs, and an absent social_account_id resolves by the
-     * same precedence a first send uses. Dismiss hides this attempt only: if the
-     * retry fails, mark_failed clears dismissed_at and the row comes back. */
+     * same precedence a first send uses.
+     *
+     * Skip is not "hide this": it marks the post 'skipped', the state this
+     * codebase already uses for a post nobody is going to send (see
+     * smart_queue_disposition's `remove`). It leaves this list because it is no
+     * longer failing, not because it is filtered out. */
     function actions(post) {
+        const id = escapeAttribute(String(post.id));
+        const retryHint = post.retryable
+            ? 'Send this again now. It is also being retried automatically.'
+            : 'Send this again now.';
         return ` <button type="button" class="failed-sends-banner__action"`
-            + ` data-action="retry" data-post-id="${escapeAttribute(String(post.id))}">Retry</button>`
+            + ` title="${retryHint}"`
+            + ` data-action="retry" data-post-id="${id}">Retry</button>`
             + ` <button type="button" class="failed-sends-banner__action"`
-            + ` data-action="dismiss" data-post-id="${escapeAttribute(String(post.id))}">Dismiss</button>`;
+            + ` title="Give up on this post. It is marked skipped and stops being`
+            + ` retried; the error and the text are kept."`
+            + ` data-action="skip" data-post-id="${id}">Skip</button>`;
+    }
+
+    /* Skip is the one action here with a consequence past this posting, so it
+     * asks — worded the same way the smart queue's Remove does, because they do
+     * the same thing and a user should not have to learn it twice. */
+    function skipWarning(post) {
+        const lines = [
+            'Skip this post?',
+            '',
+            'It is marked skipped and will not be sent or retried. The error '
+                + 'text and the post content are kept.',
+            '',
+        ];
+        if (post.smart_queue_item_id) {
+            lines.push(
+                'It belongs to a smart schedule. Skipping affects only this '
+                + 'posting — use the schedule\'s own Remove to take the video '
+                + 'out of the queue entirely.');
+        } else {
+            lines.push('Nothing will re-create it automatically.');
+        }
+        return lines.join('\n');
     }
 
     /** Identifies what the banner is currently showing, so an unchanged poll is a no-op.
@@ -174,31 +209,34 @@
         });
     }
 
-    /** Run Retry or Dismiss for one post, then re-read the list.
+    /** Run Retry or Skip for one post, then re-read the list.
      *
      * Both outcomes are reported. A retry that fails again must not look like
-     * one that worked: the row returns to the banner with the new error, which
-     * only happens because mark_failed clears dismissed_at.
+     * one that worked — it stays in the banner carrying the new error.
      */
     async function runAction(button) {
         const postId = button.dataset.postId;
         const action = button.dataset.action;
+        if (action === 'skip') {
+            const post = latestPosts.find((p) => String(p.id) === String(postId));
+            if (post && !confirm(skipWarning(post))) return;
+        }
         const url = action === 'retry'
             ? `/api/social/posts/${encodeURIComponent(postId)}/send`
-            : `/api/social/posts/${encodeURIComponent(postId)}/dismiss`;
+            : `/api/social/posts/${encodeURIComponent(postId)}/skip`;
 
         // Disable both buttons on the row: a second click while the first is in
         // flight sends the post twice.
         const row = button.closest('li') || button.parentElement;
         const buttons = row ? row.querySelectorAll('.failed-sends-banner__action') : [button];
         buttons.forEach((b) => { b.disabled = true; });
-        button.textContent = action === 'retry' ? 'Sending…' : 'Dismissing…';
+        button.textContent = action === 'retry' ? 'Sending…' : 'Skipping…';
 
         try {
             const resp = await fetch(url, {method: 'POST'});
             if (resp.ok) {
                 if (typeof showToast === 'function') {
-                    showToast(action === 'retry' ? 'Sent.' : 'Dismissed.', 'success');
+                    showToast(action === 'retry' ? 'Sent.' : 'Skipped.', 'success');
                 }
             } else {
                 const body = await resp.json().catch(() => ({}));

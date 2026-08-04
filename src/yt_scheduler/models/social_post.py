@@ -30,7 +30,14 @@ async def mark_posted(post_id: int, *, post_url: str) -> None:
         )
 
 
-async def mark_failed(post_id: int, *, error: str) -> None:
+async def mark_failed(
+    post_id: int,
+    *,
+    error: str,
+    retryable: bool = False,
+    next_retry_at: str | None = None,
+    retry_until: str | None = None,
+) -> None:
     """Record that this post's send attempt failed, and why.
 
     The mirror of :func:`mark_posted`, and the ONLY writer of the ``'failed'``
@@ -45,17 +52,23 @@ async def mark_failed(post_id: int, *, error: str) -> None:
     columns is resurrected and re-sent by the restore pass on the next restart,
     which is exactly what a terminal failure must not do.
 
-    ``dismissed_at`` clears too, and that is what makes dismissing a failure
-    safe: a dismissal hides the attempt the user actually read, never the
-    problem. A retry that fails again un-dismisses the row and it returns to the
-    banner, so a recurring failure cannot be permanently silenced.
+    ``retryable`` / ``next_retry_at`` / ``retry_until`` describe whether the
+    automatic retry path may pick this row up, and are passed in rather than
+    decided here: only the caller holds the exception, and the decision is made
+    from its TYPE. Inferring it later from ``error`` text would be guessing at a
+    string we wrote for a human.
     """
     async with write_transaction() as db:
         await db.execute(
             """UPDATE social_posts
             SET status = 'failed', error = ?, failed_at = datetime('now'),
                 scheduler_job_id = NULL, scheduled_at = NULL,
-                dismissed_at = NULL
+                retryable = ?, next_retry_at = ?,
+                -- Computed once, on the first failure of a run: recomputing it
+                -- on every attempt would walk the deadline forward forever and
+                -- the retry would never stop.
+                retry_until = COALESCE(retry_until, ?),
+                retry_count = retry_count + 1
             WHERE id = ?""",
-            (error, post_id),
+            (error, 1 if retryable else 0, next_retry_at, retry_until, post_id),
         )

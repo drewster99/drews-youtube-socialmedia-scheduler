@@ -440,8 +440,11 @@ async def list_missed(slug: str, queue_id: int):
     queue = await _queue_in_project_or_404(slug, queue_id)
     items = await smart_queue_disposition.missed_items(queue_id)
     for item in items:
+        # A failed post has had scheduled_at cleared, so fall back to the
+        # intent that survives it — otherwise every failure reported as outside
+        # the post-late window no matter how recently it failed.
         item["within_grace"] = smart_queue_disposition.within_grace(
-            queue, item["scheduled_at"]
+            queue, item["scheduled_at"] or item["intended_at"]
         )
     return {
         "missed": items,
