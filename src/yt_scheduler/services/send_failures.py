@@ -112,8 +112,13 @@ _AMBIGUOUS_EXCEPTIONS: tuple[type[BaseException], ...] = (
 #: several platform SDKs wrap sockets themselves and surface a bare OSError
 #: rather than anything httpx-shaped — the `[Errno 8] nodename nor servname
 #: provided` failures come through this way.
+#
+#: ENOENT is deliberately ABSENT. It is FileNotFoundError, and the send path
+#: shells out to ffprobe/ffmpeg while preparing media — a missing binary would
+#: have been classified "the request provably never left" and retried for 24
+#: hours. The resolver case is already covered by socket.gaierror (by class) and
+#: EAI_NONAME below.
 _CONNECT_PHASE_ERRNOS = frozenset({
-    errno.ENOENT,        # 2  — surfaces from getaddrinfo on some platforms
     errno.ECONNREFUSED,  # 61 — nothing listening
     errno.ENETDOWN,
     errno.ENETUNREACH,
@@ -191,29 +196,57 @@ def is_safe_to_retry(exc: BaseException) -> bool:
     wrong False costs one manual click, a wrong True posts twice to a real
     audience and cannot be undone.
     """
-    # Ambiguity wins over everything. Some ambiguous classes share a base with
-    # connect-phase ones, so testing this first is what keeps ConnectTimeout
-    # from dragging ReadTimeout in behind it.
-    if isinstance(exc, _AMBIGUOUS_EXCEPTIONS):
+    # __cause__ ONLY, never __context__. __cause__ is deliberate (`raise X from
+    # Y`) and states causation. __context__ is merely whatever exception
+    # happened to be in flight when this one was raised, and carries no such
+    # claim: an SDK that catches a ReadTimeout, tries to re-auth inside the
+    # handler, and lets a ConnectError escape would hand us
+    # __context__ = ConnectError over a request that may already have been
+    # delivered. That reads as safe and is not. This codebase has that exact
+    # shape in the Twitter 401-refresh path.
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    node: BaseException | None = exc
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        chain.append(node)
+        node = node.__cause__
+
+    # Ambiguity anywhere in the chain wins over a connect-phase link anywhere
+    # else — that is the invariant this module exists to hold. Checked across
+    # the whole chain first, so a ConnectError wrapping a ReadTimeout cannot
+    # come out safe. (It also keeps ConnectTimeout, which shares a base with
+    # ReadTimeout, from dragging its sibling in behind it.)
+    if any(isinstance(e, _AMBIGUOUS_EXCEPTIONS) for e in chain):
         return False
-    if isinstance(exc, _CONNECT_PHASE_EXCEPTIONS):
-        return True
+    if any(isinstance(e, _ambiguous_by_name()) for e in chain):
+        return False
 
-    # A bare OSError from an SDK that does its own socket work. gaierror is an
-    # OSError subclass, so it is already covered above; this catches the rest.
-    if isinstance(exc, OSError) and exc.errno in _CONNECT_PHASE_ERRNOS:
-        return True
+    return any(
+        isinstance(e, _CONNECT_PHASE_EXCEPTIONS)
+        # A bare OSError from an SDK doing its own socket work. gaierror is an
+        # OSError subclass and already matched by class above.
+        or (isinstance(e, OSError) and e.errno in _CONNECT_PHASE_ERRNOS)
+        for e in chain
+    )
 
-    # A wrapped cause is common: SDKs re-raise their own error type with the
-    # transport failure as __cause__. One level only — deeper than that and we
-    # are guessing about a chain we do not understand.
-    cause = exc.__cause__ or exc.__context__
-    if cause is not None and cause is not exc:
-        if isinstance(cause, _AMBIGUOUS_EXCEPTIONS):
-            return False
-        if isinstance(cause, _CONNECT_PHASE_EXCEPTIONS):
-            return True
-        if isinstance(cause, OSError) and cause.errno in _CONNECT_PHASE_ERRNOS:
-            return True
 
-    return False
+def _ambiguous_by_name() -> tuple[type[BaseException], ...]:
+    """Ambiguous classes that live in modules this one must not import eagerly.
+
+    ``ThreadsPublishOutcomeUnknown`` is the one exception class in the codebase
+    whose entire meaning is "we do not know whether this posted", so it belongs
+    here by name rather than by luck. Today it is only ever raised inside a
+    handler for an ambiguous transport error, so the chain walk above happens to
+    catch it — but that is an accident of where it is raised, and a ``raise …
+    from None`` or a third call site would silently turn it retryable and
+    blind-republish a Threads container that may already be live.
+
+    Imported lazily: ``services.social`` imports far too much to pull in from a
+    classifier that must stay cheap and side-effect free.
+    """
+    try:
+        from yt_scheduler.services.social import ThreadsPublishOutcomeUnknown
+    except Exception:  # pragma: no cover - import cycle or partial init
+        return ()
+    return (ThreadsPublishOutcomeUnknown,)

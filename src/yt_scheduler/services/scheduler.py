@@ -72,8 +72,8 @@ def _parse_iso_datetime(value) -> datetime | None:
     return parsed
 
 
-async def _claim_post_for_send(post_id: int) -> bool:
-    """Atomically transition a post from ``approved`` → ``sending``.
+async def _claim_post_for_send(post_id: int, *, from_failed: bool = False) -> bool:
+    """Atomically transition a post to ``sending``.
 
     Returns True if THIS caller won the claim and should now send;
     False if someone else already did. Stops a race where
@@ -81,12 +81,30 @@ async def _claim_post_for_send(post_id: int) -> bool:
     same instant for the same post — both used to read ``status='approved'``,
     both posted to the platform, both wrote ``status='posted'`` (1 DB row,
     2 actual social posts).
+
+    ``from_failed`` additionally accepts ``'failed'``, and is for a DELIBERATE
+    human send only — the unattended senders must never pick up a failed row,
+    which failed for a reason nobody has looked at. It is one widened UPDATE
+    rather than a route setting ``'approved'`` first and then claiming: that
+    would be a read-modify-write with a window, which is the very shape this
+    claim exists to eliminate.
+
+    Without it the failed-sends banner's Retry button could not work at all —
+    every row it lists is ``'failed'`` by definition, so the claim never matched
+    and every click returned 409.
+
+    A manual attempt also ends the current automatic retry run: the user has
+    taken over, so the backoff and the deadline restart from this attempt rather
+    than from a window some earlier failure opened.
     """
+    states = ("approved", "failed") if from_failed else ("approved",)
+    placeholders = ",".join("?" * len(states))
     async with write_transaction() as db:
         cursor = await db.execute(
-            "UPDATE social_posts SET status = 'sending' "
-            "WHERE id = ? AND status = 'approved'",
-            (post_id,),
+            f"UPDATE social_posts SET status = 'sending', retryable = 0, "
+            f"next_retry_at = NULL, retry_until = NULL, retry_count = 0 "
+            f"WHERE id = ? AND status IN ({placeholders})",
+            (post_id, *states),
         )
     return cursor.rowcount > 0
 
@@ -541,6 +559,17 @@ async def _send_scheduled_post(post_id: int, *, pre_claimed: bool = False) -> No
         logger.warning("Scheduled post %s vanished before firing", post_id)
         return
     post = dict(rows[0])
+    if pre_claimed and post.get("status") != "sending":
+        # We hold a claim, so this row must still be 'sending'. Anything else
+        # means it moved under us between the claim and this re-read — the user
+        # skipped it, or another path took it. `pre_claimed` skips both the
+        # guard below AND the claim itself, so without this nothing re-verifies
+        # ownership and we would send a post the user had just skipped.
+        logger.error(
+            "Post %s left 'sending' while claimed (now %r); not sending.",
+            post_id, post.get("status"),
+        )
+        return
     if not pre_claimed and post.get("status") in ("posted", "sending"):
         # Already sent or another worker is sending right now — abort.
         return
@@ -698,42 +727,25 @@ async def _send_scheduled_post(post_id: int, *, pre_claimed: bool = False) -> No
         # Recoverable, matching publish_video_job: the user can reconnect the
         # account and re-send. The spent DateTrigger is cleared so a restart
         # doesn't re-register a dead job for it.
-        async with write_transaction() as db:
-            await db.execute(
-                "UPDATE social_posts SET status = 'approved', error = ?, "
-                "scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
-                (f"credential resolution failed: {exc}", post_id),
-            )
+        # Recorded as a failure, not parked in 'approved'. Writing 'approved'
+        # with the error in a column left the row invisible to every surface at
+        # once — the failed-sends banner and the retry job both select 'failed',
+        # the restore pass needs scheduled_at, and missed_items needs one of the
+        # two — so it silently never sent and nothing listed it. Under a retry
+        # claim it also released ownership into that same hole.
+        await mark_failed(post_id, error=f"credential resolution failed: {exc}")
         return
 
     if not await poster.is_configured():
-        # Also recoverable — configuring the platform is a user action away.
-        async with write_transaction() as db:
-            await db.execute(
-                "UPDATE social_posts SET status = 'approved', error = ?, "
-                "scheduled_at = NULL, scheduler_job_id = NULL WHERE id = ?",
-                (f"{post['platform']} not configured", post_id),
-            )
+        # Same reasoning: a user action away, but still a failure, and it has to
+        # be visible as one.
+        await mark_failed(post_id, error=f"{post['platform']} not configured")
         return
     try:
         from yt_scheduler.services.social import decode_media_paths
         result = await poster.post(
             post["content"],
             media_paths=decode_media_paths(post),
-        )
-        await mark_posted(post_id, post_url=result.get("url", ""))
-        await events.record_event(
-            post["video_id"],
-            "social_post_published",
-            {
-                "platform": post["platform"],
-                "social_account_id": post.get("social_account_id"),
-                "post_url": result.get("url", ""),
-                "posted_at": datetime.now(timezone.utc).isoformat(),
-                # See publish_video_job: the warning must survive somewhere
-                # durable when no page is open to show the toast.
-                "warning": result.get("warning"),
-            },
         )
     except Exception as exc:
         from yt_scheduler.services.social import CredentialAuthError
@@ -769,6 +781,53 @@ async def _send_scheduled_post(post_id: int, *, pre_claimed: bool = False) -> No
             post_id, error=str(exc),
             **await send_failures.retry_plan(post_id, exc),
         )
+        return
+
+    # Recording happens OUTSIDE the failure handler above, on purpose. By this
+    # line the post is already live on the platform, so a DB error while writing
+    # the outcome must never reach mark_failed: that would show a delivered post
+    # as failed and invite a re-send — by the user, and now by the retry job —
+    # which no duplicate guard can catch, because nothing recorded the first
+    # send. routers/social_routes.send_post has guarded this for a while; the
+    # unattended path, which is the one that runs with nobody watching, did not.
+    try:
+        await mark_posted(post_id, post_url=result.get("url", ""))
+        await events.record_event(
+            post["video_id"],
+            "social_post_published",
+            {
+                "platform": post["platform"],
+                "social_account_id": post.get("social_account_id"),
+                "post_url": result.get("url", ""),
+                "posted_at": datetime.now(timezone.utc).isoformat(),
+                # See publish_video_job: the warning must survive somewhere
+                # durable when no page is open to show the toast.
+                "warning": result.get("warning"),
+            },
+        )
+    except Exception:
+        logger.exception(
+            "Post %s WAS SENT but recording the result failed. It is live on "
+            "%s — do not re-send it.", post_id, post["platform"],
+        )
+        # Best effort to stop it looking unsent. Deliberately not mark_failed.
+        try:
+            async with write_transaction() as wdb:
+                await wdb.execute(
+                    "UPDATE social_posts SET status = 'posted', "
+                    "posted_at = datetime('now'), scheduled_at = NULL, "
+                    "scheduler_job_id = NULL, error = ? WHERE id = ?",
+                    (
+                        "Sent successfully, but recording the result failed. "
+                        "The post IS live — do not send it again.",
+                        post_id,
+                    ),
+                )
+        except Exception:
+            logger.exception(
+                "Could not even record post %s as posted; it is live and the "
+                "row still says %r.", post_id, post.get("status"),
+            )
 
 
 async def schedule_social_post(post_id: int, when: datetime) -> str:
@@ -912,19 +971,44 @@ async def restore_scheduled_posts() -> None:
     there are more than :data:`_MAX_MISSED_POST_AUTO_RECOVERY` of them, in
     which case none are sent and all are marked failed for manual triage.
     """
+    db = await get_db()
+
     # On a fresh process nothing is sending yet, so any post still marked
-    # 'sending' was stranded by a crash/kill mid-send. Reset it to 'approved'
-    # so it can be re-claimed and retried — otherwise both publish_video_job
-    # (filters status='approved') and _send_scheduled_post (early-returns on
-    # 'sending') would skip it forever and it would silently never send.
-    async with write_transaction() as db:
-        cursor = await db.execute(
-            "UPDATE social_posts SET status = 'approved' WHERE status = 'sending'"
+    # 'sending' was stranded by a crash or a quit mid-send. That state is
+    # OUTCOME-UNKNOWN, not unsent: the claim was taken, the request may have
+    # been written in full, and the platform may have accepted it — the only
+    # record that it did was the mark_posted the shutdown prevented.
+    #
+    # This used to reset them to 'approved' so they could be "re-claimed and
+    # retried". But mark_posted/mark_failed are the only writers that clear
+    # scheduled_at, so a stranded row still had one — landing it straight in the
+    # overdue-recovery pass below, which re-sent it. Quitting the menubar app
+    # during a large video upload the platform had already accepted was enough
+    # to post twice, unattended.
+    #
+    # No downstream guard can catch that: find_recent_duplicate_post looks for a
+    # 'posted'/'sending' row with the same content and excludes the row itself,
+    # and nothing else ever recorded the send. So the ambiguity has to be stated
+    # and handed to a human — the same reasoning as ThreadsPublishOutcomeUnknown,
+    # applied to the process-crash case. mark_failed clears scheduled_at (so the
+    # recovery pass cannot see it) and leaves retryable False (so the retry job
+    # cannot either), and it surfaces in the failed-sends banner.
+    stranded = await db.execute_fetchall(
+        "SELECT id FROM social_posts WHERE status = 'sending'"
+    )
+    for row in stranded:
+        await mark_failed(
+            int(row["id"]),
+            error=(
+                "The server stopped while this was being sent, so it is unknown "
+                "whether it went out. Check the platform before sending again."
+            ),
         )
-    if cursor.rowcount:
+    if stranded:
         logger.warning(
-            "Recovered %d post(s) stranded in 'sending' by a previous shutdown",
-            cursor.rowcount,
+            "%d post(s) were stranded mid-send by a previous shutdown; marked "
+            "outcome-unknown rather than re-sent.",
+            len(stranded),
         )
 
     rows = await db.execute_fetchall(

@@ -296,3 +296,58 @@ async def test_the_claim_is_atomic(app_env):
 
     assert await scheduler._claim_failed_post_for_retry(1) is True
     assert await scheduler._claim_failed_post_for_retry(1) is False
+
+
+# --- the claim gaps found by the double-send audit ---------------------------
+
+
+async def test_a_failed_post_can_be_claimed_by_a_deliberate_human_send(app_env):
+    """The banner's Retry button posts to /send, and every row it lists is
+    'failed'. A claim that only took 'approved' 409'd on every click, so Retry
+    could never work at all."""
+    scheduler, db = app_env
+    await _failed_post(db, 1)
+
+    assert await scheduler._claim_post_for_send(1, from_failed=True) is True
+
+    rows = await db.execute_fetchall(
+        "SELECT status, retryable, next_retry_at, retry_until, retry_count "
+        "FROM social_posts WHERE id = 1"
+    )
+    assert rows[0]["status"] == "sending"
+    # A deliberate manual attempt ends the current automatic run — the user has
+    # taken over, so the backoff and deadline restart from this attempt.
+    assert not rows[0]["retryable"]
+    assert rows[0]["next_retry_at"] is None
+    assert rows[0]["retry_until"] is None
+    assert rows[0]["retry_count"] == 0
+
+
+async def test_unattended_senders_still_refuse_a_failed_post(app_env):
+    """A failed row failed for a reason nobody has looked at. Only a human may
+    take it; the scheduler must not pick it up on its own."""
+    scheduler, db = app_env
+    await _failed_post(db, 1)
+
+    assert await scheduler._claim_post_for_send(1) is False
+
+
+async def test_a_claimed_row_that_moves_under_us_is_not_sent(app_env, monkeypatch):
+    """pre_claimed skips BOTH the status guard and the claim, so without an
+    ownership re-check the sender would post something the user just skipped."""
+    scheduler, db = app_env
+    await _failed_post(db, 1)
+    # Simulate: we claimed it, then Skip landed before the re-read.
+    await db.execute("UPDATE social_posts SET status = 'skipped' WHERE id = 1")
+    await db.commit()
+
+    sent: list[int] = []
+
+    async def fake_poster(*a, **k):
+        sent.append(1)
+
+    monkeypatch.setattr(scheduler, "_claim_post_for_send", fake_poster)
+
+    await scheduler._send_scheduled_post(1, pre_claimed=True)
+
+    assert sent == [], "sent a post that had left our claim"

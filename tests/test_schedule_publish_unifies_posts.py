@@ -235,11 +235,17 @@ async def test_send_scheduled_post_proceeds_when_video_public(app_db) -> None:
 
     # The video is public so the gate doesn't block; the post progresses to the
     # claim+poster path. We can't mock the network here, so it stops at "not
-    # configured" — which is a *recoverable* condition (the user can connect the
-    # account and re-send), so the post is released back to 'approved' with both
-    # schedule columns cleared, matching publish_video_job. The invariant under
-    # test is which error we stopped on, not the status: reaching "not
-    # configured" at all proves the video-not-public gate let us through.
+    # configured". The invariant under test is which error we stopped on, not
+    # the status: reaching "not configured" at all proves the video-not-public
+    # gate let us through.
+    #
+    # That condition used to leave the row 'approved'. It is recoverable in the
+    # sense that connecting the account fixes it — but both schedule columns are
+    # cleared (asserted below), so the row would never send again on its own AND
+    # appeared on no surface: the failed-sends banner and the retry job both
+    # select 'failed', the restore pass needs scheduled_at, and missed_items
+    # needs one of the two. It is now recorded as the failure it is, which is
+    # what puts it in the banner where Retry can reach it.
     await scheduler_mod._send_scheduled_post(pids[0])
 
     cursor = await db.execute(
@@ -253,8 +259,9 @@ async def test_send_scheduled_post_proceeds_when_video_public(app_db) -> None:
         f"gate must not have blocked; got error={row['error']}"
     )
     assert "not configured" in row["error"]
-    assert row["status"] == "approved", (
-        f"'not configured' is recoverable; got status={row['status']}"
+    assert row["status"] == "failed", (
+        f"a post that will never send on its own must be visible as failed; "
+        f"got status={row['status']}"
     )
     # A spent DateTrigger must not be re-registered on the next restart.
     assert row["scheduled_at"] is None

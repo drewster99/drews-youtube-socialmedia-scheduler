@@ -746,21 +746,27 @@ async def skip_failed_post(post_id: int) -> dict:
     )
     if not rows:
         raise HTTPException(404, "Post not found")
-    if rows[0]["status"] != "failed":
-        raise HTTPException(
-            409,
-            f"Post {post_id} is '{rows[0]['status']}', not 'failed' \u2014 only a "
-            f"failed send can be skipped.",
-        )
 
     async with write_transaction() as wdb:
-        await wdb.execute(
+        # The status predicate is in the UPDATE, not only in the check above.
+        # Read-then-write left a window in which the retry job could claim the
+        # row into 'sending' and start posting, after which this write turned it
+        # 'skipped' — and `pre_claimed` meant the sender never re-checked
+        # ownership, so it sent the post the user had just skipped.
+        cursor = await wdb.execute(
             "UPDATE social_posts SET status = 'skipped', "
             # Clearing the retry plan is the point: a skipped post must not be
             # picked up by the retry job a minute later.
-            "retryable = 0, next_retry_at = NULL "
-            "WHERE id = ?",
+            "retryable = 0, next_retry_at = NULL, retry_until = NULL "
+            "WHERE id = ? AND status = 'failed'",
             (post_id,),
+        )
+    if not cursor.rowcount:
+        raise HTTPException(
+            409,
+            f"Post {post_id} is '{rows[0]['status']}', not 'failed' \u2014 only a "
+            f"failed send can be skipped. It may have started sending; refresh "
+            f"to see its current state.",
         )
     return {"id": post_id, "status": "skipped"}
 
@@ -1121,7 +1127,11 @@ async def send_post(post_id: int, confirm_dup: bool = Query(default=False)):
     # posts. The claim machinery existed and was used on one side only.
     from yt_scheduler.services.scheduler import _claim_post_for_send
 
-    if not await _claim_post_for_send(post_id):
+    # from_failed: this endpoint is the user pressing Send or Retry, including
+    # from the failed-sends banner — where every row is 'failed' by definition,
+    # so a claim that only took 'approved' 409'd on every click and the banner's
+    # Retry button could never work at all.
+    if not await _claim_post_for_send(post_id, from_failed=True):
         raise HTTPException(
             409,
             "That post is already being sent, or has been. Refresh to see its "
@@ -1335,6 +1345,8 @@ async def send_all_posts(
             **fields,
         }
 
+    from yt_scheduler.services.scheduler import _claim_post_for_send
+
     for row in rows:
         post = dict(row)
         cred = await _credential_for_post(post)
@@ -1347,6 +1359,26 @@ async def send_all_posts(
         if not await poster.is_configured():
             results.append(
                 _entry(post, cred, status="skipped", reason="not configured")
+            )
+            continue
+
+        # Claim, exactly as send_post and the two scheduler paths do. This loop
+        # was the one sender of four that did not, and it is the one most likely
+        # to race: `rows` is a snapshot taken before the first send, and a batch
+        # with media on the wire can run for minutes, during which a per-post
+        # DateTrigger or publish_video_job can fire for a row still in that
+        # snapshot — sending it, while this loop then sends it again from the
+        # stale list. The duplicate pre-flight above runs once, before the
+        # batch, so it cannot catch it either.
+        #
+        # Taken AFTER the two skip branches above so a post we never attempt is
+        # left in 'approved' rather than needing a release.
+        if not await _claim_post_for_send(int(post["id"])):
+            results.append(
+                _entry(
+                    post, cred, status="skipped",
+                    reason="already being sent by another worker",
+                )
             )
             continue
 
