@@ -51,6 +51,15 @@
         return window.dysDateTime.formatWhenWithAge(post.failed_at);
     }
 
+    /* The expanded list leads with the time, so a row without one left a ragged
+     * left edge and read as though the field had failed to render. It has not:
+     * these rows failed before failed_at existed, and substituting created_at —
+     * when the post was WRITTEN, which can predate the attempt by weeks — would
+     * be inventing a time. Say which it is instead of showing a gap. */
+    function whenTextOrUnknown(post) {
+        return whenText(post) || 'Time unknown (failed before this was recorded)';
+    }
+
     // Platform and title carry the identity, the error carries the detail,
     // the time says whether this is breaking now or is a leftover —
     // distinguishing them is what makes a list of eight scannable.
@@ -62,11 +71,17 @@
          * lands in a different place on every row and cannot be scanned at all.
          * The one-line summary keeps it last, where it reads as a clause of the
          * sentence rather than a column. */
-        const stamp = when
-            ? `<span class="failed-sends-banner__when">${escapeText(when)}</span>`
+        // Leading position keeps a placeholder so the column stays scannable;
+        // trailing position omits it, where it would just be noise mid-sentence.
+        const leadText = timeFirst ? whenTextOrUnknown(post) : null;
+        const lead = leadText
+            ? `<span class="failed-sends-banner__when`
+              + `${when ? '' : ' failed-sends-banner__when-unknown'}">`
+              + `${escapeText(leadText)}</span> `
             : '';
-        const lead = (timeFirst && stamp) ? `${stamp} ` : '';
-        const trail = (!timeFirst && stamp) ? `${stamp} ` : '';
+        const trail = (!timeFirst && when)
+            ? `<span class="failed-sends-banner__when">${escapeText(when)}</span> `
+            : '';
         return lead
             + `<span class="failed-sends-banner__platform">${escapeText(post.platform)}</span>`
             + ` — ${escapeText(post.video_title)}: `

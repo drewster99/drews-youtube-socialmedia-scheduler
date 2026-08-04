@@ -347,6 +347,32 @@ def _exception_host(exc: BaseException) -> str | None:
         return None
 
 
+def is_network_failure(exc: BaseException) -> bool:
+    """Did this fail before the platform could answer, rather than being
+    rejected BY the platform?
+
+    An error message must not assert a cause it cannot know. A media upload
+    handler that catches bare ``Exception`` and then tells the user to
+    re-authenticate or check their file size is guessing — and when the real
+    problem was DNS, it sends them to re-connect an account that was never
+    broken. This is what lets those handlers give the specific advice only when
+    it can apply.
+
+    Deliberately broader than :func:`services.send_failures.is_safe_to_retry`,
+    and answering a different question. That one asks "can we re-send without
+    duplicating?" and must exclude ambiguous timeouts; this one asks "was the
+    platform even reached?", for which a timeout counts.
+    """
+    if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        return True
+    if isinstance(exc, OSError) and not isinstance(exc, httpx.HTTPError):
+        # gaierror and friends: the SDKs that do their own socket work surface
+        # these bare. `[Errno 8] nodename nor servname provided` arrives here.
+        return True
+    cause = exc.__cause__
+    return cause is not None and cause is not exc and is_network_failure(cause)
+
+
 def _exception_detail(exc: BaseException) -> str:
     """Describe ``exc`` for a user who has to decide what to do next.
 
@@ -900,11 +926,26 @@ class TwitterPoster(SocialPoster):
                 except (_TwitterBearerExpired, CredentialAuthError):
                     raise
                 except Exception as exc:
+                    # The remediation advice is only offered when it can
+                    # actually apply. This used to be appended unconditionally
+                    # from a bare `except Exception`, so a DNS failure told the
+                    # user to re-authenticate X and check their file size —
+                    # neither of which had anything to do with it, and both of
+                    # which sent them chasing a problem that did not exist.
+                    if is_network_failure(exc):
+                        advice = (
+                            "The upload never reached X. Check your network "
+                            "connection, then retry."
+                        )
+                    else:
+                        advice = (
+                            "Re-run Connect with X to refresh the media.write "
+                            "scope, or check the file size/format."
+                        )
                     raise MediaUploadError(
-                        f"Couldn't attach {p.name} to the X post: {exc}. Re-run "
-                        "Connect with X to refresh the media.write scope, or check "
-                        "the file size/format. Nothing was posted — remove the "
-                        "attachment to post text only."
+                        f"Couldn't attach {p.name} to the X post: "
+                        f"{_exception_detail(exc)} {advice} Nothing was posted "
+                        f"— remove the attachment to post text only."
                     ) from exc
             return ids or None
 

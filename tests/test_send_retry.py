@@ -351,3 +351,34 @@ async def test_a_claimed_row_that_moves_under_us_is_not_sent(app_env, monkeypatc
     await scheduler._send_scheduled_post(1, pre_claimed=True)
 
     assert sent == [], "sent a post that had left our claim"
+
+
+# --- error messages must not assert a cause they cannot know -----------------
+
+
+def test_a_network_failure_is_not_reported_as_an_auth_or_format_problem() -> None:
+    """The X media handler caught bare Exception and then told the user to
+    re-authenticate and check their file size — regardless of what failed. When
+    the real cause was DNS that sent them to re-connect an account that was
+    never broken, while the actual error sat in the same sentence."""
+    social = importlib.import_module("yt_scheduler.services.social")
+
+    assert social.is_network_failure(
+        OSError(errno.ENOENT, "nodename nor servname provided, or not known")
+    ) is True
+    assert social.is_network_failure(httpx.ConnectError("dns")) is True
+    # Broader than is_safe_to_retry on purpose — different question. That one
+    # asks "can we re-send without duplicating?", this asks "was the platform
+    # even reached?", and a read timeout answers no to the second.
+    assert social.is_network_failure(httpx.ReadTimeout("no response")) is True
+    assert send_failures.is_safe_to_retry(httpx.ReadTimeout("no response")) is False
+
+    # A real API rejection still gets the specific advice.
+    assert social.is_network_failure(ValueError("file too large")) is False
+
+
+def test_a_wrapped_transport_failure_is_still_seen_as_network() -> None:
+    social = importlib.import_module("yt_scheduler.services.social")
+    wrapped = RuntimeError("tweepy error")
+    wrapped.__cause__ = httpx.ConnectError("dns")
+    assert social.is_network_failure(wrapped) is True

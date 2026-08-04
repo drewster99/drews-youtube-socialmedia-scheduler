@@ -2174,7 +2174,14 @@ dialog.modal-xwide {
     margin-right: 0.4rem;
 }
 
-/* Per-row Retry / Dismiss. Deliberately quiet: they sit beside an error
+/* An undated row still fills the time column so the list stays scannable, but
+   dimmed — it is an absence of data, not a timestamp. */
+.failed-sends-banner__when-unknown {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+/* Per-row Retry / Skip. Deliberately quiet: they sit beside an error
    message, and the message is the thing to read first. */
 .failed-sends-banner__action {
     background: transparent;
