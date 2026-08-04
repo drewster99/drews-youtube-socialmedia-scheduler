@@ -153,3 +153,43 @@ async def test_empty_when_nothing_failed(client) -> None:
     resp = client.get("/api/social/failed-posts")
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+async def test_skipping_the_last_posting_retires_its_queue_item(client) -> None:
+    """A queue item left 'scheduled' with nothing that could ever send counts
+    toward the scheduled total forever AND permanently blocks its video from
+    being selected again — the zombie the reconcile handlers exist to prevent.
+    Before the banner had Skip there was no way to reach a queue-owned post from
+    here, so this could not arise."""
+    from yt_scheduler.database import get_db
+
+    db = await get_db()
+    await db.execute(
+        "INSERT INTO videos (id, project_id, title, status) "
+        "VALUES ('vidQ', 1, 'Queued', 'published')"
+    )
+    cursor = await db.execute(
+        "INSERT INTO templates (project_id, name, applies_to) "
+        "VALUES (1, 'skip-test-template', '[]')"
+    )
+    template_id = cursor.lastrowid
+    await db.execute(
+        "INSERT INTO smart_queues (id, project_id, name, template_id, timezone) "
+        "VALUES (1, 1, 'Q', ?, 'UTC')",
+        (template_id,),
+    )
+    await db.execute(
+        "INSERT INTO smart_queue_items (id, queue_id, video_id, position, state) "
+        "VALUES (7, 1, 'vidQ', 0, 'scheduled')"
+    )
+    await db.execute(
+        "INSERT INTO social_posts "
+        "(id, video_id, platform, content, status, error, smart_queue_item_id) "
+        "VALUES (1, 'vidQ', 'bluesky', 'x', 'failed', 'boom', 7)"
+    )
+    await db.commit()
+
+    assert client.post("/api/social/posts/1/skip").status_code == 200
+
+    cursor = await db.execute("SELECT state FROM smart_queue_items WHERE id = 7")
+    assert (await cursor.fetchone())["state"] == "removed"

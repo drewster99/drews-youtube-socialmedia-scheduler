@@ -24,7 +24,13 @@ async def mark_posted(post_id: int, *, post_url: str) -> None:
         await db.execute(
             """UPDATE social_posts
             SET status = 'posted', posted_at = datetime('now'), post_url = ?,
-                error = NULL, scheduler_job_id = NULL, scheduled_at = NULL
+                error = NULL, scheduler_job_id = NULL, scheduled_at = NULL,
+                -- The retry plan belongs to the run that just ended. Leaving it
+                -- meant a later, unrelated failure inherited an expired
+                -- retry_until and got zero automatic attempts, while mark_failed
+                -- set retryable=1 so the banner claimed it was being retried.
+                retryable = NULL, retry_count = 0,
+                next_retry_at = NULL, retry_until = NULL
             WHERE id = ?""",
             (post_url, post_id),
         )
@@ -64,11 +70,18 @@ async def mark_failed(
             SET status = 'failed', error = ?, failed_at = datetime('now'),
                 scheduler_job_id = NULL, scheduled_at = NULL,
                 retryable = ?, next_retry_at = ?,
-                -- Computed once, on the first failure of a run: recomputing it
-                -- on every attempt would walk the deadline forward forever and
-                -- the retry would never stop.
-                retry_until = COALESCE(retry_until, ?),
-                retry_count = retry_count + 1
+                -- Stamped once per RUN, not per attempt: recomputing every time
+                -- would walk the deadline forward forever and retries would
+                -- never stop. But a run has to be able to END — an expired
+                -- window left over from an earlier failure would otherwise be
+                -- inherited by a new one, which then got no retries at all
+                -- while still advertising them.
+                retry_until = CASE
+                    WHEN retry_until > datetime('now') THEN retry_until ELSE ?
+                END,
+                retry_count = CASE
+                    WHEN retry_until > datetime('now') THEN retry_count + 1 ELSE 1
+                END
             WHERE id = ?""",
             (error, 1 if retryable else 0, next_retry_at, retry_until, post_id),
         )

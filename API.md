@@ -1450,9 +1450,16 @@ The error text, `failed_at` and the content are kept — this records a decision
 it does not rewrite what happened. The retry columns are cleared so the
 automatic retry job cannot pick it up a minute later.
 
+When the post belongs to a smart-queue item and was its last live posting, the
+item is retired to `state = 'removed'`. An item left `'scheduled'` with nothing
+that could ever send counts toward the queue's scheduled total forever *and*
+permanently blocks its video from being selected again — the same zombie
+`smart_queue_reconcile_handlers._retire_emptied_items` exists to prevent.
+
 **Errors** — `404` (unknown post); `409` (the post is not in status `failed` —
 on any other status this would silently change something the user is not looking
-at).
+at; the status predicate is in the UPDATE itself, so a post that starts sending
+between the check and the write is refused rather than stomped).
 
 ### `DELETE /api/social/posts/{post_id}`
 
@@ -1488,7 +1495,7 @@ Note that `failed` is not proof nothing reached the platform — a publish whose
 
 **`post_id`** — `social_posts.id` returned by `POST /api/social/generate-posts/{video_id}` (in the array of created rows) or `GET /api/social/posts/{video_id}`.
 
-**Prerequisites** — The row must already exist; `status` is not checked, so an unedited AI-generated post can be sent directly. A prior `PUT /api/social/posts/{post_id}` is only needed if the caller wants to edit `content` or `media_path` before sending.
+**Prerequisites** — The row must already exist; a `failed` post is accepted as well as an `approved` one — this endpoint is a deliberate human send, and it is what the failed-sends banner's Retry uses. Unattended senders still take only `approved`. A manual attempt also ends the current automatic retry run, so an unedited AI-generated post can be sent directly. A prior `PUT /api/social/posts/{post_id}` is only needed if the caller wants to edit `content` or `media_path` before sending.
 
 **Request body** — None.
 

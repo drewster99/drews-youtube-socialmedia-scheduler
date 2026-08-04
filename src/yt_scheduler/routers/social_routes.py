@@ -742,7 +742,8 @@ async def skip_failed_post(post_id: int) -> dict:
     """
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT status FROM social_posts WHERE id = ?", (post_id,)
+        "SELECT status, smart_queue_item_id FROM social_posts WHERE id = ?",
+        (post_id,),
     )
     if not rows:
         raise HTTPException(404, "Post not found")
@@ -767,6 +768,24 @@ async def skip_failed_post(post_id: int) -> dict:
             f"Post {post_id} is '{rows[0]['status']}', not 'failed' \u2014 only a "
             f"failed send can be skipped. It may have started sending; refresh "
             f"to see its current state.",
+        )
+
+    # Skipping the LAST live posting of a smart-queue item leaves the item
+    # 'scheduled' with nothing that could ever send \u2014 which the queue reads as
+    # "still pending", so it counts toward the scheduled total forever AND
+    # permanently blocks that video from being selected again. That is the same
+    # zombie `smart_queue_reconcile_handlers._retire_emptied_items` exists to
+    # prevent, and `smart_queue_disposition._remove` retires the item for
+    # exactly this reason. Before the banner gained Skip there was no way to
+    # reach a queue-owned post from here, so it could not arise.
+    item_id = rows[0]["smart_queue_item_id"]
+    if item_id is not None:
+        from yt_scheduler.services.smart_queue_reconcile_handlers import (
+            _retire_emptied_items,
+        )
+
+        await _retire_emptied_items(
+            [int(item_id)], "every posting was skipped from the failed-sends banner"
         )
     return {"id": post_id, "status": "skipped"}
 
