@@ -431,6 +431,65 @@ async def test_reply_fetch_uses_the_page_cap(comments, project, monkeypatch) -> 
     assert config.COMMENT_SYNC_MAX_REPLY_PAGES > 1
 
 
+async def test_the_refresh_rotation_does_not_make_every_sweep_incomplete(
+    comments, project, monkeypatch
+) -> None:
+    """The refresh cycle puts EVERY reply-bearing thread on the due list once a
+    day, so on any channel with more threads than the per-sweep budget the list
+    is never empty. If that counted as "unfetched replies" the sweep would be
+    permanently incomplete — which permanently suspends "gone from YouTube" and
+    leaves a warning banner nagging forever. A rotation running normally is not
+    an incomplete sweep."""
+    config = importlib.import_module("yt_scheduler.config")
+    monkeypatch.setattr(config, "COMMENT_SYNC_MAX_REPLY_FETCHES", 2)
+    monkeypatch.setattr(comments, "COMMENT_SYNC_MAX_REPLY_FETCHES", 2)
+
+    # Five threads, each already holding every reply YouTube reports: nothing is
+    # missing, they are merely due for a status refresh.
+    threads = [
+        _thread(_comment(f"c{i}"), video_id=None, replies=[_comment(f"c{i}r1")],
+                total_reply_count=1)
+        for i in range(5)
+    ]
+    _install_fake_youtube(
+        monkeypatch, threads=threads,
+        replies={f"c{i}": [_comment(f"c{i}r1")] for i in range(5)},
+    )
+
+    summary = await comments.sync_project_comments(project)
+
+    assert summary["threads_with_unfetched_replies"] == 0, (
+        "a normal refresh rotation was reported as unread content"
+    )
+    assert summary["sweep_was_complete"] is True
+    assert summary["swept_at"] is not None
+
+
+async def test_a_genuinely_short_thread_still_makes_the_sweep_incomplete(
+    comments, project, monkeypatch
+) -> None:
+    """The counterpart: content we know is missing and did not get to must still
+    hold the sweep back."""
+    config = importlib.import_module("yt_scheduler.config")
+    monkeypatch.setattr(config, "COMMENT_SYNC_MAX_REPLY_FETCHES", 1)
+    monkeypatch.setattr(comments, "COMMENT_SYNC_MAX_REPLY_FETCHES", 1)
+
+    threads = [
+        _thread(_comment(f"c{i}"), video_id=None, replies=[_comment(f"c{i}r1")],
+                total_reply_count=5)
+        for i in range(3)
+    ]
+    _install_fake_youtube(
+        monkeypatch, threads=threads,
+        replies={f"c{i}": [_comment(f"c{i}r{n}") for n in range(1, 6)] for i in range(3)},
+    )
+
+    summary = await comments.sync_project_comments(project)
+
+    assert summary["threads_with_unfetched_replies"] == 2
+    assert summary["sweep_was_complete"] is False
+
+
 async def test_reply_fetch_cap_is_reported_not_swallowed(
     comments, project, monkeypatch
 ) -> None:

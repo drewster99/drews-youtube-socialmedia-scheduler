@@ -85,6 +85,36 @@ async def test_only_failed_posts_are_listed_newest_first(client) -> None:
     assert newest["page_url"].endswith("/videos/vidA")
 
 
+async def test_ordering_is_by_when_it_failed_not_by_row_id(client) -> None:
+    """`id` is creation order, so a post written weeks ago that failed minutes
+    ago sorted below one written yesterday that failed last week. That is how a
+    five-day-old failure came to head the banner over four from the same
+    afternoon — the exact confusion `failed_at` was added to end. A pre-migration
+    row (NULL) is old by definition and goes last."""
+    from yt_scheduler.database import get_db
+
+    db = await get_db()
+    await db.execute(
+        "INSERT INTO videos (id, project_id, title, status) "
+        "VALUES ('vidA', 1, 'My Video', 'uploaded')"
+    )
+    await db.execute(
+        "INSERT INTO social_posts "
+        "(id, video_id, platform, content, status, error, failed_at) VALUES "
+        # Lowest id, but it failed most recently.
+        "(1, 'vidA', 'twitter', 'x', 'failed', 'recent', '2026-08-04 13:00:00'),"
+        # Highest id, but it failed days earlier.
+        "(9, 'vidA', 'bluesky', 'x', 'failed', 'older', '2026-07-30 02:00:00'),"
+        # Highest id of all and no date at all — a pre-migration row.
+        "(12, 'vidA', 'mastodon', 'x', 'failed', 'undated', NULL)"
+    )
+    await db.commit()
+
+    posts = client.get("/api/social/failed-posts").json()
+
+    assert [p["id"] for p in posts] == [1, 9, 12]
+
+
 async def test_empty_when_nothing_failed(client) -> None:
     resp = client.get("/api/social/failed-posts")
     assert resp.status_code == 200

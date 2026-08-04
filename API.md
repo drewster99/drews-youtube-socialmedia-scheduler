@@ -672,6 +672,7 @@ own channel. `last_synced_at` is `null` when no sweep has ever stored a comment 
   "reply_refreshes": 2,
   "threads_with_unfetched_replies": 0,
   "threads_at_reply_cap": 0,
+  "refreshes_deferred": 0,
   "threads_with_replies_truncated": 0,
   "reply_fetch_errors": [],
   "suspicious_empty_sweep": false,
@@ -710,6 +711,15 @@ any other call, and the dashboard would go on showing it as an ordinary live
 comment. Incomplete threads are served before stale ones, and within each group
 the least recently refreshed first, so a limited budget rotates through the
 channel rather than starving the same threads every sweep.
+
+`threads_with_unfetched_replies` counts only threads we know are **short** and
+did not get to. A thread merely due for a staleness refresh is counted in
+`refreshes_deferred` instead and does **not** make the sweep incomplete: the
+refresh puts every reply-bearing thread on the due list once a day, so on any
+channel with more of them than the budget that list is never empty, and counting
+it as unread content would make every sweep permanently incomplete — which
+permanently suspends `is_missing_from_youtube` and leaves the warning banner
+nagging forever.
 
 `threads_at_reply_cap` counts threads already holding as many replies as we are
 willing to fetch (`COMMENT_SYNC_MAX_REPLY_PAGES` × 100). They are deliberately

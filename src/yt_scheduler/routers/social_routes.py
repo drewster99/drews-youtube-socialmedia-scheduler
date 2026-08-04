@@ -624,7 +624,14 @@ async def list_failed_posts():
            JOIN videos v ON v.id = sp.video_id
            JOIN projects p ON p.id = v.project_id
            WHERE sp.status = 'failed'
-           ORDER BY sp.id DESC""",
+           -- By when it FAILED, not by sp.id — id is creation order, so a post
+           -- written weeks ago and a post written minutes ago sort by the wrong
+           -- thing entirely. That is how a five-day-old failure came to head the
+           -- banner while four failures from the same afternoon sat below it,
+           -- which is the exact confusion migration 044 added failed_at to end.
+           -- NULL means a pre-migration row, i.e. old by definition, so it goes
+           -- last; `IS NULL` rather than NULLS LAST keeps this portable.
+           ORDER BY sp.failed_at IS NULL, sp.failed_at DESC, sp.id DESC""",
     )
     posts = []
     for row in rows:

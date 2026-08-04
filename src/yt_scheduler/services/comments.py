@@ -820,7 +820,21 @@ async def _sweep_project_comments(project: dict) -> dict:
     # sweep permanently incomplete and so permanently suspend "gone from
     # YouTube" detection for the whole project, over replies that are never
     # flagged missing anyway.
-    unfetched_replies = max(0, len(pending) - len(to_fetch))
+    # Counted over INCOMPLETE threads only — content we know is missing and did
+    # not get to. A thread that is merely due for a staleness refresh is not
+    # unread content: the refresh puts every reply-bearing thread on the due
+    # list once a day, so on any channel with more of them than the per-sweep
+    # budget that list is never empty. Counting those here would make every
+    # sweep permanently incomplete, which permanently suspends "gone from
+    # YouTube" detection and leaves the warning banner nagging forever. A
+    # rotation running normally is not a failure.
+    incomplete_pending = sum(1 for c in pending if c.is_incomplete)
+    incomplete_fetched = sum(1 for c in to_fetch if c.is_incomplete)
+    unfetched_replies = max(0, incomplete_pending - incomplete_fetched)
+    # Reported separately so the rotation is visible without being an alarm.
+    refreshes_deferred = max(
+        0, (len(pending) - incomplete_pending) - (len(to_fetch) - incomplete_fetched)
+    )
 
     # A sweep that returns nothing at all while the mirror holds comments would
     # mark EVERY one of them "gone from YouTube" in a single tick. That is a
@@ -911,6 +925,7 @@ async def _sweep_project_comments(project: dict) -> dict:
         "reply_fetch_errors": reply_fetch_errors,
         "reply_refreshes": sum(1 for c in to_fetch if not c.is_incomplete),
         "threads_at_reply_cap": threads_at_reply_cap,
+        "refreshes_deferred": refreshes_deferred,
         "threads_with_replies_truncated": replies_truncated,
         "suspicious_empty_sweep": suspicious_empty_sweep,
         "mass_disappearance": (
