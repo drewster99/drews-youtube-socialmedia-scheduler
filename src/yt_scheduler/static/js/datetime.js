@@ -58,6 +58,9 @@
      * a leftover, and an absolute date alone makes that a subtraction.
      */
     function formatAge(iso) {
+        // `new Date(null)` is the epoch, not Invalid Date, so a null timestamp
+        // would render as an absurd age ("20669 days ago") instead of blank.
+        if (iso === null || iso === undefined || iso === '') return null;
         const d = new Date(ensureUtc(iso));
         if (Number.isNaN(d.getTime())) return null;
         const elapsed = Date.now() - d.getTime();

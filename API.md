@@ -500,53 +500,157 @@ YouTube.
 
 ### `GET /api/projects/{slug}/comments`
 
-**Purpose** — Newest stored comments for the whole project, for the dashboard's Recent comments section.
+**Purpose** — Stored comment *threads* for the whole project, for the dashboard's Recent comments section.
 
-**Query params** — `limit` (int, default `10`, 1–200), `offset` (int, default `0`).
+**Query params** — `limit` (int, default `10`, 1–200), `offset` (int, default `0`). **Both count threads, not comments** — a page boundary inside a thread would split a conversation across "Load more" and sort a reply away from the comment it answers.
 
 **Response 200**:
 
 ```json
 {
-  "comments": [
+  "threads": [
     {
-      "comment_id": "Ugx...",
-      "youtube_video_id": "dQw4w9WgXcQ",
-      "parent_comment_id": null,
-      "author_display_name": "@viewer",
-      "author_channel_id": "UC...",
-      "author_profile_image_url": "https://yt3.ggpht.com/...",
-      "text_display": "great episode",
-      "like_count": 3,
+      "thread_key": "Ugx...",
+      "last_activity_at": "2026-08-03T01:24:00Z",
+      "top_level_comment": {
+        "comment_id": "Ugx...",
+        "youtube_video_id": "dQw4w9WgXcQ",
+        "parent_comment_id": null,
+        "author_display_name": "@viewer",
+        "author_channel_id": "UC...",
+        "author_profile_image_url": "https://yt3.ggpht.com/...",
+        "text_display": "great episode",
+        "like_count": 3,
+        "total_reply_count": 1,
+        "published_at": "2026-08-01T10:00:00Z",
+        "youtube_updated_at": "2026-08-01T10:00:00Z",
+        "first_seen_at": "2026-08-01 14:00:00",
+        "is_channel_owner": false,
+        "is_reply": false,
+        "moderation_status": "published",
+        "viewer_rating": "like",
+        "is_missing_from_youtube": false,
+        "moderation_action": null,
+        "moderation_matched_keyword": null,
+        "local_video_id": "dQw4w9WgXcQ",
+        "video_title": "Ep 42 — Shipping Relay",
+        "episode_number": 42
+      },
+      "parent_unavailable": false,
+      "replies": [],
+      "visible_comment_count": 1,
       "total_reply_count": 1,
-      "published_at": "2026-08-01T10:00:00Z",
-      "youtube_updated_at": "2026-08-01T10:00:00Z",
-      "first_seen_at": "2026-08-01 14:00:00",
-      "is_channel_owner": false,
-      "is_reply": false,
+      "owner_has_replied": false,
+      "awaiting_owner_reply": true,
+      "owner_liked_last_word": false,
+      "youtube_video_id": "dQw4w9WgXcQ",
       "local_video_id": "dQw4w9WgXcQ",
       "video_title": "Ep 42 — Shipping Relay",
       "episode_number": 42
     }
   ],
-  "total": 137,
+  "total_threads": 137,
   "last_synced_at": "2026-08-02 08:00:00",
-  "channel_connected": true
+  "channel_connected": true,
+  "last_sweep": {
+    "started_at": "2026-08-03 08:00:00",
+    "finished_at": "2026-08-03 08:00:12",
+    "ok": true,
+    "was_complete": false,
+    "error": null,
+    "detail": { "…": "the /sync summary, verbatim" }
+  }
 }
 ```
 
-Newest first (`published_at DESC`). Comments the blocklist already rejected on
-YouTube (a `moderation_log` row with `action = 'deleted'`) are excluded, and
-`total` counts the same filtered set — YouTube keeps returning rejected comments,
-so without this the feed would show the spam moderation removed. A **failed**
-rejection (`action = 'error'`) is *not* excluded: that comment is still live.
-`youtube_video_id` is `null` for a comment
-posted on the channel rather than on a video. `local_video_id` / `video_title` /
-`episode_number` are `null` when the comment is on a channel video this app never
-imported — the comment is still listed. `is_channel_owner` is true when the
-author is the project's own channel, which is how an already-answered thread
-reads as answered. `last_synced_at` is `null` when no sweep has ever stored a
-comment — "never synced", which is not the same as "no comments".
+`last_sweep` is the recorded outcome of the project's last sweep (`null` if none
+has run). The sweep's usual caller is a 4-hourly background job, so a failure
+happens with no page open — a toast nobody saw is not a surface. `ok` is whether
+it ran to completion; `was_complete` is the stricter "it also read the whole
+listable surface"; `finished_at` is `null` for a sweep that raised part-way.
+`detail` is the `/sync` summary verbatim, so the dashboard can itemise exactly
+what went wrong hours after the fact instead of rendering a stale mirror under a
+reassuring "Synced 4 hours ago".
+
+YouTube's comment model is exactly two levels — a reply to a reply is still
+parented to the top-level comment — so `replies` is flat and there is nothing
+deeper. Threads are ordered by `last_activity_at` (the newest *visible* comment
+in the thread) descending, so a reply on a months-old video brings its thread
+back up; comments within a thread are chronological, matching YouTube.
+
+`top_level_comment` is `null` (and `parent_unavailable` true) when the thread's
+parent is not visible — the blocklist rejected it (rejecting a comment does *not*
+reject its replies) or it was never mirrored. Those replies are real comments, so
+they are returned under a stated gap rather than dropped or promoted to
+top-level.
+
+`owner_has_replied` and `awaiting_owner_reply` are different facts and both are
+returned. The first is "the channel has spoken in this thread at all"; the second
+is "the newest visible comment is not the channel's **and** the channel has not
+thumbs-upped it" — the ball is back in your court after a viewer answers your
+answer, and that thread must not read as handled.
+
+`viewer_rating` is `comments.snippet.viewerRating`: the rating given by whoever
+authorized the request, which for every sweep is the channel owner — so `"like"`
+means *you* gave the comment a thumbs-up. A **thumbs-up counts as answering**, so
+it clears `awaiting_owner_reply` and sets the thread's `owner_liked_last_word`
+(which is why the thread stopped asking, and is surfaced rather than left as a
+silent exception). Only a positive rating can do this: YouTube deliberately
+reports a dislike as `"none"`, so the absence of a like is never evidence of
+anything. `null` is unknown, never `"none"`.
+
+The **creator heart** (the channel avatar shown on a comment in the YouTube UI)
+is a different gesture and is **not exposed by the Data API at all** — no
+property on the comments resource carries it. A hearted comment is
+indistinguishable from an untouched one here; only the thumbs-up is visible.
+
+Thread-level `total_reply_count` is YouTube's count, beside `replies.length`
+which is what we hold. They disagree only while a sweep still owes this thread a
+reply follow-up (`COMMENT_SYNC_MAX_REPLY_FETCHES`); the UI renders "showing 1 of
+4" rather than presenting a truncated thread as complete.
+
+Comments the blocklist already rejected on YouTube (a `moderation_log` row with
+`action = 'deleted'`) are excluded, and `total_threads` counts the same filtered
+set — YouTube keeps returning rejected comments, so without this the feed would
+show the spam moderation removed. A **failed** rejection (`action = 'error'`) is
+*not* excluded: that comment is still live, and it carries
+`moderation_action: "error"` plus `moderation_matched_keyword` so the UI can say
+so instead of rendering it as an ordinary comment. `moderation_action` is `null`
+for a comment the blocklist never matched, and can be `"error"` or `"pending"`
+(an in-flight claim) — never `"deleted"`, since those rows are filtered out.
+
+`moderation_status` is **YouTube's** own state, which is a different thing from
+our blocklist enforcement above: `published` (viewers can see it),
+`heldForReview`, `likelySpam`, or `rejected`. `null` means unknown — a row stored
+before the column existed, or one seen only through a bucket sweep that failed —
+and is never to be read as "published". `awaiting_owner_reply` ignores anything
+that is not visible to viewers, so a held or spam comment neither creates an
+obligation to answer nor masks the genuine question beneath it; an unknown
+(`null`) status counts as visible, because a needless badge is a smaller failure
+than a hidden real question.
+
+`is_missing_from_youtube` is true when the comment was returned by earlier
+**complete** sweeps but missed by the last **two** of them. One miss is not
+proof — the three moderation buckets are read minutes apart, so a comment moving
+into an already-read bucket is in none of them, and `order=time` pagination can
+skip a thread when the window shifts under a new arrival. Two strikes discards
+those transients for the price of reporting a genuine removal one sweep later.
+Replies are never flagged: a thread carries only a preview of its replies and a
+fully-stored thread is never re-read, so a reply's absence proves nothing. Reporting a comment in YouTube
+Studio ("permanently hidden from your channel"), or its author deleting it,
+removes it without placing it in any listable bucket — and `commentThreads.list`
+cannot filter on `rejected` at all, so there is no bucket to find it in. Since
+the mirror is upsert-only and never deletes, falling out of a complete sweep is
+the only available evidence. A *truncated* sweep never marks anything missing: a
+comment we did not read is not a comment YouTube stopped returning.
+
+`youtube_video_id` is `null` for a thread posted on the channel rather than on a
+video. `local_video_id` / `video_title` / `episode_number` are `null` when the
+thread is on a channel video this app never imported — it is still listed. Every
+comment in a thread sits on the same video by construction, so the video is named
+once on the thread. `is_channel_owner` is true when the author is the project's
+own channel. `last_synced_at` is `null` when no sweep has ever stored a comment —
+"never synced", which is not the same as "no comments".
 
 **Errors** — `400` (`limit` outside 1–200, or negative `offset` — refused, not clamped); `404` (unknown slug).
 
@@ -565,7 +669,17 @@ comment — "never synced", which is not the same as "no comments".
   "updated": 282,
   "pages_truncated": false,
   "reply_fetches": 3,
-  "threads_with_unfetched_replies": 0
+  "threads_with_unfetched_replies": 0,
+  "reply_fetch_errors": [],
+  "suspicious_empty_sweep": false,
+  "moderation_buckets": {
+    "heldForReview": {"ok": true, "threads": 2, "pages_truncated": false, "error": null},
+    "likelySpam": {"ok": true, "threads": 0, "pages_truncated": false, "error": null}
+  },
+  "sweep_was_complete": true,
+  "swept_at": "2026-08-03 12:00:00",
+  "previous_swept_at": "2026-08-03 08:00:00",
+  "mass_disappearance": null
 }
 ```
 
@@ -574,9 +688,50 @@ pages still available; `threads_with_unfetched_replies` counts threads left over
 by `COMMENT_SYNC_MAX_REPLY_FETCHES`. Both are reported so a partial sweep can't
 present itself as a complete one; the next sweep picks up the remainder.
 
-**Side effects** — `commentThreads.list(allThreadsRelatedToChannelId=…)`, 1 quota unit per page (up to 20), plus 1 unit per reply follow-up (up to 50). Upserts `youtube_comments`.
+`moderation_buckets` reports the extra sweeps for the states viewers cannot see.
+YouTube's default filter is `published`, so these are *not* a subset of the main
+sweep and must be asked for by name. Each carries `ok` separately from
+`threads: 0` — "no held comments" and "we could not ask" are different answers.
+A bucket failure is recorded and skipped rather than aborting the sweep; a
+failure of the `published` bucket is the sweep's failure and still raises (a
+degraded one would turn a revoked token into a silently empty comments box).
 
-**Errors** — `400` (project has no YouTube channel bound); `404` (unknown slug); `500` (YouTube error, with the real error text).
+`reply_fetch_errors` lists threads whose reply follow-up failed. One unreadable
+thread does not abort the sweep — the threads are already stored by that point,
+and throwing a good sweep away over one bad follow-up would cost more than it
+saves — but it does mean we did not see everything.
+
+`suspicious_empty_sweep` is true when YouTube returned no threads at all while
+the mirror holds comments. Believing that would mark every stored comment "gone
+from YouTube" in one tick, and a wiped channel is indistinguishable from a broken
+call that answers empty instead of erroring — so the inference is declined and
+the reason reported rather than guessed either way.
+
+`mass_disappearance` is non-null when the sweep failed to return a large share
+of the comments it had previously seen (both an absolute floor and a fraction
+must be exceeded). Believing that would condemn all of them at once, and a video
+flipped back to unlisted looks identical to a genuine mass removal — so the
+inference is declined and the counts reported. `suspicious_empty_sweep` is the
+same guard with its threshold at 100%.
+
+`swept_at` / `previous_swept_at` are the last two stamps written to the comment
+rows; the older is the two-strike yardstick. They are persisted because the
+comment rows cannot answer it — each sweep overwrites the stamp on everything it
+saw, so the previous sweep's value stops appearing anywhere.
+
+`sweep_was_complete` is true only when nothing was truncated, every
+supplementary bucket was read and succeeded, no reply fetch failed, and the
+sweep was neither suspiciously empty nor a mass disappearance. It is
+the precondition for `swept_at` being stamped onto the rows that were seen. That
+stamp is what makes `is_missing_from_youtube` computable; without it nothing can
+be called missing.
+
+Every sweep — including one that raises — is persisted to `comment_sweep_runs`
+and returned by `GET …/comments` as `last_sweep`.
+
+**Side effects** — `commentThreads.list(allThreadsRelatedToChannelId=…)` once per moderation bucket (3): up to `COMMENT_SYNC_MAX_PAGES` (20) pages for `published` and `COMMENT_SYNC_MAX_PAGES_PER_MODERATION_BUCKET` (5) for each of the other two, at 1 quota unit per page, plus 1 unit per reply follow-up (up to 50). Quota is per **installation**, not per channel — every project draws on the same 10,000/day pool. Upserts `youtube_comments` and `comment_sweep_runs`.
+
+**Errors** — `400` (project has no YouTube channel bound); `404` (unknown slug); `409` (a sweep is already running for this project — refused rather than queued, because two concurrent sweeps corrupt the `is_missing_from_youtube` watermark); `500` (YouTube error, with the real error text).
 
 ---
 

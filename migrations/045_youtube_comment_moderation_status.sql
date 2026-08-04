@@ -1,0 +1,35 @@
+-- YouTube's OWN moderation state for a mirrored comment, and whether the last
+-- complete sweep still found it.
+--
+-- Two different facts, both previously invisible:
+--
+-- 1. moderation_status — YouTube's `comments.snippet.moderationStatus`, which
+--    is populated only for a request authorized by the channel owner. It is
+--    NOT the same as our blocklist enforcement: moderation_log records what WE
+--    did, this records what YOUTUBE thinks. A comment YouTube is holding for
+--    review or scored as likely spam is invisible to viewers, and the dashboard
+--    previously showed it as an ordinary live comment.
+--
+--    NULL means unknown, never "published": a row written before this column
+--    existed, or one seen only by a bucket sweep that failed. Only the sweep
+--    that actually read a bucket may stamp its rows.
+--
+--    `rejected` is a legal value of the column but can never be *listed*:
+--    commentThreads.list accepts only heldForReview / likelySpam / published
+--    for its moderationStatus filter. It is here because the API documents it
+--    on the resource, not because a sweep can discover it.
+--
+-- 2. last_seen_in_sweep_at — when a complete (untruncated) sweep last returned
+--    this comment. Reporting a comment in YouTube Studio "permanently hides it
+--    from your channel"; so does the author deleting it. Neither produces a
+--    listable state — the comment simply stops coming back. Because the mirror
+--    is upsert-only and never deletes, such a comment otherwise sits on the
+--    dashboard forever looking live. Comparing this against the newest complete
+--    sweep is what makes the disappearance visible.
+--
+--    NULL means no complete sweep has ever covered this row (pre-migration, or
+--    only ever seen by a truncated one), which must read as "unknown", not as
+--    "gone" — a budget-truncated sweep does not see old threads at all.
+
+ALTER TABLE youtube_comments ADD COLUMN moderation_status TEXT;
+ALTER TABLE youtube_comments ADD COLUMN last_seen_in_sweep_at TEXT;

@@ -608,17 +608,35 @@ def list_comment_threads(
     return items[:max_results]
 
 
+#: The moderation buckets ``commentThreads.list`` will actually hand back.
+#:
+#: Deliberately NOT a superset of ``comments.snippet.moderationStatus``, which
+#: also defines ``rejected``: the list filter accepts only these three, so a
+#: rejected comment cannot be enumerated at all. Anything that removes a comment
+#: from the channel — our own blocklist rejection, the owner hitting Report in
+#: Studio, the author deleting it — makes it fall out of every bucket rather
+#: than appear in one.
+LISTABLE_MODERATION_STATUSES = ("published", "heldForReview", "likelySpam")
+
+
 def list_channel_comment_threads(
     channel_id: str,
     *,
     max_pages: int,
     per_page: int = 100,
+    moderation_status: str = "published",
 ) -> tuple[list[dict], bool]:
     """Every comment thread on a channel — its videos and the channel itself.
 
     One page is 1 quota unit and covers up to ``per_page`` threads across the
     whole channel, so this is the cheap way to answer "what's new anywhere?".
     The per-video :func:`list_comment_threads` would need one call per video.
+
+    ``moderation_status`` selects the bucket. YouTube's default is
+    ``published``, so a caller that wants the comments viewers cannot see must
+    ask for them by name — they are not a subset of the normal sweep. The value
+    is passed explicitly rather than relying on that default, so the stored
+    status always reflects a bucket we actually asked for.
 
     Ordered newest-first by the top-level comment's publish time. A *reply* to
     an old thread does NOT move its thread up that ordering, which is why the
@@ -631,6 +649,13 @@ def list_channel_comment_threads(
     """
     if max_pages < 1:
         raise ValueError(f"max_pages must be at least 1, got {max_pages}")
+    if moderation_status not in LISTABLE_MODERATION_STATUSES:
+        raise ValueError(
+            f"moderation_status must be one of "
+            f"{', '.join(LISTABLE_MODERATION_STATUSES)}, got {moderation_status!r}. "
+            f"'rejected' is a real comment state but commentThreads.list cannot "
+            f"filter on it."
+        )
 
     youtube = get_youtube_service()
 
@@ -640,6 +665,7 @@ def list_channel_comment_threads(
         maxResults=min(per_page, 100),
         order="time",
         textFormat="plainText",
+        moderationStatus=moderation_status,
     )
 
     threads: list[dict] = []

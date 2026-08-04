@@ -378,11 +378,31 @@ COMMENT_SYNC_INTERVAL_MINUTES = _parse_int_env(
     "DYS_COMMENT_SYNC_MINUTES", "YTP_COMMENT_SYNC_MINUTES", 240
 )
 
-# Ceiling on one sweep. Each page is 100 threads for 1 quota unit, so a full
-# 20-page sweep costs 20 units — six times a day is ~0.1% of the 10,000/day
-# budget. The cap exists so a channel with a huge comment history can't turn one
-# tick into hundreds of sequential round trips; when it is hit, the sweep says so.
+# Ceiling on the PRIMARY (`published`) bucket of one sweep. Each page is 100
+# threads for 1 quota unit, so a full read of this bucket costs 20 units.
+#
+# The budget arithmetic is not obvious from here: the sweep runs once per
+# COMMENT_SYNC_INTERVAL_MINUTES *per channel-bound project*, and every project
+# draws on the SAME 10,000/day pool — there is one OAuth client for the whole
+# installation, so quota is per install, never per channel.
+#
+# The cap exists so a channel with a huge comment history can't turn one tick
+# into hundreds of sequential round trips; when it is hit, the sweep says so.
 COMMENT_SYNC_MAX_PAGES = 20
+
+# Ceiling on each SUPPLEMENTARY moderation bucket (`heldForReview`,
+# `likelySpam`), which the sweep reads with a separate call apiece. Deliberately
+# lower than the primary: these are additive information, not the feed, and
+# every sweep re-reads them from page one — there is no cursor, so a large
+# permanent spam backlog would bill its full cap on every tick forever while
+# returning nothing new. 5 pages is 500 threads; a channel holding more
+# held/spam comments than that has a moderation problem the truncation notice
+# should report, not one the sweep should quietly page through.
+#
+# Do not lower this much further: ANY bucket truncation makes a sweep
+# incomplete, which suspends "gone from YouTube" detection for the whole
+# project. Routine truncation would turn that feature off permanently.
+COMMENT_SYNC_MAX_PAGES_PER_MODERATION_BUCKET = 5
 
 # Ceiling on the follow-up calls that read a thread's replies past the ~5 the
 # thread preview carries. One unit each, and only threads that actually have

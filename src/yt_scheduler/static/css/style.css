@@ -798,13 +798,66 @@ body {
     margin-top: 0.75rem;
 }
 
-.comment-row {
-    display: flex;
-    gap: 0.75rem;
+/* Persistent, not a toast: the sweep that produced these problems usually ran
+   from a background job with no page open. Warning-coloured rather than danger —
+   the comments below are still real, just possibly incomplete. */
+.comments-sweep-warning {
+    border: 1px solid var(--warning);
+    border-radius: 6px;
+    padding: 0.6rem 0.8rem;
+    margin-bottom: 0.75rem;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+}
+.comments-sweep-warning strong { color: var(--warning); }
+.comments-sweep-warning ul { margin: 0.4rem 0 0.4rem 1.1rem; }
+.comments-sweep-warning li { margin: 0.15rem 0; }
+.comments-sweep-note { color: var(--text-muted); }
+
+/* A thread is the unit the dashboard lists, so the separator belongs between
+   threads — a rule between a comment and its own reply would cut the
+   conversation the grouping exists to hold together. */
+.comment-thread {
     padding: 0.7rem 0;
     border-bottom: 1px solid var(--border);
 }
-.comment-row:last-child { border-bottom: none; }
+.comment-thread:last-child { border-bottom: none; }
+
+.comment-thread-header {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 0.2rem;
+}
+
+/* Replies sit on a rail rather than a border, so depth reads at a glance
+   without a second horizontal rule competing with the thread separator. */
+.comment-replies {
+    margin-left: 1.1rem;
+    padding-left: 0.9rem;
+    border-left: 2px solid var(--border);
+}
+
+.comment-row {
+    display: flex;
+    gap: 0.75rem;
+    padding: 0.4rem 0;
+}
+
+/* Stated gap, not a dropped row: the parent was rejected by the blocklist (its
+   replies are not rejected with it) or was never mirrored. */
+.comment-row-missing {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+.comment-reply-shortfall {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    padding: 0.3rem 0;
+}
 
 .comment-avatar {
     width: 32px;
@@ -844,10 +897,42 @@ body {
 }
 .comment-line-footer { margin-top: 0.3rem; }
 .comment-likes { font-size: 0.75rem; color: var(--text-muted); }
+/* Our own thumbs-up, distinct from the total-likes count beside it. */
+.comment-you-liked { font-size: 0.75rem; color: var(--accent); }
+.comment-thread-activity { font-size: 0.75rem; color: var(--text-muted); }
 .comment-yt-link { font-size: 0.75rem; color: var(--accent); }
 
 .badge-comment-owner { background: var(--accent); color: #000; }
-.badge-comment-reply { background: var(--bg-hover); color: var(--text-secondary); }
+/* The one thread state that is a to-do rather than a description, so it is the
+   only comment badge that carries a fill. */
+.badge-comment-needs-reply { background: var(--warning); color: #000; }
+/* Why this thread ISN'T asking for a reply — without it, a liked-but-unanswered
+   thread just looks like one the needs-reply rule missed. */
+.badge-comment-acked {
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+}
+/* A blocklist match we FAILED to remove: the comment is still live on YouTube,
+   which is the opposite of what the moderation log implies happened. */
+.badge-comment-blocked { background: var(--danger); color: #fff; }
+.badge-comment-pending { background: var(--bg-hover); color: var(--text-secondary); }
+/* YouTube's own state, distinct from our blocklist enforcement: outlined
+   rather than filled, because it describes the comment instead of asking
+   anything of the reader. */
+.badge-comment-hidden {
+    background: transparent;
+    color: var(--warning);
+    border: 1px solid var(--warning);
+}
+.badge-comment-gone {
+    background: transparent;
+    color: var(--text-muted);
+    border: 1px dashed var(--text-muted);
+}
+/* Not visible to viewers — dimmed so a thread's public shape reads at a glance.
+   Still selectable and still legible: it is hidden on YouTube, not here. */
+.comment-row-hidden { opacity: 0.55; }
 
 /* Social posts */
 .social-post-card {
