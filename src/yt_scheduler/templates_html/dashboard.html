@@ -337,12 +337,13 @@ let commentThreadsShown = 0;
    options overlap teaches people to distrust it. Filtering is server-side
    because paging and the running total are: deciding it in the browser would
    page over one population and count another. */
+/* The section exists to surface what someone else is waiting on, so it always
+   opens on that — including when the answer is "nothing", which is good news and
+   worth stating plainly. An earlier version fell back to All when the filtered
+   list was empty; that left the user on a view they had not asked for with no
+   indication why, so it read as the default having failed. A hidden rule that
+   moves you somewhere is worse than an empty list that explains itself. */
 let commentsNeedsReplyOnly = true;
-/* The section exists to surface what someone else is waiting on, so it opens on
-   that. But a filtered view that is empty looks broken, so the first load falls
-   back to All when nothing is waiting — once, and never again after the user has
-   touched the toggle, or their choice would be overridden on every poll. */
-let commentsFilterChosen = false;
 
 function renderCommentsFilter(needsReplyTotal, allTotal) {
     const el = document.getElementById('comments-filter');
@@ -362,7 +363,6 @@ function renderCommentsFilter(needsReplyTotal, allTotal) {
             const want = b.dataset.needsReply === '1';
             if (want === commentsNeedsReplyOnly) return;
             commentsNeedsReplyOnly = want;
-            commentsFilterChosen = true;
             loadComments();
         });
     });
@@ -726,16 +726,6 @@ async function loadComments(append = false) {
             ? `Synced ${fmtCommentAge(data.last_synced_at)}`
             : 'Never synced';
         renderSweepWarning(data.last_sweep);
-        // Opening on an empty Needs-reply list reads as a broken section, so
-        // fall back to All — but only before the user has expressed a
-        // preference, and only when there is something else to show.
-        if (!commentsFilterChosen && commentsNeedsReplyOnly
-            && data.needs_reply_total === 0 && data.all_threads_total > 0) {
-            commentsFilterChosen = true;
-            commentsNeedsReplyOnly = false;
-            await loadComments();
-            return;
-        }
         renderCommentsFilter(data.needs_reply_total, data.all_threads_total);
 
         if (data.total_threads === 0 && commentsNeedsReplyOnly) {

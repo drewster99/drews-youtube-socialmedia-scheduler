@@ -1633,6 +1633,30 @@ def test_dashboard_reads_the_thread_contract_not_the_old_flat_one() -> None:
         )
 
 
+def test_comments_open_on_needs_reply_with_no_fallback() -> None:
+    """The section opens on what someone is waiting for — always.
+
+    An earlier version fell back to All when the needs-reply list was empty,
+    reasoning that an empty filtered view looks broken. In practice it moved the
+    user to a view they had not asked for with nothing on screen saying why, so
+    the default read as having failed. Zero threads waiting is good news and is
+    stated plainly instead. Pinning it because the fallback was a hidden rule:
+    nothing about the rendered page revealed it existed.
+    """
+    dashboard = (
+        Path(__file__).resolve().parents[1]
+        / "src/yt_scheduler/templates_html/dashboard.html"
+    ).read_text()
+
+    assert "let commentsNeedsReplyOnly = true;" in dashboard, (
+        "the comments section must default to the needs-reply filter"
+    )
+    assert "commentsFilterChosen" not in dashboard, (
+        "the one-time fall back to All is deliberately gone — it silently "
+        "overrode the default the user asked for"
+    )
+
+
 def test_recent_comments_renders_above_smart_schedules() -> None:
     """Placement is the request, not a detail: comments are what someone else
     is waiting on, so they sit at the top of the dashboard."""
