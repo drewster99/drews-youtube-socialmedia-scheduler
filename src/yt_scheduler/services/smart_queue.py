@@ -530,7 +530,13 @@ async def list_queues(project_id: int) -> list[dict]:
             f"""
             SELECT i.queue_id AS queue_id,
                    COALESCE(NULLIF(v.item_type, ''), 'unset') AS item_type,
-                   SUM(i.state = 'queued') AS unscheduled_items,
+                   -- COUNT(DISTINCT id), not SUM(state='queued'): the LEFT
+                   -- JOIN fans an item out to one row per posting, so a SUM
+                   -- would count a single queued video once per post it
+                   -- carries. Queued items have no postings TODAY, but that is
+                   -- an invariant this query should not have to depend on.
+                   COUNT(DISTINCT CASE WHEN i.state = 'queued'
+                                       THEN i.id END) AS unscheduled_items,
                    SUM(CASE WHEN p.status NOT IN ('posted','failed','skipped')
                             THEN 1 ELSE 0 END) AS posts_scheduled,
                    SUM(p.status = 'posted') AS posts_posted,

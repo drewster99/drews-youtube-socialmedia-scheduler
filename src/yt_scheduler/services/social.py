@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import mimetypes
 import os
 import re
+import socket
 import tempfile
 import time
 from contextlib import asynccontextmanager
@@ -419,6 +421,17 @@ def _exception_host(exc: BaseException) -> str | None:
         return None
 
 
+#: errnos that mean the network, not the filesystem. ENOENT is deliberately
+#: absent — see is_network_failure.
+_NETWORK_ERRNOS = frozenset({
+    errno.ECONNREFUSED, errno.ECONNRESET, errno.ECONNABORTED,
+    errno.ENETDOWN, errno.ENETUNREACH, errno.ENETRESET,
+    errno.EHOSTDOWN, errno.EHOSTUNREACH,
+    errno.ETIMEDOUT, errno.EPIPE,
+    getattr(errno, "EAI_NONAME", 8),
+})
+
+
 def is_network_failure(exc: BaseException) -> bool:
     """Did this fail before the platform could answer, rather than being
     rejected BY the platform?
@@ -437,10 +450,17 @@ def is_network_failure(exc: BaseException) -> bool:
     """
     if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
         return True
-    if isinstance(exc, OSError) and not isinstance(exc, httpx.HTTPError):
-        # gaierror and friends: the SDKs that do their own socket work surface
-        # these bare. `[Errno 8] nodename nor servname provided` arrives here.
+    # socket.gaierror by class — the SDKs that do their own socket work surface
+    # `[Errno 8] nodename nor servname provided` bare, as one of these.
+    if isinstance(exc, socket.gaierror):
         return True
+    # Other bare OSErrors only when the errno is genuinely about the network.
+    # NOT any OSError: FileNotFoundError is one, and the send path shells out to
+    # ffprobe/ffmpeg while preparing media, so a missing binary would have been
+    # described as "the request never reached the platform, check your network".
+    # Same trap as ENOENT in services.send_failures, one module over.
+    if isinstance(exc, OSError) and not isinstance(exc, httpx.HTTPError):
+        return exc.errno in _NETWORK_ERRNOS
     cause = exc.__cause__
     return cause is not None and cause is not exc and is_network_failure(cause)
 

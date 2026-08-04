@@ -245,3 +245,36 @@ async def test_queue_list_breaks_counts_down_by_video_type(disposition_env):
         }
         # Postings, not items — the whole point of the breakdown.
         assert isinstance(entry["posts_scheduled"], int)
+
+
+async def test_the_type_grid_counts_a_video_once_however_many_posts_it_has(
+    disposition_env,
+):
+    """The LEFT JOIN to social_posts fans an item out to one row per posting, so
+    SUM(state='queued') counted a single unscheduled video once per post it
+    carried. Queued items have no postings today, but the count must not depend
+    on that holding."""
+    _disposition, queue_service, db, queue_id, *_ = disposition_env
+
+    cursor = await db.execute(
+        "INSERT INTO smart_queue_items (queue_id, video_id, position, state) "
+        "VALUES (?, 'vid00000001', 0, 'queued')",
+        (queue_id,),
+    )
+    item_id = int(cursor.lastrowid)
+    for _ in range(3):
+        await db.execute(
+            "INSERT INTO social_posts (video_id, platform, content, status, "
+            "smart_queue_item_id) VALUES ('vid00000001', 'bluesky', 'x', "
+            "'draft', ?)",
+            (item_id,),
+        )
+    await db.commit()
+
+    queues = await queue_service.list_queues(project_id=1)
+    row = next(q for q in queues if q["id"] == queue_id)
+    hooks = next(e for e in row["by_type"] if e["item_type"] == "hook")
+
+    assert hooks["unscheduled_items"] == 1, (
+        f"one unscheduled video counted as {hooks['unscheduled_items']}"
+    )

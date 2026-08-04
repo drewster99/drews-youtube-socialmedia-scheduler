@@ -364,8 +364,13 @@ def test_a_network_failure_is_not_reported_as_an_auth_or_format_problem() -> Non
     social = importlib.import_module("yt_scheduler.services.social")
 
     assert social.is_network_failure(
-        OSError(errno.ENOENT, "nodename nor servname provided, or not known")
+        socket.gaierror(8, "nodename nor servname provided, or not known")
     ) is True
+    assert social.is_network_failure(OSError(errno.ECONNREFUSED, "refused")) is True
+    # NOT any OSError. FileNotFoundError is one, and the send path shells out to
+    # ffprobe/ffmpeg — a missing binary described as "check your network" is the
+    # same wrong-cause bug one module over.
+    assert social.is_network_failure(OSError(errno.ENOENT, "ffprobe missing")) is False
     assert social.is_network_failure(httpx.ConnectError("dns")) is True
     # Broader than is_safe_to_retry on purpose — different question. That one
     # asks "can we re-send without duplicating?", this asks "was the platform
