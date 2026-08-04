@@ -199,3 +199,62 @@ transcription again before any proposal work starts.
 - Until this lands, `scripts/clip_dev.py` is the fast iteration path — it
   reads the stored SRT (cue-level, one unit per cue) and never transcribes,
   so loop mechanics can be tuned in seconds without a rebuild.
+
+## A video published on YouTube directly is never considered for a smart queue
+
+`smart_queue_live.on_video_became_live` is the single funnel from "this went
+live" to "should a queue take it", and it has three call sites: a privacy flip
+through our own UI (`routers/video_routes.py:918`, keyed on the transition
+`before != 'public' && now == 'public'`), import (`services/imports.py:262`),
+and the publish timer (`services/scheduler.py:277,337`).
+
+Publishing in YouTube Studio hits none of them. What *does* happen is the drift
+sync in `GET /api/videos/{id}` (`routers/video_routes.py:298-304`), which takes
+YouTube's value as truth for title / description / tags / **privacy_status** and
+writes it straight to the row. So the local privacy is eventually corrected —
+lazily, only when someone opens that video's detail page, since there is no
+background poll — while `auto_add_considered_at` stays NULL forever and no queue
+ever looks at the video.
+
+The shape of the bug is that the drift sync writes the very column the manual
+path watches for a transition, but writes it directly, so the event is swallowed.
+
+**Acceptance:**
+
+- A video whose `privacy_status` becomes `'public'` via the drift sync is
+  considered exactly once, the same as one flipped through our UI.
+- The transition test stays where it is — an already-public video re-synced is
+  not a fresh event, and `on_video_became_live` is idempotent on
+  `auto_add_considered_at` anyway.
+- Best-effort like the existing call site: a queue problem must not make a GET
+  fail.
+
+**Notes:**
+
+- The lazy trigger is a second, separate question: with no background poll, a
+  video published in Studio and never opened here is invisible until someone
+  visits it. Decide whether that is acceptable or whether the sweep should be a
+  job — the answer probably differs for a 4-hourly poll's quota cost versus how
+  often publishing happens out of band.
+
+## Failed YouTube publishes have no confirmed surface
+
+The app-wide failed-sends banner reads `social_posts` only
+(`routers/social_routes.py:628`), so every row in it is a social post. A failed
+*YouTube publish* — `scheduler.publish_video_job` erroring — is a different
+table and a different path, and it was not traced during the work that added
+`failed_at` and the banner ordering.
+
+**Acceptance:**
+
+- Establish where a failed publish currently surfaces, if anywhere: the video's
+  `status`, a `video_events` row, `server.log` only, or nothing.
+- If it is log-only, it falls under the same working-agreement rule the social
+  banner was built for — the publish timer fires with no page open, so a failure
+  reaches nobody. Give it a surface.
+
+**Notes:**
+
+- Worth checking at the same time whether a publish that fails leaves the video
+  in a state the scheduled-publish path will retry, or whether it is stranded
+  like a failed social send was.
