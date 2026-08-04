@@ -382,3 +382,71 @@ def test_a_wrapped_transport_failure_is_still_seen_as_network() -> None:
     wrapped = RuntimeError("tweepy error")
     wrapped.__cause__ = httpx.ConnectError("dns")
     assert social.is_network_failure(wrapped) is True
+
+
+# --- remediation advice must follow the evidence ------------------------------
+
+
+def _advice(exc):
+    social = importlib.import_module("yt_scheduler.services.social")
+    return social.remediation_for(exc, platform="X", fallback="FALLBACK")
+
+
+def test_a_billing_refusal_is_not_reported_as_a_scope_or_file_problem() -> None:
+    """The real one. An X media upload refused with 402 "credits depleted" was
+    told to re-run Connect with X and check the file size — two causes it
+    demonstrably was not, while X had said exactly what was wrong in a
+    machine-readable field."""
+    social = importlib.import_module("yt_scheduler.services.social")
+    exc = social.PlatformRefused("credits depleted", status=402)
+
+    assert "billing" in _advice(exc)
+    assert "scope" not in _advice(exc)
+    assert "file size" not in _advice(exc)
+
+
+def test_the_status_is_carried_as_a_field_not_parsed_from_the_message() -> None:
+    """Reading it back out of the text would be the stringly-typed trap: the
+    message is written for a human and gets reworded, and the advice would
+    silently change with it."""
+    social = importlib.import_module("yt_scheduler.services.social")
+    exc = social.PlatformRefused("anything at all", status=402)
+
+    assert exc.status == 402
+    # Even with a message that mentions no number whatsoever.
+    assert "402" not in str(exc)
+    assert "billing" in _advice(exc)
+
+
+def test_a_wrapped_refusal_still_finds_its_status() -> None:
+    social = importlib.import_module("yt_scheduler.services.social")
+    outer = RuntimeError("upload failed")
+    outer.__cause__ = social.PlatformRefused("nope", status=429)
+
+    assert "rate-limiting" in _advice(outer)
+
+
+@pytest.mark.parametrize("status, expected", [
+    (401, "credentials"),
+    (403, "credentials"),
+    (429, "rate-limiting"),
+    (500, "server error"),
+    (503, "server error"),
+])
+def test_each_refusal_class_gets_its_own_advice(status, expected) -> None:
+    social = importlib.import_module("yt_scheduler.services.social")
+    assert expected in _advice(social.PlatformRefused("x", status=status))
+
+
+def test_an_unreadable_refusal_falls_back_to_platform_knowledge() -> None:
+    """Unknown must not invent a cause — it defers to the caller's own
+    domain-specific advice instead."""
+    social = importlib.import_module("yt_scheduler.services.social")
+    assert _advice(social.PlatformRefused("x", status=400)) == "FALLBACK"
+    assert _advice(ValueError("who knows")) == "FALLBACK"
+
+
+def test_network_failure_wins_over_any_status() -> None:
+    """If we never reached the platform, no status it might have returned is
+    relevant."""
+    assert "never reached" in _advice(httpx.ConnectError("dns"))

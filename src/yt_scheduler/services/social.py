@@ -229,7 +229,10 @@ async def _twitter_v2_chunked_upload(
         if finalize.status_code == 401:
             raise _TwitterBearerExpired(finalize.text)
         if finalize.status_code != 200:
-            raise RuntimeError(f"v2 media FINALIZE failed ({finalize.status_code}): {finalize.text}")
+            raise PlatformRefused(
+                f"v2 media FINALIZE failed: {_http_error_detail(finalize)}",
+                status=finalize.status_code,
+            )
 
         # status — wait for async transcoding (videos only).
         processing = ((finalize.json() or {}).get("data") or {}).get("processing_info")
@@ -288,6 +291,75 @@ class CredentialAuthError(RuntimeError):
     def __init__(self, uuid: str | None, message: str) -> None:
         super().__init__(message)
         self.uuid = uuid
+
+
+class PlatformRefused(RuntimeError):
+    """The platform answered and said no.
+
+    Carries the HTTP status as a FIELD so remediation advice can be chosen from
+    it. The alternative is parsing the status back out of the message text,
+    which is the stringly-typed trap: the message is written for a human and
+    gets reworded, and the advice would silently change with it.
+
+    This exists because an X media upload refused with ``402 credits depleted``
+    was told "re-run Connect with X to refresh the media.write scope, or check
+    the file size/format" — advice for two causes it demonstrably was not, while
+    X had said exactly what was wrong in a machine-readable field.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        self.status = status
+        super().__init__(message)
+
+
+def _refusal_status(exc: BaseException) -> int | None:
+    """The HTTP status a platform refused with, if it said."""
+    if isinstance(exc, PlatformRefused):
+        return exc.status
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code
+    cause = exc.__cause__
+    if cause is not None and cause is not exc:
+        return _refusal_status(cause)
+    return None
+
+
+def remediation_for(exc: BaseException, *, platform: str, fallback: str) -> str:
+    """What the user should actually do about ``exc``.
+
+    Chosen from the failure's own evidence — did we reach the platform, and if
+    so what status did it answer with — never appended unconditionally. A
+    message that asserts a cause it cannot know sends the user to fix something
+    that was never broken; that is how a DNS outage became "re-authenticate your
+    X account" and a billing wall became "check your file size".
+
+    ``fallback`` is the platform-specific advice for a refusal we have no
+    specific reading of, so each caller keeps its own domain knowledge.
+    """
+    if is_network_failure(exc):
+        return (
+            f"The request never reached {platform}. Check your network "
+            f"connection, then retry."
+        )
+    status = _refusal_status(exc)
+    if status == 402:
+        return (
+            f"{platform} refused this for billing — the account is out of "
+            f"credits or needs a paid plan. Nothing here will change that."
+        )
+    if status in (401, 403):
+        return (
+            f"{platform} rejected the credentials. Reconnect the account from "
+            f"Settings, then retry."
+        )
+    if status == 429:
+        return f"{platform} is rate-limiting this account. Wait, then retry."
+    if status is not None and 500 <= status < 600:
+        return (
+            f"{platform} had a server error, which is usually temporary. "
+            f"Retry in a few minutes."
+        )
+    return fallback
 
 
 class MediaUploadError(RuntimeError):
@@ -926,22 +998,20 @@ class TwitterPoster(SocialPoster):
                 except (_TwitterBearerExpired, CredentialAuthError):
                     raise
                 except Exception as exc:
-                    # The remediation advice is only offered when it can
-                    # actually apply. This used to be appended unconditionally
-                    # from a bare `except Exception`, so a DNS failure told the
-                    # user to re-authenticate X and check their file size —
-                    # neither of which had anything to do with it, and both of
-                    # which sent them chasing a problem that did not exist.
-                    if is_network_failure(exc):
-                        advice = (
-                            "The upload never reached X. Check your network "
-                            "connection, then retry."
-                        )
-                    else:
-                        advice = (
+                    # Advice chosen from the failure's own evidence, never
+                    # appended unconditionally. A bare `except Exception` used
+                    # to assert scope-or-file-size for everything, so a DNS
+                    # outage sent the user to re-authenticate an account that
+                    # was fine, and a 402 "credits depleted" sent them to check
+                    # a file size that was also fine — while X had said exactly
+                    # what was wrong.
+                    advice = remediation_for(
+                        exc, platform="X",
+                        fallback=(
                             "Re-run Connect with X to refresh the media.write "
                             "scope, or check the file size/format."
-                        )
+                        ),
+                    )
                     raise MediaUploadError(
                         f"Couldn't attach {p.name} to the X post: "
                         f"{_exception_detail(exc)} {advice} Nothing was posted "
@@ -1054,7 +1124,10 @@ class TwitterPoster(SocialPoster):
         except (CredentialAuthError, MediaUploadError):
             raise
         except Exception as e:
-            raise RuntimeError(f"Twitter post failed: {_exception_detail(e)}") from e
+            raise RuntimeError(
+                f"Twitter post failed: {_exception_detail(e)} "
+                f"{remediation_for(e, platform='X', fallback='Check the post content and any attachment, then retry.')}"
+            ) from e
 
 
 # Trailing chars we always peel off the end of a URL — common sentence
@@ -1179,6 +1252,40 @@ class BlueskyPoster(SocialPoster):
     ]
 
     async def _post_prepared(
+        self,
+        text: str,
+        media_path: str | None = None,
+        *,
+        media_paths: list[str] | None = None,
+        alt_texts: list[str] | None = None,
+    ) -> dict:
+        """Wrap the send so a failure names the platform and says what to do.
+
+        Every other poster does this; Bluesky did not, so a transport error
+        propagated raw and was stored verbatim — a DNS outage recorded as the
+        bare string "[Errno 8] nodename nor servname provided, or not known",
+        with no mention of Bluesky, of whether anything was posted, or of what
+        to do next. Read from a log a week later it identifies nothing.
+        """
+        try:
+            return await self._post_prepared_inner(
+                text, media_path, media_paths=media_paths, alt_texts=alt_texts,
+            )
+        except (CredentialAuthError, MediaUploadError):
+            # Already specific, and CredentialAuthError carries the uuid the
+            # caller needs to flag the credential for re-auth.
+            raise
+        except Exception as exc:
+            advice = remediation_for(
+                exc, platform="Bluesky",
+                fallback="Check the post content and any attachment, then retry.",
+            )
+            raise RuntimeError(
+                f"Bluesky post failed: {_exception_detail(exc)} {advice}"
+            ) from exc
+
+
+    async def _post_prepared_inner(
         self,
         text: str,
         media_path: str | None = None,
@@ -1804,7 +1911,10 @@ class MastodonPoster(SocialPoster):
         except CredentialAuthError:
             raise
         except Exception as e:
-            raise RuntimeError(f"Mastodon post failed: {_exception_detail(e)}") from e
+            raise RuntimeError(
+                f"Mastodon post failed: {_exception_detail(e)} "
+                f"{remediation_for(e, platform='Mastodon', fallback='Check the post content and any attachment, then retry.')}"
+            ) from e
 
 
 class LinkedInPoster(SocialPoster):
@@ -1882,10 +1992,14 @@ class LinkedInPoster(SocialPoster):
             except CredentialAuthError:
                 raise
             except Exception as exc:
+                advice = remediation_for(
+                    exc, platform="LinkedIn",
+                    fallback="Check the file size and format.",
+                )
                 raise MediaUploadError(
-                    f"Couldn't attach media to the LinkedIn post: {exc}. Nothing "
-                    "was posted — remove the attachment to post text only, then "
-                    "retry."
+                    f"Couldn't attach media to the LinkedIn post: "
+                    f"{_exception_detail(exc)} {advice} Nothing was posted — "
+                    f"remove the attachment to post text only, then retry."
                 ) from exc
 
         headers = {
@@ -1934,7 +2048,10 @@ class LinkedInPoster(SocialPoster):
         except (CredentialAuthError, MediaUploadError):
             raise
         except Exception as e:
-            raise RuntimeError(f"LinkedIn post failed: {_exception_detail(e)}") from e
+            raise RuntimeError(
+                f"LinkedIn post failed: {_exception_detail(e)} "
+                f"{remediation_for(e, platform='LinkedIn', fallback='Check the post content and any attachment, then retry.')}"
+            ) from e
 
     @staticmethod
     async def _linkedin_upload_asset(
@@ -2220,7 +2337,10 @@ class ThreadsPoster(SocialPoster):
         except (CredentialAuthError, MediaUploadError, ThreadsPublishOutcomeUnknown):
             raise
         except Exception as e:
-            raise RuntimeError(f"Threads post failed: {_exception_detail(e)}") from e
+            raise RuntimeError(
+                f"Threads post failed: {_exception_detail(e)} "
+                f"{remediation_for(e, platform='Threads', fallback='Check the post content and any attachment, then retry.')}"
+            ) from e
 
     async def refresh_if_stale(self, *, window_secs: int = 0) -> bool:
         """Renew the long-lived token before it lapses.
