@@ -97,6 +97,20 @@ async def list_smart_queues(slug: str):
     return {"queues": await smart_queue_service.list_queues(project["id"])}
 
 
+async def _waiting_item_count(queue_id: int) -> int:
+    """Items auto-add put in the queue that have no posting time yet.
+
+    Not candidates — they are already in the queue — but Accept schedules them
+    first, so any screen with an Accept button has to be able to say they exist.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) AS n FROM smart_queue_items WHERE queue_id = ? AND state = ?",
+        (queue_id, smart_queue_service.ITEM_STATE_QUEUED),
+    )
+    return int(rows[0]["n"])
+
+
 @router.get("/{queue_id}")
 async def get_smart_queue(slug: str, queue_id: int):
     """The queue, plus whether reconciliation currently has it locked.
@@ -106,6 +120,11 @@ async def get_smart_queue(slug: str, queue_id: int):
     """
     queue = await _queue_in_project_or_404(slug, queue_id)
     queue["reconcile_locked"] = await smart_queue_reconcile.queue_is_locked(queue_id)
+    # So the edit screen can offer Accept on load. Without it, work auto-add had
+    # already queued was unreachable until the user pressed "Select videos" —
+    # a button about a DIFFERENT population, which gave no hint it was the way
+    # in. 62 videos sat waiting behind a button that looked unrelated.
+    queue["waiting"] = await _waiting_item_count(queue_id)
     return queue
 
 
@@ -243,17 +262,8 @@ async def preview_candidates(slug: str, queue_id: int, data: dict | None = None)
     for video in eligible:
         by_type[video["item_type"]] = by_type.get(video["item_type"], 0) + 1
 
-    # Items auto-add already put in the queue with no posting time. They are
-    # not candidates (they're in the queue already), but Accept schedules them
-    # first, so the screen has to be able to say they exist.
-    db = await get_db()
-    waiting_rows = await db.execute_fetchall(
-        "SELECT COUNT(*) AS n FROM smart_queue_items WHERE queue_id = ? AND state = ?",
-        (queue_id, smart_queue_service.ITEM_STATE_QUEUED),
-    )
-
     return {
-        "waiting": int(waiting_rows[0]["n"]),
+        "waiting": await _waiting_item_count(queue_id),
         "eligible": eligible,
         "excluded": result["excluded"],
         "unknown_dimensions": result["unknown_dimensions"],

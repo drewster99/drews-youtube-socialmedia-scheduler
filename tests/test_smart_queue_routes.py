@@ -313,6 +313,70 @@ async def test_candidates_reports_the_waiting_count(client):
     assert body["eligible"] == [], "a queued video is in the queue, not a candidate"
 
 
+async def test_get_queue_reports_the_waiting_count(client):
+    """The edit screen reveals Accept from the queue GET, on load.
+
+    Before this, `waiting` existed only on the candidates preview, so the only
+    way to learn that auto-add had queued 62 unscheduled videos was to press
+    "Select videos" — a control about a different population entirely. The work
+    was real, reachable, and invisible.
+    """
+    http, db, template_id = client
+    await db.execute(
+        "INSERT INTO videos (id, youtube_video_id, project_id, title, item_type, "
+        "duration_seconds, privacy_status, width, height) "
+        "VALUES ('vid00000001', 'vid00000001', 1, 'Auto-added', 'hook', 60, "
+        "'public', 1080, 1920)"
+    )
+    await db.commit()
+    created = await http.post(
+        "/api/projects/default/smart-queues", json=_payload(template_id)
+    )
+    queue_id = created.json()["id"]
+
+    fresh = (await http.get(
+        f"/api/projects/default/smart-queues/{queue_id}"
+    )).json()
+    assert fresh["waiting"] == 0, "nothing queued yet"
+
+    await db.execute(
+        "INSERT INTO smart_queue_items (queue_id, video_id, position, state) "
+        "VALUES (?, 'vid00000001', 0, 'queued')",
+        (queue_id,),
+    )
+    await db.commit()
+
+    body = (await http.get(
+        f"/api/projects/default/smart-queues/{queue_id}"
+    )).json()
+    assert body["waiting"] == 1
+
+    # Both surfaces must agree: they are the same fact, and a screen that
+    # revealed Accept for a count the preview then contradicted would be worse
+    # than the button never appearing.
+    preview = (await http.post(
+        f"/api/projects/default/smart-queues/{queue_id}/candidates", json={}
+    )).json()
+    assert preview["waiting"] == body["waiting"]
+
+
+def test_edit_screen_acts_on_the_waiting_count_at_load():
+    """Serving the count is half the fix; the load path has to consume it.
+
+    A grep, because the alternative is driving the page in a browser. It holds
+    the specific line that was missing: `loadQueue` ran on every page view and
+    never touched the Accept button, so the button's only writer was the
+    candidate-preview path.
+    """
+    page = (
+        Path("src/yt_scheduler/templates_html/smart_queue_edit.html").read_text()
+    )
+    assert "function showWaitingOnly(" in page
+    assert "showWaitingOnly(queue.waiting || 0)" in page, (
+        "loadQueue must act on the waiting count, or Accept stays hidden on load"
+    )
+
+
 async def test_counts_report_posting_from_the_posts_not_the_item_state(client):
     """The dashboard chip read `smart_queue_items.state`, but sending only ever
     updates `social_posts.status` — nothing writes 'posted' to the item. So a

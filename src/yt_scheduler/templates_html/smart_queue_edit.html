@@ -311,6 +311,7 @@ async function loadQueue() {
     renderSlots();
     document.getElementById('sq-delete-btn').style.display = '';
     syncMissedPolicyFields();
+    showWaitingOnly(queue.waiting || 0);
 }
 
 function syncMissedPolicyFields() {
@@ -319,15 +320,32 @@ function syncMissedPolicyFields() {
     document.getElementById('sq-missed-hours-label').style.display = isPostLate ? '' : 'none';
 }
 
+/* Accept on page load, when auto-add has queued items nobody has scheduled.
+   Deliberately NOT a selection: running one would hit the candidate query and
+   overwrite the filters the user has not chosen yet. This only answers "is
+   there already work here?", which is the question the screen failed to. */
+function showWaitingOnly(waiting) {
+    waitingCount = waiting;
+    if (!waiting) return;
+    document.getElementById('sq-accept-btn').style.display = '';
+    document.getElementById('sq-waiting').textContent =
+        `${waiting} video${waiting === 1 ? '' : 's'} added automatically and waiting`
+        + ` for a posting time. Accept schedules ${waiting === 1 ? 'it' : 'them'} now —`
+        + ` or use Select videos first to add more alongside ${waiting === 1 ? 'it' : 'them'}.`;
+}
+
 function renderSelection(result) {
     lastSelection = result.eligible || [];
     const byType = Object.entries(result.summary.by_type || {})
         .map(([type, count]) => `${count} ${type}${count === 1 ? '' : 's'}`)
         .join(', ');
+    const waitingNow = result.waiting || 0;
     document.getElementById('sq-summary').textContent =
         result.summary.total
             ? `${byType} = ${result.summary.total} videos`
-            : 'No videos match these filters.';
+            : waitingNow
+                ? `No new videos to add — Accept will schedule the ${waitingNow} already waiting.`
+                : 'No videos match these filters, and nothing is waiting.';
 
     const forecast = document.getElementById('sq-forecast');
     if (result.warnings && result.warnings.length) {
@@ -344,13 +362,15 @@ function renderSelection(result) {
         result.summary.total ? '' : 'none';
     // Accept also promotes items auto-add already put in the queue, so it must
     // stay available when the only thing pending is waiting items.
-    waitingCount = result.waiting || 0;
-    const waiting = waitingCount;
+    waitingCount = waitingNow;
     document.getElementById('sq-accept-btn').style.display =
-        (result.summary.total || waiting) ? '' : 'none';
-    document.getElementById('sq-waiting').textContent = waiting
-        ? `${waiting} video${waiting === 1 ? '' : 's'} added automatically and waiting for a posting time — Accept will schedule ${waiting === 1 ? 'it' : 'them'} first.`
-        : '';
+        (result.summary.total || waitingNow) ? '' : 'none';
+    // Already stated by the summary line when there is nothing new to add;
+    // repeating it there reads as two different facts about two populations.
+    document.getElementById('sq-waiting').textContent =
+        (waitingNow && result.summary.total)
+            ? `${waitingNow} video${waitingNow === 1 ? '' : 's'} added automatically and waiting for a posting time — Accept will schedule ${waitingNow === 1 ? 'it' : 'them'} first.`
+            : '';
 
     document.getElementById('sq-candidates').innerHTML = lastSelection.map((video, index) => {
         const when = result.forecast[index]

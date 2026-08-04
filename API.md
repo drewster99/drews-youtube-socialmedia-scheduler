@@ -2635,7 +2635,9 @@ Eligibility is decided by a single `smart_queue.is_eligible()` used by both the 
 
 ### `GET /api/projects/{slug}/smart-queues/{queue_id}`
 
-**Response 200** — the queue row plus `slots`. **404** when the queue doesn't exist *or* belongs to another project — reported as not-found rather than forbidden so an id in another project isn't confirmed to exist by the error.
+**Response 200** — the queue row plus `slots` and `waiting`. **404** when the queue doesn't exist *or* belongs to another project — reported as not-found rather than forbidden so an id in another project isn't confirmed to exist by the error.
+
+`waiting` counts items auto-add already put in the queue with no posting time — the same number `/candidates` reports, from the same helper. It is here so the edit screen can offer Accept on **load**: previously the button appeared only after a candidate preview, so queued-but-unscheduled work was reachable only through "Select videos", a control about a different population that gave no hint it was the way in.
 
 ### `POST /api/projects/{slug}/smart-queues`
 
