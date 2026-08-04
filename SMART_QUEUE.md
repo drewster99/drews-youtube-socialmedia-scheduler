@@ -251,6 +251,44 @@ The write sites that make a video live, which the funnel must cover:
 `if new_privacy == "public" and before_status != "published"` — so the
 manual path has precedent for a transition guard.
 
+### KNOWN ISSUE — publishing on YouTube directly is never considered
+
+The table above is the list of write sites the funnel covers, and it is
+missing one. `GET /api/videos/{id}` runs a drift sync that takes YouTube's
+value as truth for title / description / tags / **`privacy_status`** and
+writes it straight to the row (`routers/video_routes.py`, the
+`_diff_youtube_metadata` block). It does not call `on_video_became_live`.
+
+So a video published in YouTube Studio, rather than through this app:
+
+* has its local `privacy_status` corrected to `public` — but **lazily**,
+  only when someone opens that video's detail page, because the drift sync
+  is triggered by the GET and there is no background poll;
+* keeps `auto_add_considered_at` NULL forever;
+* is never offered to any auto-add queue.
+
+The shape of the bug is worth stating, because it is the kind that hides:
+the drift sync writes *the very column* the manual path watches for a
+non-public → public transition, but writes it directly, so the transition
+happens with nothing looking. Enumerating "the write sites that make a
+video live" is only safe if every writer of `privacy_status` is on the
+list — and a sync that adopts YouTube's value is a writer.
+
+Two separate fixes, and they are worth deciding separately:
+
+1. **Fire the funnel from the drift sync.** Keyed on the transition, not
+   the value, and best-effort like the existing call site — a queue
+   problem must not make a GET fail. `on_video_became_live` is already
+   idempotent on `auto_add_considered_at`, so a re-sync of an
+   already-public video is harmless.
+2. **Decide whether the trigger may stay lazy.** Even with (1), a video
+   published out of band and never opened here stays invisible. Making it
+   a background sweep costs quota on a schedule; leaving it lazy means the
+   guarantee is "considered next time you look at it". Which is right
+   depends on how often publishing actually happens outside the app.
+
+Tracked in `ROADMAP.md`.
+
 ### Firing once, not twice
 
 Public → unlisted → public must **not** re-trigger. A per-video marker
