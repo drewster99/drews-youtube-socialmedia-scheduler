@@ -28,6 +28,7 @@
     <div class="comments-header">
         <h2>Recent comments</h2>
         <div class="comments-header-actions">
+            <span id="comments-filter" class="comments-filter"></span>
             <span id="comments-synced" class="comments-synced"></span>
             <button class="btn btn-sm" id="comments-refresh-btn">Refresh</button>
         </div>
@@ -331,6 +332,34 @@ async function loadAvailableImports() {
 
 const COMMENTS_PAGE_SIZE = 10;
 let commentThreadsShown = 0;
+/* One filter, not a set of modes. "Recent" would have been the same view as
+   "All" — the list is already ordered by newest activity — and a control whose
+   options overlap teaches people to distrust it. Filtering is server-side
+   because paging and the running total are: deciding it in the browser would
+   page over one population and count another. */
+let commentsNeedsReplyOnly = false;
+
+function renderCommentsFilter(needsReplyTotal, allTotal) {
+    const el = document.getElementById('comments-filter');
+    if (!el) return;
+    const btn = (on, label, count) =>
+        `<button type="button" class="comments-filter-btn${on ? ' is-on' : ''}"`
+        + ` data-needs-reply="${on ? '1' : '0'}">${label}`
+        + (count === null ? '' : ` <span class="comments-filter-count">${count}</span>`)
+        + `</button>`;
+    el.innerHTML = btn(true, 'Needs reply', needsReplyTotal)
+                 + btn(false, 'All', allTotal);
+    el.querySelectorAll('.comments-filter-btn').forEach((b) => {
+        b.classList.toggle(
+            'is-on', (b.dataset.needsReply === '1') === commentsNeedsReplyOnly);
+        b.addEventListener('click', () => {
+            const want = b.dataset.needsReply === '1';
+            if (want === commentsNeedsReplyOnly) return;
+            commentsNeedsReplyOnly = want;
+            loadComments();
+        });
+    });
+}
 
 function fmtCommentAge(iso) {
     /* Relative age — for a comment, "3 hours ago" is the fact you act on, not
@@ -461,6 +490,14 @@ function commentThreadHtml(t) {
     const episodePrefix = (t.episode_number != null && t.episode_number !== '')
         ? `Ep ${t.episode_number} — `
         : '';
+    /* The same chip the video page uses, so a hook and a short are told apart
+       here without opening either. Only promo tiers get one — an episode is the
+       default and a chip on everything is noise. */
+    const tier = (t.item_type || '').toLowerCase();
+    const tierChip = ['hook', 'short', 'segment'].includes(tier)
+        ? `<span class="badge tier-${tier}">${escapeAttr(tier)}</span> `
+        : '';
+
     let onWhat;
     if (t.local_video_id) {
         onWhat = `<a href="/projects/${projectSlug}/videos/${encodeURIComponent(t.local_video_id)}">`
@@ -482,8 +519,16 @@ function commentThreadHtml(t) {
           + `${escapeAttr(fmtCommentAge(t.last_activity_at))}</span>`
         : '';
 
+    /* The creator heart is a real acknowledgement with NO representation in the
+       Data API, so a hearted thread is indistinguishable from an untouched one
+       and would nag forever. This is the escape hatch — and it settles only this
+       exchange, since a later reply moves the thread past the stamp. */
     const needsReply = t.awaiting_owner_reply
         ? '<span class="badge badge-comment-needs-reply">Needs reply</span>'
+          + ` <button type="button" class="comment-handled-btn"`
+          + ` data-thread-key="${escapeAttr(t.thread_key)}"`
+          + ` title="Stop this thread asking for a reply — for a heart, or an`
+          + ` answer given elsewhere. A new reply brings it back.">Mark handled</button>`
         : '';
     /* You gave the last word a thumbs-up: a real response, and the reason this
      * thread is not asking for a reply. Say so, or its absence from the
@@ -526,7 +571,7 @@ function commentThreadHtml(t) {
     return `
         <div class="comment-thread">
             <div class="comment-thread-header">
-                <span class="comment-on">${onWhat}</span>
+                ${tierChip}<span class="comment-on">${onWhat}</span>
                 ${activity}
                 ${needsReply}${acknowledged}
             </div>
@@ -615,6 +660,31 @@ function renderSweepWarning(sweep) {
     el.style.display = '';
 }
 
+async function markThreadHandled(button) {
+    const key = button.dataset.threadKey;
+    button.disabled = true;
+    button.textContent = 'Marking…';
+    try {
+        const resp = await fetch(
+            `/api/projects/${encodeURIComponent(projectSlug)}/comments/threads/`
+            + `${encodeURIComponent(key)}/handled`,
+            {method: 'POST', _silent: true},
+        );
+        if (!resp.ok) {
+            const body = await resp.json().catch(() => ({}));
+            showToast(body.detail || `HTTP ${resp.status}`, 'error');
+            return;
+        }
+        showToast('Marked handled. A new reply will bring it back.', 'success');
+    } catch (err) {
+        showToast(`Could not mark it handled: ${err.message}`, 'error');
+    } finally {
+        button.disabled = false;
+        button.textContent = 'Mark handled';
+        await loadComments();
+    }
+}
+
 async function loadComments(append = false) {
     const list = document.getElementById('comments-list');
     const moreRow = document.getElementById('comments-more-row');
@@ -627,7 +697,8 @@ async function loadComments(append = false) {
         // Paged by thread, so "Load more" can never split a conversation.
         const resp = await fetch(
             `/api/projects/${encodeURIComponent(projectSlug)}/comments`
-            + `?limit=${COMMENTS_PAGE_SIZE}&offset=${commentThreadsShown}`,
+            + `?limit=${COMMENTS_PAGE_SIZE}&offset=${commentThreadsShown}`
+            + (commentsNeedsReplyOnly ? '&needs_reply=true' : ''),
             {_silent: true},
         );
         if (!resp.ok) {
@@ -648,7 +719,17 @@ async function loadComments(append = false) {
             ? `Synced ${fmtCommentAge(data.last_synced_at)}`
             : 'Never synced';
         renderSweepWarning(data.last_sweep);
+        renderCommentsFilter(data.needs_reply_total, data.all_threads_total);
 
+        if (data.total_threads === 0 && commentsNeedsReplyOnly) {
+            // Not "no comments" — nothing is WAITING, which is a different and
+            // much better piece of news. Saying the wrong one would read as a
+            // sync failure.
+            list.innerHTML = '<p class="empty-state">Nothing is waiting on a reply. '
+                           + 'Switch to All to see the rest.</p>';
+            moreRow.style.display = 'none';
+            return;
+        }
         if (data.total_threads === 0) {
             // "No comments on this channel" is a claim about YouTube, and a
             // sync that failed gives no standing to make it — the warning above
@@ -677,6 +758,10 @@ async function loadComments(append = false) {
 
         // A page that comes back short means we have reached the end even if
         // `total_threads` disagrees — a sweep can land between two pages.
+        list.querySelectorAll('.comment-handled-btn').forEach((b) => {
+            b.addEventListener('click', () => markThreadHandled(b));
+        });
+
         const more = commentThreadsShown < data.total_threads && data.threads.length > 0;
         moreRow.style.display = more ? '' : 'none';
         document.getElementById('comments-count').textContent =

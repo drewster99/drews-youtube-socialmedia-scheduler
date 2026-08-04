@@ -502,7 +502,7 @@ YouTube.
 
 **Purpose** — Stored comment *threads* for the whole project, for the dashboard's Recent comments section.
 
-**Query params** — `limit` (int, default `10`, 1–200), `offset` (int, default `0`). **Both count threads, not comments** — a page boundary inside a thread would split a conversation across "Load more" and sort a reply away from the comment it answers.
+**Query params** — `limit` (int, default `10`, 1–200), `offset` (int, default `0`), `needs_reply` (bool, default `false` — restrict to threads still waiting on a reply). **`limit`/`offset` count threads, not comments** — a page boundary inside a thread would split a conversation across "Load more" and sort a reply away from the comment it answers.
 
 **Response 200**:
 
@@ -550,6 +550,8 @@ YouTube.
     }
   ],
   "total_threads": 137,
+  "needs_reply_total": 4,
+  "all_threads_total": 137,
   "last_synced_at": "2026-08-02 08:00:00",
   "channel_connected": true,
   "last_sweep": {
@@ -583,6 +585,17 @@ parent is not visible — the blocklist rejected it (rejecting a comment does *n
 reject its replies) or it was never mirrored. Those replies are real comments, so
 they are returned under a stated gap rather than dropped or promoted to
 top-level.
+
+`total_threads` counts the population the request actually paged over, so it
+follows `needs_reply`. `needs_reply_total` and `all_threads_total` are always
+unfiltered — they label the UI's filter, so both must be right in whichever mode
+is showing.
+
+`awaiting_owner_reply` is decided in SQL, not recomputed per thread in Python:
+the list is paged and counted in SQL, and a second opinion could only disagree
+with the population it was paged from. A thread is settled when we spoke last,
+when we thumbs-upped its newest visible comment, **or** when it was marked
+handled — see `POST …/threads/{thread_key}/handled`.
 
 `owner_has_replied` and `awaiting_owner_reply` are different facts and both are
 returned. The first is "the channel has spoken in this thread at all"; the second
@@ -653,6 +666,25 @@ own channel. `last_synced_at` is `null` when no sweep has ever stored a comment 
 "never synced", which is not the same as "no comments".
 
 **Errors** — `400` (`limit` outside 1–200, or negative `offset` — refused, not clamped); `404` (unknown slug).
+
+### `POST /api/projects/{slug}/comments/threads/{thread_key}/handled`
+
+**Purpose** — Mark one comment thread as dealt with, so it stops asking for a reply.
+
+**Response 200** — `{"thread_key": "Ugx...", "handled_at": "2026-08-04 21:00:00"}`
+
+For the resolutions YouTube cannot report. Chief among them the **creator
+heart**: a real acknowledgement in the YouTube UI with *no representation in the
+Data API at all*, so a hearted thread is indistinguishable from an untouched one
+and would nag forever.
+
+The stamp is **compared** against the thread's newest activity rather than
+cleared by it, so a later reply un-handles the thread automatically — nothing has
+to notice and reset a flag. This settles one exchange, never the conversation.
+
+`DELETE` on the same path undoes it.
+
+**Errors** — `404` (unknown slug).
 
 ### `POST /api/projects/{slug}/comments/sync`
 

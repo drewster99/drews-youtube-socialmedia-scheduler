@@ -998,6 +998,70 @@ async def _sweep_project_comments(project: dict) -> dict:
 #: this one expression, and there is no recursion to write.
 _THREAD_KEY = "COALESCE(c.parent_comment_id, c.comment_id)"
 
+#: Visible to viewers? A NULL moderation status is unknown, and counts as
+#: visible — a needless badge is a smaller failure than a hidden real question.
+_VISIBLE_TO_VIEWERS = (
+    "(c.moderation_status IS NULL OR c.moderation_status = 'published')"
+)
+
+#: Per thread: its activity times, and whether the ball is in our court.
+#:
+#: Decided in SQL because the list is PAGED and COUNTED in SQL. Working it out
+#: in Python afterwards would page over one population and describe another, so
+#: "Showing N of M" would count threads the list cannot return — the same reason
+#: _NOT_MODERATED_AWAY is a single shared constant.
+#:
+#: Three ways a thread is settled, and the third is why a local flag exists at
+#: all: we spoke last; we thumbs-upped the newest visible comment (the only
+#: acknowledgement the Data API exposes); or the user marked it handled — which
+#: is what covers the creator HEART, a real gesture with no API representation
+#: whatsoever, so a hearted thread would otherwise nag forever.
+#:
+#: handled_at is COMPARED against the thread's newest activity rather than
+#: cleared by it, so a later reply un-handles the thread automatically, with no
+#: writer to remember and no sweep to keep in step.
+#:
+#: Two parameters, both project_id.
+_THREAD_ROLLUP_SQL = f"""
+    WITH base AS (
+        SELECT {_THREAD_KEY} AS tk, c.id AS row_id, c.published_at,
+               (c.author_channel_id IS NOT NULL
+                AND c.author_channel_id = p.youtube_channel_id) AS is_owner,
+               c.viewer_rating,
+               {_VISIBLE_TO_VIEWERS} AS visible
+          FROM youtube_comments c
+          JOIN projects p ON p.id = c.project_id
+         WHERE c.project_id = ? AND {_NOT_MODERATED_AWAY}
+    ),
+    per_thread AS (
+        SELECT tk,
+               MAX(published_at) AS last_any_at,
+               MAX(CASE WHEN visible THEN published_at END) AS last_visible_at
+          FROM base GROUP BY tk
+    ),
+    newest_visible AS (
+        SELECT tk, is_owner, viewer_rating,
+               ROW_NUMBER() OVER (
+                   PARTITION BY tk ORDER BY published_at DESC, row_id DESC
+               ) AS rn
+          FROM base WHERE visible
+    )
+    SELECT t.tk AS thread_key,
+           t.last_any_at,
+           t.last_visible_at,
+           (nv.tk IS NOT NULL
+            AND NOT nv.is_owner
+            AND (nv.viewer_rating IS NULL OR nv.viewer_rating <> 'like')
+            AND NOT EXISTS (
+                SELECT 1 FROM comment_thread_state s
+                 WHERE s.project_id = ?
+                   AND s.thread_key = t.tk
+                   AND s.handled_at >= t.last_any_at
+            )) AS needs_reply
+      FROM per_thread t
+      LEFT JOIN newest_visible nv ON nv.tk = t.tk AND nv.rn = 1
+"""
+
 
 async def _resolve_local_videos(project_id: int, youtube_video_ids: set[str]) -> dict:
     """Map YouTube video id -> the local row that labels and links it.
@@ -1012,7 +1076,8 @@ async def _resolve_local_videos(project_id: int, youtube_video_ids: set[str]) ->
     db = await get_db()
     placeholders = ",".join("?" * len(youtube_video_ids))
     rows = await db.execute_fetchall(
-        f"SELECT id, youtube_video_id, title, episode_number FROM videos "
+        f"SELECT id, youtube_video_id, title, episode_number, item_type "
+        f"FROM videos "
         f"WHERE project_id = ? AND youtube_video_id IN ({placeholders}) "
         f"ORDER BY created_at",
         (project_id, *youtube_video_ids),
@@ -1027,6 +1092,9 @@ async def _resolve_local_videos(project_id: int, youtube_video_ids: set[str]) ->
                 "local_video_id": row["id"],
                 "video_title": row["title"],
                 "episode_number": row["episode_number"],
+                # Drives the tier chip, so a hook and a short are told apart in
+                # the comment list without opening either video.
+                "item_type": row["item_type"],
             },
         )
     return resolved
@@ -1250,7 +1318,8 @@ async def _comments_in_threads(
 
 
 async def list_recent_threads(
-    project_id: int, *, limit: int, offset: int = 0
+    project_id: int, *, limit: int, offset: int = 0,
+    only_needs_reply: bool = False,
 ) -> list[dict]:
     """Comment threads for a project, most recently active first.
 
@@ -1268,27 +1337,21 @@ async def list_recent_threads(
     comments, so they are shown under a stated gap rather than dropped.
     """
     db = await get_db()
+    # Ordering is by the newest VIEWER-VISIBLE comment: a held or likely-spam
+    # comment must not bump a thread to the top and date it, because the badge
+    # explaining why is on the comment, not the header — the thread would look
+    # freshly active for a reason the reader cannot find. A thread whose every
+    # comment is hidden still has to sort somewhere deterministic, hence the
+    # COALESCE onto last_any_at rather than a NULL.
+    needs_reply_only = "AND needs_reply" if only_needs_reply else ""
     key_rows = await db.execute_fetchall(
         f"""
-        SELECT {_THREAD_KEY} AS thread_key,
-               -- Ordering and the thread's stated age are about the conversation
-               -- VIEWERS can see. A held or likely-spam comment must not bump a
-               -- thread to the top and date it, because the badge explaining why
-               -- is on the comment, not the header — the thread would look
-               -- freshly active for a reason the reader cannot find.
-               MAX(CASE WHEN c.moderation_status IS NULL
-                          OR c.moderation_status = 'published'
-                        THEN c.published_at END) AS last_visible_at,
-               -- A thread whose every comment is hidden still has to sort
-               -- somewhere deterministic rather than as NULL.
-               MAX(c.published_at) AS last_any_at
-        FROM youtube_comments c
-        WHERE c.project_id = ? AND {_NOT_MODERATED_AWAY}
-        GROUP BY thread_key
+        {_THREAD_ROLLUP_SQL}
+        WHERE 1 = 1 {needs_reply_only}
         ORDER BY COALESCE(last_visible_at, last_any_at) DESC, thread_key DESC
         LIMIT ? OFFSET ?
         """,
-        (project_id, limit, offset),
+        (project_id, project_id, limit, offset),
     )
     thread_keys = [r["thread_key"] for r in key_rows]
     if not thread_keys:
@@ -1312,6 +1375,7 @@ async def list_recent_threads(
         comment["local_video_id"] = local["local_video_id"] if local else None
         comment["video_title"] = local["video_title"] if local else None
         comment["episode_number"] = local["episode_number"] if local else None
+        comment["item_type"] = local["item_type"] if local else None
         by_thread[comment.pop("thread_key")].append(comment)
 
     threads = []
@@ -1357,21 +1421,71 @@ async def list_recent_threads(
             #
             # Only a *positive* rating can do this: YouTube reports a dislike as
             # 'none', so the absence of a like is never evidence of anything.
-            "awaiting_owner_reply": (
-                bool(visible)
-                and not visible[-1]["is_channel_owner"]
-                and visible[-1]["viewer_rating"] != "like"
-            ),
+            # From SQL, not recomputed here: the list is paged and counted on
+            # that same expression, and a second opinion in Python could only
+            # ever disagree with the population it was paged from.
+            "awaiting_owner_reply": bool(row["needs_reply"]),
             "owner_liked_last_word": bool(visible) and visible[-1]["viewer_rating"] == "like",
             "youtube_video_id": video_source["youtube_video_id"] if video_source else None,
             "local_video_id": video_source["local_video_id"] if video_source else None,
             "video_title": video_source["video_title"] if video_source else None,
             "episode_number": video_source["episode_number"] if video_source else None,
+            "item_type": video_source["item_type"] if video_source else None,
         })
     return threads
 
 
-async def count_threads(project_id: int) -> int:
+async def mark_thread_handled(project_id: int, thread_key: str) -> str:
+    """Record that the user has dealt with this thread. Returns the stamp.
+
+    Exists because the two signals YouTube gives us — who spoke last, and our
+    own thumbs-up — do not cover every way a human resolves a conversation. The
+    creator HEART is the case that forced it: a real acknowledgement in the
+    YouTube UI with no representation in the Data API at all, so a hearted
+    thread is byte-identical to an untouched one from here and would nag
+    forever.
+
+    Stored as a time, not a boolean, because the read path COMPARES it against
+    the thread's newest activity. A later reply therefore un-handles the thread
+    on its own — nothing has to notice and clear a flag. You can settle this
+    exchange, never the next one.
+    """
+    stamp = _utc_now()
+    async with write_transaction() as db:
+        await db.execute(
+            "INSERT INTO comment_thread_state (project_id, thread_key, handled_at) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(project_id, thread_key) DO UPDATE SET handled_at = excluded.handled_at",
+            (project_id, thread_key, stamp),
+        )
+    return stamp
+
+
+async def unmark_thread_handled(project_id: int, thread_key: str) -> None:
+    """Undo :func:`mark_thread_handled` — the row simply goes away."""
+    async with write_transaction() as db:
+        await db.execute(
+            "DELETE FROM comment_thread_state WHERE project_id = ? AND thread_key = ?",
+            (project_id, thread_key),
+        )
+
+
+async def count_needs_reply(project_id: int) -> int:
+    """Threads whose newest visible comment is still waiting on us.
+
+    The toggle's badge, and the same expression the filtered list pages over —
+    if the two could differ, the count would promise threads the list cannot
+    return.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        f"SELECT COUNT(*) AS n FROM ({_THREAD_ROLLUP_SQL}) WHERE needs_reply",
+        (project_id, project_id),
+    )
+    return int(rows[0]["n"])
+
+
+async def count_threads(project_id: int, *, only_needs_reply: bool = False) -> int:
     """How many threads the listing can actually show — the 'load more' cut-off.
 
     Counts exactly what :func:`list_recent_threads` pages over, moderation
@@ -1379,6 +1493,8 @@ async def count_threads(project_id: int) -> int:
     never reach. A thread whose only visible comments are orphaned replies
     counts once, the same as it renders.
     """
+    if only_needs_reply:
+        return await count_needs_reply(project_id)
     db = await get_db()
     rows = await db.execute_fetchall(
         f"SELECT COUNT(DISTINCT {_THREAD_KEY}) AS n FROM youtube_comments c "

@@ -1643,3 +1643,116 @@ def test_recent_comments_renders_above_smart_schedules() -> None:
     queues_at = dashboard.index('id="smart-queue-section"')
     videos_at = dashboard.index('id="video-list"')
     assert comments_at < queues_at < videos_at
+
+
+# --- the needs-reply filter and "mark handled" -------------------------------
+
+
+async def test_needs_reply_is_decided_in_sql_so_paging_and_counts_agree(
+    comments, project, monkeypatch
+) -> None:
+    """The list is paged and counted in SQL. Deciding this in Python afterwards
+    would page over one population and describe another, so "Showing N of M"
+    would count threads the filter cannot return."""
+    _install_fake_youtube(
+        monkeypatch,
+        threads=[
+            # Viewer spoke last — waiting on us.
+            _thread(_comment("t1", published="2026-08-01T10:00:00Z"), video_id=None),
+            # We answered — settled.
+            _thread(
+                _comment("t2", published="2026-08-01T10:00:00Z"),
+                video_id=None,
+                replies=[_comment("t2r", author="Drew", author_channel=CHANNEL_ID,
+                                  published="2026-08-01T11:00:00Z")],
+            ),
+            # We thumbs-upped the last word — settled.
+            _thread(_comment("t3", published="2026-08-01T10:00:00Z",
+                             viewer_rating="like"), video_id=None),
+        ],
+    )
+    await comments.sync_project_comments(project)
+
+    assert await comments.count_needs_reply(1) == 1
+    assert await comments.count_threads(1) == 3
+    assert await comments.count_threads(1, only_needs_reply=True) == 1
+
+    filtered = await comments.list_recent_threads(1, limit=10, only_needs_reply=True)
+    assert [t["thread_key"] for t in filtered] == ["t1"]
+    # The filtered list and its count must describe the same population.
+    assert len(filtered) == await comments.count_threads(1, only_needs_reply=True)
+
+
+async def test_marking_a_thread_handled_settles_it(
+    comments, project, monkeypatch
+) -> None:
+    """The creator HEART has no representation in the Data API at all, so a
+    hearted thread is byte-identical to an untouched one and would nag forever.
+    This is the only way to say "dealt with" for it."""
+    _install_fake_youtube(
+        monkeypatch,
+        threads=[_thread(_comment("t1", published="2026-08-01T10:00:00Z"),
+                         video_id=None)],
+    )
+    await comments.sync_project_comments(project)
+    assert await comments.count_needs_reply(1) == 1
+
+    await comments.mark_thread_handled(1, "t1")
+
+    assert await comments.count_needs_reply(1) == 0
+    thread = (await comments.list_recent_threads(1, limit=10))[0]
+    assert thread["awaiting_owner_reply"] is False
+
+
+async def test_a_new_reply_un_handles_the_thread_by_itself(
+    comments, project, monkeypatch
+) -> None:
+    """handled_at is COMPARED against the thread's newest activity, not cleared
+    by it — so nothing has to notice a new reply and reset a flag. You settle
+    this exchange, never the next one."""
+    first = _thread(_comment("t1", published="2026-08-01T10:00:00Z"), video_id=None)
+    _install_fake_youtube(monkeypatch, threads=[first])
+    await comments.sync_project_comments(project)
+    await comments.mark_thread_handled(1, "t1")
+    assert await comments.count_needs_reply(1) == 0
+
+    # Someone replies after the mark.
+    grown = _thread(
+        _comment("t1", published="2026-08-01T10:00:00Z"), video_id=None,
+        replies=[_comment("t1r", published="2099-01-01T10:00:00Z")],
+    )
+    _install_fake_youtube(monkeypatch, threads=[grown])
+    await comments.sync_project_comments(project)
+
+    assert await comments.count_needs_reply(1) == 1, "a new reply must bring it back"
+
+
+async def test_unmarking_restores_the_thread(comments, project, monkeypatch) -> None:
+    _install_fake_youtube(
+        monkeypatch,
+        threads=[_thread(_comment("t1", published="2026-08-01T10:00:00Z"),
+                         video_id=None)],
+    )
+    await comments.sync_project_comments(project)
+    await comments.mark_thread_handled(1, "t1")
+    assert await comments.count_needs_reply(1) == 0
+
+    await comments.unmark_thread_handled(1, "t1")
+
+    assert await comments.count_needs_reply(1) == 1
+
+
+async def test_thread_carries_item_type_for_the_tier_chip(
+    comments, project, isolated_db, monkeypatch
+) -> None:
+    """So a hook and a short are told apart in the comment list without opening
+    either video."""
+    await isolated_db.execute(
+        "UPDATE videos SET item_type = 'short' WHERE id = 'vid00000001'"
+    )
+    await isolated_db.commit()
+    _install_fake_youtube(monkeypatch, threads=[_thread(_comment("t1"))])
+    await comments.sync_project_comments(project)
+
+    thread = (await comments.list_recent_threads(1, limit=10))[0]
+    assert thread["item_type"] == "short"

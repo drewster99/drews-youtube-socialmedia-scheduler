@@ -27,7 +27,9 @@ async def _project_or_404(slug: str) -> dict:
 
 
 @router.get("")
-async def list_comment_threads(slug: str, limit: int = 10, offset: int = 0) -> dict:
+async def list_comment_threads(
+    slug: str, limit: int = 10, offset: int = 0, needs_reply: bool = False,
+) -> dict:
     """Stored comment threads for a project, most recently active first.
 
     ``limit`` and ``offset`` count THREADS, not comments: paging by comment
@@ -51,9 +53,17 @@ async def list_comment_threads(slug: str, limit: int = 10, offset: int = 0) -> d
     project_id = int(project["id"])
     return {
         "threads": await comments_service.list_recent_threads(
-            project_id, limit=limit, offset=offset
+            project_id, limit=limit, offset=offset, only_needs_reply=needs_reply,
         ),
-        "total_threads": await comments_service.count_threads(project_id),
+        # Counts the SAME population the list pages over, so "Showing N of M"
+        # cannot promise threads the filter excludes.
+        "total_threads": await comments_service.count_threads(
+            project_id, only_needs_reply=needs_reply,
+        ),
+        # Both toggle labels, always unfiltered: they have to be right in
+        # whichever mode is currently showing, so neither can be total_threads.
+        "needs_reply_total": await comments_service.count_needs_reply(project_id),
+        "all_threads_total": await comments_service.count_threads(project_id),
         "last_synced_at": await comments_service.last_synced_at(project_id),
         # The sweep normally runs from a background job, so a failure happens
         # with nobody watching. Returning the recorded outcome is what lets the
@@ -65,6 +75,33 @@ async def list_comment_threads(slug: str, limit: int = 10, offset: int = 0) -> d
         # bound, so its JS never runs in that case.
         "channel_connected": bool(project.get("youtube_channel_id")),
     }
+
+
+@router.post("/threads/{thread_key}/handled")
+async def mark_handled(slug: str, thread_key: str) -> dict:
+    """Mark one comment thread as dealt with, so it stops asking for a reply.
+
+    For the resolutions YouTube cannot tell us about — above all the creator
+    HEART, which has no representation in the Data API, so a hearted thread
+    would otherwise nag forever.
+
+    Not permanent: the stamp is compared against the thread's newest activity,
+    so a later reply un-handles it automatically. This settles one exchange, not
+    the conversation.
+    """
+    project = await _project_or_404(slug)
+    stamp = await comments_service.mark_thread_handled(
+        int(project["id"]), thread_key
+    )
+    return {"thread_key": thread_key, "handled_at": stamp}
+
+
+@router.delete("/threads/{thread_key}/handled")
+async def unmark_handled(slug: str, thread_key: str) -> dict:
+    """Undo marking a thread handled."""
+    project = await _project_or_404(slug)
+    await comments_service.unmark_thread_handled(int(project["id"]), thread_key)
+    return {"thread_key": thread_key, "handled_at": None}
 
 
 @router.post("/sync")

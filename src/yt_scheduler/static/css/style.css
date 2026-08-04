@@ -2253,3 +2253,39 @@ dialog.modal-xwide {
     border-bottom: 1px dotted var(--warning);
 }
 .sq-needs-accept:hover { color: var(--warning); border-bottom-style: solid; }
+
+/* Recent comments filter. One filter, two states — "Recent" would have been the
+   same view as "All", since the list is already newest-first. */
+.comments-filter { display: inline-flex; gap: 0.25rem; margin-right: 0.6rem; }
+.comments-filter-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 0.75rem;
+    padding: 0.1rem 0.6rem;
+}
+.comments-filter-btn:hover { border-color: var(--accent); color: var(--accent); }
+.comments-filter-btn.is-on {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.comments-filter-count { opacity: 0.7; font-variant-numeric: tabular-nums; }
+
+/* The escape hatch for a thread YouTube cannot tell us was resolved — above all
+   a creator heart, which the Data API does not expose at all. */
+.comment-handled-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 0.7rem;
+    padding: 0.05rem 0.4rem;
+}
+.comment-handled-btn:hover:not(:disabled) {
+    border-color: var(--accent); color: var(--accent);
+}
+.comment-handled-btn:disabled { cursor: default; opacity: 0.5; }
