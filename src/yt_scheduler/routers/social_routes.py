@@ -611,9 +611,14 @@ async def list_failed_posts():
 
     Powers the app-wide failed-sends banner (``static/js/failed-sends-banner.js``,
     loaded by ``base.html`` on every page): a failed send must stay visible from
-    wherever the user is standing until it is retried successfully or deleted,
-    not flash once in a toast. The ``social_posts`` table is the single source
-    of truth — there is no separate acknowledged/dismissed state.
+    wherever the user is standing until it is retried, dismissed or deleted, not
+    flash once in a toast. The ``social_posts`` table is the single source of
+    truth.
+
+    Dismissed rows are excluded, and that is only safe because
+    :func:`models.social_post.mark_failed` clears ``dismissed_at``: a dismissal
+    hides the attempt the user read, never the problem. A retry that fails again
+    puts the row straight back.
     """
     db = await get_db()
     rows = await db.execute_fetchall(
@@ -623,7 +628,7 @@ async def list_failed_posts():
            FROM social_posts sp
            JOIN videos v ON v.id = sp.video_id
            JOIN projects p ON p.id = v.project_id
-           WHERE sp.status = 'failed'
+           WHERE sp.status = 'failed' AND sp.dismissed_at IS NULL
            -- By when it FAILED, not by sp.id — id is creation order, so a post
            -- written weeks ago and a post written minutes ago sort by the wrong
            -- thing entirely. That is how a five-day-old failure came to head the
@@ -715,6 +720,40 @@ async def update_post(post_id: int, data: dict):
             )
 
     return {"status": "ok"}
+
+
+@router.post("/posts/{post_id}/dismiss")
+async def dismiss_failed_post(post_id: int) -> dict:
+    """Hide one failed send from the app-wide banner.
+
+    Only a failed post can be dismissed: on any other status the field would be
+    dead weight, and a request to dismiss something that is not failing is a
+    misunderstanding worth reporting rather than absorbing.
+
+    The row is untouched otherwise — ``status`` stays ``'failed'`` and the error
+    text is kept, so nothing about the history is rewritten. And because
+    ``mark_failed`` clears ``dismissed_at``, a later retry that fails again
+    brings it back: this hides an attempt, never a problem.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT status FROM social_posts WHERE id = ?", (post_id,)
+    )
+    if not rows:
+        raise HTTPException(404, "Post not found")
+    if rows[0]["status"] != "failed":
+        raise HTTPException(
+            409,
+            f"Post {post_id} is '{rows[0]['status']}', not 'failed' — only a "
+            f"failed send can be dismissed.",
+        )
+
+    async with write_transaction() as wdb:
+        await wdb.execute(
+            "UPDATE social_posts SET dismissed_at = datetime('now') WHERE id = ?",
+            (post_id,),
+        )
+    return {"id": post_id, "dismissed": True}
 
 
 @router.delete("/posts/{post_id}")

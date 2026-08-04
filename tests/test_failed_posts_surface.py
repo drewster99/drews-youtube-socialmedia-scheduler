@@ -115,6 +115,44 @@ async def test_ordering_is_by_when_it_failed_not_by_row_id(client) -> None:
     assert [p["id"] for p in posts] == [1, 9, 12]
 
 
+async def test_dismissing_hides_a_failure_from_the_banner(client) -> None:
+    await _seed_posts()
+
+    assert [p["id"] for p in client.get("/api/social/failed-posts").json()] == [4, 1]
+
+    assert client.post("/api/social/posts/4/dismiss").status_code == 200
+
+    assert [p["id"] for p in client.get("/api/social/failed-posts").json()] == [1]
+
+
+async def test_a_dismissed_post_that_fails_again_comes_back(client) -> None:
+    """The rule that makes dismissing safe. A dismissal hides the attempt the
+    user read, never the problem — so a retry that fails again must un-dismiss
+    the row. Without this, one click could permanently silence a recurring
+    failure, which is precisely what the no-dismissed-state design forbade."""
+    from yt_scheduler.models import social_post
+
+    await _seed_posts()
+    client.post("/api/social/posts/4/dismiss")
+    assert [p["id"] for p in client.get("/api/social/failed-posts").json()] == [1]
+
+    await social_post.mark_failed(4, error="failed again")
+
+    posts = client.get("/api/social/failed-posts").json()
+    assert [p["id"] for p in posts] == [4, 1]
+    assert posts[0]["error"] == "failed again"
+
+
+async def test_only_a_failed_post_can_be_dismissed(client) -> None:
+    """On any other status the field is dead weight, and the request is a
+    misunderstanding worth reporting rather than absorbing."""
+    await _seed_posts()
+
+    # id 2 is 'posted', id 3 is 'draft'.
+    assert client.post("/api/social/posts/2/dismiss").status_code == 409
+    assert client.post("/api/social/posts/9999/dismiss").status_code == 404
+
+
 async def test_empty_when_nothing_failed(client) -> None:
     resp = client.get("/api/social/failed-posts")
     assert resp.status_code == 200

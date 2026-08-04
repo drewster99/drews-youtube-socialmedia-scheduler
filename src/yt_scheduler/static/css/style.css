@@ -2167,6 +2167,34 @@ dialog.modal-xwide {
     white-space: nowrap;
 }
 
+/* Leading the row in the expanded list, so eight failures can be scanned by
+   date down a common left edge instead of hunting for a stamp that lands
+   wherever each error string happens to end. */
+.failed-sends-banner__list .failed-sends-banner__when {
+    margin-right: 0.4rem;
+}
+
+/* Per-row Retry / Dismiss. Deliberately quiet: they sit beside an error
+   message, and the message is the thing to read first. */
+.failed-sends-banner__action {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 0.75rem;
+    padding: 0.1rem 0.45rem;
+    white-space: nowrap;
+}
+.failed-sends-banner__action:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+.failed-sends-banner__action:disabled {
+    cursor: default;
+    opacity: 0.5;
+}
+
 .slot-hosting-warn { color: var(--danger); margin-top: 0.35rem; }
 
 

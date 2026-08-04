@@ -1433,6 +1433,24 @@ Source: `src/yt_scheduler/routers/social_routes.py`
 
 **Errors** — `400` (a `media_path`/`media_paths` entry is outside `UPLOAD_DIR`, or an invalid `status`).
 
+### `POST /api/social/posts/{post_id}/dismiss`
+
+**Purpose** — Hide one failed send from the app-wide failed-sends banner.
+
+**Response 200** — `{"id": 42, "dismissed": true}`
+
+Sets `social_posts.dismissed_at`; `status` stays `'failed'` and the error text is
+kept, so nothing about the history is rewritten. `GET /api/social/failed-posts`
+excludes dismissed rows.
+
+This hides an **attempt**, not a problem: `models.social_post.mark_failed`
+clears `dismissed_at`, so a retry that fails again puts the row straight back in
+the banner with the new error. A recurring failure cannot be permanently
+silenced.
+
+**Errors** — `404` (unknown post); `409` (the post is not in status `failed` — on
+any other status the field is dead weight and the request is a misunderstanding).
+
 ### `DELETE /api/social/posts/{post_id}`
 
 **Purpose** — Remove a draft or failed social post. Backs the **Remove** button on the video-detail page (behind a confirm).

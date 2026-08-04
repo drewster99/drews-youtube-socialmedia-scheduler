@@ -44,12 +44,18 @@ async def mark_failed(post_id: int, *, error: str) -> None:
     on success, plus one specific to failure: a row left holding its scheduling
     columns is resurrected and re-sent by the restore pass on the next restart,
     which is exactly what a terminal failure must not do.
+
+    ``dismissed_at`` clears too, and that is what makes dismissing a failure
+    safe: a dismissal hides the attempt the user actually read, never the
+    problem. A retry that fails again un-dismisses the row and it returns to the
+    banner, so a recurring failure cannot be permanently silenced.
     """
     async with write_transaction() as db:
         await db.execute(
             """UPDATE social_posts
             SET status = 'failed', error = ?, failed_at = datetime('now'),
-                scheduler_job_id = NULL, scheduled_at = NULL
+                scheduler_job_id = NULL, scheduled_at = NULL,
+                dismissed_at = NULL
             WHERE id = ?""",
             (error, post_id),
         )

@@ -1,0 +1,22 @@
+-- When the user dismissed a failed send from the app-wide banner.
+--
+-- This deliberately reverses an earlier decision ("no separate dismissed
+-- state"), which existed to stop a real failure being silenced and forgotten.
+-- That risk is answered by the write rule rather than by refusing the feature:
+--
+--   models.social_post.mark_failed CLEARS dismissed_at.
+--
+-- So a dismissal only ever silences the attempt the user actually looked at. If
+-- the post is retried and fails again, the new failure un-dismisses the row and
+-- it returns to the banner. A recurring problem therefore cannot be permanently
+-- hidden, which was the whole point of the original rule.
+--
+-- The alternative — delete the row — was already possible and is worse: it
+-- destroys the record of what went wrong, and for a scheduled post it destroys
+-- the post itself. Dismissing keeps both, and `status` stays 'failed', so
+-- nothing about the history is rewritten.
+--
+-- NULL means "not dismissed", which is every pre-existing row: a failure the
+-- user has never chosen to hide must stay visible.
+
+ALTER TABLE social_posts ADD COLUMN dismissed_at TEXT;

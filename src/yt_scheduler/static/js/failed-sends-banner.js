@@ -47,13 +47,36 @@
     // Platform and title carry the identity, the error carries the detail,
     // the time says whether this is breaking now or is a leftover —
     // distinguishing them is what makes a list of eight scannable.
-    function describe(post, errorText) {
+    function describe(post, errorText, { timeFirst = false } = {}) {
         const when = whenText(post);
-        return `<span class="failed-sends-banner__platform">${escapeText(post.platform)}</span>`
+        /* In the expanded list the time leads. Scanning eight failures, the
+         * first question is "is any of this from today?" — and an error string
+         * can run to a couple of hundred characters, so a trailing timestamp
+         * lands in a different place on every row and cannot be scanned at all.
+         * The one-line summary keeps it last, where it reads as a clause of the
+         * sentence rather than a column. */
+        const stamp = when
+            ? `<span class="failed-sends-banner__when">${escapeText(when)}</span>`
+            : '';
+        const lead = (timeFirst && stamp) ? `${stamp} ` : '';
+        const trail = (!timeFirst && stamp) ? `${stamp} ` : '';
+        return lead
+            + `<span class="failed-sends-banner__platform">${escapeText(post.platform)}</span>`
             + ` — ${escapeText(post.video_title)}: `
             + `<span class="failed-sends-banner__error">${escapeText(errorText)}</span> `
-            + (when ? `<span class="failed-sends-banner__when">${escapeText(when)}</span> ` : '')
+            + trail
             + `<a href="${escapeAttribute(post.page_url)}">View →</a>`;
+    }
+
+    /* Retry re-runs the ordinary send endpoint — the post row already carries
+     * everything a send needs, and an absent social_account_id resolves by the
+     * same precedence a first send uses. Dismiss hides this attempt only: if the
+     * retry fails, mark_failed clears dismissed_at and the row comes back. */
+    function actions(post) {
+        return ` <button type="button" class="failed-sends-banner__action"`
+            + ` data-action="retry" data-post-id="${escapeAttribute(String(post.id))}">Retry</button>`
+            + ` <button type="button" class="failed-sends-banner__action"`
+            + ` data-action="dismiss" data-post-id="${escapeAttribute(String(post.id))}">Dismiss</button>`;
     }
 
     /** Identifies what the banner is currently showing, so an unchanged poll is a no-op.
@@ -128,7 +151,8 @@
         const list = showList
             ? `<ul id="failed-sends-banner-list" class="failed-sends-banner__list">`
                 + posts.map((post) =>
-                    `<li>${describe(post, post.error || 'send failed')}</li>`).join('')
+                    `<li>${describe(post, post.error || 'send failed', {timeFirst: true})}`
+                    + `${actions(post)}</li>`).join('')
                 + `</ul>`
             : '';
 
@@ -143,6 +167,57 @@
                 const refocused = banner.querySelector('.failed-sends-banner__toggle');
                 if (refocused) refocused.focus();
             });
+        }
+
+        banner.querySelectorAll('.failed-sends-banner__action').forEach((button) => {
+            button.addEventListener('click', () => runAction(button));
+        });
+    }
+
+    /** Run Retry or Dismiss for one post, then re-read the list.
+     *
+     * Both outcomes are reported. A retry that fails again must not look like
+     * one that worked: the row returns to the banner with the new error, which
+     * only happens because mark_failed clears dismissed_at.
+     */
+    async function runAction(button) {
+        const postId = button.dataset.postId;
+        const action = button.dataset.action;
+        const url = action === 'retry'
+            ? `/api/social/posts/${encodeURIComponent(postId)}/send`
+            : `/api/social/posts/${encodeURIComponent(postId)}/dismiss`;
+
+        // Disable both buttons on the row: a second click while the first is in
+        // flight sends the post twice.
+        const row = button.closest('li') || button.parentElement;
+        const buttons = row ? row.querySelectorAll('.failed-sends-banner__action') : [button];
+        buttons.forEach((b) => { b.disabled = true; });
+        button.textContent = action === 'retry' ? 'Sending…' : 'Dismissing…';
+
+        try {
+            const resp = await fetch(url, {method: 'POST'});
+            if (resp.ok) {
+                if (typeof showToast === 'function') {
+                    showToast(action === 'retry' ? 'Sent.' : 'Dismissed.', 'success');
+                }
+            } else {
+                const body = await resp.json().catch(() => ({}));
+                // 409 on retry is the duplicate guard, whose detail is a payload
+                // rather than a string; say so instead of rendering [object].
+                const detail = typeof body.detail === 'string'
+                    ? body.detail
+                    : `HTTP ${resp.status}`;
+                if (typeof showToast === 'function') showToast(detail, 'error');
+            }
+        } catch (err) {
+            if (typeof showToast === 'function') {
+                showToast(`Could not ${action} the post: ${err.message}`, 'error');
+            }
+        } finally {
+            // Re-read either way: on success the row is gone, and on failure the
+            // error text has changed.
+            lastRenderedKey = null;
+            await check();
         }
     }
 
