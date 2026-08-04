@@ -91,6 +91,30 @@ async def test_past_due_post_is_missed(disposition_env):
     assert "time passed" in missed[0]["missed_reason"]
 
 
+async def test_missed_row_reports_whether_auto_add_has_considered_the_video(
+    disposition_env,
+):
+    """Remove is the one disposition with a consequence past this posting, and
+    which consequence depends on this fact: a video auto-add has already
+    considered is never picked up again on its own, while one it has not could
+    still be added by a later publish. The confirmation must state the row's
+    actual case rather than guess, so the row has to carry it."""
+    disposition, _qs, db, queue_id, *rest = disposition_env
+    await _make_missed(db, queue_id)
+
+    missed = await disposition.missed_items(queue_id)
+    assert "auto_add_considered_at" in missed[0]
+    assert missed[0]["auto_add_considered_at"] is None
+
+    await db.execute(
+        "UPDATE videos SET auto_add_considered_at = '2026-07-27 22:15:21'"
+    )
+    await db.commit()
+
+    missed = await disposition.missed_items(queue_id)
+    assert missed[0]["auto_add_considered_at"] == "2026-07-27 22:15:21"
+
+
 async def test_future_post_is_not_missed(disposition_env):
     disposition, _qs, db, queue_id, *_ = disposition_env
     await _make_missed(db, queue_id, hours_ago=-48)

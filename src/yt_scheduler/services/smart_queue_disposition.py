@@ -39,7 +39,13 @@ async def missed_items(queue_id: int) -> list[dict]:
     rows = await db.execute_fetchall(
         """
         SELECT p.id AS post_id, p.platform, p.status, p.scheduled_at, p.error,
-               p.failed_at, i.id AS item_id, i.video_id, v.title
+               p.failed_at, i.id AS item_id, i.video_id, v.title,
+               -- Carried so the Remove confirmation can state what actually
+               -- happens next instead of guessing. Auto-add considers a video
+               -- once; whether that has already happened is the difference
+               -- between "this will never come back on its own" and "a future
+               -- publish could still add it", and only the row knows which.
+               v.auto_add_considered_at
           FROM social_posts p
           JOIN smart_queue_items i ON i.id = p.smart_queue_item_id
           JOIN videos v ON v.id = i.video_id

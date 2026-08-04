@@ -765,6 +765,8 @@ async function loadMissed() {
             `/api/projects/${projectSlug}/smart-queues/${queueId}/missed`
         );
         const missed = data.missed || [];
+        // Kept so the Remove confirmation can describe this specific row.
+        missedByPostId = new Map(missed.map(row => [String(row.post_id), row]));
         document.getElementById('sq-missed-section').style.display =
             missed.length ? '' : 'none';
         document.getElementById('sq-missed-list').innerHTML = missed.map(row => {
@@ -799,12 +801,46 @@ async function loadMissed() {
     }
 }
 
+let missedByPostId = new Map();
+
+/* Remove is the one disposition with a consequence beyond this posting, and the
+ * old wording ("the video becomes eligible to add again later") implied the
+ * opposite of what happens: re-add is MANUAL only. Auto-add considers a video
+ * once, on its transition to live, so a video it has already considered will
+ * never be picked up on its own again — the queue simply stops seeing it.
+ *
+ * Whether that consideration has happened is a fact about the row, not
+ * something to guess at, so the two cases are worded differently. The
+ * not-yet-considered case is real: a video published on YouTube directly never
+ * reaches the funnel (see SMART_QUEUE.md), so it can still be auto-added by a
+ * later publish through this app. */
+function removeWarning(postId) {
+    const row = missedByPostId.get(String(postId));
+    const lines = [
+        'Remove this posting from the queue?',
+        '',
+        'This posting — and any others still pending for this video in this '
+            + 'queue — are marked skipped. The error text and history are kept.',
+        '',
+    ];
+    if (row && row.auto_add_considered_at) {
+        lines.push(
+            'It will NOT come back on its own. Auto-add considers each video '
+            + 'once, and this one has already been considered.');
+    } else {
+        lines.push(
+            'Auto-add has not considered this video yet, so publishing it '
+            + 'through this app later could still add it to a queue.');
+    }
+    lines.push('', 'You can always add it by hand: Auto-select → Accept.');
+    return lines.join('\n');
+}
+
 document.getElementById('sq-missed-list').addEventListener('click', async (event) => {
     const button = event.target.closest('.sq-dispose');
     if (!button) return;
     const action = button.dataset.action;
-    if (action === 'remove' &&
-        !confirm('Remove this from the queue? The video becomes eligible to add again later.')) return;
+    if (action === 'remove' && !confirm(removeWarning(button.dataset.post))) return;
     button.disabled = true;
     showError('');
     try {
