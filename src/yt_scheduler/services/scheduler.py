@@ -1604,7 +1604,11 @@ async def retry_failed_sends_job() -> None:
              FROM social_posts
             WHERE status = 'failed' AND retryable = 1
               AND next_retry_at IS NOT NULL AND next_retry_at <= ?
-              AND (retry_until IS NULL OR retry_until > ?)
+              -- NOT NULL required, not just "in the future": retry_plan always
+              -- stamps a deadline alongside retryable=1, so a row missing one
+              -- is malformed — and treating a missing deadline as "no deadline"
+              -- would retry it forever.
+              AND retry_until IS NOT NULL AND retry_until > ?
             ORDER BY next_retry_at
             LIMIT ?""",
         (now, now, RETRY_BATCH_LIMIT),
@@ -1650,10 +1654,35 @@ async def retry_failed_sends_job() -> None:
         try:
             await _send_scheduled_post(post_id, pre_claimed=True)
         except Exception as exc:
-            # _send_claimed_post already recorded the failure and the next
-            # backoff step; this is the belt on top so one bad row cannot end
-            # the batch for the others.
+            # Whoever takes the claim owns releasing it. _send_scheduled_post
+            # records the failure itself on the paths it handles, but a raise
+            # from anywhere between the claim and that handler would leave the
+            # row 'sending' — invisible twice over, since both the failed-sends
+            # banner and this job's own query select 'failed'. It would sit
+            # there until the next restart's recovery pass.
+            #
+            # Conditional on the row still being 'sending' so a failure that WAS
+            # recorded keeps its real error and its backoff step rather than
+            # being overwritten by this one.
             logger.warning("Auto-retry of post %s failed again: %s", post_id, exc)
+            # Through mark_failed, never a raw UPDATE: it is the only writer of
+            # the 'failed' state precisely so a new send path cannot skip the
+            # failed_at stamp, and a copy here would be that eleventh path.
+            #
+            # Guarded on the row still being 'sending' so a failure that WAS
+            # recorded keeps its real error and its backoff step. Safe to read
+            # then write: we hold the claim, so the only thing that could have
+            # moved this row is the call stack that just returned.
+            still_claimed = await db.execute_fetchall(
+                "SELECT status FROM social_posts WHERE id = ?", (post_id,)
+            )
+            if still_claimed and still_claimed[0]["status"] == "sending":
+                logger.error(
+                    "Auto-retry of post %s raised before its failure was "
+                    "recorded; releasing the claim and stopping retries.",
+                    post_id,
+                )
+                await mark_failed(post_id, error=f"{type(exc).__name__}: {exc}")
 
 
 async def sync_comments_job() -> None:

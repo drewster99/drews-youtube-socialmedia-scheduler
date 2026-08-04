@@ -227,6 +227,68 @@ async def test_losing_the_claim_means_not_sending(app_env, monkeypatch):
     assert sent == []
 
 
+async def test_a_raise_mid_send_never_strands_the_row_we_claimed(
+    app_env, monkeypatch
+):
+    """The claim moves the row out of 'failed' into 'sending'. If the send then
+    raises somewhere that does not record a failure, the row is left 'sending' —
+    which is invisible twice over: the banner lists only 'failed', and so does
+    the retry query. It would sit there until the next restart.
+
+    Whoever takes the claim owns releasing it."""
+    scheduler, db = app_env
+    await _failed_post(db, 1)
+
+    async def explode(post_id, *, pre_claimed=False):
+        raise RuntimeError("died between the claim and the failure handler")
+
+    monkeypatch.setattr(scheduler, "_send_scheduled_post", explode)
+
+    await scheduler.retry_failed_sends_job()
+
+    rows = await db.execute_fetchall(
+        "SELECT status, error FROM social_posts WHERE id = 1"
+    )
+    assert rows[0]["status"] != "sending", "row stranded in 'sending'"
+    assert rows[0]["status"] == "failed"
+    assert "died between the claim" in (rows[0]["error"] or "")
+
+
+async def test_a_retryable_row_with_no_deadline_is_never_picked_up(app_env, monkeypatch):
+    """retry_plan always stamps a deadline beside retryable=1, so a row without
+    one is malformed. Reading a missing deadline as "no deadline" would retry it
+    forever."""
+    scheduler, db = app_env
+    await _failed_post(db, 1, retry_until="NULL")
+
+    sent: list[int] = []
+
+    async def fake_send(post_id, *, pre_claimed=False):
+        sent.append(post_id)
+
+    monkeypatch.setattr(scheduler, "_send_scheduled_post", fake_send)
+
+    await scheduler.retry_failed_sends_job()
+
+    assert sent == []
+
+
+async def test_a_broken_retry_plan_never_replaces_the_real_error(app_env, monkeypatch):
+    """retry_plan runs inside the except handler for the send failure. If it
+    raised, it would abort the mark_failed that records what actually went wrong
+    and surface its own bookkeeping error instead."""
+    database = importlib.import_module("yt_scheduler.database")
+
+    async def broken_db():
+        raise RuntimeError("database is on fire")
+
+    monkeypatch.setattr(database, "get_db", broken_db)
+
+    plan = await send_failures.retry_plan(1, httpx.ConnectError("dns"))
+
+    assert plan == {"retryable": False, "next_retry_at": None, "retry_until": None}
+
+
 async def test_the_claim_is_atomic(app_env):
     """Only one caller can move a row out of 'failed'."""
     scheduler, db = app_env

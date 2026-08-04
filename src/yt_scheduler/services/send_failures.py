@@ -31,6 +31,7 @@ time someone improves a message.
 from __future__ import annotations
 
 import errno
+import logging
 import socket
 from datetime import datetime, timedelta, timezone
 
@@ -56,6 +57,8 @@ RETRY_BACKOFF = (
 DEFAULT_RETRY_WINDOW = timedelta(hours=24)
 
 _TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+logger = logging.getLogger(__name__)
 
 
 def _now() -> datetime:
@@ -120,6 +123,10 @@ _CONNECT_PHASE_ERRNOS = frozenset({
 })
 
 
+#: The answer whenever we cannot establish that retrying is safe.
+_NO_RETRY = {"retryable": False, "next_retry_at": None, "retry_until": None}
+
+
 async def retry_plan(post_id: int, exc: BaseException) -> dict:
     """What the retry columns should say after ``exc`` killed this send.
 
@@ -134,23 +141,34 @@ async def retry_plan(post_id: int, exc: BaseException) -> dict:
     already answered there. Everything else gets the default.
     """
     if not is_safe_to_retry(exc):
-        return {"retryable": False, "next_retry_at": None, "retry_until": None}
+        return _NO_RETRY
 
     # Imported here: this module is deliberately importable without touching the
     # database, so the classification can be unit-tested on its own.
     from yt_scheduler.database import get_db
 
-    db = await get_db()
-    rows = await db.execute_fetchall(
-        """SELECT p.retry_count, q.missed_grace_hours, q.missed_policy
-             FROM social_posts p
-             LEFT JOIN smart_queue_items i ON i.id = p.smart_queue_item_id
-             LEFT JOIN smart_queues q ON q.id = i.queue_id
-            WHERE p.id = ?""",
-        (post_id,),
-    )
+    try:
+        db = await get_db()
+        rows = await db.execute_fetchall(
+            """SELECT p.retry_count, q.missed_grace_hours, q.missed_policy
+                 FROM social_posts p
+                 LEFT JOIN smart_queue_items i ON i.id = p.smart_queue_item_id
+                 LEFT JOIN smart_queues q ON q.id = i.queue_id
+                WHERE p.id = ?""",
+            (post_id,),
+        )
+    except Exception:
+        # This runs INSIDE an except handler for the real send failure. Raising
+        # here would replace the error the user needs to read with one about our
+        # own bookkeeping, and would abort the mark_failed that records it at
+        # all. Not retrying is always the safe answer.
+        logger.exception(
+            "Could not build a retry plan for post %s; treating it as not "
+            "retryable.", post_id,
+        )
+        return _NO_RETRY
     if not rows:
-        return {"retryable": False, "next_retry_at": None, "retry_until": None}
+        return _NO_RETRY
 
     row = rows[0]
     window = None
