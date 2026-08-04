@@ -26,6 +26,8 @@ from httpx import ASGITransport, AsyncClient
 
 from tests.conftest import install_in_memory_keychain
 
+comments_module = importlib.import_module("yt_scheduler.services.comments")
+
 CHANNEL_ID = "UCchannel0000000000000"
 
 
@@ -1842,3 +1844,67 @@ async def test_a_handled_row_in_the_old_format_is_converted(comments, isolated_d
     )
     assert rows[0]["ok"] == 1
     assert rows[0]["was_ok"] == 0, "the old format must be the thing that failed"
+
+
+def test_a_timestamp_is_written_in_the_shape_it_will_be_compared_against() -> None:
+    """Two string timestamps are only comparable when they share a shape, and
+    this codebase holds three shapes at once:
+
+      * SQLite      2026-08-04 22:45:22       (datetime('now'), _utc_now)
+      * RFC3339     2026-08-04T22:45:22Z      (YouTube's published_at)
+      * ISO+offset  2026-08-04T22:45:22+00:00 (scheduled_at, intended_at)
+
+    They differ at index 10 — ' ' (0x20) versus 'T' (0x54) — so mixing two of
+    them compares as *less than* for the whole of any shared date, silently and
+    without an error. That is how "mark handled" reported success and did
+    nothing for every thread active today, and (in the browser) how every DB
+    timestamp was once shifted by the viewer's UTC offset.
+
+    handled_at is compared against youtube_comments.published_at, so it must be
+    RFC3339. The sweep stamps are compared only against each other, so they stay
+    SQLite-shaped.
+    """
+    now = comments_module._utc_now()
+    rfc = comments_module._utc_now_rfc3339()
+
+    assert now[10] == " ", "sweep stamps compare against SQLite datetime('now')"
+    assert rfc[10] == "T" and rfc.endswith("Z"), (
+        "handled_at compares against YouTube's published_at"
+    )
+    # The trap itself, stated once: same instant, different shape, wrong answer.
+    assert now[:10] == rfc[:10]
+    assert now < rfc, "a space sorts below 'T', which is the whole bug"
+
+
+async def test_a_same_day_reply_un_handles_the_thread(
+    comments, project, monkeypatch
+) -> None:
+    """The un-handle counterpart of the format bug. The existing test used a
+    2099 date, so it passed whatever shape the stamps were in; a reply arriving
+    minutes after the mark, on the same date, is the case that actually
+    exercises the comparison."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    started = (now - timedelta(hours=2)).strftime(fmt)
+    _install_fake_youtube(
+        monkeypatch,
+        threads=[_thread(_comment("t1", published=started), video_id=None)],
+    )
+    await comments.sync_project_comments(project)
+    await comments.mark_thread_handled(1, "t1")
+    assert await comments.count_needs_reply(1) == 0
+
+    # A reply an hour from now — same date, later instant.
+    later = (now + timedelta(hours=1)).strftime(fmt)
+    _install_fake_youtube(
+        monkeypatch,
+        threads=[_thread(_comment("t1", published=started), video_id=None,
+                         replies=[_comment("t1r", published=later)])],
+    )
+    await comments.sync_project_comments(project)
+
+    assert await comments.count_needs_reply(1) == 1, (
+        "a later reply on the same day must bring the thread back"
+    )
