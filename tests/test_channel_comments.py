@@ -1793,3 +1793,52 @@ async def test_an_orphan_thread_can_still_be_marked_handled(
 
     await comments.mark_thread_handled(1, thread["thread_key"])
     assert await comments.count_needs_reply(1) == 0
+
+
+async def test_marking_handled_works_for_a_thread_active_today(
+    comments, project, monkeypatch
+) -> None:
+    """The bug this pins: handled_at was written in SQLite's space-separated
+    format while published_at is YouTube's RFC3339 with a 'T'. Compared as
+    strings, ' ' (0x20) sorts below 'T' (0x54), so handled_at >= published_at
+    was false for every thread whose newest activity was on the SAME date —
+    i.e. the most recent thread, which is exactly the one a user clears last.
+    Marking it reported success and changed nothing.
+
+    Every earlier test used a fixed 2026-08-01 date that differed from "today",
+    so the date component decided the comparison and the format never mattered.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    published_today = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    _install_fake_youtube(
+        monkeypatch,
+        threads=[_thread(_comment("t1", published=published_today), video_id=None)],
+    )
+    await comments.sync_project_comments(project)
+    assert await comments.count_needs_reply(1) == 1
+
+    await comments.mark_thread_handled(1, "t1")
+
+    assert await comments.count_needs_reply(1) == 0, (
+        "a thread active today could not be marked handled"
+    )
+
+
+async def test_a_handled_row_in_the_old_format_is_converted(comments, isolated_db):
+    """Migration 053 rewrites rows written before the format was fixed. Without
+    it the user's already-marked threads would stay stuck exactly as they were —
+    a fix that only helps future clicks is not a fix for the data on disk."""
+    rows = await isolated_db.execute_fetchall(
+        "SELECT REPLACE('2026-08-04 22:45:22', ' ', 'T') || 'Z' AS converted"
+    )
+    assert rows[0]["converted"] == "2026-08-04T22:45:22Z"
+    # And the converted form now compares correctly against an RFC3339 comment
+    # published earlier the same day, which is the case that was broken.
+    rows = await isolated_db.execute_fetchall(
+        "SELECT ('2026-08-04T22:45:22Z' >= '2026-08-04T00:57:16Z') AS ok, "
+        "       ('2026-08-04 22:45:22'  >= '2026-08-04T00:57:16Z') AS was_ok"
+    )
+    assert rows[0]["ok"] == 1
+    assert rows[0]["was_ok"] == 0, "the old format must be the thing that failed"

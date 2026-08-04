@@ -655,6 +655,18 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime(_TIMESTAMP_FORMAT)
 
 
+#: YouTube's shape for `published_at`. `handled_at` is compared against that
+#: column as a STRING, so it has to be written the same way: SQLite's
+#: space-separated form sorts below the 'T' form for the same instant, which
+#: made "mark handled" silently do nothing for any thread active today.
+_RFC3339_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _utc_now_rfc3339() -> str:
+    """Now, in the shape ``youtube_comments.published_at`` uses."""
+    return datetime.now(timezone.utc).strftime(_RFC3339_FORMAT)
+
+
 def _plus_one_second(stamp: str) -> str:
     """The next representable sweep stamp after ``stamp``."""
     parsed = datetime.strptime(stamp, _TIMESTAMP_FORMAT).replace(tzinfo=timezone.utc)
@@ -1470,7 +1482,9 @@ async def mark_thread_handled(project_id: int, thread_key: str) -> str:
             f"No comment thread {thread_key!r} in this project."
         )
 
-    stamp = _utc_now()
+    # RFC3339, matching published_at — see _RFC3339_FORMAT. Two timestamps are
+    # only comparable as strings when they share a shape.
+    stamp = _utc_now_rfc3339()
     async with write_transaction() as db:
         await db.execute(
             "INSERT INTO comment_thread_state (project_id, thread_key, handled_at) "
