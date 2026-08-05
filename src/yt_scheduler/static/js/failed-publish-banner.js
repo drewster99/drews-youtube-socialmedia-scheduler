@@ -162,7 +162,12 @@
 
     async function poll() {
         try {
-            const resp = await fetch('/api/videos/failed-publishes');
+            // _silent: app.js's fetch wrapper toasts every non-ok/network
+            // failure, and a background poll's failure is not actionable —
+            // the catch below already holds the display unchanged. Without
+            // this, a downed server would toast from every banner on every
+            // tick. The ACTION fetches deliberately stay loud.
+            const resp = await fetch('/api/videos/failed-publishes', {_silent: true});
             if (!resp.ok) return;
             render(await resp.json() || []);
         } catch (err) {
