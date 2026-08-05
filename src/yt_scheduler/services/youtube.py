@@ -272,6 +272,40 @@ def get_video(video_id: str) -> dict | None:
     return items[0] if items else None
 
 
+def get_videos_privacy_status(video_ids: list[str]) -> dict[str, str]:
+    """Batch-read ``status.privacyStatus`` for a list of YouTube video ids.
+
+    Returns ``{video_id: "public" | "unlisted" | "private"}``. Costs 1 quota
+    unit per call regardless of id count (max 50 ids per call).
+
+    A requested id that YouTube does not return is **absent from the result**,
+    never mapped to a value. Deleted videos, ids we no longer have permission
+    to read, and a partial response all look identical here, and none of them is
+    evidence about privacy — the caller must treat absence as unknown rather
+    than as "private", which is the reading that would silently unpublish a
+    video in our own records.
+
+    A returned item missing ``status.privacyStatus`` is likewise omitted: the
+    field is what was asked for, so its absence is a broken answer, not a value.
+    """
+    if not video_ids:
+        return {}
+    youtube = get_youtube_service()
+    out: dict[str, str] = {}
+    # YouTube caps `id` to 50 ids per request.
+    for i in range(0, len(video_ids), 50):
+        chunk = video_ids[i : i + 50]
+        result = youtube.videos().list(
+            part="status", id=",".join(chunk)
+        ).execute()
+        for item in result.get("items", []):
+            video_id = item.get("id")
+            privacy = (item.get("status") or {}).get("privacyStatus")
+            if video_id and privacy:
+                out[video_id] = privacy
+    return out
+
+
 def get_videos_content_details(video_ids: list[str]) -> dict[str, dict]:
     """Batch-fetch ``contentDetails`` (which carries duration + dimension) for
     a list of video ids. Returns ``{video_id: {duration: "PT12M3S", ...}}``.

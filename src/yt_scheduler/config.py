@@ -370,6 +370,16 @@ CAPTION_CHECK_INTERVAL_MINUTES = _parse_int_env(
     "DYS_CAPTION_CHECK_MINUTES", "YTP_CAPTION_CHECK_MINUTES", 15
 )
 
+# How often to read each YouTube-backed video's privacy back FROM YouTube.
+# Nothing else does: every writer of videos.privacy_status is a change this app
+# made, so a video published (or unpublished) in YouTube Studio was invisible
+# here, and both the auto-add gate and the "don't announce a non-public video"
+# send gate read that stale column. Cheap enough to run often — 1 quota unit per
+# 50 videos, so a 350-video install costs ~7 units a sweep.
+VIDEO_PRIVACY_SYNC_INTERVAL_MINUTES = _parse_int_env(
+    "DYS_VIDEO_PRIVACY_SYNC_MINUTES", "YTP_VIDEO_PRIVACY_SYNC_MINUTES", 30
+)
+
 # How often the channel-wide comment sweep mirrors YouTube into
 # youtube_comments. Distinct from COMMENT_CHECK_INTERVAL_MINUTES above, which
 # paces blocklist MODERATION — that one acts on hostile comments and wants to

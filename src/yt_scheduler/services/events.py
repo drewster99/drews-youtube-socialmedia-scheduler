@@ -15,6 +15,12 @@ through ``record_event``. The payload shape is event-type specific:
                                  "scheduled_at": iso, "text": str}``
 * ``social_post_published`` — ``{"platform": str, "social_account_id": int | null,
                                  "post_url": str, "posted_at": iso}``
+* ``privacy_changed_on_youtube``
+                            — ``{"old": str | null, "new": str}``. Recorded by
+                              the privacy sweep when YouTube reports a privacy
+                              this app did not set — i.e. someone changed it in
+                              Studio. Distinct from ``metadata_updated``, which
+                              records a change WE made.
 * ``social_post_recovery_refused``
                             — ``{"platform": str, "post_id": int,
                                  "overdue_count": int, "limit": int}``

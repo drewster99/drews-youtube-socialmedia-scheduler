@@ -13,6 +13,7 @@ from yt_scheduler.config import (
     CAPTION_CHECK_INTERVAL_MINUTES,
     COMMENT_CHECK_INTERVAL_MINUTES,
     COMMENT_SYNC_INTERVAL_MINUTES,
+    VIDEO_PRIVACY_SYNC_INTERVAL_MINUTES,
 )
 from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.models.social_post import mark_failed, mark_posted
@@ -1791,6 +1792,33 @@ async def sync_comments_job() -> None:
             )
 
 
+async def sync_video_privacy_job() -> None:
+    """Read every YouTube-backed video's privacy back from YouTube.
+
+    The one job that treats YouTube as the authority on privacy rather than this
+    app. Without it a video published in Studio stayed 'unlisted' here forever —
+    invisible to auto-add, and refused by the send gate as "not public" while it
+    was public. The reverse matters equally: a stale 'public' makes that same
+    gate wave through a link nobody can open.
+    """
+    from yt_scheduler.services import video_privacy_sync
+
+    for summary in await video_privacy_sync.sync_all_projects_video_privacy():
+        if summary.get("error"):
+            # Already logged with its cause by sync_all_projects_video_privacy;
+            # this is the per-tick roll-up so a persistently broken project is
+            # visible without correlating across ticks.
+            continue
+        if summary["changed"]:
+            logger.info(
+                "Privacy sweep (project %s): %d changed on YouTube, %d newly "
+                "queued, %d checked (%d quota unit(s))",
+                summary["project_slug"], len(summary["changed"]),
+                len(summary["became_live"]), summary["checked"],
+                summary["quota_units"],
+            )
+
+
 # How often to sweep social credentials looking for tokens to pre-emptively
 # refresh. The lookahead window is per-platform (a poster class attribute,
 # ``SocialPoster.token_refresh_window_secs``): 45 minutes suits ~2-hour
@@ -2043,6 +2071,14 @@ def start_scheduler(
         id="backfill_thumbnails",
         replace_existing=True,
         next_run_time=backfill_first_run,
+    )
+
+    scheduler.add_job(
+        sync_video_privacy_job,
+        "interval",
+        minutes=VIDEO_PRIVACY_SYNC_INTERVAL_MINUTES,
+        id="sync_video_privacy",
+        replace_existing=True,
     )
     scheduler.start()
     logger.info(
