@@ -207,9 +207,10 @@ async def list_failed_publishes() -> list[dict]:
     Drives ``static/js/failed-publish-banner.js`` on every page — the publish
     job's only caller is a timer, so its failure otherwise happens with no page
     open and the video sits looking merely "scheduled". Rows leave this list
-    when the publish succeeds (retry or restart recovery), a new schedule is
-    set, or the user cancels the schedule; ``publish_failed_at`` is the single
-    source of truth and is cleared by exactly those three writers.
+    when ANY publish succeeds (retry, restart recovery, or the non-YouTube
+    branch), a new schedule is set, or the user cancels the schedule;
+    ``publish_failed_at`` is the single source of truth and every success
+    writer clears it.
 
     Ordered by ``publish_failed_at`` — when it FAILED, which is the age the
     user acts on. ``publish_at`` is when it was supposed to go out and can be

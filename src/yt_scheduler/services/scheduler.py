@@ -379,6 +379,7 @@ async def publish_video_job(video_id: str) -> dict:
             async with write_transaction() as db:
                 await db.execute(
                     """UPDATE videos SET status = 'published',
+                    publish_failed_at = NULL, publish_error = NULL,
                     updated_at = datetime('now') WHERE id = ?""",
                     (video_id,),
                 )

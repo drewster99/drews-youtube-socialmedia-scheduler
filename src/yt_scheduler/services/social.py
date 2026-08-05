@@ -372,7 +372,12 @@ def restore_mastodon_network_cause(exc: BaseException) -> None:
     # bottom. Measured, not assumed:
     #     ConnectionError -> MaxRetryError -> NewConnectionError -> OSError(61)
     node, seen = exc, {id(exc)}
-    while node.__cause__ is None and node.__context__ is not None:
+    # `not __suppress_context__`: a node with cause None but the flag set was
+    # raised `from None` — an explicit statement that its context is NOT its
+    # cause (PEP 415), which urllib3 does use in reachable code. Promoting that
+    # link would manufacture exactly the causal claim the raiser retracted.
+    while (node.__cause__ is None and not node.__suppress_context__
+           and node.__context__ is not None):
         if id(node.__context__) in seen:
             break
         node.__cause__ = node.__context__

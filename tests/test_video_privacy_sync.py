@@ -593,3 +593,45 @@ async def test_recording_the_outcome_never_becomes_a_new_failure(
     assert any("record" in r.message.lower() for r in caplog.records), (
         "it must report that it could not record, not vanish"
     )
+
+
+async def test_auto_add_from_the_sweep_never_needs_youtube(
+    privacy, monkeypatch
+):
+    """The narrow binding scope is safe ONLY while the auto-add funnel stays
+    DB + local-ffprobe.
+
+    The sweep binds the project around its one YouTube read and runs the funnel
+    unbound. That is correct today by design — rendering and AI happen at
+    Accept, never at auto-add — but every other funnel test here mocks
+    on_video_became_live, so nothing exercised the REAL funnel unbound. If a
+    YouTube call ever grew inside it, the failure mode would be a quietly
+    logged auto-add degradation affecting only the sweep path. Pin it.
+    """
+    service, db, project = privacy
+    await _add_video(db, "v1", privacy="unlisted", youtube_id="ytv1")
+    _fake_youtube(monkeypatch, service, {"ytv1": "public"})
+
+    auth = importlib.import_module("yt_scheduler.services.auth")
+    youtube_touches: list = []
+
+    def forbidden(*a, **kw):
+        youtube_touches.append(a)
+        raise AssertionError("auto-add reached get_youtube_service")
+
+    monkeypatch.setattr(auth, "get_youtube_service", forbidden)
+
+    summary = await service.sync_project_video_privacy(project)
+
+    assert youtube_touches == []
+    assert summary["changed"], "the flip was detected and committed"
+    # No queue exists in this fixture, so the real funnel returns
+    # considered=False and deliberately leaves auto_add_considered_at unset
+    # (a queue created later must still see this video). What matters is that
+    # it ran to completion — an exception inside it is swallowed by
+    # _consider_for_auto_add, so prove the no-error path via the row state.
+    rows = await db.execute_fetchall(
+        "SELECT auto_add_considered_at, privacy_status FROM videos WHERE id='v1'"
+    )
+    assert rows[0]["privacy_status"] == "public"
+    assert rows[0]["auto_add_considered_at"] is None

@@ -918,7 +918,7 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 
 **Response 200** — Array of `{"video_id", "title", "publish_at", "publish_failed_at", "publish_error", "item_type", "project_slug", "project_name"}`, ordered by `publish_failed_at DESC` (when it *failed* — the age the user acts on; `publish_at` is when it was supposed to go out and can be arbitrarily older).
 
-`videos.publish_failed_at` / `publish_error` (migration 056) are the single source of truth, cleared by exactly three writers: a successful publish, a fresh schedule, or cancelling the schedule. The banner's actions reuse `POST /api/videos/{video_id}/publish` (safe to retry — flipping public is idempotent, unlike a social send) and `DELETE /api/videos/{video_id}/schedule` (the give-up path).
+`videos.publish_failed_at` / `publish_error` (migration 056) are the single source of truth, cleared by every path that resolves the failure: any successful publish (YouTube or the non-YouTube branch), a fresh schedule, or cancelling the schedule. The banner's actions reuse `POST /api/videos/{video_id}/publish` (safe to retry — flipping public is idempotent, unlike a social send) and `DELETE /api/videos/{video_id}/schedule` (the give-up path).
 
 ### `GET /api/videos/scheduled`
 

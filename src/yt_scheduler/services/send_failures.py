@@ -31,6 +31,7 @@ time someone improves a message.
 from __future__ import annotations
 
 import errno
+import http.client
 import logging
 import socket
 from datetime import datetime, timedelta, timezone
@@ -106,6 +107,7 @@ _AMBIGUOUS_EXCEPTIONS: tuple[type[BaseException], ...] = (
     httpx.WriteTimeout,         # unknowable how much of the request was written
     httpx.WriteError,
     httpx.RemoteProtocolError,  # server dropped the connection without replying
+    http.client.IncompleteRead,  # mid-body truncation — the request arrived
 )
 
 #: OSError codes that mean the connection was never established. Checked because
@@ -245,8 +247,39 @@ def _ambiguous_by_name() -> tuple[type[BaseException], ...]:
     Imported lazily: ``services.social`` imports far too much to pull in from a
     classifier that must stay cheap and side-effect free.
     """
+    classes: list[type[BaseException]] = []
     try:
         from yt_scheduler.services.social import ThreadsPublishOutcomeUnknown
     except Exception:  # pragma: no cover - import cycle or partial init
-        return ()
-    return (ThreadsPublishOutcomeUnknown,)
+        pass
+    else:
+        classes.append(ThreadsPublishOutcomeUnknown)
+    # restore_mastodon_network_cause feeds requests/urllib3 chains into this
+    # classifier, whose static ambiguous list is httpx-shaped. Without these,
+    # denial of a requests-stack read failure rests on the default deny rather
+    # than on recognised ambiguity — and one chain came out actively WRONG: an
+    # EHOSTUNREACH that fires MID-SEND (route flap after connect) is wrapped by
+    # urllib3 as ProtocolError("Connection aborted.", OSError(65)), and the
+    # errno-alone check read it as connect-phase and retried blind. The
+    # ProtocolError wrapper is precisely the phase marker the errno lacks:
+    # connect-phase failures take the NewConnectionError/MaxRetryError path and
+    # never wrap in ProtocolError, so listing it cannot block a safe retry.
+    try:
+        import requests.exceptions
+    except Exception:  # pragma: no cover - [social] extra not installed
+        pass
+    else:
+        classes += [
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.ChunkedEncodingError,
+        ]
+    try:
+        import urllib3.exceptions
+    except Exception:  # pragma: no cover - [social] extra not installed
+        pass
+    else:
+        classes += [
+            urllib3.exceptions.ReadTimeoutError,
+            urllib3.exceptions.ProtocolError,
+        ]
+    return tuple(classes)

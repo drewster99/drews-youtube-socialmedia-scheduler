@@ -578,3 +578,100 @@ def test_network_failure_wins_over_any_status() -> None:
     """If we never reached the platform, no status it might have returned is
     relevant."""
     assert "never reached" in _advice(httpx.ConnectError("dns"))
+
+
+def test_a_send_phase_ehostunreach_is_not_mistaken_for_connect_phase() -> None:
+    """The errno alone cannot place a failure in the connect phase.
+
+    urllib3 wraps a send/read-phase OSError as ProtocolError("Connection
+    aborted.", e) — connect-phase failures take the NewConnectionError path and
+    never wrap in ProtocolError. So an EHOSTUNREACH firing MID-SEND (route flap
+    after connect) carried the connect-phase errno inside the one wrapper that
+    means "the request was partly written". Reading the errno and ignoring the
+    wrapper retried blind — a request that may have been delivered.
+    """
+    import errno as errno_mod
+
+    import urllib3.exceptions
+
+    from yt_scheduler.services import social
+
+    # The measured chain shape, built explicitly rather than via a live socket:
+    # MastodonNetworkError <-ctx- ConnectionError <-ctx- ProtocolError <-ctx- OSError(65)
+    from mastodon.errors import MastodonNetworkError
+    import requests
+
+    os_err = OSError(errno_mod.EHOSTUNREACH, "No route to host")
+    proto = urllib3.exceptions.ProtocolError("Connection aborted.", os_err)
+    proto.__context__ = os_err
+    conn = requests.exceptions.ConnectionError(proto)
+    conn.__context__ = proto
+    outer = MastodonNetworkError(f"Could not complete request: {conn}")
+    outer.__context__ = conn
+
+    social.restore_mastodon_network_cause(outer)
+
+    assert send_failures.is_safe_to_retry(outer) is False, (
+        "a ProtocolError anywhere in the chain means part of the request may "
+        "have been written; the connect-phase errno beneath it must not win"
+    )
+
+
+def test_requests_stack_read_failures_are_recognised_ambiguous() -> None:
+    """Denial of these must rest on recognised ambiguity, not on the default
+    deny — the default protects nothing when a connect-phase link shares the
+    chain, which is exactly the case above."""
+    import http.client
+
+    import requests
+    import urllib3.exceptions
+
+    from yt_scheduler.services import social
+
+    for ambiguous in (
+        requests.exceptions.ReadTimeout("read timed out"),
+        urllib3.exceptions.ReadTimeoutError(None, "/", "read timed out"),
+        http.client.IncompleteRead(b""),
+    ):
+        try:
+            _mastodon_style(lambda: (_ for _ in ()).throw(ambiguous))
+        except Exception as exc:
+            social.restore_mastodon_network_cause(exc)
+            assert send_failures.is_safe_to_retry(exc) is False
+
+
+def test_an_explicit_from_none_disclaimer_is_respected() -> None:
+    """`raise X from None` states that the in-flight exception is NOT the
+    cause (PEP 415: cause None, suppress flag set, context kept). The chain
+    repair must stop at that node rather than promote the disclaimed link —
+    it restores evidence, and a retracted claim is not evidence."""
+    import urllib3.exceptions
+
+    from yt_scheduler.services import social
+
+    try:
+        _mastodon_style(lambda: (_ for _ in ()).throw(
+            _raise_from_none_protocol_error()
+        ))
+    except Exception as exc:
+        social.restore_mastodon_network_cause(exc)
+        # The un-disclaimed outer link is still restored...
+        assert isinstance(exc.__cause__, urllib3.exceptions.ProtocolError)
+        # ...but the disclaimed one is not.
+        assert exc.__cause__.__cause__ is None
+        assert send_failures.is_safe_to_retry(exc) is False
+
+
+def _raise_from_none_protocol_error():
+    """A ProtocolError whose context was explicitly disclaimed."""
+    import urllib3.exceptions
+
+    try:
+        raise httpx.ReadTimeout("the request may well have arrived")
+    except Exception:
+        try:
+            raise urllib3.exceptions.ProtocolError(
+                "Response ended prematurely"
+            ) from None
+        except urllib3.exceptions.ProtocolError as disclaimed:
+            return disclaimed

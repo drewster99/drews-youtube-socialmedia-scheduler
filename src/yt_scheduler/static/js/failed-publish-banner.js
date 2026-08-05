@@ -22,8 +22,8 @@
 
     let latestRows = [];
     let lastRenderedKey = null;
-    // Video ids with an action running, so a poll can't replace a disabled
-    // "Publishing…" button with a fresh enabled one mid-request.
+    // Video ids with an action running, so a poll can't replace the row's
+    // disabled buttons with fresh enabled ones mid-request.
     const inFlight = new Set();
 
     function escapeText(value) {
@@ -71,9 +71,17 @@
             return;
         }
 
-        const key = rows
-            .map((r) => `${r.video_id}:${r.publish_failed_at}:${inFlight.has(String(r.video_id))}`)
-            .join('|');
+        // Keyed on the RENDERED when-text, not publish_failed_at alone: the
+        // age is relative, so "5 minutes ago" goes stale with every field
+        // unchanged. Same rule as the failed-sends banner's renderKey.
+        const key = JSON.stringify(rows.map((r) => [
+            r.video_id, r.title, r.project_name, r.project_slug,
+            r.publish_error,
+            r.publish_failed_at
+                ? window.dysDateTime.formatWhenWithAge(r.publish_failed_at)
+                : null,
+            inFlight.has(String(r.video_id)),
+        ]));
         if (key === lastRenderedKey) return;
         lastRenderedKey = key;
 
@@ -105,23 +113,49 @@
             const url = action === 'publish'
                 ? `/api/videos/${encodeURIComponent(videoId)}/publish`
                 : `/api/videos/${encodeURIComponent(videoId)}/schedule`;
+            // No _silent: app.js's global fetch wrapper already toasts non-ok
+            // responses and network errors. Only the HTTP-200 body outcomes —
+            // publish_video_job returns a scheduled-job summary, not a REST
+            // verdict — and the success confirmations are handled here.
             const resp = await fetch(url, {
                 method: action === 'publish' ? 'POST' : 'DELETE',
             });
-            if (action === 'publish' && resp.ok) {
-                // publish_video_job reports a failed YouTube step in its body
-                // with HTTP 200 — a scheduled-job summary, not a REST verdict —
-                // so "ok" alone would clear the row while the publish failed.
-                const body = await resp.json();
-                if (body && body.publish_error) {
-                    console.error('Publish retry failed:', body.publish_error);
+            if (resp.ok) {
+                if (action === 'cancel') {
+                    showToast('Schedule cancelled.', 'success');
+                } else {
+                    const body = await resp.json();
+                    if (body && body.published) {
+                        showToast('Published.', 'success');
+                    } else if (body && body.publish_error) {
+                        showToast(`Publish failed: ${body.publish_error}`, 'error');
+                    } else if (body && body.publish_blocked) {
+                        // The fire-time gate also cancelled the schedule
+                        // server-side, so this row is about to leave the banner
+                        // WITHOUT the video going out — this toast is the only
+                        // surface that says so.
+                        showToast(
+                            `Not published: ${body.publish_blocked}. The schedule `
+                            + `was cancelled — fix the description, then schedule `
+                            + `again.`, 'error');
+                    } else {
+                        // skipped_missing_video / skipped_archived / anything
+                        // new: name it, rather than reading "no error" as
+                        // success.
+                        showToast('Not published: ' + JSON.stringify(body), 'error');
+                    }
                 }
             }
+            // Non-ok: the global wrapper has already toasted the detail.
         } catch (err) {
-            console.error('Failed-publish action error:', err);
+            // Network throw: also already toasted by the wrapper.
         } finally {
             inFlight.delete(videoId);
             lastRenderedKey = null;
+            // Re-render from cache BEFORE the re-read: poll() returns without
+            // rendering on a non-ok response or a network throw, which would
+            // leave this row's buttons disabled until the next successful poll.
+            render(latestRows);
             await poll();
         }
     }

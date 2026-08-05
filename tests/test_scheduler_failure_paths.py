@@ -384,3 +384,44 @@ async def test_cancelling_the_schedule_clears_the_failure(app_db) -> None:
     assert row["publish_failed_at"] is None
     assert row["publish_error"] is None
     assert row["status"] == "ready"
+
+
+async def test_non_youtube_publish_clears_an_earlier_failure(
+    app_db, monkeypatch
+) -> None:
+    """The else branch is a success writer too.
+
+    A hook with no YouTube video that publishes must clear the stamp, or the
+    banner shows a failed row for a published video and its own Retry — which
+    re-takes the same branch — can never clear it.
+    """
+    scheduler, db = app_db
+    await db.execute(
+        "INSERT INTO videos (id, project_id, title, status, item_type, url) "
+        "VALUES ('vidF', 1, 'Hook', 'scheduled', 'hook', '')"
+    )
+    await db.execute(
+        "UPDATE videos SET publish_failed_at = datetime('now'), "
+        "publish_error = 'earlier failure' WHERE id = 'vidF'"
+    )
+    await db.commit()
+
+    youtube = importlib.import_module("yt_scheduler.services.youtube")
+
+    def _must_not_call(*a, **kw):
+        raise AssertionError("non-YouTube item must not touch YouTube")
+
+    monkeypatch.setattr(youtube, "update_video_metadata", _must_not_call)
+
+    result = await scheduler.publish_video_job("vidF")
+
+    assert result["published"] is True
+    assert result.get("youtube_skipped") is True
+    cursor = await db.execute(
+        "SELECT status, publish_failed_at, publish_error FROM videos "
+        "WHERE id = 'vidF'"
+    )
+    row = dict(await cursor.fetchone())
+    assert row["status"] == "published"
+    assert row["publish_failed_at"] is None
+    assert row["publish_error"] is None
