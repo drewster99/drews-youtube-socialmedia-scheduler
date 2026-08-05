@@ -451,14 +451,32 @@ COMMENT_REPLY_REFRESH_HOURS = 24
 
 # Lookahead for the pre-emptive token-refresh sweep: a credential is renewed
 # once its token expires within this window. Per-poster, exposed as
-# SocialPoster.token_refresh_window_secs. 45 minutes suits ~2-hour tokens
-# (Twitter, Bluesky). Threads tokens live 60 days and CANNOT be refreshed once
+# SocialPoster.token_refresh_window_secs, and a CEILING rather than the value
+# used — see effective_refresh_window. 45 minutes suits ~2-hour tokens (X); it
+# is 75% of a Bluesky token's ONE-hour life, which is how that credential came
+# to rotate on every sweep. Threads tokens live 60 days and CANNOT be refreshed once
 # expired, so their window is a week: renewal fires when <7 days remain
 # (steady-state ~every 53 days, comfortably past Meta's 24-hour minimum token
 # age), and the app merely has to run once during the final week — a sleeping
 # laptop during any one sweep is a non-event.
 SOCIAL_TOKEN_REFRESH_WINDOW_SECONDS = 45 * 60
 THREADS_TOKEN_REFRESH_WINDOW_SECONDS = 7 * 24 * 3600
+
+# A CEILING, not the window itself. The flat 45 minutes above assumed ~2-hour
+# tokens; Bluesky's are ONE hour, so 45 minutes is 75% of the token's whole life
+# and every 20-minute sweep found it "due". It rotated ~72 times a day to serve
+# a handful of posts — and because Bluesky's refresh token is single-use, each
+# rotation is another chance to lose the credential, which is exactly how one
+# minute of full disk did lose it.
+#
+# The window is now the last quarter of whatever lifetime the issuer actually
+# reported, floored so a token can never lapse unnoticed between two sweeps, and
+# capped by the platform's declared window (which is what keeps Threads' week).
+TOKEN_REFRESH_LIFETIME_FRACTION = 4
+
+# Floor: the sweep interval plus a spare tick, so a missed or slow sweep still
+# leaves a whole cycle of margin.
+TOKEN_REFRESH_MIN_WINDOW_SECONDS = 25 * 60
 
 # ---------------------------------------------------------------------------
 # Outbound HTTP call budgets

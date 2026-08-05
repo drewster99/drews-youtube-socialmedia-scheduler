@@ -959,6 +959,38 @@ class SocialPoster:
         """
         return False
 
+    @staticmethod
+    def effective_refresh_window(creds: dict, requested_secs: int) -> int:
+        """How close to expiry this credential should actually be renewed.
+
+        ``requested_secs`` is the platform's declared window and acts as a
+        CEILING. A flat window is wrong whenever it approaches the token's own
+        lifetime: 45 minutes of a 2-hour X token is a sensible last quarter, but
+        of a 1-hour Bluesky token it is 75% of the whole life, so every sweep
+        found it due and it rotated ~72 times a day to serve a few posts. Each
+        rotation spends a single-use refresh token, and losing one write loses
+        the account — this is the exposure that a full disk turned into a real
+        loss, so the number of rotations is a safety property, not a tuning knob.
+
+        Unknown lifetime keeps the declared window: a bundle predating
+        ``acquired_at`` cannot be reasoned about, and refreshing too eagerly is
+        the safe direction to be wrong in.
+        """
+        acquired_at = int(creds.get("acquired_at") or 0)
+        expires_at = int(creds.get("expires_at") or 0)
+        if not (acquired_at and expires_at):
+            return requested_secs
+        lifetime = expires_at - acquired_at
+        if lifetime <= 0:
+            return requested_secs
+        return min(
+            requested_secs,
+            max(
+                lifetime // config.TOKEN_REFRESH_LIFETIME_FRACTION,
+                config.TOKEN_REFRESH_MIN_WINDOW_SECONDS,
+            ),
+        )
+
 
 class TwitterPoster(SocialPoster):
     # Declares what refresh_if_stale below already does, so the two can't
@@ -976,6 +1008,7 @@ class TwitterPoster(SocialPoster):
         if not uuid:
             return False
         expires_at = int(creds.get("expires_at") or 0)
+        window_secs = self.effective_refresh_window(creds, window_secs)
         # Skip only when we *know* it's still fresh. If the bundle predates the
         # expires_at field (it's 0), treat it as due: refreshing once backfills
         # the expiry so future sweeps behave normally and the bearer doesn't
@@ -1723,6 +1756,7 @@ class BlueskyPoster(SocialPoster):
         if not creds.get("refresh_token"):
             return False
         expires_at = int(creds.get("expires_at") or 0)
+        window_secs = self.effective_refresh_window(creds, window_secs)
         if expires_at and expires_at - window_secs > int(time.time()):
             return False
         from yt_scheduler.services.bluesky_oauth import AuthServerUnavailable
@@ -1735,6 +1769,12 @@ class BlueskyPoster(SocialPoster):
                 creds.get("uuid"), exc,
             )
             return False
+        except CredentialPersistFailed as exc:
+            # NOT "could not be refreshed" — it was, and Bluesky has already
+            # invalidated the token it replaced. Only the write failed. Carry
+            # that message through unaltered rather than wrapping it in a cause
+            # that contradicts it; it already names the remedy.
+            raise CredentialAuthError(creds.get("uuid"), str(exc)) from exc
         except (KeychainWriteError, SecretsIndexError):
             logger.error(
                 "Keychain write failed persisting Bluesky refresh for %s",

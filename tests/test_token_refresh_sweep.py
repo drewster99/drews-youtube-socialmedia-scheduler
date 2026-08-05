@@ -253,3 +253,84 @@ def test_a_non_disk_persist_failure_still_names_the_consequence() -> None:
     ))
 
     assert "reconnected in Settings" in message
+
+
+# --- the window must fit the token, not the other way round -------------------
+
+
+def test_the_window_is_sized_from_the_actual_token_lifetime() -> None:
+    """A flat window is wrong once it approaches the token's own life.
+
+    45 minutes is a sensible last quarter of a 2-hour X token and 75% of a
+    1-hour Bluesky one — which is why every 20-minute sweep found Bluesky "due"
+    and it rotated ~72 times a day to serve a handful of posts. Each rotation
+    spends a single-use refresh token, and losing one write loses the account,
+    so the rotation count is a safety property rather than a tuning knob.
+    """
+    import time
+
+    social = importlib.import_module("yt_scheduler.services.social")
+    config = importlib.import_module("yt_scheduler.config")
+    now = int(time.time())
+
+    def window_for(hours: float, declared: int) -> int:
+        return social.SocialPoster.effective_refresh_window(
+            {"acquired_at": now, "expires_at": now + int(hours * 3600)}, declared,
+        )
+
+    one_hour = window_for(1, config.SOCIAL_TOKEN_REFRESH_WINDOW_SECONDS)
+    assert one_hour < config.SOCIAL_TOKEN_REFRESH_WINDOW_SECONDS
+    assert one_hour == config.TOKEN_REFRESH_MIN_WINDOW_SECONDS
+
+    two_hour = window_for(2, config.SOCIAL_TOKEN_REFRESH_WINDOW_SECONDS)
+    assert two_hour == 2 * 3600 // config.TOKEN_REFRESH_LIFETIME_FRACTION
+
+
+def test_the_floor_keeps_a_token_from_lapsing_between_sweeps() -> None:
+    """The window must exceed the sweep interval with a spare tick, or a slow
+    or missed sweep lets the token lapse before anyone looks again."""
+    import time
+
+    social = importlib.import_module("yt_scheduler.services.social")
+    config = importlib.import_module("yt_scheduler.config")
+    scheduler = importlib.import_module("yt_scheduler.services.scheduler")
+    now = int(time.time())
+
+    sweep_secs = scheduler._TOKEN_REFRESH_INTERVAL_MINUTES * 60
+    assert config.TOKEN_REFRESH_MIN_WINDOW_SECONDS > sweep_secs
+
+    # A very short-lived token still gets the floor, not lifetime/4.
+    tiny = social.SocialPoster.effective_refresh_window(
+        {"acquired_at": now, "expires_at": now + 600},
+        config.SOCIAL_TOKEN_REFRESH_WINDOW_SECONDS,
+    )
+    assert tiny == config.TOKEN_REFRESH_MIN_WINDOW_SECONDS
+
+
+def test_the_declared_window_is_a_ceiling_so_threads_keeps_its_week() -> None:
+    """A Threads token lives 60 days and CANNOT be refreshed once expired, so
+    its week of margin is deliberate. A quarter of 60 days would be over two
+    weeks — the ceiling is what stops the formula loosening it."""
+    import time
+
+    social = importlib.import_module("yt_scheduler.services.social")
+    config = importlib.import_module("yt_scheduler.config")
+    now = int(time.time())
+
+    window = social.SocialPoster.effective_refresh_window(
+        {"acquired_at": now, "expires_at": now + 60 * 24 * 3600},
+        config.THREADS_TOKEN_REFRESH_WINDOW_SECONDS,
+    )
+    assert window == config.THREADS_TOKEN_REFRESH_WINDOW_SECONDS
+
+
+def test_an_unknown_lifetime_keeps_the_declared_window() -> None:
+    """A bundle predating acquired_at cannot be reasoned about. Refreshing too
+    eagerly is the safe direction to be wrong in, so it keeps the old
+    behaviour rather than inventing a lifetime."""
+    social = importlib.import_module("yt_scheduler.services.social")
+
+    assert social.SocialPoster.effective_refresh_window({}, 2700) == 2700
+    assert social.SocialPoster.effective_refresh_window(
+        {"expires_at": 999}, 2700
+    ) == 2700, "expires_at alone gives no lifetime without acquired_at"
