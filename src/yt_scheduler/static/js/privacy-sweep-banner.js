@@ -43,7 +43,7 @@
             return 'It has never completed successfully.';
         }
         const age = window.dysDateTime.formatAge(row.last_success_at);
-        return `Last successful check ${escapeText(age)}.`;
+        return `Last successful check ${age}.`;
     }
 
     function rowHtml(row) {
