@@ -1218,6 +1218,17 @@ function renderEvent(ev) {
         }
         case 'published':
             return `${ts} <span>Video published ${ytLink}</span>`;
+        case 'privacy_changed_on_youtube': {
+            /* A change nobody made in this app — someone flipped it in Studio,
+               and the privacy sweep found it. The old -> new pair IS the
+               information, so it is spelled out rather than left to the default
+               branch, which prints the bare type and drops the payload. Named
+               as observed, not as done: this app did not do it. */
+            const from = ev.payload?.old || 'unknown';
+            const to = ev.payload?.new || 'unknown';
+            return `${ts} <span>Privacy changed on YouTube &lt;${escapeHtml(from)}`
+                 + ` &rarr; ${escapeHtml(to)}&gt; ${ytLink}</span>`;
+        }
         case 'social_post_scheduled': {
             const platform = ev.payload?.platform || 'social';
             return `${ts} <span>Social post scheduled [<a href="#" class="event-platform-link" data-event-id="${ev.id}">${escapeHtml(platform)}</a>]</span>`;

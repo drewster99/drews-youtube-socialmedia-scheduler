@@ -2083,6 +2083,8 @@ def start_scheduler(
     scheduler.start()
     logger.info(
         f"Scheduler started (captions every {cap_mins}m, moderation every {mod_mins}m, "
+        f"comment sync every {COMMENT_SYNC_INTERVAL_MINUTES}m, "
+        f"video-privacy sync every {VIDEO_PRIVACY_SYNC_INTERVAL_MINUTES}m, "
         f"social-token refresh every {_TOKEN_REFRESH_INTERVAL_MINUTES}m, "
         "trace pruning hourly, thumbnail backfill every 30m)"
     )

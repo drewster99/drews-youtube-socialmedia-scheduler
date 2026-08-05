@@ -328,7 +328,8 @@ function eventVerb(type) {
 function eventTier(type) {
     if (type === 'published' || type === 'social_post_published') return 'major';
     if (type === 'publish_scheduled' || type === 'social_post_scheduled') return 'scheduled';
-    if (type === 'created' || type === 'imported' || type === 'uploaded') return 'lifecycle';
+    if (type === 'created' || type === 'imported' || type === 'uploaded'
+        || type === 'privacy_changed_on_youtube') return 'lifecycle';
     if (type === 'social_post_skipped_duplicate'
         || type === 'social_post_failed_video_not_public'
         || type === 'credential_invalid') return 'warn';

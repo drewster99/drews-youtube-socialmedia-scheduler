@@ -74,20 +74,27 @@ async def _videos_due_for_check(project_id: int, limit: int) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-async def _apply_privacy(video: dict, observed: str) -> bool:
-    """Record what YouTube says about one video. Returns True if it changed.
+async def _record_observations(pairs: list[tuple[dict, str]]) -> None:
+    """Write what YouTube said, for every video read, in ONE transaction.
 
-    The stamp is written whether or not the value moved: it records that the
-    read happened, which is a different fact from the value it returned.
+    The stamp goes on whether or not the value moved: it records that the read
+    happened, which is a different fact from the value it returned.
+
+    One transaction rather than one per video, for both reasons that usually
+    argue for it — a sweep is up to ``MAX_VIDEOS_PER_SWEEP`` rows and a commit
+    apiece is a needless fsync apiece, and a failure partway through leaves
+    NOTHING stamped, which is the honest state. A half-stamped sweep would
+    report some of the library as freshly verified on the strength of a read
+    that did not finish.
     """
-    changed = (video["privacy_status"] or "") != observed
+    if not pairs:
+        return
     async with write_transaction() as db:
-        await db.execute(
+        await db.executemany(
             "UPDATE videos SET privacy_status = ?, "
             "privacy_synced_at = datetime('now') WHERE id = ?",
-            (observed, video["id"]),
+            [(privacy, video["id"]) for video, privacy in pairs],
         )
-    return changed
 
 
 async def _consider_for_auto_add(video: dict) -> bool:
@@ -134,11 +141,15 @@ async def sync_project_video_privacy(
     # asyncio.to_thread copies the current context, so the worker thread sees it.
     set_active_project(project["slug"])
 
-    by_youtube_id = {
-        video["youtube_video_id"]: video
-        for video in candidates
-        if is_youtube_backed(video)
-    }
+    # A LIST per id, not one video. Two local rows may name the same YouTube
+    # video (a re-import alongside the original), and a dict would silently keep
+    # the last — the dropped row would then never be stamped, sort first forever
+    # on privacy_synced_at IS NULL, and be dropped again every single sweep. One
+    # answer from YouTube applies to every row that asked about it.
+    by_youtube_id: dict[str, list[dict]] = {}
+    for video in candidates:
+        if is_youtube_backed(video):
+            by_youtube_id.setdefault(video["youtube_video_id"], []).append(video)
     youtube_ids = list(by_youtube_id)
     observed = await asyncio.to_thread(
         youtube_service.get_videos_privacy_status, youtube_ids
@@ -149,17 +160,25 @@ async def sync_project_video_privacy(
     # anything about privacy — so these rows keep both their stored status and
     # their old stamp, and are reported instead of being acted on.
     summary["missing"] = [y for y in youtube_ids if y not in observed]
-    summary["checked"] = len(observed)
     summary["quota_units"] = (
         len(youtube_ids) + IDS_PER_REQUEST - 1
     ) // IDS_PER_REQUEST
 
+    # Decide first, write once, then act on what actually moved. Splitting it
+    # this way is what lets the whole sweep's stamps be one atomic write.
+    observations: list[tuple[dict, str]] = []
+    moved: list[tuple[dict, str, str]] = []
     for youtube_id, privacy in observed.items():
-        video = by_youtube_id[youtube_id]
-        was = video["privacy_status"]
-        if not await _apply_privacy(video, privacy):
-            continue
+        for video in by_youtube_id[youtube_id]:
+            observations.append((video, privacy))
+            was = video["privacy_status"] or ""
+            if was != privacy:
+                moved.append((video, was, privacy))
 
+    await _record_observations(observations)
+    summary["checked"] = len(observations)
+
+    for video, was, privacy in moved:
         summary["changed"].append({
             "video_id": video["id"], "title": video["title"],
             "from": was, "to": privacy,

@@ -236,6 +236,64 @@ async def test_non_youtube_and_archived_videos_are_not_swept(
     assert seen == [["ytlive"]]
 
 
+async def test_two_rows_naming_one_youtube_video_are_both_updated(
+    privacy, monkeypatch
+):
+    """A re-import can leave two local rows pointing at the same YouTube video.
+
+    Keying the batch by youtube_video_id in a dict silently kept the last, and
+    the dropped row was then never stamped — so it sorted first forever on
+    `privacy_synced_at IS NULL` and was dropped again on every subsequent sweep.
+    Permanently unswept, with nothing anywhere saying so.
+    """
+    service, db, project = privacy
+    await _add_video(db, "v1", privacy="unlisted", youtube_id="ytsame",
+                     title="Original")
+    await _add_video(db, "v2", privacy="unlisted", youtube_id="ytsame",
+                     title="Re-imported")
+    seen: list = []
+    _fake_youtube(monkeypatch, service, {"ytsame": "public"}, seen=seen)
+
+    summary = await service.sync_project_video_privacy(project)
+
+    assert seen == [["ytsame"]], "still one id, so still one quota unit"
+    assert summary["quota_units"] == 1
+    rows = await db.execute_fetchall(
+        "SELECT id, privacy_status, privacy_synced_at FROM videos ORDER BY id"
+    )
+    assert [r["privacy_status"] for r in rows] == ["public", "public"]
+    assert all(r["privacy_synced_at"] is not None for r in rows), (
+        "both rows asked the question, so both were answered"
+    )
+    assert {c["video_id"] for c in summary["changed"]} == {"v1", "v2"}
+
+
+async def test_nothing_is_stamped_when_the_batch_write_fails(
+    privacy, monkeypatch
+):
+    """The stamps are one transaction so a partial sweep cannot report part of
+    the library as freshly verified on the strength of a read that did not
+    finish."""
+    service, db, project = privacy
+    await _add_video(db, "v1", privacy="unlisted", youtube_id="yt1")
+    await _add_video(db, "v2", privacy="unlisted", youtube_id="yt2")
+    _fake_youtube(monkeypatch, service, {"yt1": "public", "yt2": "public"})
+
+    async def boom(pairs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(service, "_record_observations", boom)
+
+    with pytest.raises(RuntimeError, match="disk full"):
+        await service.sync_project_video_privacy(project)
+
+    rows = await db.execute_fetchall(
+        "SELECT privacy_status, privacy_synced_at FROM videos"
+    )
+    assert all(r["privacy_status"] == "unlisted" for r in rows)
+    assert all(r["privacy_synced_at"] is None for r in rows)
+
+
 async def test_least_recently_verified_is_read_first(privacy, monkeypatch):
     """A capped sweep must rotate through the library, not re-read the same head
     of the list forever while the tail is never checked at all."""
