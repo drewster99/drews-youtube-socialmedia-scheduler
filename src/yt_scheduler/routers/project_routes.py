@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path
 from yt_scheduler.services import events as events_service
 from yt_scheduler.services import project_settings as project_settings_service
 from yt_scheduler.services import projects as project_service
+from yt_scheduler.services import video_privacy_sync
 from yt_scheduler.services import prompts as prompts_service
 from yt_scheduler.services.auth import (
     get_credentials,
@@ -67,6 +68,26 @@ async def upcoming(limit: int = 7) -> list[dict]:
         (limit,),
     )
     return [dict(r) for r in rows]
+
+
+@router.get("/video-privacy-sweep-failures")
+async def video_privacy_sweep_failures() -> dict:
+    """Projects whose privacy sweep has been failing long enough to report.
+
+    The sweep decides whether a video is treated as live, and two guards read
+    its result: auto-add, and the refusal to announce a non-public video. When
+    it stops running, both keep trusting a value nothing has re-verified — so a
+    persistent failure has to be visible from wherever the user is standing,
+    not only in the log.
+
+    A single failure is deliberately NOT reported. One is routine (a sleeping
+    laptop, a token mid-refresh) and a banner for each of those is a banner
+    nobody reads.
+    """
+    return {
+        "failures": await video_privacy_sync.last_sweep_runs(),
+        "min_failures": video_privacy_sync.MIN_FAILURES_BEFORE_SURFACING,
+    }
 
 
 @router.get("")

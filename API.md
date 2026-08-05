@@ -147,6 +147,14 @@ Ordering is `(created_at DESC, id DESC)`. The tiebreak is load-bearing: a batch 
 
 `type` is one of: `created`, `imported`, `uploaded`, `metadata_updated`, `publish_scheduled`, `published`, `social_post_scheduled`, `social_post_published` (see `services/events.py`). `payload` shape varies by type.
 
+### `GET /api/projects/video-privacy-sweep-failures`
+
+**Purpose** — Projects whose video-privacy sweep has been failing persistently. Drives `static/js/privacy-sweep-banner.js`, loaded on every page.
+
+**Response 200** — `{"failures": [{"project_id", "project_slug", "project_name", "started_at", "finished_at", "error", "consecutive_failures", "last_success_at"}], "min_failures": N}`.
+
+A single failed sweep is deliberately **not** reported — one is routine (a sleeping laptop, a token mid-refresh) and a banner for each would be a banner nobody reads. The server owns the threshold (`video_privacy_sync.MIN_FAILURES_BEFORE_SURFACING`); the banner renders whatever this returns rather than second-guessing it. `last_success_at` survives failed runs so the UI can say how *long* the check has been broken, not merely that it is.
+
 ### `GET /api/projects/upcoming`
 
 **Purpose** — Upcoming scheduled publishes across all projects.

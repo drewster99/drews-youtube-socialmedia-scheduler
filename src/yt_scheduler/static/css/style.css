@@ -2290,3 +2290,25 @@ dialog.modal-xwide {
     border-color: var(--accent); color: var(--accent);
 }
 .comment-handled-btn:disabled { cursor: default; opacity: 0.5; }
+
+
+/* Video-privacy sweep failure. Same sticky group as the other two banners;
+   amber rather than the failed-sends red — nothing has gone out wrong yet, but
+   the guard that decides whether a video may be announced is running blind. */
+.privacy-sweep-banner {
+    background: var(--bg-input);
+    border: 1px solid var(--warning);
+    border-radius: 6px;
+    padding: 0.6rem 0.9rem;
+    margin-bottom: 0.5rem;
+    font-size: 0.85rem;
+}
+.privacy-sweep-banner__head { color: var(--warning); font-weight: 600; }
+.privacy-sweep-banner__row { margin-top: 0.4rem; }
+.privacy-sweep-banner__why {
+    color: var(--text-muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.78rem;
+    margin-top: 0.15rem;
+    overflow-wrap: anywhere;
+}

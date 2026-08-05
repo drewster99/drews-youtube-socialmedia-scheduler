@@ -31,7 +31,10 @@ under 350 a day at the default interval, against a 10,000-unit budget.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+
+from datetime import datetime, timezone
 
 from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.models.video import is_youtube_backed
@@ -47,6 +50,97 @@ MAX_VIDEOS_PER_SWEEP = 200
 
 #: YouTube's own per-request id limit, and so the unit of quota accounting.
 IDS_PER_REQUEST = 50
+
+
+#: Consecutive failed sweeps before the UI says anything. One failure is
+#: routine — a sleeping laptop, a token mid-refresh, a flaky minute — and a
+#: banner for each of those is a banner nobody reads. Two in a row across a
+#: 90-minute interval is three hours of not knowing whether a video is public,
+#: which is long enough to matter and short enough to still be actionable.
+MIN_FAILURES_BEFORE_SURFACING = 2
+
+
+def _utc_now() -> str:
+    """SQLite's own shape, because these stamps are only ever compared with
+    each other and with ``datetime('now')`` — see the timestamp-shape rule."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def _record_sweep_run(
+    project_id: int, *, started_at: str, error: str | None, detail: dict | None,
+) -> None:
+    """Persist the outcome of one sweep, overwriting this project's last.
+
+    The sweep's only caller is a background job, so its failures happen with no
+    page open. A log line is not a surface: nothing would say the check had
+    stopped, while the two guards that read ``privacy_status`` went on trusting
+    a value nothing had verified for days.
+
+    Never raises. This records what happened and must not become a new way for
+    the sweep to fail — least of all on the path already reporting one.
+    """
+    detail_json = json.dumps(detail) if detail is not None else None
+    try:
+        async with write_transaction() as db:
+            await db.execute(
+                """
+                INSERT INTO video_privacy_sweep_runs
+                    (project_id, started_at, finished_at, ok, error,
+                     consecutive_failures, last_success_at, detail)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    started_at = excluded.started_at,
+                    finished_at = excluded.finished_at,
+                    ok = excluded.ok,
+                    error = excluded.error,
+                    -- Reset by success, incremented by failure. Never cleared
+                    -- BY a failure, so a check that flaps still accumulates
+                    -- instead of resetting itself to invisibility each time it
+                    -- briefly recovers.
+                    consecutive_failures = CASE
+                        WHEN excluded.ok = 1 THEN 0
+                        ELSE video_privacy_sweep_runs.consecutive_failures + 1
+                    END,
+                    -- Held through a failure on purpose: paired with
+                    -- finished_at it is what lets the UI say how LONG this has
+                    -- been broken, rather than only that it is.
+                    last_success_at = CASE
+                        WHEN excluded.ok = 1 THEN excluded.finished_at
+                        ELSE video_privacy_sweep_runs.last_success_at
+                    END,
+                    detail = excluded.detail
+                """,
+                (project_id, started_at, _utc_now(), 0 if error else 1, error,
+                 0 if error is None else 1,
+                 _utc_now() if error is None else None, detail_json),
+            )
+    except Exception:
+        logger.exception(
+            "Could not record the privacy sweep outcome for project %s",
+            project_id,
+        )
+
+
+async def last_sweep_runs() -> list[dict]:
+    """Every project whose privacy sweep has been failing long enough to say so.
+
+    Returns only what the UI should act on. A single failure is deliberately
+    invisible; see MIN_FAILURES_BEFORE_SURFACING.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        """
+        SELECT r.project_id, p.slug AS project_slug, p.name AS project_name,
+               r.started_at, r.finished_at, r.error,
+               r.consecutive_failures, r.last_success_at
+          FROM video_privacy_sweep_runs r
+          JOIN projects p ON p.id = r.project_id
+         WHERE r.ok = 0 AND r.consecutive_failures >= ?
+         ORDER BY r.consecutive_failures DESC, p.name
+        """,
+        (MIN_FAILURES_BEFORE_SURFACING,),
+    )
+    return [dict(row) for row in rows]
 
 
 async def _videos_due_for_check(project_id: int, limit: int) -> list[dict]:
@@ -124,11 +218,38 @@ async def sync_project_video_privacy(
 ) -> dict:
     """Read privacy for one project's videos and reconcile what changed.
 
-    Raises whatever the YouTube client raises. A sweep that cannot reach YouTube
-    must fail loudly and leave every ``privacy_synced_at`` untouched — writing a
-    confirmation it did not earn is the misleading-fine state this module exists
-    to remove, and stale stamps are the evidence that the check is not running.
+    Raises whatever the YouTube client raises, having recorded the failure
+    first. A sweep that cannot reach YouTube must fail loudly and leave every
+    ``privacy_synced_at`` untouched — writing a confirmation it did not earn is
+    the misleading-fine state this module exists to remove.
     """
+    started_at = _utc_now()
+    try:
+        summary = await _sync_project_video_privacy(project, limit=limit)
+    except Exception as exc:
+        # Recorded on the way past, not instead of raising: the caller still
+        # needs to know, and so does anyone looking at a page tomorrow.
+        await _record_sweep_run(
+            int(project["id"]), started_at=started_at,
+            error=f"{type(exc).__name__}: {exc}", detail=None,
+        )
+        raise
+    await _record_sweep_run(
+        int(project["id"]), started_at=started_at, error=None,
+        detail={
+            "checked": summary["checked"],
+            "changed": len(summary["changed"]),
+            "missing": len(summary["missing"]),
+            "quota_units": summary["quota_units"],
+        },
+    )
+    return summary
+
+
+async def _sync_project_video_privacy(
+    project: dict, *, limit: int = MAX_VIDEOS_PER_SWEEP
+) -> dict:
+    """The sweep itself. Wrapped by the recorder above."""
     summary = {
         "project_slug": project["slug"], "checked": 0, "missing": [],
         "changed": [], "became_live": [], "quota_units": 0,

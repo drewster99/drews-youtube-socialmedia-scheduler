@@ -444,3 +444,152 @@ async def test_the_binding_is_restored_even_when_youtube_raises(
         await service.sync_project_video_privacy(project)
 
     assert auth.get_active_project() == before
+
+
+# --- a sweep that stops working has to say so --------------------------------
+
+
+async def test_a_failed_sweep_is_recorded_and_reraised(privacy, monkeypatch):
+    """The sweep's only caller is a timer, so a failure happens with no page
+    open. Recording it is what lets a page say so tomorrow; re-raising is what
+    keeps the caller honest. Both, not either."""
+    service, db, project = privacy
+    await _add_video(db, "v1", privacy="unlisted", youtube_id="ytv1")
+
+    def boom(video_ids):
+        raise RuntimeError("HTTP 403 insufficientPermissions")
+
+    monkeypatch.setattr(
+        service.youtube_service, "get_videos_privacy_status", boom
+    )
+
+    with pytest.raises(RuntimeError):
+        await service.sync_project_video_privacy(project)
+
+    rows = await db.execute_fetchall(
+        "SELECT ok, error, consecutive_failures, last_success_at "
+        "FROM video_privacy_sweep_runs WHERE project_id = 1"
+    )
+    assert rows[0]["ok"] == 0
+    assert "insufficientPermissions" in rows[0]["error"]
+    assert rows[0]["consecutive_failures"] == 1
+    assert rows[0]["last_success_at"] is None
+
+
+async def test_one_failure_is_not_surfaced_but_a_run_of_them_is(
+    privacy, monkeypatch
+):
+    """A single failed sweep is routine — a sleeping laptop, a token
+    mid-refresh. A banner for each of those is a banner nobody reads."""
+    service, db, project = privacy
+    await _add_video(db, "v1", privacy="unlisted", youtube_id="ytv1")
+
+    def boom(video_ids):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(
+        service.youtube_service, "get_videos_privacy_status", boom
+    )
+
+    with pytest.raises(RuntimeError):
+        await service.sync_project_video_privacy(project)
+    assert await service.last_sweep_runs() == [], "one failure stays quiet"
+
+    with pytest.raises(RuntimeError):
+        await service.sync_project_video_privacy(project)
+    surfaced = await service.last_sweep_runs()
+    assert len(surfaced) == 1
+    assert surfaced[0]["consecutive_failures"] == 2
+    assert surfaced[0]["project_slug"] == "default"
+
+
+async def test_a_success_clears_the_streak(privacy, monkeypatch):
+    service, db, project = privacy
+    await _add_video(db, "v1", privacy="unlisted", youtube_id="ytv1")
+
+    def boom(video_ids):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(
+        service.youtube_service, "get_videos_privacy_status", boom
+    )
+    for _ in range(2):
+        with pytest.raises(RuntimeError):
+            await service.sync_project_video_privacy(project)
+    assert len(await service.last_sweep_runs()) == 1
+
+    _fake_youtube(monkeypatch, service, {"ytv1": "public"})
+    await service.sync_project_video_privacy(project)
+
+    assert await service.last_sweep_runs() == []
+    rows = await db.execute_fetchall(
+        "SELECT consecutive_failures, last_success_at "
+        "FROM video_privacy_sweep_runs WHERE project_id = 1"
+    )
+    assert rows[0]["consecutive_failures"] == 0
+    assert rows[0]["last_success_at"] is not None
+
+
+async def test_last_success_survives_a_later_failure(privacy, monkeypatch):
+    """Paired with the failure count this is what lets the banner say how LONG
+    it has been broken. "Failing" reads the same at four minutes and four days,
+    and that difference is what decides whether to care now."""
+    service, db, project = privacy
+    await _add_video(db, "v1", privacy="unlisted", youtube_id="ytv1")
+
+    _fake_youtube(monkeypatch, service, {"ytv1": "public"})
+    await service.sync_project_video_privacy(project)
+    rows = await db.execute_fetchall(
+        "SELECT last_success_at FROM video_privacy_sweep_runs WHERE project_id = 1"
+    )
+    first_success = rows[0]["last_success_at"]
+    assert first_success is not None
+
+    def boom(video_ids):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(
+        service.youtube_service, "get_videos_privacy_status", boom
+    )
+    with pytest.raises(RuntimeError):
+        await service.sync_project_video_privacy(project)
+
+    rows = await db.execute_fetchall(
+        "SELECT last_success_at FROM video_privacy_sweep_runs WHERE project_id = 1"
+    )
+    assert rows[0]["last_success_at"] == first_success, (
+        "a failed run must not erase when it last worked"
+    )
+
+
+async def test_recording_the_outcome_never_becomes_a_new_failure(
+    privacy, monkeypatch, caplog
+) -> None:
+    """This function describes failures; it must not become one — least of all
+    on the path that is already reporting a failure.
+
+    Exercised directly rather than through the sweep: write_transaction is
+    shared with the sweep's own stamping write, and breaking it globally would
+    test that the SWEEP fails (which it should) instead of that the RECORDER
+    stays quiet.
+    """
+    import contextlib
+    import logging
+
+    service, _db, _project = privacy
+
+    @contextlib.asynccontextmanager
+    async def broken_write():
+        raise RuntimeError("database is locked")
+        yield  # pragma: no cover - unreachable, keeps this a generator
+
+    monkeypatch.setattr(service, "write_transaction", broken_write)
+
+    with caplog.at_level(logging.ERROR):
+        await service._record_sweep_run(
+            1, started_at="2026-08-05 12:00:00", error=None, detail={"checked": 1},
+        )
+
+    assert any("record" in r.message.lower() for r in caplog.records), (
+        "it must report that it could not record, not vanish"
+    )
