@@ -2312,3 +2312,25 @@ dialog.modal-xwide {
     margin-top: 0.15rem;
     overflow-wrap: anywhere;
 }
+
+
+/* Scheduled YouTube publish that failed. Red like failed-sends: the date was
+   missed and every social post for the video is stuck behind it. */
+.failed-publish-banner {
+    background: var(--bg-input);
+    border: 1px solid var(--danger);
+    border-radius: 6px;
+    padding: 0.6rem 0.9rem;
+    margin-bottom: 0.5rem;
+    font-size: 0.85rem;
+}
+.failed-publish-banner__head { color: var(--danger); font-weight: 600; }
+.failed-publish-banner__row { margin-top: 0.4rem; }
+.failed-publish-banner__when { color: var(--text-muted); margin-right: 0.4rem; font-size: 0.78rem; }
+.failed-publish-banner__error {
+    color: var(--text-muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.78rem;
+    overflow-wrap: anywhere;
+}
+.failed-publish-banner__actions { margin-left: 0.5rem; white-space: nowrap; }

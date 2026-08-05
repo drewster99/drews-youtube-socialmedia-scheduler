@@ -1218,6 +1218,13 @@ function renderEvent(ev) {
         }
         case 'published':
             return `${ts} <span>Video published ${ytLink}</span>`;
+        case 'publish_failed': {
+            /* The error is the actionable part — quota, auth and validation
+               failures all need different things done about them. */
+            const why = ev.payload?.error || 'unknown error';
+            return `${ts} <span style="color: var(--danger);">YouTube publish failed:`
+                 + ` ${escapeHtml(why)}</span>`;
+        }
         case 'privacy_changed_on_youtube': {
             /* A change nobody made in this app — someone flipped it in Studio,
                and the privacy sweep found it. The old -> new pair IS the

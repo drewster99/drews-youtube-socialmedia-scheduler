@@ -200,6 +200,37 @@ async def is_transcription_model_cached(backend: str, model: str) -> dict:
     return {"backend": backend, "model": model, "cached": cached}
 
 
+@router.get("/failed-publishes")
+async def list_failed_publishes() -> list[dict]:
+    """Videos whose scheduled YouTube publish failed and is still unresolved.
+
+    Drives ``static/js/failed-publish-banner.js`` on every page — the publish
+    job's only caller is a timer, so its failure otherwise happens with no page
+    open and the video sits looking merely "scheduled". Rows leave this list
+    when the publish succeeds (retry or restart recovery), a new schedule is
+    set, or the user cancels the schedule; ``publish_failed_at`` is the single
+    source of truth and is cleared by exactly those three writers.
+
+    Ordered by ``publish_failed_at`` — when it FAILED, which is the age the
+    user acts on. ``publish_at`` is when it was supposed to go out and can be
+    arbitrarily older.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        """
+        SELECT v.id AS video_id, v.title, v.publish_at, v.publish_failed_at,
+               v.publish_error, v.item_type,
+               p.slug AS project_slug, p.name AS project_name
+          FROM videos v
+          JOIN projects p ON p.id = v.project_id
+         WHERE v.publish_failed_at IS NOT NULL
+           AND COALESCE(v.archived, 0) = 0
+         ORDER BY v.publish_failed_at DESC
+        """
+    )
+    return [dict(r) for r in rows]
+
+
 @router.get("/scheduled")
 async def list_scheduled():
     """List all videos with scheduled publishes."""

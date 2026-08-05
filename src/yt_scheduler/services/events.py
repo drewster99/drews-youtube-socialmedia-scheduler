@@ -15,6 +15,11 @@ through ``record_event``. The payload shape is event-type specific:
                                  "scheduled_at": iso, "text": str}``
 * ``social_post_published`` — ``{"platform": str, "social_account_id": int | null,
                                  "post_url": str, "posted_at": iso}``
+* ``publish_failed``         — ``{"platform": "youtube", "error": str}``. The
+                              scheduled publish's YouTube step failed; the
+                              video keeps ``status='scheduled'`` and the
+                              failed-publish banner reads the row's
+                              ``publish_failed_at`` / ``publish_error``.
 * ``privacy_changed_on_youtube``
                             — ``{"old": str | null, "new": str}``. Recorded by
                               the privacy sweep when YouTube reports a privacy

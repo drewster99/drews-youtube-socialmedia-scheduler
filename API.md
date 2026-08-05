@@ -912,6 +912,14 @@ Source: `src/yt_scheduler/routers/video_routes.py`
 
 **Response 200** — Array (shape determined by `services/transcription.list_available_backends()`); each element includes a backend id (e.g. `mlx-whisper`, `whisper.cpp`, `macos-speech`) and human-readable info.
 
+### `GET /api/videos/failed-publishes`
+
+**Purpose** — Videos whose scheduled YouTube publish failed and is still unresolved. Drives `static/js/failed-publish-banner.js` (loaded on every page), the failed-sends banner's twin for the step *before* the social posts.
+
+**Response 200** — Array of `{"video_id", "title", "publish_at", "publish_failed_at", "publish_error", "item_type", "project_slug", "project_name"}`, ordered by `publish_failed_at DESC` (when it *failed* — the age the user acts on; `publish_at` is when it was supposed to go out and can be arbitrarily older).
+
+`videos.publish_failed_at` / `publish_error` (migration 056) are the single source of truth, cleared by exactly three writers: a successful publish, a fresh schedule, or cancelling the schedule. The banner's actions reuse `POST /api/videos/{video_id}/publish` (safe to retry — flipping public is idempotent, unlike a social send) and `DELETE /api/videos/{video_id}/schedule` (the give-up path).
+
 ### `GET /api/videos/scheduled`
 
 **Purpose** — List videos that currently have an APScheduler `publish_*` job pending.

@@ -306,6 +306,7 @@ async def publish_video_job(video_id: str) -> dict:
                 async with write_transaction() as db:
                     await db.execute(
                         """UPDATE videos SET privacy_status = 'public', status = 'published',
+                        publish_failed_at = NULL, publish_error = NULL,
                         updated_at = datetime('now') WHERE id = ?""",
                         (video_id,),
                     )
@@ -331,6 +332,26 @@ async def publish_video_job(video_id: str) -> dict:
             except Exception as e:
                 logger.error(f"Failed to publish video {video_id}: {e}")
                 results["publish_error"] = str(e)
+                # The row is the single source of truth for "this publish
+                # failed", exactly like social_posts.failed_at: the job's only
+                # caller is a timer, so a return value and a log line reach
+                # nobody, and the video otherwise keeps status='scheduled' with
+                # a past publish_at — which no page reads as trouble. The
+                # failed-publish banner renders from these columns app-wide.
+                async with write_transaction() as db:
+                    await db.execute(
+                        "UPDATE videos SET publish_failed_at = datetime('now'), "
+                        "publish_error = ? WHERE id = ?",
+                        (str(e), video_id),
+                    )
+                # Always an event, not only for auth-shaped failures: a quota
+                # refusal or a 500 missed its date just as thoroughly, and the
+                # video's own Log is where someone asks "why isn't this live?".
+                await events.record_event(
+                    video_id,
+                    "publish_failed",
+                    {"platform": "youtube", "error": str(e)},
+                )
                 # Auth-shaped failures need user action. Surface them in
                 # the Log so the user sees "Credential for YouTube is
                 # invalid — Update" instead of having to find the warning
@@ -1149,13 +1170,16 @@ async def schedule_publish(
         if manual is None:
             await db.execute(
                 "UPDATE videos SET publish_at = ?, status = 'scheduled', "
+                "publish_failed_at = NULL, publish_error = NULL, "
                 "updated_at = datetime('now') WHERE id = ?",
                 (publish_at.isoformat(), video_id),
             )
         else:
             await db.execute(
                 "UPDATE videos SET publish_at = ?, publish_at_manual = ?, "
-                "status = 'scheduled', updated_at = datetime('now') WHERE id = ?",
+                "status = 'scheduled', "
+                "publish_failed_at = NULL, publish_error = NULL, "
+                "updated_at = datetime('now') WHERE id = ?",
                 (publish_at.isoformat(), 1 if manual else 0, video_id),
             )
 
@@ -1351,7 +1375,9 @@ async def cancel_scheduled_publish(video_id: str) -> bool:
 
     async with write_transaction() as db:
         await db.execute(
-            "UPDATE videos SET publish_at = NULL, status = 'ready', updated_at = datetime('now') WHERE id = ?",
+            "UPDATE videos SET publish_at = NULL, status = 'ready', "
+            "publish_failed_at = NULL, publish_error = NULL, "
+            "updated_at = datetime('now') WHERE id = ?",
             (video_id,),
         )
     logger.info(f"Cancelled scheduled publish for {video_id}")

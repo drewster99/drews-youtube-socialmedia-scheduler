@@ -292,3 +292,95 @@ async def test_archived_video_is_still_skipped(app_db) -> None:
     results = await scheduler.publish_video_job("vidA")
 
     assert results.get("skipped_archived") is True
+
+
+# --- a failed YouTube publish is recorded where a page can see it -------------
+
+
+async def test_failed_publish_stamps_the_row_and_records_an_event(
+    app_db, monkeypatch
+) -> None:
+    """The publish job's only caller is a timer, so its return value and its
+    log line reach nobody. Before the stamp, the video kept status='scheduled'
+    with a past publish_at — which no page renders as trouble — while every
+    approved social post sat unsent and nothing retried until a restart."""
+    scheduler, db = app_db
+    await _seed_video(db, "vidF", "unlisted", status="scheduled")
+
+    youtube = importlib.import_module("yt_scheduler.services.youtube")
+
+    def boom(video_id, **kw):
+        raise RuntimeError("quotaExceeded: publish refused")
+
+    monkeypatch.setattr(youtube, "update_video_metadata", boom)
+
+    result = await scheduler.publish_video_job("vidF")
+
+    assert "quotaExceeded" in result["publish_error"]
+    cursor = await db.execute(
+        "SELECT status, publish_failed_at, publish_error FROM videos WHERE id = 'vidF'"
+    )
+    row = dict(await cursor.fetchone())
+    assert row["publish_failed_at"] is not None
+    assert "quotaExceeded" in row["publish_error"]
+    assert row["status"] == "scheduled", (
+        "still scheduled — restart recovery must keep re-attempting it"
+    )
+
+    events = await db.execute_fetchall(
+        "SELECT type FROM video_events WHERE video_id = 'vidF'"
+    )
+    assert "publish_failed" in [e["type"] for e in events], (
+        "a non-auth failure gets an event too — a quota refusal missed its "
+        "date as thoroughly as a revoked token"
+    )
+
+
+async def test_successful_publish_clears_an_earlier_failure(
+    app_db, monkeypatch
+) -> None:
+    """publish_failed_at is the banner's source of truth, so leaving it set
+    after a successful retry would keep a resolved failure on every page."""
+    scheduler, db = app_db
+    await _seed_video(db, "vidF", "unlisted", status="scheduled")
+    await db.execute(
+        "UPDATE videos SET publish_failed_at = datetime('now'), "
+        "publish_error = 'earlier failure' WHERE id = 'vidF'"
+    )
+    await db.commit()
+
+    youtube = importlib.import_module("yt_scheduler.services.youtube")
+    monkeypatch.setattr(youtube, "update_video_metadata", lambda *a, **kw: {})
+
+    result = await scheduler.publish_video_job("vidF")
+
+    assert result["published"] is True
+    cursor = await db.execute(
+        "SELECT publish_failed_at, publish_error FROM videos WHERE id = 'vidF'"
+    )
+    row = dict(await cursor.fetchone())
+    assert row["publish_failed_at"] is None
+    assert row["publish_error"] is None
+
+
+async def test_cancelling_the_schedule_clears_the_failure(app_db) -> None:
+    """Cancel is the banner's give-up action. The failure clears WITH the
+    schedule, or the banner would keep a row with nothing left to act on."""
+    scheduler, db = app_db
+    await _seed_video(db, "vidF", "unlisted", status="scheduled")
+    await db.execute(
+        "UPDATE videos SET publish_at = '2026-01-01T00:00:00+00:00', "
+        "publish_failed_at = datetime('now'), publish_error = 'boom' "
+        "WHERE id = 'vidF'"
+    )
+    await db.commit()
+
+    assert await scheduler.cancel_scheduled_publish("vidF") is True
+
+    cursor = await db.execute(
+        "SELECT publish_failed_at, publish_error, status FROM videos WHERE id = 'vidF'"
+    )
+    row = dict(await cursor.fetchone())
+    assert row["publish_failed_at"] is None
+    assert row["publish_error"] is None
+    assert row["status"] == "ready"

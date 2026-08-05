@@ -312,6 +312,7 @@ function eventVerb(type) {
         metadata_updated: 'Updated',
         publish_scheduled: 'Schedule publish',
         published: 'Video published',
+        publish_failed: 'YouTube publish FAILED',
         privacy_changed_on_youtube: 'Privacy changed on YouTube',
         social_post_scheduled: 'Social post scheduled',
         social_post_published: 'Social post published',
@@ -332,6 +333,7 @@ function eventTier(type) {
         || type === 'privacy_changed_on_youtube') return 'lifecycle';
     if (type === 'social_post_skipped_duplicate'
         || type === 'social_post_failed_video_not_public'
+        || type === 'publish_failed'
         || type === 'credential_invalid') return 'warn';
     return 'minor';
 }
