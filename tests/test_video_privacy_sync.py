@@ -391,3 +391,56 @@ async def test_a_change_is_recorded_as_an_event(privacy, monkeypatch):
         if r["type"] == "privacy_changed_on_youtube"
     )
     assert '"old": "unlisted"' in payload and '"new": "public"' in payload
+
+
+async def test_the_project_binding_does_not_leak_past_the_sweep(
+    privacy, monkeypatch
+):
+    """A bare set_active_project leaves the ContextVar set on the way out.
+
+    The root asyncio context is the copy-on-create template for every Task
+    spawned afterwards, so a stale slug there is inherited by unrelated jobs —
+    and get_youtube_service refuses to guess precisely because reading one
+    project's data under another's grant is the wrong-channel mistake.
+    """
+    service, db, project = privacy
+    auth = importlib.import_module("yt_scheduler.services.auth")
+    await _add_video(db, "v1", privacy="unlisted", youtube_id="ytv1")
+
+    seen_inside: list = []
+
+    def fake(video_ids):
+        seen_inside.append(auth.get_active_project())
+        return {"ytv1": "public"}
+
+    monkeypatch.setattr(
+        service.youtube_service, "get_videos_privacy_status", fake
+    )
+
+    before = auth.get_active_project()
+    await service.sync_project_video_privacy(project)
+
+    assert seen_inside == ["default"], "bound while the call is in flight"
+    assert auth.get_active_project() == before, "and restored afterwards"
+
+
+async def test_the_binding_is_restored_even_when_youtube_raises(
+    privacy, monkeypatch
+):
+    """The exception path is the one a bare set + manual reset gets wrong."""
+    service, db, project = privacy
+    auth = importlib.import_module("yt_scheduler.services.auth")
+    await _add_video(db, "v1", privacy="unlisted", youtube_id="ytv1")
+
+    def boom(video_ids):
+        raise RuntimeError("HTTP 403")
+
+    monkeypatch.setattr(
+        service.youtube_service, "get_videos_privacy_status", boom
+    )
+
+    before = auth.get_active_project()
+    with pytest.raises(RuntimeError):
+        await service.sync_project_video_privacy(project)
+
+    assert auth.get_active_project() == before

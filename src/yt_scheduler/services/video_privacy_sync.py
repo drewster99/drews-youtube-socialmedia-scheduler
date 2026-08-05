@@ -36,7 +36,7 @@ import logging
 from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.models.video import is_youtube_backed
 from yt_scheduler.services import events, youtube as youtube_service
-from yt_scheduler.services.auth import set_active_project
+from yt_scheduler.services.auth import scoped_active_project
 
 logger = logging.getLogger(__name__)
 
@@ -137,10 +137,6 @@ async def sync_project_video_privacy(
     if not candidates:
         return summary
 
-    # Every youtube.* wrapper below resolves credentials through this binding.
-    # asyncio.to_thread copies the current context, so the worker thread sees it.
-    set_active_project(project["slug"])
-
     # A LIST per id, not one video. Two local rows may name the same YouTube
     # video (a re-import alongside the original), and a dict would silently keep
     # the last — the dropped row would then never be stamped, sort first forever
@@ -151,9 +147,17 @@ async def sync_project_video_privacy(
         if is_youtube_backed(video):
             by_youtube_id.setdefault(video["youtube_video_id"], []).append(video)
     youtube_ids = list(by_youtube_id)
-    observed = await asyncio.to_thread(
-        youtube_service.get_videos_privacy_status, youtube_ids
-    )
+    # SCOPED, not a bare set_active_project: the ContextVar must be restored on
+    # the way out, including on the exception path. A bare set leaves the root
+    # asyncio context — the copy-on-create template for every Task spawned
+    # afterwards — holding this project's slug, so an unrelated job that forgot
+    # to bind would silently inherit it and read the wrong channel's videos.
+    # comments.sync_project_comments does the same for the same reason.
+    # asyncio.to_thread copies the current context, so the worker sees it.
+    with scoped_active_project(project["slug"]):
+        observed = await asyncio.to_thread(
+            youtube_service.get_videos_privacy_status, youtube_ids
+        )
 
     # Absence is not a value. A deleted video, one we lost read access to, and a
     # truncated response are indistinguishable here, and none of them says
