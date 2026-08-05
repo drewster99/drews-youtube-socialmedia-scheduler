@@ -87,6 +87,129 @@ def test_a_transport_failure_wrapped_by_an_sdk_is_still_seen() -> None:
     assert send_failures.is_safe_to_retry(ambiguous) is False
 
 
+# --- SDKs that drop the causal chain -----------------------------------------
+
+
+def _mastodon_style(inner):
+    """Reproduce mastodon.internals exactly: one request call, bare re-raise.
+
+    ``except Exception as e: raise MastodonNetworkError(f"...{e}")`` — no
+    ``from e``, so the cause survives only as ``__context__``.
+    """
+    from mastodon.errors import MastodonNetworkError
+
+    try:
+        inner()
+    except Exception as exc:
+        raise MastodonNetworkError(f"Could not complete request: {exc}")
+
+
+def test_a_connect_failure_mastodon_dropped_the_cause_for_is_still_retried() -> None:
+    """A real "[Errno 65] No route to host" was classified unrecognised.
+
+    mastodon.py wraps transport errors WITHOUT ``from``, and requests and
+    urllib3 each do the same again beneath it, so the errno that decides the
+    question sat four levels down a pure ``__context__`` chain with ``__cause__``
+    empty at every level. is_safe_to_retry walks ``__cause__`` only — correctly,
+    and by design — so it saw nothing and refused. The send provably never left
+    the machine and was never retried.
+    """
+    import requests
+
+    from yt_scheduler.services import social
+
+    try:
+        # A closed local port: ECONNREFUSED, instantly, no outbound traffic —
+        # and the genuine requests/urllib3 chain rather than a hand-built one.
+        _mastodon_style(lambda: requests.post("http://127.0.0.1:9/x", timeout=2))
+    except Exception as exc:
+        assert exc.__cause__ is None, "the SDK really does drop it"
+        social.restore_mastodon_network_cause(exc)
+        assert send_failures.is_safe_to_retry(exc) is True
+
+
+def test_restoring_the_chain_never_turns_an_ambiguous_failure_safe() -> None:
+    """The repair restores EVIDENCE, not a verdict.
+
+    mastodon.py catches ``Exception`` broadly, so the recovered cause may be a
+    read-phase failure — the request may have arrived and only the response was
+    lost. Ambiguity-anywhere-wins must still refuse, or this fix would have
+    bought retry coverage at the cost of double-posting.
+    """
+    from yt_scheduler.services import social
+
+    for ambiguous in (httpx.ReadTimeout("lost"), httpx.ReadError("lost")):
+        try:
+            _mastodon_style(lambda: (_ for _ in ()).throw(ambiguous))
+        except Exception as exc:
+            social.restore_mastodon_network_cause(exc)
+            assert send_failures.is_safe_to_retry(exc) is False
+
+
+def test_the_restore_only_touches_mastodon_errors() -> None:
+    """Following ``__context__`` is unsafe in general — it is not a causal
+    claim. This repair is scoped to the one SDK whose defect we have measured,
+    and must leave every other exception exactly as it found it."""
+    from yt_scheduler.services import social
+
+    try:
+        try:
+            raise httpx.ReadTimeout("the request may well have arrived")
+        except Exception:
+            raise RuntimeError("some other SDK")
+    except RuntimeError as exc:
+        social.restore_mastodon_network_cause(exc)
+        assert exc.__cause__ is None, "a non-Mastodon error must be untouched"
+        assert send_failures.is_safe_to_retry(exc) is False
+
+
+# --- what we tell the user ---------------------------------------------------
+
+
+def test_only_a_provably_undelivered_request_is_called_undelivered() -> None:
+    """"Network failure" and "did it arrive" are different questions.
+
+    A ConnectError never left; a ReadError means we connected, sent, and lost
+    the response — the post may be live. Both are network failures, and telling
+    the user the second "never reached" invites the one mistake that cannot be
+    undone. The banner said exactly that about a Threads ReadError.
+    """
+    from yt_scheduler.services import social
+
+    never = social.remediation_for(
+        httpx.ConnectError("no route"), platform="Threads", fallback="f"
+    )
+    assert "never reached" in never
+
+    unknown = social.remediation_for(
+        httpx.ReadError("connection lost"), platform="Threads", fallback="f"
+    )
+    assert "never reached" not in unknown, (
+        "a read-phase failure may have posted; claiming otherwise invites a "
+        "duplicate post"
+    )
+    assert "may or may not have posted" in unknown
+
+
+def test_the_message_and_the_retry_decision_cannot_disagree() -> None:
+    """The sentence the user reads and the decision the retry job makes come
+    from one classifier, so they can never tell different stories."""
+    from yt_scheduler.services import social
+
+    for exc in (
+        httpx.ConnectError("x"), httpx.ConnectTimeout("x"),
+        httpx.ReadError("x"), httpx.ReadTimeout("x"),
+        socket.gaierror(getattr(socket, "EAI_NONAME", 8), "nodename nor servname"),
+    ):
+        says_never = "never reached" in social.remediation_for(
+            exc, platform="Threads", fallback="f"
+        )
+        assert says_never is send_failures.is_safe_to_retry(exc), (
+            f"{type(exc).__name__}: the message and the retry classifier "
+            f"disagree about whether the request arrived"
+        )
+
+
 # --- backoff -----------------------------------------------------------------
 
 

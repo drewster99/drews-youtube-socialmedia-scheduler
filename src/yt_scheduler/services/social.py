@@ -22,6 +22,7 @@ import httpx
 # routers already refer to this module.
 from yt_scheduler import config
 from yt_scheduler.services import media as media_service
+from yt_scheduler.services import send_failures
 from yt_scheduler.services.keychain import KeychainWriteError, SecretsIndexError
 
 logger = logging.getLogger(__name__)
@@ -326,6 +327,58 @@ def _refusal_status(exc: BaseException) -> int | None:
     return None
 
 
+def restore_mastodon_network_cause(exc: BaseException) -> None:
+    """Reattach the cause ``mastodon.py`` drops when it wraps a transport error.
+
+    ``mastodon.internals`` does ``except Exception as e: raise
+    MastodonNetworkError(f"...{e}")`` — no ``from e`` — so the causal link
+    survives only as ``__context__``. :func:`send_failures.is_safe_to_retry`
+    walks ``__cause__`` ONLY, deliberately, because ``__context__`` is not a
+    causal claim. The result was that a real "[Errno 65] No route to host"
+    reached the classifier as an unrecognised error and was never retried,
+    although it provably never left the machine.
+
+    Narrow on purpose. This repairs ONE library's known defect at the boundary
+    where we know about it, rather than teaching the classifier to trust
+    ``__context__`` everywhere — that reading is unsafe in general and is the
+    thing send_failures refuses to do.
+
+    What makes it sound HERE specifically: the SDK's ``try`` block wraps exactly
+    one ``session.request(...)`` and nothing else, so its context chain *is* its
+    causal chain. The shape that makes ``__context__`` untrustworthy in general
+    — an SDK catching a ReadTimeout, re-authing inside the handler, and letting
+    a ConnectError escape — cannot arise from a block that only makes one call.
+    And even if it somehow did, the ReadTimeout would still be in the chain, and
+    ambiguity-anywhere-wins would refuse the retry.
+
+    It restores EVIDENCE, never a verdict: the SDK catches ``Exception``
+    broadly, so the recovered cause may just as well be a ``ReadTimeout``, and
+    the classifier will then still refuse the retry. Making the truth visible is
+    the whole change.
+    """
+    try:
+        from mastodon.errors import MastodonNetworkError
+    except ImportError:
+        # The [social] extra is not installed, so no such exception can exist.
+        return
+    if not isinstance(exc, MastodonNetworkError):
+        return
+
+    # The WHOLE chain, not one link. requests raises `ConnectionError(e)` inside
+    # its own except block, and urllib3 does the same again beneath that, so a
+    # real refusal arrives as four exceptions deep in __context__ with __cause__
+    # empty at every level — the errno that decides the question sits at the
+    # bottom. Measured, not assumed:
+    #     ConnectionError -> MaxRetryError -> NewConnectionError -> OSError(61)
+    node, seen = exc, {id(exc)}
+    while node.__cause__ is None and node.__context__ is not None:
+        if id(node.__context__) in seen:
+            break
+        node.__cause__ = node.__context__
+        node = node.__cause__
+        seen.add(id(node))
+
+
 def remediation_for(exc: BaseException, *, platform: str, fallback: str) -> str:
     """What the user should actually do about ``exc``.
 
@@ -339,9 +392,22 @@ def remediation_for(exc: BaseException, *, platform: str, fallback: str) -> str:
     specific reading of, so each caller keeps its own domain knowledge.
     """
     if is_network_failure(exc):
+        # "Network problem" is not the same question as "did it arrive". A
+        # ConnectError provably never left; a ReadError means we connected, sent,
+        # and lost the response — the post may well be live. Both are network
+        # failures, and telling the user the second one "never reached" invites
+        # the one mistake that cannot be undone. send_failures owns this
+        # distinction for the automatic path; asking it here keeps the sentence
+        # the user reads and the decision the retry job makes in agreement,
+        # rather than having a second opinion drift away from the first.
+        if send_failures.is_safe_to_retry(exc):
+            return (
+                f"The request never reached {platform}. Check your network "
+                f"connection, then retry."
+            )
         return (
-            f"The request never reached {platform}. Check your network "
-            f"connection, then retry."
+            f"The connection to {platform} dropped before it answered, so this "
+            f"may or may not have posted. Check {platform} before retrying."
         )
     status = _refusal_status(exc)
     if status == 402:
@@ -1931,6 +1997,7 @@ class MastodonPoster(SocialPoster):
         except CredentialAuthError:
             raise
         except Exception as e:
+            restore_mastodon_network_cause(e)
             raise RuntimeError(
                 f"Mastodon post failed: {_exception_detail(e)} "
                 f"{remediation_for(e, platform='Mastodon', fallback='Check the post content and any attachment, then retry.')}"
