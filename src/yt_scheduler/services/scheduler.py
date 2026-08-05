@@ -2115,12 +2115,21 @@ def start_scheduler(
         next_run_time=backfill_first_run,
     )
 
+    # First run shortly after launch, not one interval in. The app cannot see
+    # Studio changes while it is closed, so the blind window is LONGEST at
+    # startup — waiting a further 90 minutes extends exactly the gap the sweep
+    # exists to close. Two minutes rather than the backfills' 15s: it spends
+    # YouTube quota and wants startup's restore passes out of the way.
+    privacy_first_run = None
+    if "pytest" not in sys.modules:
+        privacy_first_run = datetime.now(timezone.utc) + timedelta(seconds=120)
     scheduler.add_job(
         sync_video_privacy_job,
         "interval",
         minutes=VIDEO_PRIVACY_SYNC_INTERVAL_MINUTES,
         id="sync_video_privacy",
         replace_existing=True,
+        next_run_time=privacy_first_run,
     )
     scheduler.start()
     logger.info(
