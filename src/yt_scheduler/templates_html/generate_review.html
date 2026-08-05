@@ -145,13 +145,7 @@ function escapeAttr(s) {
     return String(s ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
 }
 function fmtSeconds(s) {
-    if (s == null || isNaN(s)) return '?';
-    const total = Math.floor(s);
-    const h = Math.floor(total / 3600);
-    const m = Math.floor((total % 3600) / 60);
-    const sec = total % 60;
-    if (h) return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
-    return `${m}:${String(sec).padStart(2, '0')}`;
+    return dysDateTime.formatDuration(s) || '?';
 }
 
 function showSection(id) {

@@ -162,6 +162,8 @@ Ordering is `(created_at DESC, id DESC)`. The tiebreak is load-bearing: a batch 
     "title": "...",
     "publish_at": "2026-04-28T15:00:00+00:00",
     "project_id": 1,
+    "item_type": "short",
+    "duration_seconds": 96,
     "project_name": "Default",
     "project_slug": "default"
   }
@@ -169,6 +171,8 @@ Ordering is `(created_at DESC, id DESC)`. The tiebreak is load-bearing: a batch 
 ```
 
 Filters to videos with `publish_at IS NOT NULL AND status != 'published'`, ordered ascending by `publish_at`.
+
+`item_type` and `duration_seconds` drive the Home page's Upcoming row: a tier chip (promo tiers only — an episode is the default, and a chip on every row is noise) and the length in the same muted treatment as the time. `duration_seconds` is NULL when the video has not been probed, and the row then shows **no** length rather than `0:00` — an unknown duration is not a zero-length video.
 
 ### `GET /api/projects`
 

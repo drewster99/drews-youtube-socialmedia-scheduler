@@ -235,6 +235,28 @@ def test_no_template_redefines_the_shared_date_helpers() -> None:
     )
 
 
+def test_no_template_redefines_the_shared_duration_formatter() -> None:
+    """The same arithmetic had reached FOUR copies — dashboard, generate_review,
+    video_detail, and very nearly home — before it moved into
+    ``dysDateTime.formatDuration``.
+
+    They had already drifted: one returned '' for a zero duration and another
+    rendered "0:00", so the same unprobed video read as unknown on one page and
+    as zero-length on the next. Copies do not stay identical; that is the whole
+    lesson of ``_ensureUtc`` above.
+    """
+    templates = SRC_ROOT / "templates_html"
+    offenders = [
+        str(path.relative_to(SRC_ROOT))
+        for path in sorted(templates.glob("*.html"))
+        if re.search(r"function\s+formatDuration\s*\(", path.read_text())
+    ]
+    assert offenders == [], (
+        "These templates define their own formatDuration instead of calling "
+        f"window.dysDateTime.formatDuration: {offenders}"
+    )
+
+
 def test_every_template_that_uses_dysdatetime_inherits_base() -> None:
     """``dysDateTime`` is vended by a <script> in base.html's <head>. A page
     that calls it without extending base has no such script, and the call

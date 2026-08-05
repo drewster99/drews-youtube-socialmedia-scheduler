@@ -56,6 +56,7 @@ async def upcoming(limit: int = 7) -> list[dict]:
     rows = await db.execute_fetchall(
         """
         SELECT v.id AS video_id, v.title, v.publish_at, v.project_id,
+               v.item_type, v.duration_seconds,
                p.name AS project_name, p.slug AS project_slug
         FROM videos v
         JOIN projects p ON p.id = v.project_id

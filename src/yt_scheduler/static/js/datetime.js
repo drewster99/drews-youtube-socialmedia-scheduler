@@ -86,5 +86,32 @@
         return age ? `${when} (${age})` : when;
     }
 
-    window.dysDateTime = { ensureUtc, formatWhen, formatAge, formatWhenWithAge };
+    /**
+     * A video's length as compact mm:ss, or h:mm:ss once it passes an hour.
+     *
+     * Returns '' for null / non-numeric / non-positive, so a caller can omit
+     * the element entirely rather than render "0:00" or "NaN:aN" — an unknown
+     * duration is not a zero-length one.
+     *
+     * A duration is not a timestamp, but it is the same job — turning a time
+     * value into something a person reads — and this is the module every page
+     * already loads for that. It arrived as the THIRD copy of the same
+     * arithmetic (dashboard, generate_review, and nearly home); see the note at
+     * the top of this file about how the last set of copies went.
+     */
+    function formatDuration(seconds) {
+        if (seconds === null || seconds === undefined) return '';
+        const total = Math.round(Number(seconds));
+        if (Number.isNaN(total) || total <= 0) return '';
+        const hours = Math.floor(total / 3600);
+        const minutes = Math.floor((total % 3600) / 60);
+        const secs = total % 60;
+        const pad = (n) => String(n).padStart(2, '0');
+        return hours > 0
+            ? `${hours}:${pad(minutes)}:${pad(secs)}`
+            : `${minutes}:${pad(secs)}`;
+    }
+
+    window.dysDateTime = { ensureUtc, formatWhen, formatAge, formatWhenWithAge,
+                           formatDuration };
 })();

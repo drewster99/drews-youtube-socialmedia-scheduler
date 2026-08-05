@@ -474,15 +474,7 @@ function parseIsoDuration(iso) {
     return (parseInt(m[1] || 0) * 3600) + (parseInt(m[2] || 0) * 60) + parseFloat(m[3] || 0);
 }
 
-function formatDuration(sec) {
-    if (sec == null) return '';
-    const s = Math.round(sec);
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const r = s % 60;
-    const pad = n => String(n).padStart(2, '0');
-    return h > 0 ? `${h}:${pad(m)}:${pad(r)}` : `${m}:${pad(r)}`;
-}
+const formatDuration = dysDateTime.formatDuration;
 
 // Tier classification per spec: hook <50s, short 50–180s, segment 180–720s, video ≥720s.
 function tierFor(sec) {

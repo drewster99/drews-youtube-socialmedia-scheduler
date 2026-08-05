@@ -263,6 +263,24 @@ function fmtWhen(iso) {
     return `${dow} ${datePart} ${h}:${m}${ampm}`;
 }
 
+/* The same chip the dashboard and video page use, so a hook and a short are
+   told apart without opening either. Only promo tiers get one: an episode is
+   the default, and a chip on every row is noise rather than information. */
+function upcomingTierChip(itemType) {
+    const tier = (itemType || '').toLowerCase();
+    return ['hook', 'short', 'segment'].includes(tier)
+        ? `<span class="badge tier-${tier}">${escapeHtml(tier)}</span>`
+        : '';
+}
+
+/* Muted, like the time on the same row — it is context for the title, not a
+   second thing to read. Omitted entirely when the duration is unknown, rather
+   than shown as 0:00, which would assert a length we do not have. */
+function upcomingLength(seconds) {
+    const text = dysDateTime.formatDuration(seconds);
+    return text ? `<span class="event-length">${escapeHtml(text)}</span>` : '';
+}
+
 async function loadUpcoming() {
     const container = document.getElementById('upcoming-list');
     try {
@@ -275,7 +293,9 @@ async function loadUpcoming() {
         container.innerHTML = items.map(i => `
             <div class="event-row">
                 <span class="event-when">${fmtWhen(i.publish_at)}</span>
+                ${upcomingTierChip(i.item_type)}
                 <a href="/projects/${i.project_slug}/videos/${i.video_id}">${escapeHtml(i.title)}</a>
+                ${upcomingLength(i.duration_seconds)}
                 <span class="event-project">${escapeHtml(i.project_name)}</span>
             </div>
         `).join('');

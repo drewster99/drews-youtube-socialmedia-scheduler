@@ -1405,6 +1405,7 @@ body {
 }
 .event-row:last-child { border-bottom: none; }
 .event-row .event-when { color: var(--text-muted); font-size: 0.75rem; min-width: 8rem; }
+.event-row .event-length { color: var(--text-muted); font-size: 0.75rem; }
 .event-row .event-project {
     margin-left: auto;
     font-size: 0.75rem;
