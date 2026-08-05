@@ -512,9 +512,24 @@ def _index_record(service: str, account: str) -> None:
     Records the sentinel only. Secret VALUES are never written here — that is
     the whole point of the index: it is the list of keys to ask the Keychain
     for, not a second copy of the answers.
+
+    A key already recorded writes NOTHING. The sentinel is a constant, so
+    re-recording an existing key rewrites the file to a byte-identical copy —
+    and :func:`store_secret` calls this BEFORE the Keychain write, so that
+    pointless write is a precondition of storing the secret. A rotating token
+    refreshing every twenty minutes performed it every twenty minutes, and when
+    the disk was full for one minute a Bluesky rotation landed in it: the index
+    write raised, ``_keychain_set`` was never reached, the new token was never
+    stored, and the old one had already been invalidated by the provider. The
+    account was unrecoverable, over a write whose only effect was to reproduce a
+    file that already said the right thing.
+
+    Refreshing an existing credential now touches the filesystem not at all.
     """
     with _secrets_file_lock:
         data = _load_secrets_file()
+        if data.get(service, {}).get(account) == KEYCHAIN_SENTINEL:
+            return
         data.setdefault(service, {})[account] = KEYCHAIN_SENTINEL
         _save_secrets_file(data)
 

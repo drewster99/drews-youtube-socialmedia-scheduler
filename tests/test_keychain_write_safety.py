@@ -137,3 +137,100 @@ def test_wedged_keychain_does_not_fail_a_read(keychain, monkeypatch):
 
     assert keychain.load_secret("ns", "k") == "legacy-value"
     assert service != legacy_service
+
+
+# --- the index write must not gatekeep the Keychain write ---------------------
+
+
+def test_rerecording_an_existing_key_writes_nothing(keychain, monkeypatch):
+    """A refresh of an existing credential must not touch the filesystem.
+
+    The sentinel is a constant, so re-recording a key already in the index
+    rewrites the file to a byte-identical copy. store_secret does that BEFORE
+    the Keychain write, deliberately — which makes a pointless write a
+    precondition of storing the secret.
+
+    It cost an account. The disk was full for one minute, a Bluesky rotation
+    landed in it, the index write raised, _keychain_set was never reached, and
+    the provider had already invalidated the token being replaced.
+    """
+    stored: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        keychain, "_keychain_set",
+        lambda service, account, value: stored.append((service, account, value)) or True,
+    )
+
+    keychain.store_secret("bluesky", "bundle_u1", "first-token")
+    assert keychain.SECRETS_FILE.exists()
+    before = keychain.SECRETS_FILE.read_bytes()
+
+    saves: list[int] = []
+    real_save = keychain._save_secrets_file
+    monkeypatch.setattr(
+        keychain, "_save_secrets_file",
+        lambda data: saves.append(1) or real_save(data),
+    )
+
+    keychain.store_secret("bluesky", "bundle_u1", "rotated-token")
+
+    assert saves == [], "re-recording a known key must not rewrite the index"
+    assert keychain.SECRETS_FILE.read_bytes() == before
+    assert stored[-1] == (
+        keychain._service_name("bluesky"), "bundle_u1", "rotated-token"
+    ), "the Keychain write must still happen — that is the part that matters"
+
+
+def test_a_full_disk_no_longer_blocks_refreshing_a_known_credential(
+    keychain, monkeypatch
+):
+    """The exact failure, reproduced: index writes fail, the rotation survives.
+
+    Before, ENOSPC on a 1.5 KB bookkeeping file meant the credential was never
+    stored and the account was gone.
+    """
+    import errno
+
+    stored: list[str] = []
+    monkeypatch.setattr(
+        keychain, "_keychain_set",
+        lambda service, account, value: stored.append(value) or True,
+    )
+    keychain.store_secret("bluesky", "bundle_u1", "first-token")
+
+    def full_disk(_data):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(keychain, "_save_secrets_file", full_disk)
+
+    keychain.store_secret("bluesky", "bundle_u1", "rotated-token")
+    assert stored[-1] == "rotated-token"
+
+
+def test_a_genuinely_new_key_is_still_indexed(keychain, monkeypatch):
+    """The skip must not stop a first-time key being recorded — an unindexed
+    Keychain item is invisible to load_all, export and delete."""
+    monkeypatch.setattr(keychain, "_keychain_set", lambda *a: True)
+
+    keychain.store_secret("bluesky", "bundle_u1", "v")
+    keychain.store_secret("twitter", "bundle_u2", "v")
+
+    data = json.loads(keychain.SECRETS_FILE.read_text())
+    assert data[keychain._service_name("bluesky")]["bundle_u1"] == \
+        keychain.KEYCHAIN_SENTINEL
+    assert data[keychain._service_name("twitter")]["bundle_u2"] == \
+        keychain.KEYCHAIN_SENTINEL
+
+
+def test_a_key_dropped_from_the_index_is_recorded_again(keychain, monkeypatch):
+    """delete_secret removes the index entry, so a later store must write it
+    back rather than trusting a stale in-memory belief."""
+    monkeypatch.setattr(keychain, "_keychain_set", lambda *a: True)
+    monkeypatch.setattr(keychain, "_keychain_delete", lambda *a: True)
+
+    keychain.store_secret("bluesky", "bundle_u1", "v")
+    keychain.delete_secret("bluesky", "bundle_u1")
+    keychain.store_secret("bluesky", "bundle_u1", "v2")
+
+    data = json.loads(keychain.SECRETS_FILE.read_text())
+    assert data[keychain._service_name("bluesky")]["bundle_u1"] == \
+        keychain.KEYCHAIN_SENTINEL
