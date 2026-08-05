@@ -1851,7 +1851,11 @@ async def refresh_social_tokens_job() -> None:
     the post path); a transient/network error is left for the next sweep.
     """
     from yt_scheduler.services.social import CredentialAuthError, get_poster_for_uuid
-    from yt_scheduler.services.social_credentials import list_credentials, mark_needs_reauth
+    from yt_scheduler.services.social_credentials import (
+        CredentialPersistFailed,
+        list_credentials,
+        mark_needs_reauth,
+    )
 
     try:
         creds = await list_credentials()
@@ -1885,6 +1889,18 @@ async def refresh_social_tokens_job() -> None:
                 logger.info("Token refresh sweep: renewed %s", label)
         except CredentialAuthError as exc:
             logger.warning("Token refresh sweep: %s needs re-auth — %s", label, exc)
+            try:
+                await mark_needs_reauth(uuid)
+            except Exception as me:
+                logger.warning("Token refresh sweep: failed to flag %s: %s", uuid, me)
+        except CredentialPersistFailed as exc:
+            # NOT transient, and the distinction is the whole point: the refresh
+            # SUCCEEDED and the provider has already invalidated the token it
+            # replaced. Nothing we hold can work again, so retrying next sweep
+            # only presents a spent token — which is exactly how a one-minute
+            # disk-full at 00:33 became "Refresh token replayed" at 00:53 and a
+            # post failing at 09:00 with nothing in between saying why.
+            logger.error("Token refresh sweep: %s LOST ITS TOKEN — %s", label, exc)
             try:
                 await mark_needs_reauth(uuid)
             except Exception as me:

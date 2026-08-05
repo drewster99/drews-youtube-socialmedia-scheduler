@@ -14,12 +14,15 @@ still pointing at the deleted credential render as
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
+import shutil
 import time
 from datetime import datetime, timezone
 import logging
 import uuid as uuidlib
 
+from yt_scheduler import config
 from yt_scheduler.database import get_db, write_transaction
 from yt_scheduler.services._keyed_locks import KeyedLocks
 from yt_scheduler.services.keychain import (
@@ -216,6 +219,59 @@ _SECRET_WRITE_ATTEMPTS: int = 3
 _SECRET_WRITE_RETRY_SECONDS: float = 0.25
 
 
+class CredentialPersistFailed(RuntimeError):
+    """The provider issued new tokens and we could not store them.
+
+    Its own type because the two failures either side of it look identical from
+    a bare ``except Exception`` and could not be more different:
+
+    * the refresh call failed  → nothing changed, the stored token still works,
+      try again next sweep. Genuinely transient.
+    * the refresh call SUCCEEDED and the write failed → the provider has already
+      invalidated the token it replaced. Nothing is stored that can ever work
+      again, and every later sweep presents a spent token. The account is gone
+      until the user re-authorises, and no amount of retrying changes that.
+
+    This happened: the disk filled for one minute, a Bluesky rotation landed in
+    it, and the sweep logged "transient error" and retried twenty minutes later
+    with the consumed token — which answered "Refresh token replayed". The only
+    signal the user got was a post failing eight hours later.
+    """
+
+    def __init__(self, platform: str, uuid: str, cause: BaseException) -> None:
+        self.platform = platform
+        self.uuid = uuid
+        self.cause = cause
+        super().__init__(self._describe(platform, cause))
+
+    @staticmethod
+    def _describe(platform: str, cause: BaseException) -> str:
+        # ENOSPC is called out by name because it is the one cause the user can
+        # act on directly, and because "no space left on device" buried in a
+        # Keychain error does not read as "your social account is about to need
+        # reconnecting".
+        if isinstance(cause, OSError) and cause.errno == errno.ENOSPC:
+            free = ""
+            try:
+                free = (
+                    f" Free space now: "
+                    f"{shutil.disk_usage(config.DATA_DIR).free / 1e9:.1f} GB."
+                )
+            except OSError:
+                pass
+            return (
+                f"The disk was full while saving a refreshed {platform} token, "
+                f"so the new token was lost. {platform} has already invalidated "
+                f"the previous one, so this account must be reconnected in "
+                f"Settings.{free}"
+            )
+        return (
+            f"A refreshed {platform} token could not be stored ({cause}). "
+            f"{platform} has already invalidated the previous one, so this "
+            f"account must be reconnected in Settings."
+        )
+
+
 async def save_bundle(platform: str, uuid: str, bundle: dict) -> None:
     bundle["uuid"] = uuid
     payload = json.dumps(bundle)
@@ -225,7 +281,7 @@ async def save_bundle(platform: str, uuid: str, bundle: dict) -> None:
                 platform, f"{CREDENTIAL_KEY_PREFIX}{uuid}", payload,
             )
             break
-        except Exception:
+        except Exception as exc:
             if attempt == _SECRET_WRITE_ATTEMPTS:
                 logger.exception(
                     "Could not store the %s credential bundle for %s after %d "
@@ -233,7 +289,7 @@ async def save_bundle(platform: str, uuid: str, bundle: dict) -> None:
                     "this credential will need reconnecting.",
                     platform, uuid, _SECRET_WRITE_ATTEMPTS,
                 )
-                raise
+                raise CredentialPersistFailed(platform, uuid, exc) from exc
             logger.warning(
                 "Keychain write for %s/%s failed (attempt %d of %d); retrying.",
                 platform, uuid, attempt, _SECRET_WRITE_ATTEMPTS,

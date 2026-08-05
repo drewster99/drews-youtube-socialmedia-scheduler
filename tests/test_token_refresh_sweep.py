@@ -158,3 +158,98 @@ async def test_sweep_skips_credentials_awaiting_reconnect(sweep_env) -> None:
     # skipped before any work.
     assert got_uuids == ["u-live"]
     assert attempted == ["called"]
+
+
+# --- a rotation we could not store is terminal, not transient ----------------
+
+
+async def test_a_lost_rotated_token_flags_reauth_rather_than_retrying(
+    sweep_env, caplog
+) -> None:
+    """The disk filled for one minute and it cost an account.
+
+    A refresh has two halves. If the CALL fails, nothing changed and the next
+    sweep should try again. If the call SUCCEEDS and the write fails, the
+    provider has already invalidated the token it replaced — nothing we hold can
+    ever authenticate again, and every later sweep just presents the spent one.
+
+    That is exactly what happened: ENOSPC at 00:33 during a Bluesky rotation,
+    logged as "transient error"; at 00:53 the next sweep offered the consumed
+    token and Bluesky answered "Refresh token replayed"; the user found out at
+    09:00 when a post failed. Flagging it immediately is the whole fix.
+    """
+    import errno
+    import logging
+
+    monkeypatch = sweep_env
+    scheduler = importlib.import_module("yt_scheduler.services.scheduler")
+    social = importlib.import_module("yt_scheduler.services.social")
+    creds_mod = importlib.import_module("yt_scheduler.services.social_credentials")
+
+    class _StubPoster:
+        token_refresh_window_secs = 0
+
+        async def refresh_if_stale(self, *, window_secs: int = 0) -> bool:
+            raise creds_mod.CredentialPersistFailed(
+                "bluesky", "u-1",
+                OSError(errno.ENOSPC, "No space left on device"),
+            )
+
+    async def fake_list_credentials(**_kw):
+        return [{"uuid": "u-1", "platform": "bluesky", "label": "@drew",
+                 "needs_reauth": False}]
+
+    flagged: list[str] = []
+
+    async def fake_mark(uuid):
+        flagged.append(uuid)
+
+    monkeypatch.setattr(creds_mod, "list_credentials", fake_list_credentials)
+    monkeypatch.setattr(creds_mod, "mark_needs_reauth", fake_mark)
+    monkeypatch.setattr(social, "get_poster_for_uuid",
+                        lambda platform, uuid: _make_poster(_StubPoster()))
+
+    with caplog.at_level(logging.WARNING):
+        await scheduler.refresh_social_tokens_job()
+
+    assert flagged == ["u-1"], (
+        "a credential whose rotated token was lost must be flagged for "
+        "reconnect, not left for a sweep that can only present a spent token"
+    )
+    assert not any(
+        "transient" in r.message.lower() for r in caplog.records
+    ), "this is the opposite of transient"
+    assert any(r.levelno >= logging.ERROR for r in caplog.records), (
+        "losing an account silently is what this fix exists to stop"
+    )
+
+
+async def _make_poster(poster):
+    return poster
+
+
+def test_the_disk_full_case_says_so_and_names_the_remedy() -> None:
+    """The user can act on "the disk was full"; they cannot act on a Keychain
+    errno buried in a stack trace. It must also say the account needs
+    reconnecting, because that is the consequence they will otherwise discover
+    hours later from a failed post."""
+    import errno
+
+    creds_mod = importlib.import_module("yt_scheduler.services.social_credentials")
+    message = str(creds_mod.CredentialPersistFailed(
+        "Bluesky", "u-1", OSError(errno.ENOSPC, "No space left on device")
+    ))
+
+    assert "disk was full" in message
+    assert "reconnected in Settings" in message
+
+
+def test_a_non_disk_persist_failure_still_names_the_consequence() -> None:
+    """Whatever stopped the write, the provider has already rotated. The
+    remedy sentence is the part that must never go missing."""
+    creds_mod = importlib.import_module("yt_scheduler.services.social_credentials")
+    message = str(creds_mod.CredentialPersistFailed(
+        "X", "u-1", RuntimeError("Keychain refused")
+    ))
+
+    assert "reconnected in Settings" in message

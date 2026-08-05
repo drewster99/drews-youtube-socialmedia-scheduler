@@ -24,6 +24,7 @@ from yt_scheduler import config
 from yt_scheduler.services import media as media_service
 from yt_scheduler.services import send_failures
 from yt_scheduler.services.keychain import KeychainWriteError, SecretsIndexError
+from yt_scheduler.services.social_credentials import CredentialPersistFailed
 
 logger = logging.getLogger(__name__)
 
@@ -1158,6 +1159,19 @@ class TwitterPoster(SocialPoster):
                     )
                 try:
                     new_b = await _twitter_refresh_bearer(current)
+                except CredentialPersistFailed as pexc:
+                    # The one storage failure that IS a reconnect. The refresh
+                    # succeeded, so X has already invalidated the bearer this
+                    # replaced; we simply could not store its successor. Reading
+                    # every storage failure as "local problem, don't nag the
+                    # user" predates watching a disk fill mid-rotation and take
+                    # the account with it — after that write, there is nothing
+                    # left that can ever authenticate.
+                    logger.error(
+                        "X refresh for %s succeeded but could not be stored: %s",
+                        uuid, pexc,
+                    )
+                    raise CredentialAuthError(uuid, str(pexc)) from pexc
                 except (KeychainWriteError, SecretsIndexError):
                     # Local storage failure, not a provider verdict — the post
                     # fails loudly via the generic handler without the false
