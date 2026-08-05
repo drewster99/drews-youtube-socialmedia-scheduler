@@ -177,6 +177,45 @@ def test_flatten_emits_one_record_per_comment(comments) -> None:
     assert records[1].total_reply_count is None
 
 
+def test_bucket_status_stamps_the_top_level_comment_not_its_replies(
+    comments,
+) -> None:
+    """The bucket is a claim about the THREAD, which YouTube selects by the
+    status of its top-level comment. Replies ride along unfiltered.
+
+    Stamping them with the bucket asserts something YouTube never said, and it
+    is wrong in both directions: a held reply inside a published thread reads as
+    visible (so spam sits under a real question), and a published reply inside a
+    held thread reads as hidden (so the thread stops asking for a reply).
+
+    A reply keeps a status only when its OWN resource carries one. Absent that,
+    NULL — unknown, which the read path already treats as visible, because a
+    needless badge beats a hidden question.
+    """
+    threads = [_thread(_comment("c1"), replies=[_comment("r1")])]
+
+    records = comments.flatten_threads(threads, bucket_status="heldForReview")
+
+    top, reply = records
+    assert top.moderation_status == "heldForReview"
+    assert reply.moderation_status is None, (
+        "a reply in the preview was stamped with the bucket its PARENT matched"
+    )
+
+
+def test_a_replys_own_moderation_status_still_wins(comments) -> None:
+    """Suppressing the bucket must not suppress the resource's own field —
+    that is YouTube speaking about this exact comment."""
+    held_reply = _comment("r1")
+    held_reply["snippet"]["moderationStatus"] = "heldForReview"
+    threads = [_thread(_comment("c1"), replies=[held_reply])]
+
+    records = comments.flatten_threads(threads, bucket_status="published")
+
+    assert records[0].moderation_status == "published"
+    assert records[1].moderation_status == "heldForReview"
+
+
 def test_channel_level_comment_is_kept_with_no_video(comments) -> None:
     """A sweep also returns comments on the channel itself. Those have no
     videoId, and dropping them would lose real comments."""
@@ -428,7 +467,10 @@ async def test_a_reply_held_after_we_stored_it_is_corrected_on_refresh(
     rows = await isolated_db.execute_fetchall(
         "SELECT moderation_status FROM youtube_comments WHERE comment_id = 'r1'"
     )
-    assert rows[0]["moderation_status"] == "published"
+    assert rows[0]["moderation_status"] is None, (
+        "the reply resource carries no status of its own, and the bucket is a "
+        "claim about its parent — unknown is the only honest starting state"
+    )
 
     # YouTube now holds that reply. It vanishes from the thread preview and the
     # thread's own bucket never mentions it.

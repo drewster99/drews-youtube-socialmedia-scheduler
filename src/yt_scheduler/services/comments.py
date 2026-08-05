@@ -171,8 +171,9 @@ def flatten_threads(
     become rows — "all comments", as a flat list, is what the dashboard shows
     and what a reply to a months-old video needs in order to surface at all.
 
-    ``bucket_status`` is the ``moderationStatus`` the sweep asked this page for;
-    it stamps every comment the page returned.
+    ``bucket_status`` is the ``moderationStatus`` the sweep asked this page for.
+    It stamps the TOP-LEVEL comments only — that is what the query selected on.
+    A reply keeps a status only if its own resource carries one.
     """
     records: list[CommentRecord] = []
     for thread in threads:
@@ -196,7 +197,17 @@ def flatten_threads(
                     video_id=video_id,
                     parent_comment_id=top["id"],
                     total_reply_count=None,
-                    bucket_status=bucket_status,
+                    # NOT the bucket: YouTube selects THREADS by the status of
+                    # their top-level comment, and the preview replies ride
+                    # along unfiltered. Stamping them with it asserted something
+                    # YouTube never said, wrongly in both directions — a held
+                    # reply under a published thread read as visible (spam
+                    # sitting under a real question), and a published reply
+                    # under a held thread read as hidden (so the thread stopped
+                    # asking for a reply). A reply's own field still wins below;
+                    # absent that, NULL is unknown, which the read path treats
+                    # as visible on purpose.
+                    bucket_status=None,
                 )
             )
     return records
@@ -840,7 +851,12 @@ async def _sweep_project_comments(project: dict) -> dict:
     # means that value can no longer be corrected by this path, so it must not
     # happen silently: a pinned `viewer_rating` would keep a thread permanently
     # marked as answered.
-    for record in thread_records:
+    #
+    # TOP-LEVEL only. A preview reply legitimately has no moderationStatus of
+    # its own — the query selected on its parent, not on it — so warning about
+    # every reply would emit a line per reply per sweep for a condition that is
+    # normal, and bury the one case that is not.
+    for record in (r for r in thread_records if r.parent_comment_id is None):
         missing = [
             name for name, value in (
                 ("moderationStatus", record.moderation_status),
