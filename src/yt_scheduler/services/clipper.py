@@ -1009,6 +1009,82 @@ def _validate_indexed_proposals(
     return out, rejected
 
 
+def _message_with_last_block_cache_marked(message: dict) -> dict:
+    """A copy of one message with an ephemeral cache breakpoint on its last
+    content block.
+
+    A string ``content`` (the transcript user turn) is wrapped into a single
+    text block carrying the marker; a list ``content`` (tool_result blocks) has
+    the marker added to its final block. Returns a NEW dict with a NEW content
+    list — the input message and its content are never mutated, so the caller's
+    canonical ``messages`` list stays marker-free and breakpoints can't
+    accumulate across rounds. A non-dict tail block is a construction bug and
+    raises rather than silently skipping the cache.
+    """
+    out = dict(message)
+    content = out["content"]
+    if isinstance(content, str):
+        out["content"] = [{
+            "type": "text", "text": content,
+            "cache_control": {"type": "ephemeral"},
+        }]
+        return out
+    blocks = list(content)
+    tail = blocks[-1]
+    if not isinstance(tail, dict):
+        raise TypeError(
+            "cache breakpoint expects a dict content block at the tail of the "
+            f"message, got {type(tail).__name__}"
+        )
+    tail = dict(tail)
+    tail["cache_control"] = {"type": "ephemeral"}
+    blocks[-1] = tail
+    out["content"] = blocks
+    return out
+
+
+def _messages_with_cache_breakpoints(messages: list[dict]) -> list[dict]:
+    """A copy of ``messages`` carrying up to TWO ephemeral cache breakpoints:
+    a FIXED one on the transcript turn (``messages[0]``) and a MOVING one on the
+    newest turn.
+
+    Anthropic prompt caching is a prefix match over ``tools -> system ->
+    messages``, so a marker on ``messages[0]``'s block caches the whole prefix
+    up to it — the tools, the (per-kind) system prompt, and the ~15.5k-token
+    transcript — which is the part re-sent unchanged on every round and the
+    measured bulk of the cost.
+
+    Why the transcript breakpoint must be FIXED, not a single trailing one: a
+    cache read walks back at most 20 content blocks from a breakpoint to find a
+    prior entry. One check_range round appends ``2N`` blocks (N tool_use + N
+    tool_result), and the first round routinely issues 20-25 checks — so a
+    trailing-only marker sits 40+ blocks past the transcript entry the previous
+    round wrote and the lookback never reaches it: the transcript would silently
+    MISS on exactly the largest, most expensive rounds and be re-written at
+    1.25x. Pinning the marker to ``messages[0]`` makes the entry sit at the
+    breakpoint (0 blocks back), so the transcript is read at 0.1x every round
+    from the second on, regardless of how many checks a round fires.
+
+    The MOVING marker on the last turn additionally caches the accumulated
+    check_range history when it falls inside the 20-block window; when it
+    doesn't, the transcript read via the fixed marker still lands, so the moving
+    marker only ever helps. On round 1 the two coincide (``messages[0]`` is the
+    only turn) and just one breakpoint is emitted. At most two are ever set,
+    well inside Anthropic's limit of four.
+
+    Scoped to the proposal loop ONLY, on purpose: it is the one call whose
+    multi-round re-sends were measured to dominate cost. Other Claude calls are
+    deliberately left uncached until their own usage is analysed.
+    """
+    if not messages:
+        return messages
+    out = [dict(m) for m in messages]
+    out[0] = _message_with_last_block_cache_marked(out[0])
+    if len(out) > 1:
+        out[-1] = _message_with_last_block_cache_marked(out[-1])
+    return out
+
+
 async def propose_clips_for_kind_indexed(
     *,
     kind: ClipKind,
@@ -1088,7 +1164,10 @@ async def propose_clips_for_kind_indexed(
         # until the round cap, and the batch is lost. Forcing the final turn
         # makes it submit the candidates it already validated.
         is_final_round = round_number == MAX_PROPOSAL_ROUNDS
-        round_kwargs = {**kwargs, "messages": messages}
+        round_kwargs = {
+            **kwargs,
+            "messages": _messages_with_cache_breakpoints(messages),
+        }
         if is_final_round:
             round_kwargs["tool_choice"] = {"type": "tool", "name": "propose_clips"}
         try:

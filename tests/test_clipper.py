@@ -344,7 +344,14 @@ async def test_index_over_requests_when_existing_then_caps_output(
         content = [_Block()]
 
     def fake_create(**kw):
-        captured["user_text"] = kw["messages"][0]["content"]
+        # The proposal loop marks a trailing prompt-cache breakpoint, so the
+        # first user turn ships as a text block (carrying cache_control), not a
+        # bare string. Read the text out of whichever shape arrives.
+        content = kw["messages"][0]["content"]
+        captured["user_text"] = (
+            content if isinstance(content, str)
+            else "".join(b["text"] for b in content if b.get("type") == "text")
+        )
         return _Msg()
 
     class _Client:
