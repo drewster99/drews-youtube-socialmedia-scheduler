@@ -3092,10 +3092,13 @@ def platform_requires_hosted_media(platform: str) -> bool:
 # guessed. Mastodon's entry is a floor only: its real caps are per-instance
 # and MastodonPoster.media_limits() reads them from the instance.
 PLATFORM_MEDIA_LIMITS: dict[str, media_service.PlatformMediaLimits] = {
-    # Bluesky publishes no numbers in its docs; these are the constants the
-    # first-party client enforces (VIDEO_MAX_SIZE_MB / VIDEO_MAX_DURATION_MS).
+    # We embed video as a plain blob (app.bsky.embed.video), so the binding cap
+    # is that lexicon's server-enforced blob maxSize of 100,000,000 bytes — NOT
+    # the first-party app's softer VIDEO_MAX_SIZE_MB. A wrong (larger) value here
+    # is silent: violates_limits won't flag the file, no transcode runs, and
+    # createRecord rejects it with "blob too big (maximum 100000000, got …)".
     "bluesky": media_service.PlatformMediaLimits(
-        max_bytes=300 * 1000 * 1000,
+        max_bytes=100 * 1000 * 1000,
         max_duration_seconds=180,
         video_codecs=("h264", "hevc", "vp8", "vp9"),
     ),

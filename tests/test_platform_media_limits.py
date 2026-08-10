@@ -69,7 +69,7 @@ class TestFitDimensions:
 
 class TestViolatesLimits:
     def test_compliant_file_reports_nothing(self):
-        # Bluesky: 300 MB / 3 min, no resolution cap — a 92 MB 68s clip fits.
+        # A generous cap with no resolution limit — a 92 MB 68s clip fits.
         limits = media.PlatformMediaLimits(
             max_bytes=300_000_000, max_duration_seconds=180
         )
@@ -132,6 +132,15 @@ class TestPlatformRegistry:
         # Premium raises this; assuming the higher tier would produce uploads
         # that fail for anyone without it.
         assert PLATFORM_MEDIA_LIMITS["twitter"].max_duration_seconds == 140
+
+    def test_bluesky_byte_cap_is_the_embed_video_lexicon_max(self):
+        """We embed video as a plain blob, so the binding cap is the
+        app.bsky.embed.video lexicon's maxSize. Declaring it larger is silent:
+        the file passes violates_limits, skips transcode, and createRecord
+        rejects it server-side as "blob too big (maximum 100000000, …)"."""
+        from yt_scheduler.services.social import PLATFORM_MEDIA_LIMITS
+
+        assert PLATFORM_MEDIA_LIMITS["bluesky"].max_bytes == 100_000_000
 
     def test_mastodon_static_entry_is_the_strict_fallback(self):
         """The static entry is only used when the instance can't be reached,
