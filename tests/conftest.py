@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import ctypes.util
 import importlib
 import os
 import sqlite3
+import subprocess
 import sys
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
@@ -65,6 +68,151 @@ def _refuse(database: object) -> None:
         "(purging yt_scheduler.* from sys.modules first), or use the "
         "`isolated_db` / `isolated_data_dir` fixture."
     )
+
+
+# --- real-Keychain guard --------------------------------------------------
+#
+# The database guard above has no counterpart for secrets, and the gap was not
+# theoretical: `test_project_url_invariants` starts the app through TestClient's
+# lifespan, which calls repair_keychain_acls() and then the channel backfills.
+# With no in-memory Keychain installed those ran against the user's real login
+# Keychain, fetched the live YouTube channel with real OAuth tokens, and wrote
+# that channel's id and thumbnail into the test's tmp database — where an
+# assertion that a fresh install has no channel binding then failed, describing
+# the developer's account rather than the code.
+#
+# Two costs, neither visible from the test's source: real API quota spent by a
+# test run, and a modal Keychain password prompt that can wedge the suite.
+# There are TWO ways down to the real Keychain, and guarding only the obvious
+# one proves nothing: `_keychain_get` reads through the Security framework via
+# ctypes and never spawns a process, so blocking the `security` CLI alone left
+# the test binding the live channel exactly as before. Both are blocked here:
+#
+#   1. ctypes  — `find_library("Security")` answers None and a direct CDLL load
+#      raises OSError, which is precisely what `_get_sec_lib` already treats as
+#      "framework unavailable" (it catches OSError and returns None).
+#   2. subprocess — `_keychain_get` then falls through to `_keychain_get_cli`,
+#      which is where the refusal below fires. `_keychain_get_cli` catches only
+#      FileNotFoundError and TimeoutExpired, so it propagates.
+#
+# So the framework path degrades quietly to the CLI path, and the CLI path is
+# loud. There is no route left that silently returns a real secret.
+#
+# install_in_memory_keychain() patches well above both levels, so every properly
+# isolated test never reaches either.
+
+
+#: The one documented way to turn the guard off. Named here rather than in the
+#: test module that wants it so the variable has a single spelling.
+LIVE_API_TESTS_ENV = "DYS_RUN_LIVE_API_TESTS"
+
+
+def live_api_tests_opted_in() -> bool:
+    """True when the user has explicitly asked for real, billed API calls.
+
+    ``test_template_render_live`` says it is "segregated from the default suite",
+    but it gated on whether an Anthropic key happened to be in the Keychain —
+    which on the developer's own machine is always true. So four tests that each
+    cost real tokens ran on every single ``pytest`` invocation, and were roughly
+    half the suite's wall-clock. An opt-in has to be an opt-in.
+    """
+    return os.getenv(LIVE_API_TESTS_ENV) == "1"
+
+
+class ProductionKeychainAccess(RuntimeError):
+    """A test tried to read or write the user's real login Keychain."""
+
+
+class _SecurityFrameworkBlocked(OSError):
+    """Refusal shaped as the failure ``_get_sec_lib`` already handles.
+
+    OSError is what a failed ``dlopen`` raises, so the module takes its own
+    documented "framework can't be loaded" branch rather than meeting an
+    exception type it has no answer for.
+    """
+
+
+def _is_security_cli(args: object) -> bool:
+    """True when ``args`` invokes the macOS ``security`` binary."""
+    if isinstance(args, (str, os.PathLike)):
+        argv0 = str(args)
+    elif isinstance(args, (list, tuple)) and args:
+        first = args[0]
+        if not isinstance(first, (str, os.PathLike)):
+            return False
+        argv0 = str(first)
+    else:
+        return False
+    return argv0 == "security" or argv0.endswith("/security")
+
+
+def _is_security_framework(path: object) -> bool:
+    """True when ``path`` names the macOS Security framework binary."""
+    if not isinstance(path, (str, os.PathLike)):
+        return False
+    return "Security.framework" in str(path)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _block_real_keychain() -> Iterator[None]:
+    # The live-API tests need the real Anthropic key, and they are the only
+    # thing in this suite that legitimately does. Asking for them is asking for
+    # real credentials, real money, and possibly a Keychain password prompt —
+    # which is exactly why it has to be said out loud rather than inferred from
+    # a key being present.
+    if live_api_tests_opted_in():
+        yield
+        return
+
+    real_run = subprocess.run
+    real_popen = subprocess.Popen
+    real_find_library = ctypes.util.find_library
+    real_cdll = ctypes.CDLL
+
+    def guarded_find_library(name):
+        if name == "Security":
+            return None
+        return real_find_library(name)
+
+    def guarded_cdll(name=None, *rest, **kwargs):
+        if _is_security_framework(name):
+            raise _SecurityFrameworkBlocked(
+                f"Test tried to load the macOS Security framework ({name!r}) to "
+                "reach the real login Keychain."
+            )
+        return real_cdll(name, *rest, **kwargs)
+
+    def _refuse_keychain(args: object) -> None:
+        raise ProductionKeychainAccess(
+            f"Test tried to run the macOS `security` CLI: {args!r}.\n"
+            "That reads or writes the user's real login Keychain and can raise "
+            "a modal password prompt mid-run.\n"
+            "Use tests.conftest.install_in_memory_keychain(monkeypatch, "
+            "keychain_module), or the `isolated_data_dir` / `isolated_db` "
+            "fixture, which installs it for you."
+        )
+
+    def guarded_run(args, *rest, **kwargs):
+        if _is_security_cli(args):
+            _refuse_keychain(args)
+        return real_run(args, *rest, **kwargs)
+
+    def guarded_popen(args, *rest, **kwargs):
+        if _is_security_cli(args):
+            _refuse_keychain(args)
+        return real_popen(args, *rest, **kwargs)
+
+    subprocess.run = guarded_run
+    subprocess.Popen = guarded_popen
+    ctypes.util.find_library = guarded_find_library
+    ctypes.CDLL = guarded_cdll
+    try:
+        yield
+    finally:
+        subprocess.run = real_run
+        subprocess.Popen = real_popen
+        ctypes.util.find_library = real_find_library
+        ctypes.CDLL = real_cdll
 
 
 #: Every aiosqlite connection opened during a test, so teardown can close the

@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -47,6 +48,11 @@ _DETERMINISTIC_RENDER_FAILURES = (
 )
 
 logger = logging.getLogger(__name__)
+
+#: ``(videos_done, videos_total)``. The unit is the VIDEO, not the post: a video
+#: is what the user selected and what the count on screen refers to, and the
+#: number of posts behind each one varies with how many slots can carry it.
+AcceptProgress = Callable[[int, int], Awaitable[None]]
 
 # One Accept per queue at a time. The maxima that decide the next free time
 # and the next position are read before a render loop that can run for
@@ -196,8 +202,55 @@ async def _plan_video(
     return VideoPlan(posts, skipped_slots)
 
 
+async def check_acceptable(queue_id: int) -> None:
+    """Raise ``SmartQueueError`` for anything Accept cannot possibly get past.
+
+    Accept runs on the background worker, where a failure becomes a red banner
+    the user has to go and read. The two ways it can be dead on arrival — the
+    queue is gone, or it has no posting times at all — are both immediately
+    fixable and both knowable without doing any work, so they are answered at
+    the button as a 400 instead. Everything else is genuinely per-video and
+    belongs in the job's report.
+
+    Deliberately does NOT pre-render or pre-resolve anything: a check that can
+    itself be slow or flaky is a second place for Accept to fail, which is what
+    moving Accept off the request was meant to stop.
+    """
+    queue = await queue_service.get_queue(queue_id)
+    if not queue["slots"]:
+        raise queue_service.SmartQueueError(
+            "This queue has no posting times, so nothing can be scheduled."
+        )
+    await _template_by_id(int(queue["template_id"]))
+
+
 async def accept_selection(
-    queue_id: int, video_ids: list[str], *, default_ai_system: str | None = None
+    queue_id: int,
+    video_ids: list[str],
+    *,
+    default_ai_system: str | None = None,
+    progress: AcceptProgress | None = None,
+) -> dict:
+    """Take the queue's Accept lock and schedule the batch.
+
+    The body is :func:`_accept_selection_locked`, split out for the reconcile
+    worker: ``run_job`` already holds this lock for every job kind, so a handler
+    that called this wrapper would deadlock against itself. Same shape as
+    ``reflow_pending`` / ``_reflow_pending_locked`` below.
+    """
+    async with _accept_locks.get(queue_id):
+        return await _accept_selection_locked(
+            queue_id, video_ids,
+            default_ai_system=default_ai_system, progress=progress,
+        )
+
+
+async def _accept_selection_locked(
+    queue_id: int,
+    video_ids: list[str],
+    *,
+    default_ai_system: str | None = None,
+    progress: AcceptProgress | None = None,
 ) -> dict:
     """Give a posting time to everything waiting in this queue.
 
@@ -227,98 +280,104 @@ async def accept_selection(
     queue = await queue_service.get_queue(queue_id)
     db = await get_db()
 
-    # One Accept per queue at a time. The render loop runs for minutes, and the
-    # "next free time" and "next position" maxima are read before it — two
-    # overlapping Accepts (a double-click is enough) would otherwise read the
-    # same maxima and stamp the same instants.
-    async with _accept_locks.get(queue_id):
-        template = await _template_by_id(int(queue["template_id"]))
-        slots = template["slots"]
+    # The caller holds the queue's Accept lock. The render loop runs for
+    # minutes, and the "next free time" and "next position" maxima are read
+    # before it — two overlapping Accepts (a double-click is enough) would
+    # otherwise read the same maxima and stamp the same instants.
+    template = await _template_by_id(int(queue["template_id"]))
+    slots = template["slots"]
 
-        # A repeated id would otherwise be scheduled twice in one batch.
-        # dict.fromkeys de-dupes while preserving order, so "the order is the
-        # caller's" still holds.
-        video_ids = list(dict.fromkeys(video_ids))
+    # A repeated id would otherwise be scheduled twice in one batch.
+    # dict.fromkeys de-dupes while preserving order, so "the order is the
+    # caller's" still holds.
+    video_ids = list(dict.fromkeys(video_ids))
 
-        skipped: list[dict] = []
-        errors: list[dict] = []
+    skipped: list[dict] = []
+    errors: list[dict] = []
 
-        # Waiting items first, oldest position first: auto-add put them here and
-        # they have been waiting longest.
-        waiting = await db.execute_fetchall(
-            "SELECT id, video_id FROM smart_queue_items "
-            "WHERE queue_id = ? AND state = ? ORDER BY position",
-            (queue_id, queue_service.ITEM_STATE_QUEUED),
+    # Waiting items first, oldest position first: auto-add put them here and
+    # they have been waiting longest.
+    waiting = await db.execute_fetchall(
+        "SELECT id, video_id FROM smart_queue_items "
+        "WHERE queue_id = ? AND state = ? ORDER BY position",
+        (queue_id, queue_service.ITEM_STATE_QUEUED),
+    )
+    pending: list[tuple[int | None, str]] = [
+        (int(row["id"]), row["video_id"]) for row in waiting
+    ]
+    waiting_ids = {row["video_id"] for row in waiting}
+
+    already = await queue_service.already_scheduled_video_ids(queue_id, video_ids)
+    for video_id in video_ids:
+        if video_id in waiting_ids:
+            # Already picked up above as a waiting item; scheduling it again
+            # here would give the same video two rows in one batch.
+            continue
+        if video_id in already:
+            # The screen's selection can be stale — a failed Accept leaves
+            # the list untouched, and re-submitting must not append a second
+            # copy of what already landed.
+            skipped.append({
+                "video_id": video_id,
+                "reason": "already scheduled by this queue",
+            })
+            continue
+        pending.append((None, video_id))
+
+    if not pending:
+        return {"scheduled": 0, "items": [], "skipped": skipped, "errors": errors}
+
+    # Resolve every video BEFORE any posting time is computed. An id that no
+    # longer names a video must consume neither an instant nor a position:
+    # an abandoned instant is a posting time at which nothing goes out, and
+    # nothing ever backfills it.
+    batch: list[tuple[int | None, dict]] = []
+    for item_id, video_id in pending:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM videos WHERE id = ?", (video_id,)
         )
-        pending: list[tuple[int | None, str]] = [
-            (int(row["id"]), row["video_id"]) for row in waiting
-        ]
-        waiting_ids = {row["video_id"] for row in waiting}
+        if not rows:
+            skipped.append({
+                "video_id": video_id, "reason": "video no longer exists",
+            })
+            continue
+        video = dict(rows[0])
+        if int(video.get("project_id") or 0) != int(queue["project_id"]):
+            # A video id from another project must never be scheduled here:
+            # it would post another channel's clip on this queue's accounts.
+            skipped.append({
+                "video_id": video_id,
+                "reason": "belongs to a different project",
+            })
+            continue
+        batch.append((item_id, video))
+    if not batch:
+        return {"scheduled": 0, "items": [], "skipped": skipped, "errors": errors}
 
-        already = await queue_service.already_scheduled_video_ids(queue_id, video_ids)
-        for video_id in video_ids:
-            if video_id in waiting_ids:
-                # Already picked up above as a waiting item; scheduling it again
-                # here would give the same video two rows in one batch.
-                continue
-            if video_id in already:
-                # The screen's selection can be stale — a failed Accept leaves
-                # the list untouched, and re-submitting must not append a second
-                # copy of what already landed.
-                skipped.append({
-                    "video_id": video_id,
-                    "reason": "already scheduled by this queue",
-                })
-                continue
-            pending.append((None, video_id))
+    instants = await queue_service.next_free_posting_times(queue, len(batch))
+    instant_index = 0
 
-        if not pending:
-            return {"scheduled": 0, "items": [], "skipped": skipped, "errors": errors}
+    position_rows = await db.execute_fetchall(
+        "SELECT COALESCE(MAX(position), -1) AS last FROM smart_queue_items "
+        "WHERE queue_id = ?",
+        (queue_id,),
+    )
+    position = int(position_rows[0]["last"]) + 1
 
-        # Resolve every video BEFORE any posting time is computed. An id that no
-        # longer names a video must consume neither an instant nor a position:
-        # an abandoned instant is a posting time at which nothing goes out, and
-        # nothing ever backfills it.
-        batch: list[tuple[int | None, dict]] = []
-        for item_id, video_id in pending:
-            rows = await db.execute_fetchall(
-                "SELECT * FROM videos WHERE id = ?", (video_id,)
-            )
-            if not rows:
-                skipped.append({
-                    "video_id": video_id, "reason": "video no longer exists",
-                })
-                continue
-            video = dict(rows[0])
-            if int(video.get("project_id") or 0) != int(queue["project_id"]):
-                # A video id from another project must never be scheduled here:
-                # it would post another channel's clip on this queue's accounts.
-                skipped.append({
-                    "video_id": video_id,
-                    "reason": "belongs to a different project",
-                })
-                continue
-            batch.append((item_id, video))
-        if not batch:
-            return {"scheduled": 0, "items": [], "skipped": skipped, "errors": errors}
+    created_items: list[dict] = []
 
-        instants = await queue_service.next_free_posting_times(queue, len(batch))
-        instant_index = 0
+    # Read once for the whole batch: it is install-wide config, and every
+    # slot of every video would otherwise re-answer the same question.
+    media_hosting_configured = await media_hosting.is_configured()
 
-        position_rows = await db.execute_fetchall(
-            "SELECT COALESCE(MAX(position), -1) AS last FROM smart_queue_items "
-            "WHERE queue_id = ?",
-            (queue_id,),
-        )
-        position = int(position_rows[0]["last"]) + 1
+    # Published before the first render so the banner shows "0 of 27"
+    # immediately. Without it a long batch reads as 0 of 0 until the first
+    # video lands, which is indistinguishable from a job that is wedged.
+    if progress is not None:
+        await progress(0, len(batch))
 
-        created_items: list[dict] = []
-
-        # Read once for the whole batch: it is install-wide config, and every
-        # slot of every video would otherwise re-answer the same question.
-        media_hosting_configured = await media_hosting.is_configured()
-
-        for item_id, video in batch:
+    for done, (item_id, video) in enumerate(batch, start=1):
+        try:
             video_id = video["id"]
 
             # Everything that touches the network happens here, before any lock.
@@ -389,6 +448,13 @@ async def accept_selection(
                 "scheduled_at": when.isoformat() if when is not None else None,
                 "posted_to_any": bool(plan.posts),
             })
+        finally:
+            # In a finally so the two `continue` paths above — a transient
+            # render failure and a failed write — still advance the count.
+            # A batch that stalls at 12 of 27 while it is really working
+            # through video 13 reads exactly like a wedged job.
+            if progress is not None:
+                await progress(done, len(batch))
 
     return {
         "scheduled": sum(1 for item in created_items if item["posted_to_any"]),

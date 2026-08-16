@@ -37,6 +37,12 @@ KIND_SLOTS_ADDED = "slots_added"
 KIND_SLOTS_REMOVED = "slots_removed"
 KIND_SLOT_BODY_CHANGED = "slot_body_changed"
 KIND_APPLIES_TO_REMOVED = "applies_to_removed"
+# Not queued by a template diff — the user presses Accept. It is here because it
+# is the same shape of work as the four above (render N posts, one Anthropic
+# call apiece, minutes long) and because it was the last one still running
+# inside its HTTP request: no progress anywhere, and an outcome that existed
+# only in a response body the browser threw away if the user navigated.
+KIND_ACCEPT = "accept"
 # Not a unit of work — only ever recorded already-failed, so a template edit
 # that could not be queued is visible rather than silently unreconciled.
 KIND_ENQUEUE_FAILED = "enqueue_failed"
@@ -49,12 +55,27 @@ STATUS_FAILED = "failed"
 _UNFINISHED = (STATUS_PENDING, STATUS_RUNNING)
 
 KIND_LABELS = {
+    KIND_ACCEPT: "Scheduling accepted videos",
     KIND_SLOTS_ADDED: "Adding posts for new slots",
     KIND_SLOTS_REMOVED: "Removing posts for deleted slots",
     KIND_SLOT_BODY_CHANGED: "Re-rendering posts for edited slots",
     KIND_APPLIES_TO_REMOVED: "Removing posts for videos no longer included",
     KIND_ENQUEUE_FAILED: "Template change could not be scheduled",
 }
+
+
+class ReportedJobFailure(Exception):
+    """A job that ran, decided its own outcome was bad, and wrote the message.
+
+    Every other exception reaching the worker is a surprise, so it is recorded
+    as ``TypeName: text`` — "APIStatusError" and "KeyError" say very different
+    things about who should look at it. This one is not a surprise: Accept
+    finishing with two of twenty-seven videos unscheduled is a normal, expected
+    result that the user has to see and act on, and prefixing a sentence written
+    for them with a Python class name makes it read like a crash. ``str(exc)``
+    is used verbatim.
+    """
+
 
 # One worker, process-wide. Serialises every queue's reconciliation against
 # every other's, which is what makes "queued behind" true rather than hopeful.
@@ -209,11 +230,24 @@ async def queue_is_locked(queue_id: int) -> bool:
     return bool(rows)
 
 
+#: How long a successfully finished job keeps being reported. Long enough that
+#: a page open while it ran can notice and show what it did, short enough that
+#: it is gone by the next visit. Failures are NOT time-limited — they stay until
+#: dismissed, because nobody has acknowledged them.
+_COMPLETED_JOB_WINDOW_MINUTES = 10
+
+
 async def status_summary() -> dict:
-    """What the app-wide banner shows: everything unfinished, plus recent failures.
+    """What the app-wide banner shows: everything unfinished, plus failures.
 
     Failures are included because a job that died has to be visible from
     wherever the user happens to be — it changed the schedule partway.
+
+    ``completed`` carries just-finished successes, whose ``detail`` is the only
+    record of what they did. Accept is why it exists: its outcome used to live
+    in an HTTP response, so a clean run that skipped four Twitter slots for
+    being over the duration cap had to say so *somewhere*, and a done job leaves
+    the other two buckets instantly.
     """
     db = await get_db()
     rows = await db.execute_fetchall(
@@ -225,11 +259,14 @@ async def status_summary() -> dict:
           LEFT JOIN smart_queues q ON q.id = j.queue_id
           LEFT JOIN projects p ON p.id = q.project_id
          WHERE j.status IN (?,?,?)
+            OR (j.status = ? AND j.finished_at IS NOT NULL
+                AND j.finished_at >= datetime('now', ?))
          ORDER BY j.id
         """,
-        (*_UNFINISHED, STATUS_FAILED),
+        (*_UNFINISHED, STATUS_FAILED, STATUS_DONE,
+         f"-{_COMPLETED_JOB_WINDOW_MINUTES} minutes"),
     )
-    active, failed = [], []
+    active, failed, completed = [], [], []
     for row in rows:
         entry = {
             "id": int(row["id"]),
@@ -244,13 +281,23 @@ async def status_summary() -> dict:
             "status": row["status"],
             "done": int(row["progress_done"] or 0),
             "total": int(row["progress_total"] or 0),
+            "detail": row["detail"],
             "error": row["last_error"],
         }
-        (failed if row["status"] == STATUS_FAILED else active).append(entry)
+        if row["status"] == STATUS_FAILED:
+            failed.append(entry)
+        elif row["status"] == STATUS_DONE:
+            completed.append(entry)
+        else:
+            active.append(entry)
     return {
         "active": active,
         "failed": failed,
+        "completed": completed,
         "busy": bool(active),
+        # Only unfinished work locks a queue. A finished job in `completed` has
+        # released it, so folding that list in here would 409 every mutation for
+        # ten minutes after a successful run.
         "locked_queue_ids": sorted({e["queue_id"] for e in active}),
     }
 
@@ -336,6 +383,8 @@ async def _run_job_locked(job, payload, queue_id, job_id, handlers) -> str:
         await _set_progress(job_id, done, total)
 
     kind = job["kind"]
+    if kind == KIND_ACCEPT:
+        return await handlers.accept_videos(queue_id, payload["video_ids"], progress)
     if kind == KIND_SLOTS_ADDED:
         return await handlers.add_slots(queue_id, payload["slot_ids"], progress)
     if kind == KIND_SLOTS_REMOVED:
@@ -367,9 +416,12 @@ async def _worker_loop() -> None:
             raise
         except Exception as exc:
             logger.exception("reconcile: job %s (%s) failed", job_id, job["kind"])
+            message = (
+                str(exc) if isinstance(exc, ReportedJobFailure)
+                else f"{type(exc).__name__}: {exc}"
+            )
             try:
-                await _finish(job_id, status=STATUS_FAILED,
-                              error=f"{type(exc).__name__}: {exc}")
+                await _finish(job_id, status=STATUS_FAILED, error=message)
             except Exception:
                 # If recording the failure ALSO fails, the loop must not die:
                 # the worker is process-wide, and its death would leave the job

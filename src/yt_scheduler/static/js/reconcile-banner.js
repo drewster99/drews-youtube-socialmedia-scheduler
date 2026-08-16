@@ -99,6 +99,23 @@
         timer = setTimeout(poll, busy ? BUSY_MS : IDLE_MS);
     }
 
+    /** Poll now instead of waiting out the current interval.
+     *
+     * Idle polling is 15 seconds, which is the right cadence for noticing work
+     * somebody else started and the wrong one for work the user just started
+     * here: pressing a button that enqueues a job and then watching nothing
+     * happen for fifteen seconds is the same dead air the background worker
+     * exists to remove. A page that enqueues calls this; `lastSignature` is
+     * cleared so the render happens even if the status is unchanged.
+     */
+    function refresh() {
+        lastSignature = '';
+        clearTimeout(timer);
+        poll();
+    }
+
+    window.dysReconcileBanner = {refresh};
+
     document.addEventListener('click', async (event) => {
         const button = event.target.closest('[data-dismiss-job]');
         if (!button) return;
@@ -112,9 +129,7 @@
                 `/api/projects/${slug}/smart-queues/${queueId}/reconcile-jobs/${jobId}/dismiss`,
                 {method: 'POST'}
             );
-            lastSignature = '';
-            clearTimeout(timer);
-            poll();
+            refresh();
         } catch (err) {
             button.disabled = false;
         }

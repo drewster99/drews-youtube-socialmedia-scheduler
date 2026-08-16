@@ -52,6 +52,10 @@
         One video goes out at each time. Any number per day, including none.
     </p>
     <div id="sq-slots"></div>
+    <!-- Says a change is pending the moment it is made, rather than leaving the
+         user to discover at Accept that nothing on screen has reached the
+         server. Sits with the slots because that is where the edit happens. -->
+    <p class="form-hint" id="sq-unsaved-note" style="display:none; color: var(--danger); margin-top:0.5rem;"></p>
     <div class="field-control" style="margin-top:0.5rem;">
         <select id="sq-new-weekday">
             <option value="0">Monday</option>
@@ -158,10 +162,10 @@
     <p class="form-hint" id="sq-busy-note" style="display:none; margin-top:0.5rem;"></p>
     <p class="form-hint" id="sq-slot-gap" style="display:none; margin-top:0.5rem;"></p>
     <p class="form-hint">
-        Accept renders post text, so it runs while this page is open and says so.
-        Re-render and "Add missing slots" hand the work to the background worker —
-        they return at once and report in the banner at the top of every page, so
-        you can leave. Save and Re-flow apply immediately. Accept is optional — a
+        Accept, Re-render and "Add missing slots" all hand the work to the
+        background worker — they return at once and report progress in the banner
+        at the top of every page, so you can leave and the result will be waiting
+        for you. Save and Re-flow apply immediately. Accept is optional — a
         queue can just collect new videos as they go live. Post text is rendered
         when you Accept, so edit the template first, or use Re-render afterwards.
     </p>
@@ -184,6 +188,9 @@ let lastSelection = [];
 // Snapshot of the posting times as last saved, so Save can tell whether
 // the recurrence actually changed and only then offer to re-flow.
 let savedSlotsSignature = '[]';
+// The same settings as the server last stored them, for the different question
+// serverReadSettings() documents. NULL until the queue has been saved once.
+let savedServerReadSettings = null;
 // Items auto-add already put in the queue with no posting time. Accept
 // schedules them first, so it must stay usable when they're all there is.
 let waitingCount = 0;
@@ -222,6 +229,7 @@ function renderSlots() {
     const host = document.getElementById('sq-slots');
     if (!slots.length) {
         host.innerHTML = '<p class="form-hint">No posting times yet — this queue would never post.</p>';
+        refreshUnsavedNote();
         return;
     }
     const ordered = [...slots].sort(
@@ -234,6 +242,7 @@ function renderSlots() {
         </div>`
     ).join('');
     slots = ordered;
+    refreshUnsavedNote();
 }
 
 function selectedOrientations() {
@@ -265,6 +274,69 @@ function queuePayload() {
             : null,
         ...currentFilters(),
     };
+}
+
+/* The queue settings Auto-select and Accept read back from the DATABASE rather
+ * than take from the request body — so an unsaved edit to any of them is not
+ * "applied later", it is ignored outright.
+ *
+ * That is not hypothetical: six posting days were removed on screen, Accept was
+ * pressed without a Save in between, and 27 videos were scheduled onto the old
+ * days. Nothing reported anything, because from the server's point of view
+ * nothing unusual happened — it never saw the removal.
+ *
+ * The keys are the words shown to the user, so the message can never drift from
+ * the thing being compared. The duration and orientation filters are
+ * deliberately absent: they travel in the candidates request body and so apply
+ * live, and warning about them would be false.
+ */
+function serverReadSettings() {
+    return {
+        'posting times': [...slots].map(s => [s.weekday, s.time_of_day]).sort(),
+        'time zone': document.getElementById('sq-timezone').value.trim(),
+        'template': document.getElementById('sq-template').value,
+    };
+}
+
+function unsavedSettingNames() {
+    // A queue that has never been saved has nothing to differ from; Auto-select
+    // creates it, which is what makes the first Accept legitimate.
+    if (!savedServerReadSettings) return [];
+    const now = serverReadSettings();
+    return Object.keys(now).filter(name =>
+        JSON.stringify(now[name]) !== JSON.stringify(savedServerReadSettings[name])
+    );
+}
+
+function joinList(items) {
+    if (items.length < 2) return items.join('');
+    return `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
+}
+
+function refreshUnsavedNote() {
+    const unsaved = unsavedSettingNames();
+    const note = document.getElementById('sq-unsaved-note');
+    note.textContent = unsaved.length
+        ? `Unsaved ${joinList(unsaved)} — press Save to apply. Until then Auto-select and Accept use the saved settings.`
+        : '';
+    note.style.display = unsaved.length ? '' : 'none';
+}
+
+/* Refuse rather than save on the user's behalf. Saving here would apply a
+ * posting-time change to a live schedule and then have to ask about re-flowing
+ * in the middle of a different operation — a question whose consequences (real,
+ * already-visible dates moving) belong on the Save button, where the user can
+ * see what they are agreeing to. Returns true when the caller must stop.
+ */
+function refuseIfUnsaved(action) {
+    const unsaved = unsavedSettingNames();
+    if (!unsaved.length) return false;
+    showError(
+        `Unsaved ${joinList(unsaved)} — press Save first. ` +
+        `${action} reads the saved settings, so it would ignore ` +
+        `${unsaved.length === 1 ? 'that change' : 'those changes'} entirely.`
+    );
+    return true;
 }
 
 async function loadTemplates() {
@@ -308,6 +380,9 @@ async function loadQueue() {
     savedSlotsSignature = JSON.stringify(
         [...slots].map(s => [s.weekday, s.time_of_day]).sort()
     );
+    // Taken after every field above has been populated, so it records what the
+    // server holds and not a half-filled form.
+    savedServerReadSettings = serverReadSettings();
     renderSlots();
     document.getElementById('sq-delete-btn').style.display = '';
     syncMissedPolicyFields();
@@ -408,44 +483,32 @@ function renderSelection(result) {
 // the schedule — so a double-click on a new one fired two creates, the second
 // of which failed the (project, name) uniqueness check and reported an error
 // for work that had actually succeeded.
-// Work that runs in the request, not in a background job: Accept and
-// Re-render both render post text, and a template with an AI block calls
-// Claude once per post. Leaving the page aborts the fetch mid-way, so the
-// answer to "can I go?" is no — and the user had no way to know that. Rather
-// than a warning nobody reads, say it while it is true and let the browser
-// enforce it. Both operations are idempotent, so an interrupted run is safe to
-// repeat; it is the silence that was the problem, not the risk.
-let mustStayCount = 0;
-
-window.addEventListener('beforeunload', (event) => {
-    if (!mustStayCount) return;
-    event.preventDefault();
-    event.returnValue = '';
-});
-
+// Nothing on this page holds the connection for minutes any more. Accept was
+// the last one, and it now enqueues a job like Re-render and Add missing slots
+// do, so every request here is short.
+//
+// That retired a `mustStay` flag and a beforeunload prompt which between them
+// asserted that leaving the page "stops it partway" — twice, and wrongly both
+// times: uvicorn's connection_lost sets cycle.disconnected and cancels only the
+// keep-alive timer, and Starlette's BaseHTTPMiddleware never cancels the
+// downstream app either, so the work always ran to completion and only the
+// response was dropped. What actually got lost was the REPORT, and the fix for
+// that is to persist it on the job rather than to ask the user to stand guard.
 function setBusyNote(text) {
     const note = document.getElementById('sq-busy-note');
     note.textContent = text;
     note.style.display = text ? '' : 'none';
 }
 
-async function withBusyButton(id, busyLabel, work, {mustStay = false} = {}) {
+async function withBusyButton(id, busyLabel, work) {
     const button = document.getElementById(id);
     if (button.disabled) return;
     const label = button.textContent;
     button.disabled = true;
     button.textContent = busyLabel;
-    if (mustStay) {
-        mustStayCount += 1;
-        setBusyNote(`${busyLabel} Keep this page open until it finishes — leaving now stops it partway. (Safe to run again if it does.)`);
-    }
     try {
         return await work();
     } finally {
-        if (mustStay) {
-            mustStayCount -= 1;
-            if (!mustStayCount) setBusyNote('');
-        }
         button.disabled = false;
         button.textContent = label;
     }
@@ -453,6 +516,10 @@ async function withBusyButton(id, busyLabel, work, {mustStay = false} = {}) {
 
 async function runSelection(shuffle) {
     showError('');
+    // The forecast times beside each candidate come from the SAVED posting
+    // times, so proposing a schedule from settings the server does not have
+    // would show times the user had just edited away.
+    if (refuseIfUnsaved('Auto-select')) return;
     try {
         // Selecting needs a queue id, because the candidate list excludes
         // videos this queue already holds. Save rather than refuse: the user
@@ -489,14 +556,28 @@ document.getElementById('sq-slots').addEventListener('click', (event) => {
     renderSlots();
 });
 
+// The slot list refreshes the note from renderSlots(); these two have no
+// re-render of their own, so they say it themselves.
+document.getElementById('sq-timezone').addEventListener('input', refreshUnsavedNote);
+document.getElementById('sq-template').addEventListener('change', refreshUnsavedNote);
+
 document.getElementById('sq-missed-policy').addEventListener('change', syncMissedPolicyFields);
 document.getElementById('sq-select-btn').addEventListener('click', () =>
     withBusyButton('sq-select-btn', 'Selecting…', () => runSelection(false)));
 document.getElementById('sq-shuffle-btn').addEventListener('click', () =>
     withBusyButton('sq-shuffle-btn', 'Shuffling…', () => runSelection(true)));
 
+// Every button here that enqueues work calls this: the banner's idle poll is
+// 15 seconds, and watching nothing happen for that long after pressing a button
+// is the dead air the background worker was supposed to remove.
+function wakeReconcileBanner() {
+    if (window.dysReconcileBanner) window.dysReconcileBanner.refresh();
+}
+
 document.getElementById('sq-accept-btn').addEventListener('click', async () => {
     if (!lastSelection.length && !waitingCount) return;
+    showError('');
+    if (refuseIfUnsaved('Accept')) return;
     const button = document.getElementById('sq-accept-btn');
     // The order on screen is the order that gets scheduled, shuffled or not.
     const videoIds = lastSelection.map(video => video.id);
@@ -508,15 +589,12 @@ document.getElementById('sq-accept-btn').addEventListener('click', async () => {
             waitingCount + videoIds.length === 1 ? '' : 's'}?` +
         (waitingCount ? '\n\nWaiting videos go first — they have been in the queue longest.' : '')
     )) return;
-    // These ids go stale the moment the request leaves: on a partial failure
-    // some are already scheduled. Drop them so a second click can't re-submit
-    // a batch the server has partly accepted; the refresh supplies fresh ones.
+    // These ids go stale the moment the request leaves: the worker may already
+    // have scheduled some. Drop them so a second click can't re-submit a batch
+    // the server has partly accepted; the refresh supplies fresh ones.
     lastSelection = [];
     button.disabled = true;
-    button.textContent = 'Scheduling…';
-    // Accept renders every post it schedules — same Claude cost as Re-render.
-    mustStayCount += 1;
-    setBusyNote('Scheduling… Keep this page open until it finishes — leaving now stops it partway. (Safe to run again if it does.)');
+    button.textContent = 'Queueing…';
     showError('');
     try {
         const result = await apiCall(
@@ -524,41 +602,61 @@ document.getElementById('sq-accept-btn').addEventListener('click', async () => {
             {method: 'POST', headers: {'Content-Type': 'application/json'},
              body: JSON.stringify({video_ids: videoIds})}
         );
-        // Skipped slots are reported, not hidden — a platform that couldn't
-        // take a clip should be visible now, not a surprise later.
-        const skipped = result.skipped || [];
-        const failed = result.errors || [];
-        const note = skipped.length
-            ? ` ${skipped.length} slot${skipped.length === 1 ? '' : 's'} skipped: ` +
-              skipped.slice(0, 5).map(s => `${s.platform || s.video_id} (${s.reason})`).join('; ')
-            : '';
-        // Refresh BEFORE reporting: runSelection clears the banner and rewrites
-        // the summary, so reporting first would erase both.
-        await runSelection(false);
-        await loadUpcoming();
-        document.getElementById('sq-summary').textContent =
-            `Scheduled ${result.scheduled} video${result.scheduled === 1 ? '' : 's'}.${note}` +
-            (failed.length
-                ? ` ${failed.length} could not be scheduled — see below.`
-                : '');
-        // Never let a partial batch read as a clean one: a video that failed
-        // was left untouched and stays a candidate, so say so.
-        if (failed.length) {
-            showError(
-                `${failed.length} video${failed.length === 1 ? '' : 's'} could not be ` +
-                `scheduled and ${failed.length === 1 ? 'was' : 'were'} left untouched — ` +
-                `press Accept again to retry: ` +
-                failed.map(e => `${e.video_id} (${e.error})`).join(' · ')
-            );
-        }
+        // Remembered so the completion handler can tell OUR job's outcome from
+        // any other queue's job finishing in the same banner poll.
+        acceptJobId = result.job_id;
+        wakeReconcileBanner();
+        setBusyNote(
+            'Scheduling… Watch the banner at the top of the page for progress. '
+            + 'This runs in the background — you can leave this page, and the '
+            + 'result will be waiting in the banner when it finishes.'
+        );
+        document.getElementById('sq-summary').textContent = '';
     } catch (err) {
         showError(err.message);
     } finally {
-        mustStayCount -= 1;
-        if (!mustStayCount) setBusyNote('');
         button.disabled = false;
         button.textContent = 'Accept';
     }
+});
+
+/* Report the Accept we started, wherever it ends up.
+ *
+ * The banner owns progress and owns failures app-wide, but a CLEAN run leaves
+ * both of its buckets the moment it finishes, and a clean run still has things
+ * to say — which platform slots were skipped and why. `completed` carries that
+ * for a few minutes, which is what this reads.
+ *
+ * Failures are deliberately NOT re-reported here: the banner already shows them
+ * with a Dismiss button, on every page, until acknowledged. Saying it twice on
+ * this one page would imply two problems.
+ */
+let acceptJobId = null;
+
+// On `document`, not `window`: reconcile-banner.js dispatches there and the
+// event does not bubble, so a window listener would never fire at all.
+document.addEventListener('reconcile-status', async (event) => {
+    if (acceptJobId === null) return;
+    const status = event.detail || {};
+    const mine = job => job.id === acceptJobId;
+    const done = (status.completed || []).find(mine);
+    const failed = (status.failed || []).find(mine);
+    if (!done && !failed) return;
+
+    acceptJobId = null;
+    setBusyNote('');
+    // Refresh BEFORE reporting: runSelection rewrites the summary line, so
+    // reporting first would erase what we just wrote.
+    //
+    // Only re-run the selection when it can actually run. Save returns 409
+    // while a job owns the queue, so the user may well be sitting on an edit
+    // they were not allowed to apply — and runSelection would then refuse,
+    // replacing the report of a finished Accept with a warning about something
+    // else entirely. The other two refreshes are reads and always safe.
+    if (!unsavedSettingNames().length) await runSelection(false);
+    await loadUpcoming();
+    await refreshSlotGap();
+    if (done) document.getElementById('sq-summary').textContent = done.detail || '';
 });
 
 // Slot membership is fixed at Accept, so enabling a template slot afterwards
@@ -607,6 +705,7 @@ document.getElementById('sq-backfill-btn').addEventListener('click', () =>
             `/api/projects/${projectSlug}/smart-queues/${queueId}/backfill-slots`,
             {method: 'POST'}
         );
+        wakeReconcileBanner();
         document.getElementById('sq-summary').textContent = result.queued
             ? 'Queued — watch the banner at the top of the page. You can leave this page.'
             : 'Nothing to add: this template has no enabled slots.';
@@ -633,6 +732,7 @@ document.getElementById('sq-rerender-btn').addEventListener('click', () =>
         // The work now runs on the background worker, so this returns at once
         // and the banner at the top of every page owns the progress. Leaving
         // this page no longer stops it.
+        wakeReconcileBanner();
         document.getElementById('sq-summary').textContent = result.queued
             ? 'Re-render queued — watch the banner at the top of the page. You can leave this page.'
             : 'Nothing to re-render: this template has no enabled slots.';
@@ -678,6 +778,8 @@ async function saveQueue({offerReflow = true} = {}) {
     savedSlotsSignature = JSON.stringify(
         [...slots].map(s => [s.weekday, s.time_of_day]).sort()
     );
+    savedServerReadSettings = serverReadSettings();
+    refreshUnsavedNote();
     if (!queueId) {
         queueId = saved.id;
         // Replace rather than push: going Back should return to the

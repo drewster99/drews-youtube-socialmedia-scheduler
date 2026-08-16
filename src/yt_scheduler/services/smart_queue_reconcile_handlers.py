@@ -32,6 +32,12 @@ Progress = Callable[[int, int], Awaitable[None]]
 # A post that has gone out, or is going out right now, is not ours to touch.
 _PENDING_STATUSES = ("posted", "sending")
 
+# How many skipped slots / failed videos an Accept summary names before it
+# switches to a count. The summary goes in a banner, so an unbounded list of a
+# hundred entries would push everything else off the screen; the count that
+# follows is what says the list was cut, so it never reads as complete.
+_ACCEPT_REPORT_LIMIT = 5
+
 
 async def _pending_items(queue_id: int) -> list[dict]:
     """Scheduled items with nothing already published.
@@ -133,6 +139,71 @@ async def _default_ai_system_for_queue(queue_id: int) -> str | None:
             "queue %s; refusing to re-render against a different one", queue_id,
         )
         raise
+
+
+def _describe_accept(result: dict) -> str:
+    """One sentence per fact the user has to act on, in decreasing urgency."""
+    scheduled = int(result.get("scheduled") or 0)
+    skipped = result.get("skipped") or []
+    errors = result.get("errors") or []
+
+    parts = [f"Scheduled {scheduled} video{'' if scheduled == 1 else 's'}."]
+    if skipped:
+        # Named individually rather than counted: "4 slots skipped" sends the
+        # user hunting, and the reason ("143s is over twitter's 140s limit") is
+        # the whole content of the message.
+        detail = "; ".join(
+            f"{entry.get('platform') or entry.get('video_id')}"
+            f" ({entry.get('reason')})"
+            for entry in skipped[:_ACCEPT_REPORT_LIMIT]
+        )
+        more = len(skipped) - _ACCEPT_REPORT_LIMIT
+        parts.append(
+            f"{len(skipped)} slot{'' if len(skipped) == 1 else 's'} skipped: "
+            f"{detail}{f' (+{more} more)' if more > 0 else ''}."
+        )
+    if errors:
+        detail = "; ".join(
+            f"{entry.get('video_id')} ({entry.get('error')})"
+            for entry in errors[:_ACCEPT_REPORT_LIMIT]
+        )
+        more = len(errors) - _ACCEPT_REPORT_LIMIT
+        parts.append(
+            f"{len(errors)} video{'' if len(errors) == 1 else 's'} could not be "
+            f"scheduled and {'was' if len(errors) == 1 else 'were'} left "
+            f"untouched — press Accept again to retry: "
+            f"{detail}{f' (+{more} more)' if more > 0 else ''}."
+        )
+    return " ".join(parts)
+
+
+async def accept_videos(
+    queue_id: int, video_ids: list[str], progress: Progress
+) -> str:
+    """Schedule an accepted batch, reporting progress per video.
+
+    Calls the *locked* body: ``run_job`` already holds this queue's Accept lock
+    for every job kind, so going through the public wrapper would deadlock the
+    worker against itself.
+
+    A batch where some videos failed is reported as a FAILED job rather than a
+    done one. The job ran to completion, but part of what the user asked for did
+    not happen and the videos were left untouched, so it has to stay on screen
+    until they retry or dismiss it — a done job leaves the banner immediately,
+    which is exactly the silent half-success this whole design exists to stop.
+    """
+    from yt_scheduler.services import smart_queue_accept
+    from yt_scheduler.services.smart_queue_reconcile import ReportedJobFailure
+
+    result = await smart_queue_accept._accept_selection_locked(
+        queue_id, video_ids,
+        default_ai_system=await _default_ai_system_for_queue(queue_id),
+        progress=progress,
+    )
+    summary = _describe_accept(result)
+    if result.get("errors"):
+        raise ReportedJobFailure(summary)
+    return summary
 
 
 async def add_slots(queue_id: int, slot_ids: list[int], progress: Progress) -> str:

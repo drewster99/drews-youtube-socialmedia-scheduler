@@ -1,11 +1,16 @@
 """Live integration tests for the template renderer.
 
-These hit the real Anthropic API via ``services.templates.render``. They
-auto-skip when no Anthropic API key is configured in the Keychain
-(encrypted-file fallback elsewhere). Each test costs a few cents in tokens
-and a few seconds in latency, so they're segregated from the default
-suite via a module-level skip — run with ``pytest tests/test_template_render_live.py``
-to exercise them deliberately.
+These hit the real Anthropic API via ``services.templates.render``. Each test
+costs real tokens and a few seconds of latency, so they are **opt-in**::
+
+    DYS_RUN_LIVE_API_TESTS=1 pytest tests/test_template_render_live.py
+
+They used to claim to be segregated from the default suite while gating only on
+whether an Anthropic key happened to be in the Keychain — which on the machine
+that has one is always true. So they ran on every ``pytest``, billed every time,
+and accounted for roughly half the suite's wall-clock. The gate is now the env
+var, which is also the single documented opt-out of the conftest guard that
+otherwise keeps the whole suite off the real Keychain.
 
 Lock down end-to-end behaviour the mocked tests can't:
 - That the live model honours short-output instructions (so we can
@@ -20,13 +25,30 @@ from __future__ import annotations
 
 import pytest
 
-from yt_scheduler.config import get_anthropic_api_key
 from yt_scheduler.services import templates
+
+from tests.conftest import LIVE_API_TESTS_ENV, live_api_tests_opted_in
+
+
+def _live_tests_runnable() -> bool:
+    """Opt-in first, key second — the key is only asked for once invited.
+
+    Order matters: reading it unconditionally is a real Keychain hit at
+    collection time, which is the thing the guard exists to prevent.
+    """
+    if not live_api_tests_opted_in():
+        return False
+    from yt_scheduler.config import get_anthropic_api_key
+
+    return bool(get_anthropic_api_key())
 
 
 pytestmark = pytest.mark.skipif(
-    not get_anthropic_api_key(),
-    reason="No Anthropic API key configured in Keychain — skipping live API tests",
+    not _live_tests_runnable(),
+    reason=(
+        f"Live Anthropic tests are opt-in and cost real tokens — set "
+        f"{LIVE_API_TESTS_ENV}=1 with an Anthropic key in the Keychain to run them"
+    ),
 )
 
 

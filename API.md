@@ -2699,9 +2699,17 @@ The forecast continues after everything the queue has already stamped, matching 
 
 Two sources feed one plan, in this order: items already in the queue in state `queued` (what auto-add appends when a video goes live — they keep their position, so they go out in the order they arrived), then `video_ids`. **Accept is the only thing that assigns a posting time**; auto-add deliberately does not, so "when does this go out" is decided in one place.
 
-**Response 200** — `{"scheduled": N, "items": [{"id", "video_id", "scheduled_at", "posted_to_any"}], "skipped": [{"video_id", "platform", "reason"}], "errors": [{"video_id", "post_id"?, "error"}]}`.
+**Response 200** — `{"queued": true, "job_id": N}`, immediately.
 
-It does not raise once the loop has begun — a caller told nothing cannot tell a half-landed batch from a normal one, so every outcome comes back in the ledger. `skipped` reasons include `already scheduled by this queue` (re-submitting a stale selection cannot double-book), `belongs to a different project`, and `video no longer exists`. Ids repeated within one request are scheduled once.
+The work runs on the reconcile worker as job kind `accept`, alongside the four kinds a template edit queues — same worker, same per-queue lock, same banner. It used to run inside this request: one Anthropic call per post meant a 27-video batch held the connection for two and a half minutes behind a static label, with no progress anywhere, and its outcome existed only in this response body, so navigating away discarded the record of which slots were skipped and which videos failed.
+
+Progress (videos done / videos total) and the finished report are at [`GET /api/reconcile-status`](#get-apireconcile-status): `active` while it runs, then `completed[].detail` for ten minutes, or `failed[].error` — kept until dismissed — if any video could not be scheduled.
+
+**Errors** — `400` when the queue has no posting times or its template is missing (both dead on arrival and immediately fixable, so they are refused at the button rather than becoming a failed job; nothing is enqueued). `409` when the queue already has unfinished jobs — including a previous Accept, which is what stops a double-click stamping two batches onto the same instants.
+
+It does not abandon a batch once the loop has begun — a report that stopped at the first problem could not distinguish a half-landed batch from a normal one, so every outcome reaches the job's `detail`/`error`. `skipped` reasons include `already scheduled by this queue` (re-submitting a stale selection cannot double-book), `belongs to a different project`, and `video no longer exists`. Ids repeated within one request are scheduled once.
+
+A batch in which **any** video failed finishes the job as `failed`, not `done`, even though the rest were scheduled: a `done` job leaves the banner at once, and videos left untouched need to stay on screen until the user retries or dismisses. The message states both halves — what landed and what did not.
 
 Each video is written **whole or not at all**: its item row and all its posts commit in one transaction, and posts carry `scheduled_at` from the moment they exist, so a crash before the timer is registered is recovered at the next restart rather than stranding a post nothing can see. A **deterministic** render failure (undefined variable, malformed section) skips that slot; anything else — Anthropic overloaded, no API key, network down — abandons that **video**, writes nothing for it, and reports it in `errors`, so it stays a candidate and the retry is clean. A video that will post nothing consumes no posting time.
 
@@ -2793,16 +2801,27 @@ Posts already `posted` (or mid-`sending`) are left alone — they are history. R
 
 ```json
 {
-  "active": [{"id": 3, "queue_id": 1, "queue_name": "Daily Shorts",
+  "active": [{"id": 3, "queue_id": 1, "project_slug": "podcast",
+              "queue_name": "Daily Shorts",
               "kind": "slots_added", "label": "Adding posts for new slots",
-              "status": "running", "done": 12, "total": 48, "error": null}],
+              "status": "running", "done": 12, "total": 48,
+              "detail": null, "error": null}],
   "failed": [],
+  "completed": [],
   "busy": true,
   "locked_queue_ids": [1]
 }
 ```
 
-`kind` is one of `slots_added`, `slots_removed`, `slot_body_changed`, `applies_to_removed`, plus `enqueue_failed` (only ever recorded already-failed, when a saved template edit could not be turned into jobs).
+`kind` is one of `accept`, `slots_added`, `slots_removed`, `slot_body_changed`, `applies_to_removed`, plus `enqueue_failed` (only ever recorded already-failed, when a saved template edit could not be turned into jobs).
+
+Three buckets, answering three different questions:
+
+- `active` — unfinished (`pending` or `running`), with `done`/`total` progress.
+- `failed` — kept until explicitly dismissed, because nobody has acknowledged them.
+- `completed` — successes that finished within the last **10 minutes**, carrying the `detail` they wrote. This exists for `accept`: a clean run still has things to say (which platform slots were skipped and why), and that used to live only in the response body. A time window rather than a dismissal, because there is nothing to acknowledge.
+
+`locked_queue_ids` is derived from `active` alone. A finished job has released its queue, so `completed` deliberately does not contribute — otherwise every mutation would `409` for ten minutes after a successful run.
 
 A queue in `locked_queue_ids` returns `409` from every schedule mutation — `PATCH`, `DELETE`, `/accept`, `/re-flow`, `/re-render`, `/backfill-slots` — until its jobs finish. Reading stays allowed.
 

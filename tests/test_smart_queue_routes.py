@@ -275,7 +275,17 @@ async def test_accept_with_no_ids_schedules_the_waiting_items(client):
     )
 
     assert response.status_code == 200, response.text
-    assert response.json()["scheduled"] == 1
+    # Accept enqueues rather than scheduling inline, so the route's answer is a
+    # job id. Run that job to keep asserting the thing that actually matters:
+    # the waiting item ends up scheduled.
+    assert response.json()["queued"] is True
+    job_id = response.json()["job_id"]
+
+    reconcile = importlib.import_module("yt_scheduler.services.smart_queue_reconcile")
+    job = await reconcile._claim_next_job()
+    assert job is not None and int(job["id"]) == job_id
+    await reconcile.run_job(job)
+
     rows = await db.execute_fetchall(
         "SELECT state, scheduled_at FROM smart_queue_items"
     )

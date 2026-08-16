@@ -289,8 +289,17 @@ async def accept_selection(slug: str, queue_id: int, data: dict):
 
     Items already scheduled by this queue are untouched; new times continue
     after the last one on the books.
+
+    Returns ``{"queued": true, "job_id": N}`` immediately — the work runs on the
+    background worker, exactly like ``/re-render`` and ``/backfill-slots``, and
+    reports through ``GET /api/reconcile-status`` and the app-wide banner. It
+    used to run inside this request: one Anthropic call per post meant a 27-video
+    batch held the connection for two and a half minutes with no progress
+    anywhere, and its outcome existed only in this response body, so navigating
+    away discarded the record of which slots were skipped and which videos
+    failed.
     """
-    queue = await _queue_in_project_or_404(slug, queue_id)
+    await _queue_in_project_or_404(slug, queue_id)
     await _require_not_reconciling(queue_id)
     video_ids = data.get("video_ids") or []
     if not isinstance(video_ids, list):
@@ -298,14 +307,22 @@ async def accept_selection(slug: str, queue_id: int, data: dict):
     # An empty list is legitimate: it means "schedule whatever is already
     # waiting in this queue", which is what auto-add fills.
 
+    # Validated here rather than in the worker: a queue with no posting times,
+    # or a template that has gone missing, is a mistake the user can fix right
+    # now, and a 400 at the button says so far better than a failed job.
     try:
-        result = await smart_queue_accept.accept_selection(
-            queue_id, [str(v) for v in video_ids],
-            default_ai_system=await _default_ai_system(queue["project_id"]),
-        )
+        await smart_queue_accept.check_acceptable(queue_id)
     except SmartQueueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    return result
+
+    job_ids = await smart_queue_reconcile.enqueue_jobs(
+        queue_id,
+        [{
+            "kind": smart_queue_reconcile.KIND_ACCEPT,
+            "payload": {"video_ids": [str(v) for v in video_ids]},
+        }],
+    )
+    return {"queued": True, "job_id": job_ids[0]}
 
 
 @router.post("/{queue_id}/re-flow")
@@ -424,15 +441,13 @@ async def backfill_pending_slots(slug: str, queue_id: int):
     return {"queued": True, "jobs": len(ids)}
 
 
-async def _default_ai_system(project_id: int) -> str:
-    """The project's editable default system prompt for ``{{ai: …}}`` blocks,
-    so a queue render honours the same setting the generate path does."""
-    from yt_scheduler.services import prompts as prompt_service
-
-    resolved = await prompt_service.get_prompt_with_fallback(
-        "ai_block_default_system_prompt", project_id=project_id
-    )
-    return resolved["system"]
+# The default {{ai:}} system prompt used to be resolved here for Accept, in a
+# near-copy of smart_queue_reconcile_handlers._default_ai_system_for_queue that
+# differed in the way that mattered: this one let every failure propagate as a
+# 500, while the handler's distinguishes "genuinely absent" (warn, render
+# without one) from "we could not read it" (refuse, rather than silently render
+# against a DIFFERENT system prompt than the rest of the queue used). Accept now
+# runs on the worker and shares that single implementation.
 
 
 @router.get("/{queue_id}/missed")
