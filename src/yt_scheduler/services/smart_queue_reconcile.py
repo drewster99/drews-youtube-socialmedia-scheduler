@@ -15,6 +15,12 @@ Four changes matter, and each maps to one job kind:
 Adding to "applies to" is deliberately not a job: it widens what *future*
 Accepts may pick up and says nothing about what is already scheduled.
 
+A fifth kind, ``accept``, is not a template change at all — the user presses
+Accept. It lives here because it is the same shape of work and wants the same
+machinery: minutes of rendering, one queue at a time, progress somebody can see,
+and an outcome that survives the request. It was the last such job still running
+inside its HTTP request.
+
 Jobs are persisted and run on a single worker, so only one is ever in flight —
 they re-render N posts with an AI round-trip apiece, and two at once on the
 same queue would race each other's writes. Work outliving the request that
@@ -380,7 +386,20 @@ async def run_job(job: dict) -> str:
 async def _run_job_locked(job, payload, queue_id, job_id, handlers) -> str:
 
     async def progress(done: int, total: int) -> None:
-        await _set_progress(job_id, done, total)
+        # Bookkeeping must never be the thing that kills the work it describes —
+        # the same rule ai.create_message follows for its request/response log.
+        # Accept made it matter: its progress call sits in a `finally` inside
+        # the per-video loop, so a failed status write would have propagated out
+        # of the loop and abandoned a batch that was scheduling correctly. A
+        # stalled counter is a far smaller harm than a lost batch, and a genuine
+        # database problem will surface on the real writes a moment later.
+        try:
+            await _set_progress(job_id, done, total)
+        except Exception:
+            logger.exception(
+                "reconcile: could not record progress %s/%s for job %s; the job "
+                "continues", done, total, job_id,
+            )
 
     kind = job["kind"]
     if kind == KIND_ACCEPT:

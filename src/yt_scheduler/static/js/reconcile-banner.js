@@ -49,7 +49,15 @@
                                         : 'Queued';
             parts.push(
                 `<span class="reconcile-banner__spinner" aria-hidden="true"></span>`
-                + `<span><strong>Updating schedules to match template changes.</strong> `
+                // Deliberately states no cause. This used to read "to match
+                // template changes", which was already only sometimes true —
+                // Re-render and Add missing slots queue the same jobs — and is
+                // now plainly false for the most common one: the user pressed
+                // Accept and no template was touched. Blaming an edit the user
+                // did not make sends them looking for the wrong thing, which is
+                // the same reason the 409 message avoids saying it. Each job's
+                // own label says what it is actually doing.
+                + `<span><strong>Updating smart schedules.</strong> `
                 + `${escapeText(lead)}`
                 + (queued ? ` (${queued} more queued)` : '')
                 + ` — smart schedules can't be saved until this finishes.</span>`
@@ -57,7 +65,7 @@
         }
         for (const job of failed) {
             parts.push(
-                `<span class="reconcile-banner__failed"><strong>Schedule update failed</strong>`
+                `<span class="reconcile-banner__failed"><strong>Smart schedule task failed</strong>`
                 + ` — ${escapeText(job.queue_name)}: ${escapeText(job.label)}.`
                 + ` ${escapeText(job.error || 'no detail')}`
                 + ` <button type="button" class="btn btn-sm" data-dismiss-job="${job.id}"`
@@ -75,7 +83,15 @@
         return div.innerHTML;
     }
 
-    async function poll() {
+    // Which poll chain is the live one. clearTimeout cannot cancel a poll that
+    // is already awaiting its fetch, so refresh() would otherwise leave the old
+    // one running: it resumes, schedules its own timer, and from then on TWO
+    // chains poll forever. Every enqueueing button calls refresh(), so pressing
+    // two of them in quick succession was enough. A superseded chain checks its
+    // token on the way out and simply stops.
+    let pollGeneration = 0;
+
+    async function poll(generation) {
         let status = null;
         try {
             const resp = await fetch('/api/reconcile-status');
@@ -85,6 +101,7 @@
             // work is running, so leave whatever is on screen rather than
             // clearing it and implying everything finished.
         }
+        if (generation !== pollGeneration) return;
         if (status) {
             const signature = JSON.stringify(status);
             if (signature !== lastSignature) {
@@ -96,7 +113,7 @@
             }
         }
         const busy = status && status.busy;
-        timer = setTimeout(poll, busy ? BUSY_MS : IDLE_MS);
+        timer = setTimeout(() => poll(generation), busy ? BUSY_MS : IDLE_MS);
     }
 
     /** Poll now instead of waiting out the current interval.
@@ -111,7 +128,8 @@
     function refresh() {
         lastSignature = '';
         clearTimeout(timer);
-        poll();
+        pollGeneration += 1;
+        poll(pollGeneration);
     }
 
     window.dysReconcileBanner = {refresh};
@@ -135,9 +153,12 @@
         }
     });
 
+    // Arrow-wrapped, not passed by reference: a listener hands its Event to the
+    // callback, which would arrive as `generation`, fail the identity check on
+    // the way out and stop the chain before it ever scheduled a second poll.
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', poll);
+        document.addEventListener('DOMContentLoaded', () => poll(pollGeneration));
     } else {
-        poll();
+        poll(pollGeneration);
     }
 })();
